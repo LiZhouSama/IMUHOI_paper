@@ -11,6 +11,7 @@ from configs import (
     FRAME_RATE, _SENSOR_POS_INDICES, _SENSOR_ROT_INDICES, _VEL_SELECTION_INDICES,
     _REDUCED_INDICES, _IGNORED_INDICES, _SENSOR_NAMES, _SENSOR_VEL_NAMES, _REDUCED_POSE_NAMES
 )
+from process.imu_noise import apply_imu_noise, merge_noise_cfg, NOITOM_IMU_NOISE_CFG
 
 # --- IMU 计算函数 ---
 def _central_diff(tensor: torch.Tensor, dt: float) -> torch.Tensor:
@@ -136,6 +137,24 @@ def find_contact_segments(contact_mask):
     segments.append((start, end))
     return segments
 
+def gaussian_label_from_indices(indices, length, sigma=2.0, device=None, dtype=None):
+    """根据接触起止帧生成高斯平滑标签"""
+    if device is None:
+        device = torch.device("cpu")
+    if dtype is None:
+        dtype = torch.float32
+    if isinstance(indices, torch.Tensor):
+        idx_list = indices.tolist()
+    else:
+        idx_list = list(indices)
+    if len(idx_list) == 0:
+        return torch.zeros(length, device=device, dtype=dtype)
+    t = torch.arange(length, device=device, dtype=dtype)
+    labels = torch.zeros(length, device=device, dtype=dtype)
+    for idx in idx_list:
+        labels = torch.maximum(labels, torch.exp(-0.5 * ((t - float(idx)) / sigma) ** 2))
+    return labels
+
 def compute_obj_direction_supervision(position_global, obj_trans, obj_rot, 
                                     lhand_contact, rhand_contact):
     """
@@ -200,7 +219,7 @@ def compute_obj_direction_supervision(position_global, obj_trans, obj_rot,
     return result
 
 class IMUDataset(Dataset):
-    def __init__(self, data_dir, window_size=60, debug=False, min_obj_contact_frames=10, full_sequence=False):
+    def __init__(self, data_dir, window_size=60, debug=False, min_obj_contact_frames=10, full_sequence=False, imu_noise_cfg=None, simulate_imu_noise=True):
         """
         IMU数据集 - 每个epoch为每个序列随机采样一个窗口
         Args:
@@ -209,6 +228,8 @@ class IMUDataset(Dataset):
             debug: 是否在调试模式
             min_obj_contact_frames: 序列中至少需要的物体接触帧数，少于此值的序列将被过滤掉
             full_sequence: 是否使用整段模式
+            imu_noise_cfg: 可选，IMU 噪声配置（None 使用 Noitom 风格默认值）
+            simulate_imu_noise: 是否对合成 IMU 施加真实感噪声模型
         """
         # 支持单个目录或多个目录
         if isinstance(data_dir, str):
@@ -222,6 +243,8 @@ class IMUDataset(Dataset):
         self.debug = debug
         self.min_obj_contact_frames = min_obj_contact_frames
         self.full_sequence = full_sequence
+        self.simulate_imu_noise = simulate_imu_noise
+        self.imu_noise_cfg = merge_noise_cfg(imu_noise_cfg)
 
         # 查找所有目录中的序列文件
         self.sequence_files = []
@@ -238,14 +261,17 @@ class IMUDataset(Dataset):
         # 初始化用于存储预加载数据和序列信息的容器
         self.loaded_data = {}
         self.sequence_info = [] # Store sequence metadata: {'file_path': ..., 'seq_name': ..., 'seq_len': ...}
+        self.has_human_real_imu = False
+        self.has_obj_real_imu = False
 
         # 执行加载、共享和序列信息收集
         self._load_share_and_collect_info()
+        print(f"真实IMU使用情况：人体={'存在' if self.has_human_real_imu else '生成'}，物体={'存在' if self.has_obj_real_imu else '生成'}")
         print(f"预加载并收集信息完成，共找到{len(self.sequence_info)}个有效序列")
         if self.full_sequence:
-            print(f"过滤条件：整段模式启用，序列长度 >= 1，物体接触帧数 >= {self.min_obj_contact_frames}")
+            print(f"过滤条件：整段模式启用，序列长度 >= 1，手部接触帧数(左右手任一) >= {self.min_obj_contact_frames}")
         else:
-            print(f"过滤条件：序列长度 >= {self.window_size + 1}，物体接触帧数 >= {self.min_obj_contact_frames}")
+            print(f"过滤条件：序列长度 >= {self.window_size + 1}，手部接触帧数(左右手任一) >= {self.min_obj_contact_frames}")
 
         # 检查BPS文件夹 - 对于多个数据目录，检查第一个目录的BPS文件夹
         self.bps_dir = os.path.join(os.path.dirname(self.data_dirs[0]), "bps_features")
@@ -273,6 +299,12 @@ class IMUDataset(Dataset):
                 seq_data = torch.load(file_path)
                 seq_name = os.path.basename(file_path).replace(".pt", "")
 
+                # 判定是否有物体：显式 has_object 优先，其次根据 obj_trans 是否存在
+                has_object_flag = seq_data.get("has_object", None)
+                if has_object_flag is None:
+                    has_object_flag = ("obj_trans" in seq_data and seq_data["obj_trans"] is not None)
+                has_object_flag = bool(has_object_flag)
+
                 # 检查基本数据是否存在
                 if seq_data is None or "rotation_local_full_gt_list" not in seq_data or seq_data["rotation_local_full_gt_list"] is None:
                     print(f"警告：跳过文件 {file_path}，缺少必要的 'rotation_local_full_gt_list' 数据。")
@@ -292,22 +324,32 @@ class IMUDataset(Dataset):
                         # print(f"调试：跳过文件 {file_path}，序列长度 {seq_len} 不足以创建大小为 {self.window_size} 的窗口。")
                         continue
 
-                # 检查物体接触帧数是否足够
-                if "obj_contact" in seq_data and seq_data["obj_contact"] is not None:
-                    obj_contact_frames = seq_data["obj_contact"]
-                    if isinstance(obj_contact_frames, torch.Tensor):
-                        contact_count = obj_contact_frames.sum().item()
-                    else:
-                        contact_count = np.sum(obj_contact_frames)
-                    
-                    if contact_count < self.min_obj_contact_frames:
-                        # print(f"跳过文件 {file_path}，物体接触帧数 {contact_count} 少于最小要求 {self.min_obj_contact_frames}")
+                # 检查手部接触帧数是否足够（仅对含物体序列生效，左右手任一达到阈值即通过）
+                if has_object_flag:
+                    def _contact_count(contact):
+                        if contact is None:
+                            return 0
+                        if isinstance(contact, torch.Tensor):
+                            return contact.sum().item()
+                        return np.sum(contact)
+
+                    l_contact_cnt = _contact_count(seq_data.get("lhand_contact"))
+                    r_contact_cnt = _contact_count(seq_data.get("rhand_contact"))
+
+                    if l_contact_cnt < self.min_obj_contact_frames and r_contact_cnt < self.min_obj_contact_frames:
+                        # print(f"跳过文件 {file_path}，左右手接触帧数分别为 {l_contact_cnt}, {r_contact_cnt}，均少于最小要求 {self.min_obj_contact_frames}")
                         continue
 
                 # 将所有Tensor移动到共享内存
                 for key, value in seq_data.items():
                     if isinstance(value, torch.Tensor):
                         value.share_memory_()
+
+                # 记录真实 IMU 是否存在（一次全局统计，不重复打印）
+                if seq_data.get("human_imu_real") is not None:
+                    self.has_human_real_imu = True
+                if seq_data.get("obj_imu_real") is not None:
+                    self.has_obj_real_imu = True
 
                 # 存储预加载的数据 (使用 file_path 作为 key)
                 self.loaded_data[file_path] = seq_data
@@ -316,7 +358,8 @@ class IMUDataset(Dataset):
                 self.sequence_info.append({
                     "file_path": file_path,
                     "seq_name": seq_name,
-                    "seq_len": seq_len
+                    "seq_len": seq_len,
+                    "has_object": has_object_flag,
                 })
 
             except Exception as e:
@@ -352,6 +395,7 @@ class IMUDataset(Dataset):
             file_path = seq_info["file_path"]
             seq_name = seq_info["seq_name"]
             seq_len = seq_info["seq_len"]
+            seq_has_object = seq_info.get("has_object", None)
         except IndexError:
              print(f"错误：索引 {idx} 超出 sequence_info 范围 (大小: {len(self.sequence_info)})")
              raise IndexError(f"索引 {idx} 超出范围")
@@ -395,18 +439,55 @@ class IMUDataset(Dataset):
             ori_glb_reduced = rotation_global_full[:, _REDUCED_INDICES] # [seq, n_reduced, 3, 3]
             ori_root_reduced = rotation_global_full[:, :1].transpose(-1, -2).matmul(ori_glb_reduced)
 
+            device = position_global_full.device
+            dtype = position_global_full.dtype
+
+            def _slice_real_imu(data):
+                if data is None:
+                    return None
+                if isinstance(data, torch.Tensor):
+                    tensor = data[start_idx:end_idx]
+                else:
+                    tensor = torch.from_numpy(np.asarray(data))[start_idx:end_idx]
+                if tensor.shape[0] < actual_seq_len:
+                    return None
+                return tensor.to(device=device, dtype=dtype)
+
+            human_imu_real = _slice_real_imu(seq_data.get("human_imu_real"))
+            obj_imu_real = _slice_real_imu(seq_data.get("obj_imu_real"))
+            if human_imu_real is not None and human_imu_real.shape[0] > actual_seq_len:
+                human_imu_real = human_imu_real[:actual_seq_len]
+            if obj_imu_real is not None and obj_imu_real.shape[0] > actual_seq_len:
+                obj_imu_real = obj_imu_real[:actual_seq_len]
+
+            seq_noise_cfg_raw = seq_data.get("imu_noise_params", None)
+            seq_noise_cfg = merge_noise_cfg(seq_noise_cfg_raw) if seq_noise_cfg_raw is not None else self.imu_noise_cfg
+            imu_noise_applied = False
+
             # --- DynaIP 风格的人体 IMU 与速度处理 ---
-            human_imu = _build_human_imu_root(position_global_full, rotation_global_full, _SENSOR_POS_INDICES, _SENSOR_ROT_INDICES, FRAME_RATE) # [seq, num_imus, 9]
+            if human_imu_real is not None:
+                human_imu = human_imu_real
+                imu_noise_applied = True
+            else:
+                human_imu = _build_human_imu_root(position_global_full, rotation_global_full, _SENSOR_POS_INDICES, _SENSOR_ROT_INDICES, FRAME_RATE) # [seq, num_imus, 9]
+                if self.simulate_imu_noise:
+                    human_acc = human_imu[:, :, :3]
+                    human_rot6d = human_imu[:, :, 3:]
+                    human_acc, human_rot6d, _ = apply_imu_noise(human_acc, human_rot6d, FRAME_RATE, seq_noise_cfg)
+                    human_imu = torch.cat((human_acc, human_rot6d), dim=-1)
+                    imu_noise_applied = True
             joint_vel_root = _compute_joint_velocity_root(rotation_global_full, position_global_full, FRAME_RATE)
             root_vel = _central_diff(position_global_full[:, 0, :], 1.0 / FRAME_RATE)
             sensor_vel_root = joint_vel_root[:, _VEL_SELECTION_INDICES, :] # [seq, 6, 3]
             sensor_vel_glb = _central_diff(position_global_full[:, _SENSOR_POS_INDICES, :], 1.0 / FRAME_RATE)
 
             # --- 物体数据准备 ---
-            has_object = "obj_trans" in seq_data and seq_data["obj_trans"] is not None
+            # 优先使用显式标记，其次根据obj字段推断
+            has_object = seq_has_object
+            if has_object is None:
+                has_object = ("obj_trans" in seq_data and seq_data["obj_trans"] is not None)
+            has_object = bool(has_object)
             obj_name = ""
-            device = position_global_full.device
-            dtype = position_global_full.dtype
             imu_dim = human_imu.shape[-1]
             obj_trans = torch.zeros(actual_seq_len, 3, device=device, dtype=dtype)
             obj_rot = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(actual_seq_len, 1, 1)
@@ -421,8 +502,23 @@ class IMUDataset(Dataset):
                 obj_rot = seq_data["obj_rot"][start_idx:end_idx].to(device=device, dtype=dtype)
                 obj_rot_6d = transforms.matrix_to_rotation_6d(obj_rot.reshape(-1, 3, 3)).reshape(actual_seq_len, 6)
                 obj_scale = seq_data["obj_scale"][start_idx:end_idx].to(device=device, dtype=dtype)
-                obj_imu = _build_object_imu(obj_rot_6d, obj_trans, FRAME_RATE) # [seq, 9]
+                if obj_imu_real is not None:
+                    obj_imu = obj_imu_real
+                    if obj_imu.dim() == 3 and obj_imu.shape[1] == 1:
+                        obj_imu = obj_imu.squeeze(1)
+                    imu_noise_applied = True
+                else:
+                    obj_imu = _build_object_imu(obj_rot_6d, obj_trans, FRAME_RATE) # [seq, 9]
+                    if self.simulate_imu_noise:
+                        obj_acc = obj_imu[:, :3]
+                        obj_rot6d = obj_imu[:, 3:]
+                        obj_acc, obj_rot6d, _ = apply_imu_noise(obj_acc, obj_rot6d, FRAME_RATE, seq_noise_cfg)
+                        obj_imu = torch.cat((obj_acc, obj_rot6d), dim=-1)
+                        imu_noise_applied = True
                 obj_vel = _central_diff(obj_trans, 1.0 / FRAME_RATE)
+            else:
+                # 无物体时保持占位但不使用接触信息
+                obj_rot_6d = transforms.matrix_to_rotation_6d(obj_rot.reshape(-1, 3, 3)).reshape(actual_seq_len, 6)
 
             # --- 提前初始化所有接触窗口变量 ---
             lfoot_contact_window = seq_data.get("lfoot_contact", torch.zeros(seq_len, dtype=torch.float))[start_idx:end_idx]
@@ -430,6 +526,10 @@ class IMUDataset(Dataset):
             lhand_contact_window = seq_data.get("lhand_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
             rhand_contact_window = seq_data.get("rhand_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
             obj_contact_window = seq_data.get("obj_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
+            if not has_object:
+                lhand_contact_window = torch.zeros_like(lhand_contact_window)
+                rhand_contact_window = torch.zeros_like(rhand_contact_window)
+                obj_contact_window = torch.zeros_like(obj_contact_window)
 
             # --- 虚拟关节监督 ---
             lhand_obj_direction = torch.zeros(actual_seq_len, 3, device=device, dtype=dtype)
@@ -452,9 +552,24 @@ class IMUDataset(Dataset):
                     lhand_obj_direction = torch.zeros(actual_seq_len, 3, device=device, dtype=dtype)
                     rhand_obj_direction = torch.zeros(actual_seq_len, 3, device=device, dtype=dtype)
 
+            # --- 交互起止帧标签 ---
+            contact_mask_for_boundary = obj_contact_window.bool()
+            start_label = torch.zeros(actual_seq_len, device=device, dtype=dtype)
+            end_label = torch.zeros(actual_seq_len, device=device, dtype=dtype)
+            start_indices = []
+            end_indices = []
+            for seg_start, seg_end in find_contact_segments(contact_mask_for_boundary):
+                start_label[seg_start] = 1.0
+                end_label[seg_end] = 1.0
+                start_indices.append(seg_start)
+                end_indices.append(seg_end)
+            start_gauss = gaussian_label_from_indices(start_indices, actual_seq_len, sigma=2.0, device=device, dtype=dtype)
+            end_gauss = gaussian_label_from_indices(end_indices, actual_seq_len, sigma=2.0, device=device, dtype=dtype)
+
             result = {
                 "human_imu": human_imu.float(),  # [seq, num_imus, 9]
                 "obj_imu": obj_imu.float(),  # [seq, 9]
+                "imu_noise_applied": bool(imu_noise_applied),
                 "seq_name": seq_name,
                 "seq_file": os.path.basename(file_path),
                 "window_start": int(start_idx),
@@ -476,6 +591,10 @@ class IMUDataset(Dataset):
                 "lhand_contact": lhand_contact_window.bool(),
                 "rhand_contact": rhand_contact_window.bool(),
                 "obj_contact": obj_contact_window.bool(),
+                "interaction_start": start_label.float(),
+                "interaction_end": end_label.float(),
+                "interaction_start_gauss": start_gauss.float(),
+                "interaction_end_gauss": end_gauss.float(),
                 "lfoot_contact": lfoot_contact_window.float(),
                 "rfoot_contact": rfoot_contact_window.float(),
                 "lhand_obj_direction": lhand_obj_direction.float(),
@@ -494,5 +613,3 @@ class IMUDataset(Dataset):
             traceback.print_exc() # 打印详细错误
             # 抛出异常让DataLoader跳过该样本
             raise RuntimeError(f"处理样本{idx}时出错: {e}")
-
-

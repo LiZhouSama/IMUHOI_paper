@@ -49,6 +49,8 @@ class SensorMeta:
     start_jumps: List[int]
     end_jumps: List[int]
     tpose_original: Tuple[int, int]
+    # 用于可视化：静止期结束帧（例如 ZUPT window 的 end）。若 <0 则回退到 end_idx
+    static_end: int = -1
 
 
 @dataclass
@@ -255,43 +257,44 @@ def smooth_imu_acceleration(acc_data, smooth_n=4, frame_rate=60):
     return smoothed_acc.numpy() if return_numpy else smoothed_acc
 
 
-def detect_jump_sequences(lin_acc_data, magnitude_threshold=20.0, min_peak_distance=20,
-                          min_jump_interval=20, max_jump_interval=80):
-    """检测连续的跳跃序列"""
+def detect_start_jump_sequence(lin_acc_data, magnitude_threshold=20.0, min_peak_distance=5,
+                               min_jump_interval=10, max_jump_interval=30):
+    """
+    检测开始的跳跃序列（用于对齐）
+    
+    两阶段检测：
+    1. 用 min_peak_distance 过滤噪声峰值
+    2. 找到第一个符合间隔条件 [min_jump_interval, max_jump_interval] 的连续3次跳跃
+    """
+    # 阶段1：检测所有可能的峰值（过滤噪声）
     acc_magnitude = np.sqrt(np.sum(lin_acc_data**2, axis=1))
-    peaks, _ = find_peaks(acc_magnitude, height=magnitude_threshold, distance=min_peak_distance)
-
-    if len(peaks) < 6:
-        print(f"警告：只检测到 {len(peaks)} 个峰值")
-        return np.array([]), np.array([])
-
-    print(f"检测到 {len(peaks)} 个加速度峰值: {peaks[:10]}...")
-
-    jump_sequences = []
-    i = 0
-    while i < len(peaks) - 2:
-        current_sequence = [peaks[i]]
-        j = i + 1
-        while j < len(peaks) and len(current_sequence) < 3:
-            time_gap = peaks[j] - current_sequence[-1]
-            if min_jump_interval <= time_gap <= max_jump_interval:
-                current_sequence.append(peaks[j])
-                j += 1
-            elif time_gap < min_jump_interval:
-                j += 1
-            else:
+    all_peaks, _ = find_peaks(acc_magnitude, height=magnitude_threshold, distance=min_peak_distance)
+    
+    if len(all_peaks) < 3:
+        print(f"警告：只检测到 {len(all_peaks)} 个峰值，不足以形成跳跃序列")
+        return np.array([])
+    
+    print(f"检测到 {len(all_peaks)} 个加速度峰值: {all_peaks[:10]}...")
+    
+    # 阶段2：找到第一个符合条件的连续3次跳跃
+    for i in range(len(all_peaks) - 2):
+        candidate = [all_peaks[i]]
+        
+        for j in range(i + 1, len(all_peaks)):
+            interval = all_peaks[j] - candidate[-1]
+            
+            # 间隔符合条件，加入候选序列
+            if min_jump_interval <= interval <= max_jump_interval:
+                candidate.append(all_peaks[j])
+                if len(candidate) == 3:
+                    print(f"找到开始跳跃序列: {candidate}, 间隔: [{candidate[1]-candidate[0]}, {candidate[2]-candidate[1]}]")
+                    return np.array(candidate)
+            # 间隔太大，尝试下一个起始点
+            elif interval > max_jump_interval:
                 break
-        if len(current_sequence) == 3:
-            jump_sequences.append(current_sequence)
-            i = j
-        else:
-            i += 1
-
-    if len(jump_sequences) < 2:
-        print("警告：未检测到足够的跳跃序列")
-        return np.array([]), np.array([])
-
-    return np.array(jump_sequences[0]), np.array(jump_sequences[-1])
+    
+    print("警告：未检测到符合条件的跳跃序列")
+    return np.array([])
 
 
 def apply_coordinate_transform(acc_data, quat_data):
@@ -434,27 +437,6 @@ def _parse_noitom_sensors(csv_path: str, sensor_order: List[str], gravity_scale:
     return sensors
 
 
-def _detect_range_from_hips(hip_seq: SensorSequence, threshold: float = None) -> SensorMeta:
-    acc_for_detection = hip_seq.acc[:, 1:2]
-    if threshold is None:
-        acc_mag = np.sqrt(np.sum(acc_for_detection**2, axis=1))
-        threshold = max(2.0, float(np.percentile(acc_mag, 85)))
-    print(f"[Noitom] Hips 检测阈值: {threshold:.2f}")
-
-    start_seq, end_seq = detect_jump_sequences(acc_for_detection, magnitude_threshold=threshold,
-                                                min_peak_distance=5, min_jump_interval=10, max_jump_interval=30)
-    if len(start_seq) > 0:
-        start_idx = int(start_seq[-1]) + 100
-    else:
-        start_idx = 0
-    end_idx = int(end_seq[0]) - 100 if len(end_seq) > 0 else len(hip_seq.acc)
-    start_idx = max(0, min(start_idx, len(hip_seq.acc)))
-    end_idx = max(start_idx, min(end_idx, len(hip_seq.acc)))
-    if end_idx <= start_idx:
-        start_idx, end_idx = 0, len(hip_seq.acc)
-
-    return SensorMeta(start_idx=start_idx, end_idx=end_idx, tpose_start=-1, tpose_end=-1,
-                      start_jumps=start_seq.tolist(), end_jumps=end_seq.tolist(), tpose_original=(-1, -1))
 
 
 # ===================== STAG 物体数据处理 =====================
@@ -553,7 +535,7 @@ def _build_object_features(acc: np.ndarray, quat: np.ndarray, obj_start: int, ob
 
 def _build_data_dict(human_imu: torch.Tensor, obj_imu: torch.Tensor) -> Dict[str, torch.Tensor]:
     bs, seq_len = 1, human_imu.shape[0]
-    identity_6d = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=torch.float32)
+    identity_6d = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=torch.float32)
     p_init = identity_6d.view(1, 1, 6).repeat(bs, len(_REDUCED_POSE_NAMES), 1)
     return {
         "human_imu": human_imu.unsqueeze(0),
@@ -561,10 +543,10 @@ def _build_data_dict(human_imu: torch.Tensor, obj_imu: torch.Tensor) -> Dict[str
         "v_init": torch.zeros(bs, len(_SENSOR_VEL_NAMES), 3),
         "p_init": p_init,
         "trans_init": torch.tensor([[0.0, 1.2, 0.0]]).repeat(bs, 1),
-        "obj_trans_init": torch.tensor([[0.2, 0.94, 0.35]]).repeat(bs, 1),
+        "obj_trans_init": torch.tensor([[0.0, 0.94, 0.15]]).repeat(bs, 1),
         "obj_vel_init": torch.zeros(bs, 3),
         "hand_vel_glb_init": torch.zeros(bs, 2, 3),
-        "contact_init": torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
+        "contact_init": torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32),
         "has_object": torch.ones(bs, dtype=torch.bool),
         "use_object_data": True,
     }
@@ -585,7 +567,9 @@ def create_demo_overview_visualization(save_path: str, hip_acc_raw: np.ndarray, 
             valid = [j for j in hip_meta.end_jumps if j < len(hip_y)]
             axes[0].scatter(np.array(valid)/TARGET_FPS, hip_y[valid], color='red', marker='^', s=60, label='End Jumps', zorder=5)
         axes[0].axvline(hip_meta.start_idx/TARGET_FPS, color='orange', linestyle='--', linewidth=2, label='Start Cut')
-        axes[0].axvline(hip_meta.end_idx/TARGET_FPS, color='purple', linestyle='--', linewidth=2, label='End Cut')
+        hip_end_cut = hip_meta.static_end if (hip_meta.static_end is not None and hip_meta.static_end >= 0) else hip_meta.end_idx
+        hip_end_cut = int(np.clip(hip_end_cut, 0, max(0, len(hip_y) - 1))) if len(hip_y) > 0 else 0
+        axes[0].axvline(hip_end_cut/TARGET_FPS, color='purple', linestyle='--', linewidth=2, label='End Cut')
         axes[0].set_title("Noitom Hips Detection (Y-axis)")
         axes[0].set_ylabel("Acc (m/s^2)")
         axes[0].legend(loc='upper right')
@@ -601,7 +585,9 @@ def create_demo_overview_visualization(save_path: str, hip_acc_raw: np.ndarray, 
             valid = [j for j in obj_meta.end_jumps if j < len(obj_y)]
             axes[1].scatter(np.array(valid)/TARGET_FPS, obj_y[valid], color='red', marker='^', s=60, label='End Jumps', zorder=5)
         axes[1].axvline(obj_meta.start_idx/TARGET_FPS, color='orange', linestyle='--', linewidth=2, label='Start Cut')
-        axes[1].axvline(obj_meta.end_idx/TARGET_FPS, color='purple', linestyle='--', linewidth=2, label='End Cut')
+        obj_end_cut = obj_meta.static_end if (obj_meta.static_end is not None and obj_meta.static_end >= 0) else obj_meta.end_idx
+        obj_end_cut = int(np.clip(obj_end_cut, 0, max(0, len(obj_y) - 1))) if len(obj_y) > 0 else 0
+        axes[1].axvline(obj_end_cut/TARGET_FPS, color='purple', linestyle='--', linewidth=2, label='End Cut')
         axes[1].set_title("STAG Object Data (Y-axis)")
         axes[1].set_ylabel("Acc (m/s^2)")
         axes[1].set_xlabel("Time (s)")
@@ -621,11 +607,11 @@ def create_demo_overview_visualization(save_path: str, hip_acc_raw: np.ndarray, 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="生成 IMUHOI StageNet demo data_dict")
     parser.add_argument("--human-csv", default="noitom/6IMU/Output/1204_01_.csv", help="Noitom 人体 IMU CSV")
-    parser.add_argument("--obj-csv", default="noitom/OBJ/STAG_VQF_DATA_20251204_182847.csv", help="STAG 物体 IMU CSV")
+    parser.add_argument("--obj-csv", default="noitom/OBJ/1204_1.csv", help="STAG 物体 IMU CSV")
     parser.add_argument("--output", default="noitom/demo_data_dict.pt", help="data_dict 输出路径")
     parser.add_argument("--device", default="cpu", help="BodyModel FK 所用设备")
     parser.add_argument("--visualize", default=True, help="生成可视化")
-    parser.add_argument("--human-threshold", type=float, default=10, help="Noitom 跳跃检测阈值")
+    parser.add_argument("--human-threshold", type=float, default=8, help="Noitom 跳跃检测阈值")
     parser.add_argument("--obj-threshold", type=float, default=10, help="STAG 跳跃检测阈值")
     return parser.parse_args()
 
@@ -637,26 +623,26 @@ def main():
     print("=== 处理 Noitom 人体 IMU 数据 ===")
     sensors = _parse_noitom_sensors(args.human_csv, sensor_order, GRAVITY_ACC)
     hip_seq = sensors["Hips"]
-    hip_meta = _detect_range_from_hips(hip_seq, args.human_threshold)
-
-    if not hip_meta.start_jumps:
+    start_seq_human = detect_start_jump_sequence(hip_seq.acc[:, 1:2], magnitude_threshold=args.human_threshold,
+                                       min_peak_distance=5, min_jump_interval=10, max_jump_interval=30)
+    if len(start_seq_human) == 0:
         raise ValueError("Noitom Hips 未检测到跳跃")
-    human_jump_idx = hip_meta.start_jumps[0]
+    human_jump_idx = int(start_seq_human[0])
     print(f"[Noitom] 使用第一个跳跃点 {human_jump_idx} 对齐")
 
     print("=== 处理 STAG 物体 IMU 数据 ===")
     obj_acc, obj_quat = _load_object_data(args.obj_csv)
     obj_acc_mag = np.linalg.norm(obj_acc, axis=1, keepdims=True)
-    start_seq_obj, end_seq_obj = detect_jump_sequences(obj_acc_mag, magnitude_threshold=args.obj_threshold,
-                                                        min_peak_distance=5, min_jump_interval=10, max_jump_interval=30)
+    start_seq_obj = detect_start_jump_sequence(obj_acc_mag, magnitude_threshold=args.obj_threshold,
+                                                min_peak_distance=5, min_jump_interval=10, max_jump_interval=30)
     if len(start_seq_obj) == 0:
         raise ValueError("STAG Object 未检测到跳跃")
     obj_jump_idx = int(start_seq_obj[0])
     print(f"[STAG] 使用第一个跳跃点 {obj_jump_idx} 对齐")
 
     # ZUPT 偏置补偿
-    OFFSET_SEC, STATIC_START_SEC, STATIC_END_SEC = 3.0, 5, 8
-    offset_frames = int(OFFSET_SEC * TARGET_FPS)
+    STATIC_START_SEC, STATIC_END_SEC = 4, 8
+    offset_frames = int(STATIC_START_SEC * TARGET_FPS)  # 序列裁切开始时间=ZUPT静息开始时间
     static_start = obj_jump_idx + int(STATIC_START_SEC * TARGET_FPS)
     static_end = obj_jump_idx + int(STATIC_END_SEC * TARGET_FPS)
     print("=== ZUPT 偏置补偿 ===")
@@ -687,10 +673,14 @@ def main():
     if args.visualize:
         viz_dir = "noitom/"
         os.makedirs(viz_dir, exist_ok=True)
-        hip_meta.start_idx, hip_meta.end_idx = human_start, human_end
+        # 对齐前的“静止期结束帧”，用于可视化 End Cut 位置
+        human_static_end = human_jump_idx + int(STATIC_END_SEC * TARGET_FPS)
+        hip_meta = SensorMeta(start_idx=human_start, end_idx=human_end, tpose_start=-1, tpose_end=-1,
+                              start_jumps=[int(x) for x in start_seq_human], end_jumps=[], tpose_original=(-1, -1),
+                              static_end=human_static_end)
         obj_meta = SensorMeta(start_idx=obj_start, end_idx=obj_end, tpose_start=-1, tpose_end=-1,
-                              start_jumps=[int(x) for x in start_seq_obj], end_jumps=[int(x) for x in end_seq_obj],
-                              tpose_original=(-1, -1))
+                              start_jumps=[int(x) for x in start_seq_obj], end_jumps=[], tpose_original=(-1, -1),
+                              static_end=static_end)
         obj_trans_full, _ = apply_coordinate_transform(obj_acc, obj_quat)
         create_demo_overview_visualization(os.path.join(viz_dir, "process_demo_overview.png"),
                                            hip_seq.acc, obj_trans_full, hip_meta, obj_meta)

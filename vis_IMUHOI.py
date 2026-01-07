@@ -186,6 +186,9 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
         pred_obj_trans_seq = None
         pred_obj_trans_fk_seq = None
         pred_obj_trans_imu_seq = None
+        pred_hand_contact_prob_seq = None
+        pred_lhand_contact_seq = None
+        pred_rhand_contact_seq = None
 
         if not vis_gt_only:
             try:
@@ -211,6 +214,13 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                 pred_obj_trans_seq = pred_dict["pred_obj_trans"][bs].to(device)
             if compare_3 and "pred_obj_trans_fk" in pred_dict:
                 pred_obj_trans_fk_seq = pred_dict["pred_obj_trans_fk"][bs].to(device)
+
+            pred_hand_contact_prob_all = pred_dict.get("pred_hand_contact_prob")
+            if pred_hand_contact_prob_all is not None:
+                pred_hand_contact_prob_seq = pred_hand_contact_prob_all[bs].to(device)
+                if pred_hand_contact_prob_seq.shape[-1] >= 2:
+                    pred_lhand_contact_seq = pred_hand_contact_prob_seq[:, 0] > 0.5
+                    pred_rhand_contact_seq = pred_hand_contact_prob_seq[:, 1] > 0.5
             
             if compare_3 and "pred_obj_vel" in pred_dict and model_input is not None:
                 try:
@@ -371,30 +381,60 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
         lhand_idx, rhand_idx = 20, 21
         contact_radius = 0.03
 
-        if Jtr_gt_seq is not None and show_hands_contact:
-            if lhand_contact_seq is not None:
-                gt_lhand_contact_points = [Jtr_gt_seq[t, lhand_idx] for t in range(T) if lhand_contact_seq[t]]
-                if gt_lhand_contact_points:
-                    points = torch.stack(gt_lhand_contact_points, dim=0)
-                    points_yup = torch.matmul(points, R_yup.T.to(device))
-                    spheres = Spheres(
-                        positions=points_yup.detach().cpu().numpy(),
-                        radius=contact_radius, name="GT-LHandContact",
-                        color=(1.0, 0.0, 0.0, 0.8), gui_affine=False, is_selectable=False
-                    )
-                    viewer.scene.add(spheres)
-            
-            if rhand_contact_seq is not None:
-                gt_rhand_contact_points = [Jtr_gt_seq[t, rhand_idx] for t in range(T) if rhand_contact_seq[t]]
-                if gt_rhand_contact_points:
-                    points = torch.stack(gt_rhand_contact_points, dim=0)
-                    points_yup = torch.matmul(points, R_yup.T.to(device))
-                    spheres = Spheres(
-                        positions=points_yup.detach().cpu().numpy(),
-                        radius=contact_radius, name="GT-RHandContact",
-                        color=(0.0, 0.0, 1.0, 0.8), gui_affine=False, is_selectable=False
-                    )
-                    viewer.scene.add(spheres)
+        if show_hands_contact:
+            if Jtr_gt_seq is not None:
+                if lhand_contact_seq is not None:
+                    gt_lhand_contact_points = [Jtr_gt_seq[t, lhand_idx] for t in range(T) if lhand_contact_seq[t]]
+                    if gt_lhand_contact_points:
+                        points = torch.stack(gt_lhand_contact_points, dim=0)
+                        points_yup = torch.matmul(points, R_yup.T.to(device))
+                        spheres = Spheres(
+                            positions=points_yup.detach().cpu().numpy(),
+                            radius=contact_radius, name="GT-LHandContact",
+                            color=(1.0, 0.0, 0.0, 0.8), gui_affine=False, is_selectable=False
+                        )
+                        viewer.scene.add(spheres)
+                
+                if rhand_contact_seq is not None:
+                    gt_rhand_contact_points = [Jtr_gt_seq[t, rhand_idx] for t in range(T) if rhand_contact_seq[t]]
+                    if gt_rhand_contact_points:
+                        points = torch.stack(gt_rhand_contact_points, dim=0)
+                        points_yup = torch.matmul(points, R_yup.T.to(device))
+                        spheres = Spheres(
+                            positions=points_yup.detach().cpu().numpy(),
+                            radius=contact_radius, name="GT-RHandContact",
+                            color=(0.0, 0.0, 1.0, 0.8), gui_affine=False, is_selectable=False
+                        )
+                        viewer.scene.add(spheres)
+
+            if (not vis_gt_only and Jtr_pred_seq is not None and pred_hand_contact_prob_seq is not None):
+                if pred_lhand_contact_seq is not None:
+                    pred_lhand_contact_points = [
+                        Jtr_pred_seq[t, lhand_idx] + pred_offset for t in range(T) if pred_lhand_contact_seq[t]
+                    ]
+                    if pred_lhand_contact_points:
+                        points = torch.stack(pred_lhand_contact_points, dim=0)
+                        points_yup = torch.matmul(points, R_yup.T.to(device))
+                        spheres = Spheres(
+                            positions=points_yup.detach().cpu().numpy(),
+                            radius=contact_radius, name="Pred-LHandContact",
+                            color=(1.0, 0.5, 0.0, 0.8), gui_affine=False, is_selectable=False
+                        )
+                        viewer.scene.add(spheres)
+
+                if pred_rhand_contact_seq is not None:
+                    pred_rhand_contact_points = [
+                        Jtr_pred_seq[t, rhand_idx] + pred_offset for t in range(T) if pred_rhand_contact_seq[t]
+                    ]
+                    if pred_rhand_contact_points:
+                        points = torch.stack(pred_rhand_contact_points, dim=0)
+                        points_yup = torch.matmul(points, R_yup.T.to(device))
+                        spheres = Spheres(
+                            positions=points_yup.detach().cpu().numpy(),
+                            radius=contact_radius, name="Pred-RHandContact",
+                            color=(0.0, 0.6, 1.0, 0.8), gui_affine=False, is_selectable=False
+                        )
+                        viewer.scene.add(spheres)
 
         viewer.virtual_bone_info = {'has_data': False}
 
@@ -486,8 +526,8 @@ def main():
     parser = argparse.ArgumentParser(description='Interactive IMUHOI Visualization Tool')
     parser.add_argument('--config', type=str, default='configs/IMUHOI_train.yaml', help='配置文件路径')
     parser.add_argument('--smpl_model_path', type=str, default=None, help='SMPL模型路径')
-    parser.add_argument('--test_data_dir', type=str, default="process/processed_split_data_BEHAVE/debug", help='测试数据目录')
-    parser.add_argument('--obj_geo_root', type=str, default='./datasets/BEHAVE/objects', help='物体几何根目录')
+    parser.add_argument('--test_data_dir', type=str, default="process/processed_split_data_OMOMO/test", help='测试数据目录')
+    parser.add_argument('--obj_geo_root', type=str, default='datasets/OMOMO/captured_objects', help='物体几何根目录')
     parser.add_argument('--num_workers', type=int, default=0, help='DataLoader workers')
     parser.add_argument('--no_objects', action='store_true', help='不加载物体')
     parser.add_argument('--vis_gt_only', action='store_true', help='只显示GT')
@@ -506,6 +546,9 @@ def main():
 
     print(f"Loading config from: {args.config}")
     config = load_config(args.config)
+    module_paths = None
+    if hasattr(config, "pretrained_modules") and config.pretrained_modules:
+        module_paths = dict(config.pretrained_modules)
     
     if args.smpl_model_path:
         config.body_model_path = args.smpl_model_path
@@ -516,7 +559,7 @@ def main():
     smpl_model_path = config.get('body_model_path', 'datasets/smpl_models/smplh/neutral/model.npz')
     smpl_model = load_smpl_model(smpl_model_path, device)
 
-    model = load_model(config, device, no_trans=args.no_trans)
+    model = load_model(config, device, no_trans=args.no_trans, module_paths=module_paths)
 
     test_data_dir = args.test_data_dir
     if not test_data_dir or not os.path.exists(test_data_dir):

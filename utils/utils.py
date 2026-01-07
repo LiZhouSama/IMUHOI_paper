@@ -128,20 +128,26 @@ def build_model_input_dict(batch, cfg, device, add_noise=True):
     Returns:
         dict: 模型输入字典
     """
+    skip_extra_noise = batch.get('imu_noise_applied', False)
+    if isinstance(skip_extra_noise, torch.Tensor):
+        skip_extra_noise = bool(skip_extra_noise.flatten()[0].item())
+    else:
+        skip_extra_noise = bool(skip_extra_noise)
+
     human_imu = batch['human_imu'].to(device)
     bs, seq = human_imu.shape[:2]
     dtype = human_imu.dtype
     
     # 添加噪声
     imu_noise_std = getattr(cfg, 'imu_noise_std', 0.1)
-    if add_noise and imu_noise_std > 0:
+    if add_noise and (not skip_extra_noise) and imu_noise_std > 0:
         human_imu = human_imu + torch.randn_like(human_imu) * imu_noise_std
     
     obj_imu = batch.get('obj_imu')
     if isinstance(obj_imu, torch.Tensor):
         obj_imu = obj_imu.to(device)
         obj_noise_std = getattr(cfg, 'obj_imu_noise_std', 0.1)
-        if add_noise and obj_noise_std > 0:
+        if add_noise and (not skip_extra_noise) and obj_noise_std > 0:
             obj_imu = obj_imu + torch.randn_like(obj_imu) * obj_noise_std
     else:
         obj_feat_dim = getattr(cfg, 'obj_imu_dim', 9)
@@ -207,7 +213,7 @@ def build_model_input_dict(batch, cfg, device, add_noise=True):
         rhand_contact[:, 0].float().to(device=device, dtype=dtype),
         obj_contact[:, 0].float().to(device=device, dtype=dtype),
     ], dim=-1)
-    contact_init = torch.cat((contact_first, obj_vel_init), dim=-1)
+    contact_init = contact_first
     
     # has_object
     def _prepare_has_object(value):

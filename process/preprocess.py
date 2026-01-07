@@ -486,7 +486,7 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
         "trans": trans_torch.cpu(),
         "rotation_global": rotation_global_matrot_reshaped.cpu(), # [T, 22, 3, 3]
         "lfoot_contact": lfoot_contact.cpu(),  # 左脚接触标签
-        "rfoot_contact": rfoot_contact.cpu()   # 右脚接触标签
+        "rfoot_contact": rfoot_contact.cpu(),   # 右脚接触标签
     }
     
     # 添加物体数据(如果存在)
@@ -632,15 +632,17 @@ def preprocess_amass(args, bm):
                 seq_data = {
                     'seq_name': seq_name,
                     'gender': 'neutral',
+                    # AMASS 不含物体交互，后续数据加载时需明确标记
+                    'has_object': False,
                     'rotation_local_full_gt_list': pose_6d.reshape(seq_len, -1),
                     'position_global_full_gt_world': position_global_full_gt_world.cpu().numpy(),
                     'trans': trans_data,
                     'rotation_global': rotation_global_matrot_reshaped.cpu(),
-                    # 添加物体数据字段（AMASS无物体交互，填充0值）
-                    'obj_scale': np.ones(seq_len, dtype=np.float32),  # [T]
-                    'obj_trans': np.zeros((seq_len, 3), dtype=np.float32),  # [T, 3]
+                    # 物体相关字段占位，保持兼容但配合 has_object=False
+                    'obj_scale': np.ones(seq_len, dtype=np.float32),          # [T]
+                    'obj_trans': np.zeros((seq_len, 3), dtype=np.float32),     # [T, 3]
                     'obj_rot': np.tile(np.eye(3, dtype=np.float32), (seq_len, 1, 1)),  # [T, 3, 3]
-                    'obj_com_pos': np.zeros((seq_len, 3), dtype=np.float32),  # [T, 3]
+                    'obj_com_pos': np.zeros((seq_len, 3), dtype=np.float32),   # [T, 3]
                 }
                 
                 # 决定分配到训练集还是测试集

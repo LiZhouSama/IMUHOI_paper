@@ -25,7 +25,7 @@ REDUCED_POSE_NAMES: ['LeftHip', 'RightHip', 'Spine1', 'Spine2', 'Spine3', 'Neck'
 # ============ 训练超参数 ============
 epoch: 300
 batch_size: 60
-lr: 0.002
+lr: 0.0002
 weight_decay: 0.0001
 milestones: [100, 200]
 gamma: 0.2
@@ -51,7 +51,7 @@ hand_contact_distance: 0.1
 
 # ============ 要使用的数据集 ============
 # 修改此项来选择训练数据
-train_datasets: ["omomo"]  # 可选: behave, imhd, omomo, amass
+train_datasets: ["imhd"]  # 可选: behave, imhd, omomo, amass
 
 # ============ 数据集路径 ============
 datasets:
@@ -78,9 +78,6 @@ loss_weights:
   obj_vel: 1.0
   hand_vel: 1.0
   hand_contact: 1.0
-  obj_move: 1.0
-  interaction_boundary: 1.0
-  interaction_order: 1.0
   
   # Stage 2: HumanPose
   vel_root: 1.0
@@ -107,11 +104,4 @@ train:
 
 test:
   window: 120
-
-# ============ 预训练模块路径（可选）============
-# 取消注释以使用预训练权重
-pretrained_modules:
-  velocity_contact: "outputs/IMUHOI/joint_train_12311229/best_velocity_contact.pt"
-  human_pose: "outputs/IMUHOI/joint_train_12311229/best_human_pose.pt"
-  object_trans: "outputs/IMUHOI/joint_train_12311229/best_object_trans.pt"
 

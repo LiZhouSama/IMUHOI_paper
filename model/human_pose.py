@@ -245,6 +245,17 @@ class HumanPoseModule(nn.Module):
             torso_vel[:, 0] = torso_vel[:, 1]
         return torso_vel.view(batch_size, seq_len, -1)
 
+    def _compute_root_velocity_from_trans(self, trans: torch.Tensor):
+        if trans is None:
+            return None
+        if trans.dim() == 2:
+            trans = trans.unsqueeze(1)
+        vel = torch.zeros_like(trans)
+        if trans.size(1) > 1:
+            vel[:, 1:] = (trans[:, 1:] - trans[:, :-1]) * self.fps
+            vel[:, 0] = vel[:, 1]
+        return vel
+
     def _apply_floor_penetration(self, root_velocities: torch.Tensor, joints_pos: torch.Tensor):
         if (not getattr(self, "prevent_floor_penetration", False)) or joints_pos is None:
             return root_velocities
@@ -367,8 +378,19 @@ class HumanPoseModule(nn.Module):
         root_R = orientation_mat[:, :, 0]
 
         joints_pos = None
+        full_glb_rotmats = None
+        full_glb_rot6d = None
         if self.body_model is not None:
             joints_pos = self._compute_fk_joints_batched(p_pred, orientation_mat.clone())
+            try:
+                full_glb_rotmats = self._reduced_glb_6d_to_full_glb_mat(p_pred, orientation_mat.clone())
+                full_glb_rot6d = matrix_to_rotation_6d(full_glb_rotmats.reshape(-1, 3, 3)).reshape(
+                    batch_size, seq_len, 24, 6
+                )
+            except Exception as exc:
+                print(f"Failed to compute full pose rotations: {exc}")
+                full_glb_rotmats = None
+                full_glb_rot6d = None
 
         results = {
             "v_pred": v_pred,
@@ -391,7 +413,15 @@ class HumanPoseModule(nn.Module):
             else:
                 pred_hand_glb_pos = torch.zeros(batch_size, seq_len, 2, 3, device=device, dtype=human_imu.dtype)
 
-            results["pred_hand_glb_pos"] = pred_hand_glb_pos
+            root_vel_pred = self._compute_root_velocity_from_trans(trans_gt)
+            if root_vel_pred is None:
+                root_vel_pred = torch.zeros(batch_size, seq_len, 3, device=device, dtype=human_imu.dtype)
+
+            results.update({
+                "pred_hand_glb_pos": pred_hand_glb_pos,
+                "root_vel_pred": root_vel_pred,
+                "root_trans_pred": trans_gt,
+            })
         else:
             # 普通模式：预测根节点位移
             if joints_pos is not None:
@@ -433,6 +463,22 @@ class HumanPoseModule(nn.Module):
                 "pred_hand_glb_pos": pred_hand_glb_pos,
             })
 
+        if joints_pos is not None:
+            results["pred_joints_local"] = joints_pos
+            if "root_trans_pred" in results:
+                results["pred_joints_global"] = joints_pos + results["root_trans_pred"].unsqueeze(2)
+        else:
+            results["pred_joints_local"] = torch.zeros(batch_size, seq_len, 24, 3, device=device, dtype=human_imu.dtype)
+            if "root_trans_pred" in results:
+                results["pred_joints_global"] = torch.zeros(batch_size, seq_len, 24, 3, device=device, dtype=human_imu.dtype)
+
+        if full_glb_rotmats is not None:
+            results["pred_full_pose_rotmat"] = full_glb_rotmats
+            results["pred_full_pose_6d"] = full_glb_rot6d
+        else:
+            results["pred_full_pose_rotmat"] = torch.zeros(batch_size, seq_len, 24, 3, 3, device=device, dtype=human_imu.dtype)
+            results["pred_full_pose_6d"] = torch.zeros(batch_size, seq_len, 24, 6, device=device, dtype=human_imu.dtype)
+
         return results
 
     @staticmethod
@@ -442,6 +488,12 @@ class HumanPoseModule(nn.Module):
             "v_pred": torch.zeros(batch_size, seq_len, len(_SENSOR_VEL_NAMES) * 3, device=device),
             "p_pred": torch.zeros(batch_size, seq_len, len(_REDUCED_POSE_NAMES) * 6, device=device),
             "pred_hand_glb_pos": torch.zeros(batch_size, seq_len, 2, 3, device=device),
+            "root_vel_pred": torch.zeros(batch_size, seq_len, 3, device=device),
+            "root_trans_pred": torch.zeros(batch_size, seq_len, 3, device=device),
+            "pred_joints_local": torch.zeros(batch_size, seq_len, 24, 3, device=device),
+            "pred_joints_global": torch.zeros(batch_size, seq_len, 24, 3, device=device),
+            "pred_full_pose_rotmat": torch.zeros(batch_size, seq_len, 24, 3, 3, device=device),
+            "pred_full_pose_6d": torch.zeros(batch_size, seq_len, 24, 6, device=device),
         }
         if not no_trans:
             results.update({
@@ -451,4 +503,3 @@ class HumanPoseModule(nn.Module):
                 "root_trans_pred": torch.zeros(batch_size, seq_len, 3, device=device),
             })
         return results
-

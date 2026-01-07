@@ -112,6 +112,8 @@ outputs/
 datasets
 noitom
 process/processed_split_data_OMOMO
+*.png
+*.svg
 
 # 特大文件
 *.pt

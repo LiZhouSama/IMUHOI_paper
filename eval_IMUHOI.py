@@ -63,9 +63,9 @@ def get_default_dataset_config(no_trans: bool = False):
         "processed_split_data_OMOMO": {
             "data_dir": PROCESS_ROOT / "processed_split_data_OMOMO" / "test",
             "modules": {
-                "velocity_contact": "outputs/IMUHOI/velocity_contact_12082304/best.pt",
-                "human_pose": "outputs/IMUHOI/human_pose_12082312/best.pt",
-                "object_trans": "outputs/IMUHOI/object_trans_12091027/best_object_trans.pt",
+                "velocity_contact": "outputs/IMUHOI/joint_train_12311229/best_velocity_contact.pt",
+                "human_pose": "outputs/IMUHOI/joint_train_12311229/best_human_pose.pt",
+                "object_trans": "outputs/IMUHOI/joint_train_12311229/best_object_trans.pt",
             },
         },
     }

@@ -48,6 +48,8 @@ def get_base_args():
     parser.add_argument('--seed', type=int, default=10, help='随机种子')
     parser.add_argument('--batch_size', type=int, default=None, help='批量大小')
     parser.add_argument('--epochs', type=int, default=None, help='训练轮数')
+    parser.add_argument('--lr', type=float, default=None, help='学习率（优先于配置文件）')
+    parser.add_argument('--pretrained_ckpt', type=str, default=None, help='预训练权重路径')
     parser.add_argument('--debug', action='store_true', help='调试模式')
     parser.add_argument('--no_trans', action='store_true', help='禁用根节点位移预测')
     return parser
@@ -67,6 +69,9 @@ def merge_config(args):
         cfg.batch_size = args.batch_size
     if args.epochs is not None:
         cfg.epoch = args.epochs
+    if args.lr is not None:
+        cfg.lr = args.lr
+    cfg.pretrained_ckpt = args.pretrained_ckpt or getattr(cfg, 'pretrained_ckpt', None)
     
     cfg.debug = args.debug
     cfg.no_trans = args.no_trans
@@ -208,6 +213,19 @@ class BaseTrainer:
         self.train_loader = train_loader
         self.test_loader = test_loader
         self.device = torch.device(cfg.device)
+
+        # 预训练权重加载（可选）
+        self.pretrained_epoch = None
+        pretrained_ckpt = getattr(cfg, "pretrained_ckpt", None)
+        if pretrained_ckpt:
+            if os.path.exists(pretrained_ckpt):
+                try:
+                    self.pretrained_epoch = load_checkpoint(self.model, pretrained_ckpt, self.device, strict=False)
+                    print(f"加载预训练权重: {pretrained_ckpt} (epoch {self.pretrained_epoch})")
+                except Exception as exc:
+                    print(f"警告：加载预训练权重失败 {pretrained_ckpt}: {exc}")
+            else:
+                print(f"警告：预训练权重文件不存在: {pretrained_ckpt}")
         
         # 多GPU包装
         if cfg.use_multi_gpu:

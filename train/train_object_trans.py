@@ -46,6 +46,8 @@ def get_args():
                         help='VelocityContactModule权重路径')
     parser.add_argument('--hp_ckpt', type=str, default=None, 
                         help='HumanPoseModule权重路径')
+    parser.add_argument('--ot_ckpt', type=str, default=None,
+                        help='ObjectTransModule预训练权重路径（联合微调起点）')
     parser.add_argument('--joint_train', action='store_true', 
                         help='是否进行联合训练（微调所有模块）')
     
@@ -89,8 +91,10 @@ class Stage3JointTrainer:
         
         # 设置训练/冻结状态
         if joint_train:
-            # 联合训练：所有模块都可训练
-            print("联合训练模式：所有模块可训练")
+            # 联合微调：VC 仍然冻结，仅微调 HP + OT
+            print("联合训练模式：冻结VelocityContact，微调HumanPose + ObjectTrans")
+            for param in self.vc_model.parameters():
+                param.requires_grad = False
         else:
             # Stage3：冻结VC和HP，只训练OT
             print("Stage3模式：冻结VelocityContact和HumanPose，只训练ObjectTrans")
@@ -113,13 +117,15 @@ class Stage3JointTrainer:
         # 收集可训练参数
         trainable_params = []
         if joint_train:
-            trainable_params.extend(self.vc_model.parameters())
             trainable_params.extend(self.hp_model.parameters())
         trainable_params.extend(self.ot_model.parameters())
         trainable_params = [p for p in trainable_params if p.requires_grad]
         
         # 优化器
         lr = cfg.lr
+        if joint_train:
+            lr_factor = getattr(cfg, "joint_lr_factor", 0.1)
+            lr = lr * lr_factor
         if cfg.use_multi_gpu:
             lr = lr * len(cfg.gpus)
         
@@ -133,7 +139,7 @@ class Stage3JointTrainer:
         
         # 损失函数
         loss_weights = getattr(cfg, 'loss_weights', {})
-        self.vc_loss_fn = VelocityContactLoss(weights=loss_weights) if joint_train else None
+        self.vc_loss_fn = None  # VC冻结，不参与训练
         self.hp_loss_fn = HumanPoseLoss(weights=loss_weights, no_trans=cfg.no_trans) if joint_train else None
         self.ot_loss_fn = ObjectTransLoss(weights=loss_weights)
         
@@ -176,7 +182,7 @@ class Stage3JointTrainer:
     
     def train_epoch(self, epoch):
         """训练一个epoch"""
-        self.vc_model.train() if self.joint_train else self.vc_model.eval()
+        self.vc_model.eval()
         self.hp_model.train() if self.joint_train else self.hp_model.eval()
         self.ot_model.train()
         
@@ -195,12 +201,6 @@ class Stage3JointTrainer:
             # 计算损失
             losses = {}
             
-            if self.joint_train and self.vc_loss_fn:
-                vc_loss, vc_losses, _ = self.vc_loss_fn(vc_out, batch, self.device)
-                losses.update({f'vc_{k}': v for k, v in vc_losses.items()})
-            else:
-                vc_loss = torch.tensor(0.0, device=self.device)
-            
             if self.joint_train and self.hp_loss_fn:
                 hp_loss, hp_losses, _ = self.hp_loss_fn(hp_out, batch, self.device)
                 losses.update({f'hp_{k}': v for k, v in hp_losses.items()})
@@ -211,7 +211,7 @@ class Stage3JointTrainer:
             losses.update({f'ot_{k}': v for k, v in ot_losses.items()})
             
             # 总损失
-            batch_loss = vc_loss + hp_loss + ot_loss
+            batch_loss = hp_loss + ot_loss
             
             self.scaler.scale(batch_loss).backward()
             self.scaler.step(self.optimizer)
@@ -225,7 +225,6 @@ class Stage3JointTrainer:
             # 更新进度条
             postfix = {'loss': batch_loss.item(), 'ot': ot_loss.item()}
             if self.joint_train:
-                postfix['vc'] = vc_loss.item()
                 postfix['hp'] = hp_loss.item()
             train_iter.set_postfix(postfix)
             
@@ -233,7 +232,6 @@ class Stage3JointTrainer:
                 self.writer.add_scalar('train/total_loss', batch_loss.item(), self.n_iter)
                 self.writer.add_scalar('train/ot_loss', ot_loss.item(), self.n_iter)
                 if self.joint_train:
-                    self.writer.add_scalar('train/vc_loss', vc_loss.item(), self.n_iter)
                     self.writer.add_scalar('train/hp_loss', hp_loss.item(), self.n_iter)
             
             self.n_iter += 1
@@ -265,12 +263,24 @@ class Stage3JointTrainer:
                 results, vc_out, hp_out, ot_out = self.forward_all(data_dict)
                 
                 # 计算测试损失
+                hp_loss = torch.tensor(0.0, device=self.device)
+                hp_losses = {}
+                if self.joint_train and self.hp_loss_fn:
+                    if hasattr(self.hp_loss_fn, "compute_test_loss"):
+                        hp_loss, hp_losses = self.hp_loss_fn.compute_test_loss(hp_out, batch, self.device)
+                    else:
+                        hp_loss, hp_losses, _ = self.hp_loss_fn(hp_out, batch, self.device)
+
                 ot_loss, ot_losses = self.ot_loss_fn.compute_test_loss(ot_out, batch, self.device)
-                
-                total_loss += ot_loss.item()
+
+                combined_loss = ot_loss + hp_loss
+                total_loss += combined_loss.item()
                 for key, value in ot_losses.items():
                     if isinstance(value, torch.Tensor):
                         loss_components[key] = loss_components.get(key, 0) + value.item()
+                for key, value in hp_losses.items():
+                    if isinstance(value, torch.Tensor):
+                        loss_components[f"hp_{key}"] = loss_components.get(f"hp_{key}", 0) + value.item()
         
         total_loss /= len(self.test_loader)
         for key in loss_components:
@@ -370,6 +380,7 @@ def main():
     # 查找/加载预训练权重
     vc_ckpt = args.vc_ckpt
     hp_ckpt = args.hp_ckpt
+    ot_ckpt = args.ot_ckpt
 
     base_save_dir = os.path.dirname(save_dir)
     if vc_ckpt is None:
@@ -378,6 +389,10 @@ def main():
     if hp_ckpt is None:
         hp_ckpt = find_latest_checkpoint(base_save_dir, 'human_pose')
         print(f"自动找到HumanPose权重: {hp_ckpt}")
+    if ot_ckpt is None:
+        ot_ckpt = find_latest_checkpoint(base_save_dir, 'object_trans')
+        if args.joint_train:
+            print(f"自动找到ObjectTrans预训练权重(用于联合微调): {ot_ckpt}")
     
     if vc_ckpt is None or hp_ckpt is None:
         print("警告: 未找到预训练权重，将使用随机初始化")
@@ -402,6 +417,12 @@ def main():
         load_checkpoint(hp_model, hp_ckpt, device)
     
     ot_model = ObjectTransModule(cfg)
+    if args.joint_train:
+        if ot_ckpt and os.path.exists(ot_ckpt):
+            load_checkpoint(ot_model, ot_ckpt, device)
+            print(f"联合微调起点加载ObjectTrans权重: {ot_ckpt}")
+        else:
+            raise ValueError("联合微调需要已训练的ObjectTrans权重，请先进行单独Stage3训练或指定 --ot_ckpt")
     
     print(f"VelocityContact参数量: {sum(p.numel() for p in vc_model.parameters())}")
     print(f"HumanPose参数量: {sum(p.numel() for p in hp_model.parameters())}")
@@ -433,4 +454,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

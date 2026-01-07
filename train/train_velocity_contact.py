@@ -26,6 +26,8 @@ def get_args():
     """获取命令行参数"""
     parser = get_base_args()
     parser.description = 'VelocityContactModule训练 (Stage 1)'
+    parser.add_argument('--hp_ckpt', type=str, default=None,
+                        help='HumanPoseModule权重路径（便于分阶段训练时先加载HP模型）')
     return parser.parse_args()
 
 
@@ -37,19 +39,14 @@ class VelocityContactTrainer(BaseTrainer):
     
     def model_forward(self, data_dict):
         """模型前向传播"""
-        return self.model(
-            data_dict['human_imu'],
-            data_dict['obj_imu'],
-            data_dict['hand_vel_glb_init'],
-            data_dict['obj_vel_init'],
-            contact_init=data_dict['contact_init'],
-        )
+        return self.model(data_dict)
 
 
 def main():
     """主函数"""
     args = get_args()
     cfg = merge_config(args)
+    cfg.hp_ckpt = getattr(args, "hp_ckpt", None)
     
     setup_seed(cfg.seed)
     cfg = setup_device(cfg)
@@ -60,6 +57,9 @@ def main():
     print(f"设备: {cfg.device}")
     print(f"批次大小: {cfg.batch_size}")
     print(f"训练轮数: {cfg.epoch}")
+    print(f"学习率: {cfg.lr}")
+    if getattr(cfg, "pretrained_ckpt", None):
+        print(f"预训练权重: {cfg.pretrained_ckpt}")
     print(f"保存目录: {save_dir}")
     print("=" * 50)
     
@@ -97,4 +97,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

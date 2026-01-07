@@ -6,6 +6,7 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
+from pytorch3d.transforms import rotation_6d_to_matrix
 
 from .velocity_contact import VelocityContactModule
 from .human_pose import HumanPoseModule
@@ -19,7 +20,112 @@ class IMUHOIModel(nn.Module):
     - HumanPoseModule (Stage 2): 预测人体姿态
     - ObjectTransModule (Stage 3): 预测物体位置
     """
-    
+
+    @staticmethod
+    def _fk_obj_trans_baseline_hard(
+        pred_hand_contact_prob: torch.Tensor,  # [B, T, 3]
+        pred_hand_positions: torch.Tensor,     # [B, T, 2, 3]
+        obj_rotm: torch.Tensor,                # [B, T, 3, 3]
+        obj_trans_init: torch.Tensor,          # [B, 3]
+        contact_threshold: float = 0.5,
+    ) -> torch.Tensor:
+        """
+        严格复刻 trash/IMUHOI_stage_net.py::pred_obj_pos_fk 的硬阈值FK baseline，
+        但用“单次时序状态机”实现（不显式构造contact_segments），输出每帧物体位置。
+        """
+        batch_size, seq_len, _ = pred_hand_contact_prob.shape
+        device = pred_hand_contact_prob.device
+        dtype = pred_hand_positions.dtype
+
+        computed_obj_trans = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
+        obj_trans_init = obj_trans_init.to(device=device, dtype=dtype)
+        if seq_len == 0:
+            return computed_obj_trans
+        computed_obj_trans[:, 0] = obj_trans_init
+
+        # threshold -> {0,1}，并强制第一帧为0（与原实现一致）
+        l_contact = (pred_hand_contact_prob[..., 0] > contact_threshold).float()
+        r_contact = (pred_hand_contact_prob[..., 1] > contact_threshold).float()
+        l_contact[:, 0] = 0.0
+        r_contact[:, 0] = 0.0
+
+        # 起始接触帧：t>=1 且contact[t]=1 & contact[t-1]=0
+        l_start = torch.zeros_like(l_contact)
+        r_start = torch.zeros_like(r_contact)
+        if seq_len > 1:
+            l_start[:, 1:] = ((l_contact[:, 1:] > 0) & (l_contact[:, :-1] == 0)).float()
+            r_start[:, 1:] = ((r_contact[:, 1:] > 0) & (r_contact[:, :-1] == 0)).float()
+
+        z_unit = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype)
+        default_len = torch.tensor(0.1, device=device, dtype=dtype)
+
+        for b in range(batch_size):
+            current = -1
+            obj_pos = obj_trans_init[b].clone()
+            dir_local = None
+            dist = None
+
+            for t in range(seq_len):
+                # new_contact：左优先（与原实现一致）
+                new = -1
+                if l_start[b, t] > 0:
+                    new = 0
+                elif r_start[b, t] > 0:
+                    new = 1
+
+                if current == 0:
+                    has_contact = l_contact[b, t] > 0
+                    has_contact_another = r_contact[b, t] > 0
+                elif current == 1:
+                    has_contact = r_contact[b, t] > 0
+                    has_contact_another = l_contact[b, t] > 0
+                else:
+                    has_contact = False
+                    has_contact_another = False
+
+                # 状态转移规则与原实现一致：new_contact 优先，其次“断开但另一只手仍接触”的切换，再次“断开结束”
+                if new != -1:
+                    current = new
+                    hand0 = pred_hand_positions[b, t, current, :]
+                    R0 = obj_rotm[b, t]
+                    vec_world = obj_pos - hand0
+                    dist0 = torch.norm(vec_world)
+                    if dist0 > 1e-6:
+                        unit_world = vec_world / dist0
+                    else:
+                        unit_world = z_unit
+                        dist0 = default_len
+                    dir_local = R0.transpose(0, 1) @ unit_world
+                    dist = dist0
+                elif (not has_contact) and has_contact_another:
+                    current = 1 - current
+                    hand0 = pred_hand_positions[b, t, current, :]
+                    R0 = obj_rotm[b, t]
+                    vec_world = obj_pos - hand0
+                    dist0 = torch.norm(vec_world)
+                    if dist0 > 1e-6:
+                        unit_world = vec_world / dist0
+                    else:
+                        unit_world = z_unit
+                        dist0 = default_len
+                    dir_local = R0.transpose(0, 1) @ unit_world
+                    dist = dist0
+                elif (not has_contact) and current != -1:
+                    current = -1
+                    dir_local = None
+                    dist = None
+
+                # 生成当前帧位置：无接触保持不动；有接触则用 hand_pos + R @ dir_local * dist
+                if current == -1:
+                    computed_obj_trans[b, t] = obj_pos
+                else:
+                    Rt = obj_rotm[b, t]
+                    direction_world = Rt @ dir_local
+                    obj_pos = pred_hand_positions[b, t, current, :] + direction_world * dist
+                    computed_obj_trans[b, t] = obj_pos
+
+        return computed_obj_trans
+
     def __init__(self, cfg, device, no_trans: bool = False):
         """
         Args:
@@ -92,32 +198,31 @@ class IMUHOIModel(nn.Module):
         
         results = {}
         
-        # Stage 1: VelocityContact - 预测速度和接触
-        vc_input_dict = {
-            'human_imu': human_imu,
-            'obj_imu': data_dict["obj_imu"],
-            'hand_vel_glb_init': data_dict["hand_vel_glb_init"],
-            'obj_vel_init': data_dict["obj_vel_init"],
-            'contact_init': data_dict.get("contact_init"),
-        }
-        vc_out = self.velocity_contact_module(vc_input_dict)
-        results.update(vc_out)
-        
-        # Stage 2: HumanPose - 预测人体姿态
+        # Stage 1: HumanPose - 先预测人体姿态
         hp_input_dict = {
             'human_imu': human_imu,
             'v_init': data_dict["v_init"],
             'p_init': data_dict["p_init"],
         }
         if self.no_trans:
-            # noTrans模式：使用GT trans
             hp_input_dict['trans_gt'] = data_dict["trans_gt"]
         else:
-            # 正常模式：预测trans
             hp_input_dict['trans_init'] = data_dict["trans_init"]
         
         hp_out = self.human_pose_module(hp_input_dict)
         results.update(hp_out)
+        
+        # Stage 2: VelocityContact - 使用HPE结果估计接触
+        vc_input_dict = {
+            'human_imu': human_imu,
+            'obj_imu': data_dict["obj_imu"],
+            'hand_vel_glb_init': data_dict["hand_vel_glb_init"],
+            'obj_vel_init': data_dict["obj_vel_init"],
+            'contact_init': data_dict.get("contact_init"),
+            'hp_out': hp_out,
+        }
+        vc_out = self.velocity_contact_module(vc_input_dict, hp_out=hp_out)
+        results.update(vc_out)
         
         # Stage 3: ObjectTrans - 预测物体位置
         has_object = data_dict.get("has_object")
@@ -129,46 +234,22 @@ class IMUHOIModel(nn.Module):
                 obj_imu=data_dict["obj_imu"],
                 human_imu=human_imu,
                 obj_vel_input=vc_out["pred_obj_vel"],
-                contact_init=data_dict["contact_init"],
+                contact_init=data_dict.get("contact_init"),
                 has_object_mask=has_object,
             )
             results.update(ot_out)
             
-            # 如果需要计算FK方法的物体位置（用于比较）
-            if compute_fk and "pred_lhand_obj_trans" in ot_out and "pred_rhand_obj_trans" in ot_out:
-                # 使用gating weights融合左右手FK结果
-                gating_weights = ot_out.get("gating_weights")
-                if gating_weights is not None:
-                    # gating_weights: [B, T, 3] (left, right, imu)
-                    # 归一化左右手权重
-                    lhand_weight = gating_weights[..., 0:1]
-                    rhand_weight = gating_weights[..., 1:2]
-                    fk_weight_sum = lhand_weight + rhand_weight
-                    fk_weight_sum = torch.clamp(fk_weight_sum, min=1e-6)
-                    lhand_weight_norm = lhand_weight / fk_weight_sum
-                    rhand_weight_norm = rhand_weight / fk_weight_sum
-                    
-                    # 融合FK结果
-                    pred_obj_trans_fk = (
-                        lhand_weight_norm * ot_out["pred_lhand_obj_trans"] +
-                        rhand_weight_norm * ot_out["pred_rhand_obj_trans"]
-                    )
-                else:
-                    # 如果没有gating weights，使用接触概率
-                    contact_prob = vc_out["pred_hand_contact_prob"]
-                    lhand_prob = contact_prob[..., 0:1]
-                    rhand_prob = contact_prob[..., 1:2]
-                    prob_sum = lhand_prob + rhand_prob
-                    prob_sum = torch.clamp(prob_sum, min=1e-6)
-                    lhand_prob_norm = lhand_prob / prob_sum
-                    rhand_prob_norm = rhand_prob / prob_sum
-                    
-                    pred_obj_trans_fk = (
-                        lhand_prob_norm * ot_out["pred_lhand_obj_trans"] +
-                        rhand_prob_norm * ot_out["pred_rhand_obj_trans"]
-                    )
-                
-                results["pred_obj_trans_fk"] = pred_obj_trans_fk
+            # 如果需要计算FK方式的物体位置（用于比较）
+            if compute_fk:
+                obj_imu = data_dict["obj_imu"]
+                obj_rot6d = obj_imu[..., 3:9]
+                obj_rotm = rotation_6d_to_matrix(obj_rot6d.reshape(-1, 6)).reshape(batch_size, seq_len, 3, 3)
+                results["pred_obj_trans_fk"] = self._fk_obj_trans_baseline_hard(
+                    vc_out["pred_hand_contact_prob"],
+                    hp_out["pred_hand_glb_pos"],
+                    obj_rotm,
+                    data_dict["obj_trans_init"],
+                )
         
         results["has_object"] = has_object
         return results
@@ -221,4 +302,3 @@ def load_model(
     model.eval()
     
     return model
-

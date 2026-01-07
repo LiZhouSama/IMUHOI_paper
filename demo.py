@@ -54,9 +54,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Full TransPose checkpoint (.pt). If omitted, provide individual module weights.",
     )
-    parser.add_argument("--velocity-module", default='outputs/IMUHOI/omomo/modules/velocity_contact_best.pt', help="Pretrained velocity_contact module checkpoint.")
-    parser.add_argument("--human-module", default='outputs/IMUHOI/omomo/modules/human_pose_best.pt', help="Pretrained human_pose module checkpoint.")
-    parser.add_argument("--object-module", default='outputs/IMUHOI/omomo/modules/object_trans_best.pt', help="Pretrained object_trans module checkpoint.")
+    parser.add_argument("--velocity-module", default='outputs/IMUHOI/joint_train_12311229/best_velocity_contact.pt', help="Pretrained velocity_contact module checkpoint.")
+    parser.add_argument("--human-module", default='outputs/IMUHOI/joint_train_12311229/best_human_pose.pt', help="Pretrained human_pose module checkpoint.")
+    parser.add_argument("--object-module", default='outputs/IMUHOI/joint_train_12311229/best_object_trans.pt', help="Pretrained object_trans module checkpoint.")
     parser.add_argument("--device", default="cuda:0", help="Torch device for inference (e.g. cuda:0 or cpu).")
     parser.add_argument(
         "--object-mesh",
@@ -151,7 +151,7 @@ def build_model(cfg: edict, args: argparse.Namespace, device: torch.device) -> I
 def load_body_model(path: str, device: torch.device) -> BodyModel:
     if not os.path.isfile(path):
         raise FileNotFoundError(f"SMPL-H model not found at {path}")
-    smpl = BodyModel(bm_fname=path, num_betas=16, model_type="smplh").to(device)
+    smpl = BodyModel(bm_fname=path, num_betas=16).to(device)
     smpl.eval()
     return smpl
 

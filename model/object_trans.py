@@ -63,7 +63,7 @@ class ObjectTransModule(nn.Module):
             n_input=n_gating_input,
             n_output=3,  # 左手FK、右手FK、IMU积分
             n_hidden=64 * hidden_dim_multiplier,
-            n_init=6,
+            n_init=3,
             n_rnn_layer=1,
             bidirectional=False,
             dropout=0.2,
@@ -151,17 +151,16 @@ class ObjectTransModule(nn.Module):
         v_rhand: torch.Tensor,    # [B, T, 3]
         p_left: torch.Tensor,     # [B, T, 1]
         p_right: torch.Tensor,    # [B, T, 1]
+        p_move: torch.Tensor,     # [B, T, 1]
     ) -> torch.Tensor:
         """
         两阶段速度校正：
         1. 静止校正：无接触时物体静止
         2. 接触方向校正：接触时物体速度在手方向上的分量=手速度
         """
-        p_max = torch.maximum(p_left, p_right)
-        
         # === 阶段1：静止校正因子 ===
-        # p_max < threshold 时开始衰减到0
-        static_factor = torch.clamp(p_max / self.vel_static_threshold, 0, 1)
+        # 以物体运动概率为依据
+        static_factor = torch.clamp(p_move / self.vel_static_threshold, 0, 1)
         
         # === 阶段2：接触方向校正 ===
         def direction_correct(v_obj, v_hand, p_contact):
@@ -215,12 +214,12 @@ class ObjectTransModule(nn.Module):
         
         Args:
             hand_positions: [B, T, 2, 3] 手部位置 (来自HumanPoseModule)
-            pred_hand_contact_prob: [B, T, 3] 接触概率 (来自VelocityContactModule)
+            pred_hand_contact_prob: [B, T, 3] 接触概率 (左/右无条件接触 + 物体运动，来自VelocityContactModule)
             obj_trans_init: [B, 3] 初始物体位置
             obj_imu: [B, T, 9] 物体IMU数据
             human_imu: [B, T, num_imu, imu_dim] 人体IMU数据
             obj_vel_input: [B, T, 3] 物体速度 (来自VelocityContactModule)
-            contact_init: [B, 6] 初始接触状态
+            contact_init: [B, 3] 初始接触状态
             has_object_mask: [B] 是否有物体
         
         Returns:
@@ -268,11 +267,12 @@ class ObjectTransModule(nn.Module):
 
         pL = pred_hand_contact_prob[:, :, 0:1]
         pR = pred_hand_contact_prob[:, :, 1:2]
+        p_move = pred_hand_contact_prob[:, :, 2:3]
 
         # 计算手速度并校正物体速度
         lhand_vel = self._compute_hand_velocity(lhand_position)
         rhand_vel = self._compute_hand_velocity(rhand_position)
-        obj_vel_corrected = self._correct_obj_velocity(obj_vel_input, lhand_vel, rhand_vel, pL, pR)
+        obj_vel_corrected = self._correct_obj_velocity(obj_vel_input, lhand_vel, rhand_vel, pL, pR, p_move)
 
         # 构建FK输入
         fk_l_input = self._build_fk_inputs(obj_rot, lhand_position, pL, obj_imu, lhand_imu9, obj_vel_input, obj_rot_delta)
@@ -290,12 +290,16 @@ class ObjectTransModule(nn.Module):
         r_init_vec = torch.cat((r_oe0, r_lb0), dim=-1)
 
         if contact_init is None:
-            contact_init_vec = torch.cat((torch.zeros(bs, 3, device=device, dtype=dtype), obj_vel_input[:, 0, :]), dim=-1)
+            contact_init_vec = torch.zeros(bs, 3, device=device, dtype=dtype)
         else:
             if contact_init.dim() == 1:
                 contact_init_vec = contact_init.unsqueeze(0).expand(bs, -1)
             else:
                 contact_init_vec = contact_init
+            if contact_init_vec.shape[-1] > 3:
+                contact_init_vec = contact_init_vec[..., :3]
+            if contact_init_vec.shape[-1] != 3:
+                raise ValueError(f"contact_init must have last dim 3, got {contact_init_vec.shape}")
 
         # FK预测
         l_fk_out = self.lhand_fk_head((fk_l_input, l_init_vec))
@@ -315,7 +319,7 @@ class ObjectTransModule(nn.Module):
         # Gating预测
         gating_input = self._build_gating_inputs(pred_hand_contact_prob, obj_vel_input, obj_imu_acc)
         gate_logits = self.gating_head((gating_input, contact_init_vec))
-        prior_im = 1.0 - torch.maximum(pL.squeeze(-1), pR.squeeze(-1))
+        prior_im = 1.0 - p_move.squeeze(-1)
         prior = torch.stack([pL.squeeze(-1), pR.squeeze(-1), prior_im], dim=-1)
         gate_logits = gate_logits + self.gating_prior_beta * torch.log(prior + 1e-6)
         weights_raw = F.softmax(gate_logits / self.gating_temperature, dim=-1)
@@ -413,4 +417,3 @@ class ObjectTransModule(nn.Module):
             "init_rhand_lb": torch.zeros(batch_size, device=device),
             "gating_smoothing_applied": False,
         }
-
