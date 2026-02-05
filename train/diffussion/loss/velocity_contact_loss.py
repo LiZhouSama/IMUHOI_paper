@@ -101,41 +101,56 @@ class VelocityContactLoss:
             gt_hand_vel = sensor_vel_glb_gt[:, :, hand_indices, :]
             losses['hand_vel'] = F.mse_loss(pred_dict['pred_hand_glb_vel'], gt_hand_vel)
 
-        # obj move prob
+        # obj move (use logits for numerical stability)
         obj_move_pred = pred_dict.get('pred_obj_move_prob')
-        if obj_move_pred is None and 'pred_hand_contact_prob' in pred_dict:
-            obj_move_pred = pred_dict['pred_hand_contact_prob'][..., 2:3]
-        if obj_move_pred is not None:
+        contact_logits = pred_dict.get('pred_hand_contact_logits')
+        obj_move_logits = None
+        if contact_logits is not None and contact_logits.shape[-1] >= 3:
+            obj_move_logits = contact_logits[..., 2:3]
+        if obj_move_logits is not None:
+            losses['obj_move'] = F.binary_cross_entropy_with_logits(
+                obj_move_logits, obj_contact_gt.float().unsqueeze(-1)
+            )
+        elif obj_move_pred is not None:
+            # fallback to prob if logits missing
             losses['obj_move'] = F.binary_cross_entropy(
                 obj_move_pred, obj_contact_gt.float().unsqueeze(-1)
             )
 
         # conditional hand contact (only when object moving)
+        hand_contact_prob = pred_dict.get('pred_hand_contact_prob_cond')
         hand_logits_cond = pred_dict.get('pred_hand_contact_logits_cond')
         if hand_logits_cond is None:
-            contact_logits = pred_dict.get('pred_hand_contact_logits')
-            if isinstance(contact_logits, torch.Tensor) and contact_logits.shape[-1] >= 2:
+            if contact_logits is not None and contact_logits.shape[-1] >= 2:
                 hand_logits_cond = contact_logits[..., :2]
-        use_prob_as_log = False
-        if hand_logits_cond is None and 'pred_hand_contact_prob_cond' in pred_dict:
-            prob_cond = pred_dict['pred_hand_contact_prob_cond']
-            hand_logits_cond = torch.log(prob_cond.clamp_min(1e-6))
-            use_prob_as_log = True
-
+        if hand_contact_prob is None:
+            if hand_logits_cond is not None:
+                hand_contact_prob = torch.sigmoid(hand_logits_cond)
         if hand_logits_cond is not None:
-            hand_contact_gt_2 = torch.stack([
-                lhand_contact_gt.float(),
-                rhand_contact_gt.float(),
-            ], dim=-1)
-            gt_sum = hand_contact_gt_2.sum(dim=-1, keepdim=True).clamp_min(1.0)
-            gt_cond = hand_contact_gt_2 / gt_sum
-            log_probs = hand_logits_cond if use_prob_as_log else F.log_softmax(hand_logits_cond, dim=-1)
-            cond_loss = -(gt_cond * log_probs).sum(dim=-1)
+            hand_contact_gt_2 = torch.stack(
+                [lhand_contact_gt.float(), rhand_contact_gt.float()], dim=-1
+            )
+            cond_loss = F.binary_cross_entropy_with_logits(
+                hand_logits_cond, hand_contact_gt_2.float(), reduction='none'
+            )
             mask = obj_contact_gt.float()
-            if mask.sum() > 0:
-                losses['hand_contact_cond'] = (cond_loss * mask).sum() / mask.sum()
-            else:
-                losses['hand_contact_cond'] = zero.clone()
+            losses['hand_contact_cond'] = (
+                (cond_loss * mask.unsqueeze(-1)).sum() / mask.sum().clamp_min(1e-6)
+                if mask.sum() > 0
+                else zero.clone()
+            )
+        elif hand_contact_prob is not None:
+            # fallback to prob path if logits missing
+            hand_contact_gt_2 = torch.stack(
+                [lhand_contact_gt.float(), rhand_contact_gt.float()], dim=-1
+            )
+            cond_loss = F.binary_cross_entropy(hand_contact_prob, hand_contact_gt_2.float(), reduction='none')
+            mask = obj_contact_gt.float()
+            losses['hand_contact_cond'] = (
+                (cond_loss * mask.unsqueeze(-1)).sum() / mask.sum().clamp_min(1e-6)
+                if mask.sum() > 0
+                else zero.clone()
+            )
 
         # interaction boundary focal loss
         boundary_pred = pred_dict.get('pred_interaction_boundary_prob')
@@ -164,18 +179,24 @@ class VelocityContactLoss:
             t = torch.arange(seq, device=device, dtype=dtype).view(1, seq)
             start_prob = boundary_pred[..., 0]
             end_prob = boundary_pred[..., 1]
-            start_time = (start_prob * t).sum(dim=1) / start_prob.sum(dim=1).clamp_min(1e-6)
-            end_time = (end_prob * t).sum(dim=1) / end_prob.sum(dim=1).clamp_min(1e-6)
-            order_loss = F.relu(start_time - end_time)
-            if has_object_mask is not None:
-                mask_flat = has_object_mask.view(bs)
-                if mask_flat.sum() > 0:
-                    order_loss = (order_loss * mask_flat).sum() / mask_flat.sum()
+            start_mass = start_prob.sum(dim=1)
+            end_mass = end_prob.sum(dim=1)
+            valid_mask = (start_mass > 1e-3) & (end_mass > 1e-3)
+            if valid_mask.any():
+                start_time = (start_prob[valid_mask] * t).sum(dim=1) / start_mass[valid_mask]
+                end_time = (end_prob[valid_mask] * t).sum(dim=1) / end_mass[valid_mask]
+                order_loss = F.relu(start_time - end_time)
+                if has_object_mask is not None:
+                    mask_flat = has_object_mask.view(bs)[valid_mask]
+                    if mask_flat.numel() > 0 and mask_flat.sum() > 0:
+                        order_loss = (order_loss * mask_flat).sum() / mask_flat.sum()
+                    else:
+                        order_loss = zero.clone()
                 else:
-                    order_loss = zero.clone()
+                    order_loss = order_loss.mean()
+                losses['interaction_order'] = order_loss
             else:
-                order_loss = order_loss.mean()
-            losses['interaction_order'] = order_loss
+                losses['interaction_order'] = zero.clone()
 
         # weighted sum
         total_loss = zero.clone()

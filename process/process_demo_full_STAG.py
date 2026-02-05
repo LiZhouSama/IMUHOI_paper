@@ -606,8 +606,8 @@ def create_demo_overview_visualization(save_path: str, hip_acc_raw: np.ndarray, 
 # ===================== 主流程 =====================
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="生成 IMUHOI StageNet demo data_dict")
-    parser.add_argument("--human-csv", default="noitom/6IMU/Output/1204_01_.csv", help="Noitom 人体 IMU CSV")
-    parser.add_argument("--obj-csv", default="noitom/OBJ/1204_1.csv", help="STAG 物体 IMU CSV")
+    parser.add_argument("--human-csv", default="noitom/6IMU/Output/1204_04_.csv", help="Noitom 人体 IMU CSV")
+    parser.add_argument("--obj-csv", default="noitom/OBJ/1204_4.csv", help="STAG 物体 IMU CSV")
     parser.add_argument("--output", default="noitom/demo_data_dict.pt", help="data_dict 输出路径")
     parser.add_argument("--device", default="cpu", help="BodyModel FK 所用设备")
     parser.add_argument("--visualize", default=True, help="生成可视化")

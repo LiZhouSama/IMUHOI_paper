@@ -194,7 +194,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
             try:
                 model_input = build_model_input_dict(batch_device, config, device, add_noise=False)
                 compute_fk_flag = bool(use_fk or compare_3)
-                pred_dict = model(model_input, use_object_data=True, compute_fk=compute_fk_flag)
+                pred_dict = model.inference(model_input, use_object_data=True, compute_fk=compute_fk_flag)
             except Exception as exc:
                 print(f"Model inference failed: {exc}")
                 pred_dict = None

@@ -61,11 +61,11 @@ def get_default_dataset_config(no_trans: bool = False):
         #     },
         # },
         "processed_split_data_OMOMO": {
-            "data_dir": PROCESS_ROOT / "processed_split_data_OMOMO" / "test",
+            "data_dir": PROCESS_ROOT / "processed_split_data_OMOMO" / "debug",
             "modules": {
-                "velocity_contact": "outputs/IMUHOI/joint_train_12311229/best_velocity_contact.pt",
-                "human_pose": "outputs/IMUHOI/joint_train_12311229/best_human_pose.pt",
-                "object_trans": "outputs/IMUHOI/joint_train_12311229/best_object_trans.pt",
+                "human_pose": "outputs/IMUHOI_DiT/human_pose_01201159/best.pt",
+                "velocity_contact": "outputs/IMUHOI_DiT/velocity_contact_01211542/best.pt",
+                # "object_trans": "outputs/IMUHOI_DiT/object_trans_01160252/best_object_trans.pt",
             },
         },
     }
@@ -185,7 +185,7 @@ def evaluate_model(
             
             compute_fk = evaluate_objects and compare_three
             try:
-                pred_dict = model(
+                pred_dict = model.inference(
                     data_dict,
                     use_object_data=True,
                     compute_fk=compute_fk,
@@ -466,6 +466,7 @@ def main():
     parser.add_argument("--no_trans", action="store_true", help="使用noTrans模式")
     parser.add_argument("--no_eval_objects", action="store_true", help="跳过物体相关指标")
     parser.add_argument("--compare_3", action="store_true", help="比较FK/IMU方法")
+    parser.add_argument("--model_arch", type=str, choices=["rnn", "dit"], default=None, help="选择模型架构")
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -484,6 +485,8 @@ def main():
     for dataset_name, dataset_cfg in dataset_runs:
         print(f"\n=== Evaluating dataset: {dataset_name} ===")
         config = load_config(args.config)
+        if args.model_arch is not None:
+            config.model_arch = args.model_arch
         
         if args.num_workers is not None:
             config.num_workers = args.num_workers
@@ -529,7 +532,7 @@ def main():
             data_dir=str(data_path),
             window_size=test_window,
             debug=config.get("debug", False),
-            full_sequence=True,
+            full_sequence=False,
         )
         
         if len(test_dataset) == 0:

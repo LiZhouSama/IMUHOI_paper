@@ -7,6 +7,7 @@ from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_rotation_6d
 
 from .base import RNNWithInit
 from configs import FRAME_RATE, _SENSOR_NAMES
+from utils.utils import _central_diff, _smooth_acceleration
 
 
 class VelocityContactModule(nn.Module):
@@ -38,9 +39,12 @@ class VelocityContactModule(nn.Module):
         }
         group_hidden = getattr(cfg, "boundary_group_hidden", max(hidden_dim // 2, 32))
         boundary_hidden = getattr(cfg, "boundary_hidden_dim", hidden_dim)
+        self.boundary_hidden_dim = boundary_hidden
         self.group_encoders = nn.ModuleDict()
+        self.group_norms = nn.ModuleDict()
         for name, idx in self.body_group_indices.items():
             group_input_dim = len(idx) * (6 + 3 + 3) + 3  # pose6d + vel + acc + root vel
+            self.group_norms[name] = nn.LayerNorm(group_input_dim)
             self.group_encoders[name] = nn.GRU(
                 input_size=group_input_dim,
                 hidden_size=group_hidden,
@@ -55,6 +59,8 @@ class VelocityContactModule(nn.Module):
             batch_first=True,
         )
         self.boundary_head = nn.Linear(boundary_hidden, 2)
+        self.boundary_input_norm = nn.LayerNorm(boundary_input_dim)
+        self.boundary_hidden_norm = nn.LayerNorm(boundary_hidden)
 
         # Velocity predictor (shared for hands/obj)
         self.vel_net = RNNWithInit(
@@ -80,7 +86,7 @@ class VelocityContactModule(nn.Module):
             dropout=dropout,
         )
         # Hand contact conditioned on object moving
-        hand_contact_input_dim = 2 * (3 + 3) + 3 + self.obj_imu_dim + 2  # vel+acc per hand + root vel + obj imu + boundary prob
+        hand_contact_input_dim = 2 * (3 + 3) + 3 + self.obj_imu_dim + boundary_hidden  # vel+acc per hand + root vel + obj imu + boundary features
         self.hand_contact_net = RNNWithInit(
             n_input=hand_contact_input_dim,
             n_output=2,  # left/right conditional prob
@@ -90,6 +96,7 @@ class VelocityContactModule(nn.Module):
             bidirectional=False,
             dropout=dropout,
         )
+        self.hand_contact_input_norm = nn.LayerNorm(hand_contact_input_dim)
 
         self.left_hand_sensor = _SENSOR_NAMES.index("LeftForeArm")
         self.right_hand_sensor = _SENSOR_NAMES.index("RightForeArm")
@@ -118,23 +125,6 @@ class VelocityContactModule(nn.Module):
 
         return human_imu_denorm
 
-    def _first_order(self, tensor: torch.Tensor):
-        vel = torch.zeros_like(tensor)
-        if tensor.size(1) > 1:
-            vel[:, 1:] = (tensor[:, 1:] - tensor[:, :-1]) * self.fps
-            vel[:, 0] = vel[:, 1]
-        return vel
-
-    def _second_order(self, tensor: torch.Tensor):
-        acc = torch.zeros_like(tensor)
-        if tensor.size(1) > 2:
-            acc[:, 2:] = (tensor[:, 2:] - 2 * tensor[:, 1:-1] + tensor[:, :-2]) * (self.fps ** 2)
-            acc[:, 1] = acc[:, 2]
-            acc[:, 0] = acc[:, 2]
-        elif tensor.size(1) > 1:
-            acc[:, 1:] = (tensor[:, 1:] - tensor[:, :-1]) * (self.fps ** 2)
-        return acc
-
     def _prepare_pose_streams(self, hp_out, device, dtype, batch_size, seq_len):
         pose_6d = None
         joint_pos = None
@@ -155,10 +145,11 @@ class VelocityContactModule(nn.Module):
         if hand_pos is None:
             hand_pos = torch.zeros(batch_size, seq_len, 2, 3, device=device, dtype=dtype)
 
-        joint_vel = self._first_order(joint_pos)
-        joint_acc = self._second_order(joint_pos)
-        hand_vel = self._first_order(hand_pos)
-        hand_acc = self._second_order(hand_pos)
+        dt = 1.0 / self.fps
+        joint_vel = _central_diff(joint_pos, dt)
+        joint_acc = _smooth_acceleration(joint_pos, self.fps, smooth_n=4)
+        hand_vel = _central_diff(hand_pos, dt)
+        hand_acc = _smooth_acceleration(hand_pos, self.fps, smooth_n=4)
 
         return {
             "pose_6d": pose_6d,
@@ -183,14 +174,17 @@ class VelocityContactModule(nn.Module):
             vel_feat = joint_vel[:, :, idx, :].reshape(batch_size, seq_len, -1)
             acc_feat = joint_acc[:, :, idx, :].reshape(batch_size, seq_len, -1)
             group_input = torch.cat((pose_feat, vel_feat, acc_feat, root_vel), dim=-1)
+            group_input = self.group_norms[name](group_input)
             group_out, _ = encoder(group_input)
             boundary_features.append(group_out)
 
         boundary_input = torch.cat(boundary_features, dim=-1)
+        boundary_input = self.boundary_input_norm(boundary_input)
         boundary_out, _ = self.boundary_rnn(boundary_input)
-        boundary_logits = self.boundary_head(boundary_out)
+        boundary_out_norm = self.boundary_hidden_norm(boundary_out)
+        boundary_logits = self.boundary_head(boundary_out_norm)
         boundary_prob = torch.sigmoid(boundary_logits)
-        return boundary_logits, boundary_prob
+        return boundary_logits, boundary_prob, boundary_out_norm
 
     def forward(self, data_dict: dict, hp_out: dict = None):
         """
@@ -272,9 +266,9 @@ class VelocityContactModule(nn.Module):
 
         # Boundary prediction from HPE outputs
         pose_streams = self._prepare_pose_streams(hp_out or data_dict.get("hp_out"), device, dtype, batch_size, seq_len)
-        boundary_logits, boundary_prob = self._encode_body_groups(pose_streams)
+        boundary_logits, boundary_prob, boundary_out = self._encode_body_groups(pose_streams)
 
-        # Hand contact using HPE-derived velocity/acc plus boundary cues
+        # Hand contact using HPE-derived velocity/acc plus boundary hidden states
         hand_dyn_feat = torch.cat(
             (
                 pose_streams["hand_vel"].reshape(batch_size, seq_len, -1),
@@ -283,10 +277,11 @@ class VelocityContactModule(nn.Module):
             dim=-1,
         )
         root_vel_feat = pose_streams["root_vel"]
-        hand_contact_input = torch.cat((hand_dyn_feat, root_vel_feat, obj_imu, boundary_prob), dim=-1)
+        hand_contact_input = torch.cat((hand_dyn_feat, root_vel_feat, obj_imu, boundary_out), dim=-1)
+        hand_contact_input = self.hand_contact_input_norm(hand_contact_input)
 
         hand_contact_logits = self.hand_contact_net((hand_contact_input, contact_init_vec))
-        hand_contact_prob_cond = torch.softmax(hand_contact_logits, dim=-1)
+        hand_contact_prob_cond = torch.sigmoid(hand_contact_logits)
 
         # Unconditional hand contact = object move prob * conditional
         hand_contact_prob = obj_move_prob * hand_contact_prob_cond

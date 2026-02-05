@@ -2,13 +2,30 @@
 # 通过命令行 --no_trans 参数切换模式
 
 # ============ 基本配置 ============
-model_name: "IMUHOI"
 save_dir: "outputs/IMUHOI"
 body_model_path: datasets/smpl_models/smplh/male/model.npz
 use_tensorboard: True
 use_multi_gpu: True
 device: "cuda:0"
 gpus: [0]
+model_arch: "rnn"  # 可选: rnn, dit
+
+# ============ DiT超参数(仅在model_arch=dit时使用) ============
+dit:
+  dit_d_model: 256
+  dit_nhead: 8
+  dit_num_layers: 6
+  dit_dim_feedforward: 1024
+  dit_dropout: 0.1
+  dit_timesteps: 1000
+  dit_use_time_embed: true
+  dit_use_noise: true
+  dit_max_seq_len: 256
+  dit_x_start_mode: "gt"   # gt: 训练时对GT加噪；seed: 兼容旧版seed输入
+  ot_variant: "direct"        # direct 或 fk_gating
+  ot_gating_hidden: 64
+  ot_gating_temperature: 1.0
+  ot_gating_prior_beta: 5.0
 
 # ============ 全局常量 ============
 FRAME_RATE: 30
@@ -74,18 +91,18 @@ datasets:
 
 # ============ 损失权重 ============
 loss_weights:
-  # Stage 1: VelocityContact
-  obj_vel: 1.0
-  hand_vel: 1.0
-  hand_contact: 1.0
-  
-  # Stage 2: HumanPose
+  # Stage 1: HumanPose
   vel_root: 1.0
   pose_reduced: 10.0  
   root_vel_local: 1.0
   root_vel: 1.0
   root_trans: 1.0
   hand_pos: 1.0
+  
+  # Stage 2: VelocityContact
+  obj_vel: 1.0
+  hand_vel: 1.0
+  hand_contact_cond: 1.0
   
   # Stage 3: ObjectTrans
   obj_trans: 1.0
@@ -104,4 +121,3 @@ train:
 
 test:
   window: 120
-

@@ -1,6 +1,6 @@
 """
 HumanPoseModule: 预测人体姿态和根节点位移
-Stage 2 - 可独立训练
+Stage 1 - 可独立训练
 支持noTrans模式：不预测根节点位移，使用GT位移
 """
 import torch
@@ -383,8 +383,14 @@ class HumanPoseModule(nn.Module):
         if self.body_model is not None:
             joints_pos = self._compute_fk_joints_batched(p_pred, orientation_mat.clone())
             try:
-                full_glb_rotmats = self._reduced_glb_6d_to_full_glb_mat(p_pred, orientation_mat.clone())
-                full_glb_rot6d = matrix_to_rotation_6d(full_glb_rotmats.reshape(-1, 3, 3)).reshape(
+                BT = batch_size * seq_len
+                glb_pose_flat = p_pred.reshape(BT, len(_REDUCED_POSE_NAMES), 6)
+                orientation_flat = orientation_mat[:, :, : len(_SENSOR_ROT_INDICES)].reshape(
+                    BT, len(_SENSOR_ROT_INDICES), 3, 3
+                )
+                full_glb_rotmats_flat = self._reduced_glb_6d_to_full_glb_mat(glb_pose_flat, orientation_flat)
+                full_glb_rotmats = full_glb_rotmats_flat.reshape(batch_size, seq_len, 24, 3, 3)
+                full_glb_rot6d = matrix_to_rotation_6d(full_glb_rotmats_flat.reshape(-1, 3, 3)).reshape(
                     batch_size, seq_len, 24, 6
                 )
             except Exception as exc:

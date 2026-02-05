@@ -2,14 +2,14 @@
 # IMUHOI 训练脚本
 # 
 # 用法示例:
-#   # Stage 1: 训练 VelocityContact
-#   bash scripts/train.sh vc
-#   
-#   # Stage 2: 训练 HumanPose (普通模式)
+#   # Stage 1: 训练 HumanPose
 #   bash scripts/train.sh hp
 #   
-#   # Stage 2: 训练 HumanPose (noTrans模式)
-#   bash scripts/train.sh hp --no_trans
+#   # Stage 2: 训练 VelocityContact (普通模式)
+#   bash scripts/train.sh vc
+#   
+#   # Stage 2: 训练 VelocityContact (noTrans模式)
+#   bash scripts/train.sh vc --no_trans
 #   
 #   # Stage 3: 训练 ObjectTrans
 #   bash scripts/train.sh ot --vc_ckpt path/to/vc.pt --hp_ckpt path/to/hp.pt
@@ -43,8 +43,8 @@ show_help() {
     echo "用法: bash scripts/train.sh <stage> [options]"
     echo ""
     echo "Stage 选项:"
-    echo "  vc, velocity_contact    训练 VelocityContactModule (Stage 1)"
-    echo "  hp, human_pose          训练 HumanPoseModule (Stage 2)"  
+    echo "  hp, human_pose          训练 HumanPoseModule (Stage 1)"
+    echo "  vc, velocity_contact    训练 VelocityContactModule (Stage 2)"
     echo "  ot, object_trans        训练 ObjectTransModule (Stage 3)"
     echo "  joint                   联合训练所有模块"
     echo "  all                     依次训练所有阶段"
@@ -52,7 +52,7 @@ show_help() {
     echo "通用选项:"
     echo "  --cfg FILE              指定配置文件 (默认: $CONFIG)"
     echo "  --debug                 调试模式 (小数据集, 少epoch)"
-    echo "  --no_trans              使用noTrans模式 (Stage 2+)"
+    echo "  --no_trans              使用noTrans模式 (Stage 1+)"
     echo "  --batch_size N          批量大小"
     echo "  --epochs N              训练轮数"
     echo ""
@@ -62,8 +62,8 @@ show_help() {
     echo "  --auto_find_ckpt        自动搜索最新权重"
     echo ""
     echo "示例:"
-    echo "  bash scripts/train.sh vc                              # 训练Stage1"
-    echo "  bash scripts/train.sh hp --no_trans                   # 训练Stage2 noTrans模式"
+    echo "  bash scripts/train.sh hp                              # 训练Stage1"
+    echo "  bash scripts/train.sh vc --no_trans                   # 训练Stage2 noTrans模式"
     echo "  bash scripts/train.sh ot --auto_find_ckpt             # 训练Stage3 自动搜索权重"
     echo "  bash scripts/train.sh all --no_trans                  # 依次训练所有阶段"
     echo "  bash scripts/train.sh vc --debug --batch_size 4       # 调试模式"
@@ -77,32 +77,32 @@ fi
 
 # 运行训练
 case "$STAGE" in
-    vc|velocity_contact)
-        echo "=========================================="
-        echo "Stage 1: 训练 VelocityContactModule"
-        echo "=========================================="
-        python train/train_velocity_contact.py --cfg "$CONFIG" "$@"
-        ;;
-    
     hp|human_pose)
         echo "=========================================="
-        echo "Stage 2: 训练 HumanPoseModule"
+        echo "Stage 1: 训练 HumanPoseModule"
         echo "=========================================="
-        python train/train_human_pose.py --cfg "$CONFIG" "$@"
+        python train/diffussion/train_human_pose.py --cfg "$CONFIG" "$@"
+        ;;
+    
+    vc|velocity_contact)
+        echo "=========================================="
+        echo "Stage 2: 训练 VelocityContactModule"
+        echo "=========================================="
+        python train/diffussion/train_velocity_contact.py --cfg "$CONFIG" "$@"
         ;;
     
     ot|object_trans)
         echo "=========================================="
         echo "Stage 3: 训练 ObjectTransModule"
         echo "=========================================="
-        python train/train_object_trans.py --cfg "$CONFIG" "$@"
+        python train/diffussion/train_object_trans.py --cfg "$CONFIG" "$@"
         ;;
     
     joint)
         echo "=========================================="
         echo "联合训练所有模块"
         echo "=========================================="
-        python train/train_object_trans.py --cfg "$CONFIG" --joint_train "$@"
+        python train/diffussion/train_object_trans.py --cfg "$CONFIG" --joint_train "$@"
         ;;
     
     all)
@@ -111,16 +111,16 @@ case "$STAGE" in
         echo "=========================================="
         
         echo ""
-        echo "[1/3] 训练 VelocityContactModule..."
-        python train/train_velocity_contact.py --cfg "$CONFIG" "$@"
+        echo "[1/3] 训练 HumanPoseModule..."
+        python train/diffussion/train_human_pose.py --cfg "$CONFIG" "$@"
         
         echo ""
-        echo "[2/3] 训练 HumanPoseModule..."
-        python train/train_human_pose.py --cfg "$CONFIG" "$@"
+        echo "[2/3] 训练 VelocityContactModule..."
+        python train/diffussion/train_velocity_contact.py --cfg "$CONFIG" "$@"
         
         echo ""
         echo "[3/3] 训练 ObjectTransModule..."
-        python train/train_object_trans.py --cfg "$CONFIG" --auto_find_ckpt "$@"
+        python train/diffussion/train_object_trans.py --cfg "$CONFIG" --auto_find_ckpt "$@"
         
         echo ""
         echo "=========================================="
@@ -138,4 +138,3 @@ esac
 
 echo ""
 echo "训练完成!"
-

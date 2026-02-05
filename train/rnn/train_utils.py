@@ -1,6 +1,7 @@
 """
 训练专用工具函数
 """
+from __future__ import annotations
 import os
 import argparse
 import yaml
@@ -52,6 +53,7 @@ def get_base_args():
     parser.add_argument('--pretrained_ckpt', type=str, default=None, help='预训练权重路径')
     parser.add_argument('--debug', action='store_true', help='调试模式')
     parser.add_argument('--no_trans', action='store_true', help='禁用根节点位移预测')
+    parser.add_argument('--model_arch', type=str, choices=['rnn', 'dit'], default=None, help='选择模型架构(rnn/dit)')
     return parser
 
 
@@ -76,6 +78,7 @@ def merge_config(args):
     cfg.debug = args.debug
     cfg.no_trans = args.no_trans
     cfg.cfg_file = args.cfg
+    cfg.model_arch = args.model_arch or getattr(cfg, 'model_arch', 'rnn')
     
     if args.debug:
         cfg.batch_size = min(cfg.batch_size, 4)
@@ -246,6 +249,14 @@ class BaseTrainer:
         
         self.best_loss = float('inf')
         self.n_iter = 0
+
+    def model_forward(
+        self,
+        data_dict,
+        batch=None,
+    ):
+        """默认的前向封装，可被子类重写"""
+        return self.model(data_dict)
     
     def train_epoch(self, epoch):
         """训练一个epoch"""
@@ -259,7 +270,7 @@ class BaseTrainer:
             data_dict = build_model_input_dict(batch, self.cfg, self.device, add_noise=True)
             
             self.optimizer.zero_grad()
-            pred_dict = self.model(data_dict)
+            pred_dict = self.model_forward(data_dict, batch=batch)
             
             total_loss, losses, weighted_losses = self.loss_fn(pred_dict, batch, self.device)
             
@@ -308,7 +319,7 @@ class BaseTrainer:
             
             for batch in test_iter:
                 data_dict = build_model_input_dict(batch, self.cfg, self.device, add_noise=False)
-                pred_dict = self.model(data_dict)
+                pred_dict = self.model_forward(data_dict, batch=batch)
                 
                 if hasattr(self.loss_fn, 'compute_test_loss'):
                     total_loss, losses = self.loss_fn.compute_test_loss(pred_dict, batch, self.device)

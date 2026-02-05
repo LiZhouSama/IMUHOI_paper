@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--data-dict",
-        default="noitom/demo_data_dict.pt",
+        default="noitom/7IMU/shoe004.pt",
         help="Serialized data_dict produced by process/process_demo.py.",
     )
     parser.add_argument(
@@ -54,19 +54,20 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Full TransPose checkpoint (.pt). If omitted, provide individual module weights.",
     )
-    parser.add_argument("--velocity-module", default='outputs/IMUHOI/joint_train_12311229/best_velocity_contact.pt', help="Pretrained velocity_contact module checkpoint.")
-    parser.add_argument("--human-module", default='outputs/IMUHOI/joint_train_12311229/best_human_pose.pt', help="Pretrained human_pose module checkpoint.")
+    parser.add_argument("--model-arch", choices=["rnn", "dit"], default=None, help="Select backbone architecture.")
+    parser.add_argument("--velocity-module", default='outputs/IMUHOI/joint_train_01112057/best_velocity_contact.pt', help="Pretrained velocity_contact module checkpoint.")
+    parser.add_argument("--human-module", default='outputs/IMUHOI/joint_train_01112057/best_human_pose.pt', help="Pretrained human_pose module checkpoint.")
     parser.add_argument("--object-module", default='outputs/IMUHOI/joint_train_12311229/best_object_trans.pt', help="Pretrained object_trans module checkpoint.")
     parser.add_argument("--device", default="cuda:0", help="Torch device for inference (e.g. cuda:0 or cpu).")
     parser.add_argument(
         "--object-mesh",
-        default='datasets/OMOMO/captured_objects/smallbox_cleaned_simplified.obj',
+        default='/mnt/d/a_WORK/Projects/PhD/paper_work/EgoIMU/Rebuttal/shoe_transformed.obj',
         help="Optional triangulated mesh (.obj/.ply/...) that will be placed at the predicted object poses.",
     )
     parser.add_argument(
         "--object-scale",
         type=float,
-        default=0.315,
+        default=1,
         help="Uniform scale applied to the provided object mesh.",
     )
     parser.add_argument(
@@ -198,13 +199,18 @@ def load_data_dict(path: str, device: torch.device) -> Dict[str, torch.Tensor]:
 
 
 def run_inference(
+    cfg: edict,
     model: IMUHOIModel,
     data_dict: Dict[str, torch.Tensor],
     use_object_data: bool,
     compute_fk: bool,
 ) -> Dict[str, torch.Tensor]:
+
     with torch.no_grad():
-        outputs = model(data_dict, use_object_data=use_object_data, compute_fk=compute_fk)
+        if cfg.model_arch == 'dit':
+            outputs = model.inference(data_dict, use_object_data=use_object_data, compute_fk=compute_fk)
+        else:
+            outputs = model(data_dict, use_object_data=use_object_data, compute_fk=compute_fk)
     print("[demo] Model forward pass complete.")
     return outputs
 
@@ -262,57 +268,245 @@ def reconstruct_human_sequence(
     print("[demo] Reconstructed predicted human mesh.")
     return verts, faces
 
+### box/shoe
+# def load_object_template(
+#     mesh_path: Optional[str],
+#     mesh_scale: float,
+#     fallback_size: float,
+#     device: torch.device,
+# ) -> Tuple[torch.Tensor, np.ndarray]:
+#     if mesh_path:
+#         print(f"[demo] 忽略 --object-mesh ({mesh_path})，改用内置长方体。")
+#     _ = mesh_scale
+#     _ = fallback_size
+
+#     # length = 0.3
+#     # width = 0.20
+#     # height = 0.15
+#     length = 0.11
+#     width = 0.28
+#     height = 0.05
+#     half_len = length / 2.0
+#     half_width = width / 2.0
+#     top = 0.0
+#     bottom = -height
+#     vertices = torch.tensor(
+#         [
+#             [half_len, top, half_width],
+#             [half_len, top, -half_width],
+#             [-half_len, top, -half_width],
+#             [-half_len, top, half_width],
+#             [half_len, bottom, half_width],
+#             [half_len, bottom, -half_width],
+#             [-half_len, bottom, -half_width],
+#             [-half_len, bottom, half_width],
+#         ],
+#         dtype=torch.float32,
+#         device=device,
+#     )
+#     faces = np.array(
+#         [
+#             [0, 1, 2],
+#             [0, 2, 3],
+#             [4, 7, 6],
+#             [4, 6, 5],
+#             [0, 4, 5],
+#             [0, 5, 1],
+#             [1, 5, 6],
+#             [1, 6, 2],
+#             [2, 6, 7],
+#             [2, 7, 3],
+#             [3, 7, 4],
+#             [3, 4, 0],
+#         ],
+#         dtype=np.int32,
+#     )
+#     print("[demo] Built 0.25×0.20×0.10 m box mesh（原点位于顶面中心，长沿 +X，宽沿 +Z，高沿 +Y）。")
+#     return vertices, faces
+
+### wine
+# def load_object_template(
+#     mesh_path: Optional[str],
+#     mesh_scale: float,
+#     fallback_size: float,
+#     device: torch.device,
+#     sections: int = 32  # 圆柱体的圆周分段数，越大越圆滑
+# ) -> Tuple[torch.Tensor, np.ndarray]:
+#     """Load external mesh if provided, otherwise use stepped-cylinder fallback."""
+#     if mesh_path and os.path.isfile(mesh_path):
+#         mesh = trimesh.load(mesh_path, force="mesh")
+#         if isinstance(mesh, trimesh.Scene):
+#             mesh = mesh.dump(concatenate=True)
+#         if mesh_scale != 1:
+#             mesh.apply_scale(mesh_scale)
+#         vertices = torch.tensor(mesh.vertices, dtype=torch.float32, device=device)
+#         faces = np.asarray(mesh.faces, dtype=np.int32)
+#         print(f"[demo] Loaded object mesh from {mesh_path} (verts={len(vertices)}, faces={len(faces)}), scale={mesh_scale}.")
+#         return vertices, faces
+
+#     # fallback parameters (meters)
+#     _ = fallback_size
+#     r1, h1 = 0.016, 0.10  # top section radius/height
+#     r2, h2 = 0.04, 0.17  # bottom section radius/height
+
+#     y0, y1, y2 = 0.0, -h1, -(h1 + h2)
+
+#     vertices = [[0, y0, 0]]
+#     angles = np.linspace(0, 2 * np.pi, sections, endpoint=False)
+#     for y, r in [(y0, r1), (y1, r1), (y1, r2), (y2, r2)]:
+#         for angle in angles:
+#             vertices.append([r * np.cos(angle), y, r * np.sin(angle)])
+#     vertices.append([0, y2, 0])
+
+#     v_tensor = torch.tensor(vertices, dtype=torch.float32, device=device)
+
+#     faces = []
+#     N = sections
+#     for i in range(N):
+#         nxt = (i + 1) % N
+#         faces.append([0, i + 1, nxt + 1])
+#         v1, v2 = i + 1, nxt + 1
+#         v3, v4 = i + 1 + N, nxt + 1 + N
+#         faces.extend([[v1, v3, v4], [v1, v4, v2]])
+#         v1, v2 = i + 1 + N, nxt + 1 + N
+#         v3, v4 = i + 1 + 2 * N, nxt + 1 + 2 * N
+#         faces.extend([[v1, v3, v4], [v1, v4, v2]])
+#         v1, v2 = i + 1 + 2 * N, nxt + 1 + 2 * N
+#         v3, v4 = i + 1 + 3 * N, nxt + 1 + 3 * N
+#         faces.extend([[v1, v3, v4], [v1, v4, v2]])
+#         bottom_center = 4 * N + 1
+#         faces.append([bottom_center, nxt + 1 + 3 * N, i + 1 + 3 * N])
+
+#     f_array = np.array(faces, dtype=np.int32)
+#     print(f"[demo] Built stepped cylinder fallback mesh (verts={len(vertices)}, faces={len(faces)}).")
+#     return v_tensor, f_array
+
+## bottol
+# def load_object_template(
+#     mesh_path: Optional[str],
+#     mesh_scale: float,
+#     fallback_size: float,
+#     device: torch.device,
+#     sections: int = 32
+# ) -> Tuple[torch.Tensor, np.ndarray]:
+    
+#     # 忽略输入参数
+#     _ = mesh_path
+#     _ = mesh_scale
+#     _ = fallback_size
+
+#     # 参数设置 (单位：米)
+#     radius = 0.03  # 直径6cm -> 半径0.03m
+#     height = 0.16  # 高度16cm
+    
+#     top_y = 0.0
+#     bottom_y = -height
+
+#     vertices = []
+    
+#     # 1. 生成顶点
+#     # 索引 0: 顶面中心点
+#     vertices.append([0, top_y, 0])
+    
+#     # 索引 1 ~ N: 顶面圆周顶点
+#     # 索引 N+1 ~ 2N: 底面圆周顶点
+#     angles = np.linspace(0, 2 * np.pi, sections, endpoint=False)
+    
+#     # 顶层圆周
+#     for angle in angles:
+#         vertices.append([radius * np.cos(angle), top_y, radius * np.sin(angle)])
+        
+#     # 底层圆周
+#     for angle in angles:
+#         vertices.append([radius * np.cos(angle), bottom_y, radius * np.sin(angle)])
+            
+#     # 索引 2N+1: 底面中心点
+#     vertices.append([0, bottom_y, 0])
+    
+#     v_tensor = torch.tensor(vertices, dtype=torch.float32, device=device)
+    
+#     # 2. 生成面 (Faces)
+#     faces = []
+#     N = sections
+    
+#     for i in range(N):
+#         next_i = (i + 1) % N
+        
+#         # a. 顶面封口 (中心点为0)
+#         # 顶点顺序 0 -> i+1 -> next_i+1
+#         faces.append([0, i + 1, next_i + 1])
+        
+#         # b. 侧面 (两个三角形组成一个矩形)
+#         v_top_curr = i + 1
+#         v_top_next = next_i + 1
+#         v_bot_curr = i + 1 + N
+#         v_bot_next = next_i + 1 + N
+        
+#         # 三角形1: 顶当前, 底当前, 底下一个
+#         faces.append([v_top_curr, v_bot_curr, v_bot_next])
+#         # 三角形2: 顶当前, 底下一个, 顶下一个
+#         faces.append([v_top_curr, v_bot_next, v_top_next])
+        
+#         # c. 底面封口 (中心点为 2N + 1)
+#         # 注意为了使法线朝外，底面的绕行方向与顶面相反
+#         bottom_center = 2 * N + 1
+#         faces.append([bottom_center, v_bot_next, v_bot_curr])
+
+#     f_array = np.array(faces, dtype=np.int32)
+    
+#     print(f"[demo] Built cylinder: d=6cm, h=16cm (Origin at top center).")
+#     return v_tensor, f_array
+
 
 def load_object_template(
     mesh_path: Optional[str],
     mesh_scale: float,
     fallback_size: float,
     device: torch.device,
+    sections: int = 32,
 ) -> Tuple[torch.Tensor, np.ndarray]:
-    if mesh_path:
-        print(f"[demo] 忽略 --object-mesh ({mesh_path})，改用内置长方体。")
-    _ = mesh_scale
-    _ = fallback_size
+    """
+    Load an external object mesh when provided; otherwise return a cube of edge ``fallback_size``.
+    The previous template variants are kept above as comments for reference.
+    """
+    if mesh_path and os.path.isfile(mesh_path):
+        mesh = trimesh.load(mesh_path, force="mesh")
+        if isinstance(mesh, trimesh.Scene):
+            mesh = mesh.dump(concatenate=True)
+        if mesh_scale != 1:
+            mesh.apply_scale(mesh_scale)
+        vertices = torch.tensor(mesh.vertices, dtype=torch.float32, device=device)
+        faces = np.asarray(mesh.faces, dtype=np.int32)
+        print(f"[demo] Loaded object mesh from {mesh_path} (verts={len(vertices)}, faces={len(faces)}), scale={mesh_scale}.")
+        return vertices, faces
 
-    length = 0.3
-    width = 0.20
-    height = 0.15
-    half_len = length / 2.0
-    half_width = width / 2.0
-    top = 0.0
-    bottom = -height
+    half = fallback_size / 2.0
     vertices = torch.tensor(
         [
-            [half_len, top, half_width],
-            [half_len, top, -half_width],
-            [-half_len, top, -half_width],
-            [-half_len, top, half_width],
-            [half_len, bottom, half_width],
-            [half_len, bottom, -half_width],
-            [-half_len, bottom, -half_width],
-            [-half_len, bottom, half_width],
+            [ half,  half,  half],
+            [ half,  half, -half],
+            [ half, -half,  half],
+            [ half, -half, -half],
+            [-half,  half,  half],
+            [-half,  half, -half],
+            [-half, -half,  half],
+            [-half, -half, -half],
         ],
         dtype=torch.float32,
         device=device,
     )
     faces = np.array(
         [
-            [0, 1, 2],
-            [0, 2, 3],
-            [4, 7, 6],
-            [4, 6, 5],
-            [0, 4, 5],
-            [0, 5, 1],
-            [1, 5, 6],
-            [1, 6, 2],
-            [2, 6, 7],
-            [2, 7, 3],
-            [3, 7, 4],
-            [3, 4, 0],
+            [0, 1, 3], [0, 3, 2],  # +X
+            [4, 6, 7], [4, 7, 5],  # -X
+            [0, 2, 6], [0, 6, 4],  # +Z
+            [1, 5, 7], [1, 7, 3],  # -Z
+            [0, 4, 5], [0, 5, 1],  # +Y
+            [2, 3, 7], [2, 7, 6],  # -Y
         ],
         dtype=np.int32,
     )
-    print("[demo] Built 0.25×0.20×0.10 m box mesh（原点位于顶面中心，长沿 +X，宽沿 +Z，高沿 +Y）。")
+    print(f"[demo] Using cube fallback mesh (edge={fallback_size} m).")
     return vertices, faces
 
 
@@ -341,6 +535,11 @@ def build_object_renderables(
             rot_mat = torch.eye(3, device=device).unsqueeze(0).repeat(seq_len, 1, 1)
     else:
         rot_mat = torch.eye(3, device=device).unsqueeze(0).repeat(seq_len, 1, 1)
+
+    # Normalize orientation so the first frame is identity (rest pose)
+    if rot_mat.shape[0] > 0:
+        r0_inv = rot_mat[0].transpose(0, 1)
+        rot_mat = torch.matmul(r0_inv.unsqueeze(0), rot_mat)
 
     min_len = min(rot_mat.shape[0], seq_len)
     rot_mat = rot_mat[:min_len]
@@ -375,6 +574,11 @@ def visualize_predictions(
         return
 
     viewer = Viewer(title="IMUHOI Demo")
+    viewer.scene.floor.material.diffuse = 0.1
+    viewer.scene.floor.tiling = False
+    viewer.scene.floor.material.color = (132/255, 150/255, 183/255, 1.0)
+    viewer.scene.floor.material.ambient = 0.30
+    viewer.scene.background_color = (0.5, 0.5, 0.5, 1.0)
     device = human_verts.device if human_verts is not None else torch.device("cpu")
 
     if human_verts is not None and human_faces is not None:
@@ -383,10 +587,11 @@ def visualize_predictions(
             verts_yup.detach().cpu().numpy(),
             human_faces,
             name="Pred-Human",
-            color=(0.9, 0.2, 0.2, 0.85),
+            color=(225/255, 166/255, 100/255, 1),
             gui_affine=False,
             is_selectable=False,
         )
+        mesh.material.ambient = 0.32
         viewer.scene.add(mesh)
 
     obj_verts = object_renderables.get("verts")
@@ -397,10 +602,11 @@ def visualize_predictions(
             obj_yup.detach().cpu().numpy(),
             obj_faces,
             name="Pred-Object",
-            color=(0.2, 0.4, 0.9, 0.85),
+            color=(164/255, 99/255, 204/255, 1),
             gui_affine=False,
             is_selectable=False,
         )
+        obj_mesh.material.ambient = 0.41
         viewer.scene.add(obj_mesh)
 
     obj_fk_verts = object_renderables.get("fk_verts")
@@ -445,11 +651,14 @@ def main():
     args = parse_args()
     device = resolve_device(args.device)
     cfg = load_config(args.config, device)
+    if args.model_arch is not None:
+        cfg.model_arch = args.model_arch
     model = build_model(cfg, args, device)
     smpl_model = load_body_model(args.body_model, device)
     data_dict = load_data_dict(args.data_dict, device)
 
     outputs = run_inference(
+        cfg,
         model,
         data_dict,
         use_object_data=data_dict.get("use_object_data", True),

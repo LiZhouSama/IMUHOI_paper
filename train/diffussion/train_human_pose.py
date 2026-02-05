@@ -1,18 +1,21 @@
 """
-HumanPoseModule独立训练脚本 (Stage 2)
+HumanPoseModule独立训练脚本 (Stage 1)
 可与VelocityContactModule同时训练
 支持--no_trans参数禁用根节点位移预测
 """
+from __future__ import annotations
+
 import os
 import sys
 import torch
 
 # 添加项目根目录到路径
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, PROJECT_ROOT)
 
 from model import HumanPoseModule
-from train.loss.human_pose_loss import HumanPoseLoss
-from train.train_utils import (
+from train.diffussion.loss.human_pose_loss import HumanPoseLoss
+from train.diffussion.train_utils import (
     get_base_args,
     merge_config,
     setup_seed,
@@ -26,7 +29,7 @@ from train.train_utils import (
 def get_args():
     """获取命令行参数"""
     parser = get_base_args()
-    parser.description = 'HumanPoseModule训练 (Stage 2)'
+    parser.description = 'HumanPoseModule训练 (Stage 1)'
     return parser.parse_args()
 
 
@@ -37,24 +40,22 @@ class HumanPoseTrainer(BaseTrainer):
         super().__init__(cfg, model, loss_fn, train_loader, test_loader)
         self.no_trans = cfg.no_trans
     
-    def model_forward(self, data_dict):
-        """模型前向传播"""
-        if self.no_trans:
-            # noTrans模式：传入trans_gt
-            return self.model(
-                data_dict['human_imu'],
-                data_dict['v_init'],
-                data_dict['p_init'],
-                trans_gt=data_dict['trans_gt'],
-            )
-        else:
-            # 普通模式：传入trans_init
-            return self.model(
-                data_dict['human_imu'],
-                data_dict['v_init'],
-                data_dict['p_init'],
-                trans_init=data_dict['trans_init'],
-            )
+    def model_forward(
+        self,
+        data_dict,
+        batch=None,
+        use_gt_targets: bool = True,
+        force_inference: bool = False,
+        sample_steps: int | None = None,
+    ):
+        """模型前向传播（统一由HumanPoseModule内部根据no_trans处理）"""
+        gt_arg = batch if use_gt_targets else None
+        if force_inference:
+            return self.model.inference(data_dict, sample_steps=sample_steps)
+        try:
+            return self.model(data_dict, gt_targets=gt_arg)
+        except TypeError:
+            return self.model(data_dict)
 
 
 def main():
@@ -69,7 +70,7 @@ def main():
     mode_str = "noTrans" if cfg.no_trans else "普通"
     
     print("=" * 50)
-    print(f"Stage 2: HumanPoseModule训练 ({mode_str}模式)")
+    print(f"Stage 1: HumanPoseModule训练 ({mode_str}模式)")
     print(f"设备: {cfg.device}")
     print(f"批次大小: {cfg.batch_size}")
     print(f"训练轮数: {cfg.epoch}")
@@ -112,4 +113,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

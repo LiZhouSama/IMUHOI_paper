@@ -12,59 +12,9 @@ from configs import (
     _REDUCED_INDICES, _IGNORED_INDICES, _SENSOR_NAMES, _SENSOR_VEL_NAMES, _REDUCED_POSE_NAMES
 )
 from process.imu_noise import apply_imu_noise, merge_noise_cfg, NOITOM_IMU_NOISE_CFG
+from utils.utils import _central_diff, _smooth_acceleration
 
-# --- IMU 计算函数 ---
-def _central_diff(tensor: torch.Tensor, dt: float) -> torch.Tensor:
-    """使用中心差分计算一阶导数，支持任意最后一维。"""
-    if tensor.shape[0] <= 1:
-        return torch.zeros_like(tensor)
-    vel = torch.zeros_like(tensor)
-    vel[1:-1] = (tensor[2:] - tensor[:-2]) / (2.0 * dt)
-    vel[0] = (tensor[1] - tensor[0]) / dt
-    vel[-1] = (tensor[-1] - tensor[-2]) / dt
-    return vel
-
-def _smooth_acceleration(position: torch.Tensor, fps: float, smooth_n: int = 4) -> torch.Tensor:
-    """
-    对位置序列计算平滑的加速度，参考 TransPose 的平滑策略。
-    
-    Args:
-        position: 位置序列 [T, ..., 3] 或 [T, 3]
-        fps: 帧率
-        smooth_n: 平滑窗口大小（默认4）
-    
-    Returns:
-        平滑后的加速度 [T, ..., 3] 或 [T, 3]
-    """
-    if position.shape[0] <= 2:
-        return torch.zeros_like(position)
-    
-    # 保存原始形状
-    original_shape = position.shape
-    # 重塑为 [T, -1] 以便处理任意维度
-    pos_flat = position.reshape(position.shape[0], -1)
-    
-    mid = smooth_n // 2
-    dt = 1.0 / fps
-    fps_squared = fps * fps  # 对应参考代码中的 3600 (60^2)
-    
-    # 初始化加速度：使用标准的二阶差分
-    acc = torch.stack([
-        (pos_flat[i] + pos_flat[i + 2] - 2 * pos_flat[i + 1]) * fps_squared 
-        for i in range(0, pos_flat.shape[0] - 2)
-    ])
-    acc = torch.cat((torch.zeros_like(acc[:1]), acc, torch.zeros_like(acc[:1])))
-    
-    # 对中间部分使用更大的平滑窗口
-    if mid != 0 and acc.shape[0] > smooth_n * 2:
-        acc[smooth_n:-smooth_n] = torch.stack([
-            (pos_flat[i] + pos_flat[i + smooth_n * 2] - 2 * pos_flat[i + smooth_n]) * fps_squared / (smooth_n ** 2)
-            for i in range(0, pos_flat.shape[0] - smooth_n * 2)
-        ])
-    
-    # 恢复原始形状
-    acc = acc.reshape(original_shape)
-    return acc
+# --- IMU 计算函数（公共） ---
 
 def _build_human_imu_root(position_global: torch.Tensor,
                      rotation_global: torch.Tensor,
@@ -534,6 +484,8 @@ class IMUDataset(Dataset):
             # --- 虚拟关节监督 ---
             lhand_obj_direction = torch.zeros(actual_seq_len, 3, device=device, dtype=dtype)
             rhand_obj_direction = torch.zeros(actual_seq_len, 3, device=device, dtype=dtype)
+            lhand_lb = torch.zeros(actual_seq_len, device=device, dtype=dtype)
+            rhand_lb = torch.zeros(actual_seq_len, device=device, dtype=dtype)
 
             if has_object:
                 try:
@@ -545,12 +497,22 @@ class IMUDataset(Dataset):
                     lhand_obj_direction = virtual_joint_data["lhand_obj_direction"]
                     rhand_obj_direction = virtual_joint_data["rhand_obj_direction"]
 
+                    # 手-物距离（骨长），在无接触时置零
+                    lhand_pos_gt = position_global_full[:, 20, :]
+                    rhand_pos_gt = position_global_full[:, 21, :]
+                    lhand_lb = torch.norm(obj_trans - lhand_pos_gt, dim=-1)
+                    rhand_lb = torch.norm(obj_trans - rhand_pos_gt, dim=-1)
+                    lhand_lb = lhand_lb * lhand_contact_window.float()
+                    rhand_lb = rhand_lb * rhand_contact_window.float()
+
                 except Exception as e:
                     print(f"计算虚拟关节数据时出错: {e}")
                     import traceback
                     traceback.print_exc()
                     lhand_obj_direction = torch.zeros(actual_seq_len, 3, device=device, dtype=dtype)
                     rhand_obj_direction = torch.zeros(actual_seq_len, 3, device=device, dtype=dtype)
+                    lhand_lb = torch.zeros(actual_seq_len, device=device, dtype=dtype)
+                    rhand_lb = torch.zeros(actual_seq_len, device=device, dtype=dtype)
 
             # --- 交互起止帧标签 ---
             contact_mask_for_boundary = obj_contact_window.bool()
@@ -599,6 +561,8 @@ class IMUDataset(Dataset):
                 "rfoot_contact": rfoot_contact_window.float(),
                 "lhand_obj_direction": lhand_obj_direction.float(),
                 "rhand_obj_direction": rhand_obj_direction.float(),
+                "lhand_lb": lhand_lb.float(),
+                "rhand_lb": rhand_lb.float(),
 
                 "position_global": position_global_full.float(),
                 "rotation_global": rotation_global_full.float(),

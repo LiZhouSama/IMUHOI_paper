@@ -1,7 +1,10 @@
 """
-VelocityContactModule独立训练脚本 (Stage 1)
-可与HumanPoseModule同时训练
+HumanPoseModule独立训练脚本 (Stage 1)
+可与VelocityContactModule同时训练
+支持--no_trans参数禁用根节点位移预测
 """
+from __future__ import annotations
+
 import os
 import sys
 import torch
@@ -9,9 +12,9 @@ import torch
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from model import VelocityContactModule
-from train.loss.velocity_contact_loss import VelocityContactLoss
-from train.train_utils import (
+from model import HumanPoseModule
+from train.rnn.loss.human_pose_loss import HumanPoseLoss
+from train.rnn.train_utils import (
     get_base_args,
     merge_config,
     setup_seed,
@@ -25,20 +28,23 @@ from train.train_utils import (
 def get_args():
     """获取命令行参数"""
     parser = get_base_args()
-    parser.description = 'VelocityContactModule训练 (Stage 1)'
-    parser.add_argument('--hp_ckpt', type=str, default=None,
-                        help='HumanPoseModule权重路径（便于分阶段训练时先加载HP模型）')
+    parser.description = 'HumanPoseModule训练 (Stage 1)'
     return parser.parse_args()
 
 
-class VelocityContactTrainer(BaseTrainer):
-    """VelocityContactModule专用训练器"""
+class HumanPoseTrainer(BaseTrainer):
+    """HumanPoseModule专用训练器"""
     
     def __init__(self, cfg, model, loss_fn, train_loader, test_loader=None):
         super().__init__(cfg, model, loss_fn, train_loader, test_loader)
+        self.no_trans = cfg.no_trans
     
-    def model_forward(self, data_dict):
-        """模型前向传播"""
+    def model_forward(
+        self,
+        data_dict,
+        batch=None,
+    ):
+        """模型前向传播（统一由HumanPoseModule内部根据no_trans处理）"""
         return self.model(data_dict)
 
 
@@ -46,20 +52,19 @@ def main():
     """主函数"""
     args = get_args()
     cfg = merge_config(args)
-    cfg.hp_ckpt = getattr(args, "hp_ckpt", None)
     
     setup_seed(cfg.seed)
     cfg = setup_device(cfg)
-    save_dir = create_save_dir(cfg, 'velocity_contact')
+    save_dir = create_save_dir(cfg, 'human_pose')
+    
+    mode_str = "noTrans" if cfg.no_trans else "普通"
     
     print("=" * 50)
-    print("Stage 1: VelocityContactModule训练")
+    print(f"Stage 1: HumanPoseModule训练 ({mode_str}模式)")
     print(f"设备: {cfg.device}")
     print(f"批次大小: {cfg.batch_size}")
     print(f"训练轮数: {cfg.epoch}")
-    print(f"学习率: {cfg.lr}")
-    if getattr(cfg, "pretrained_ckpt", None):
-        print(f"预训练权重: {cfg.pretrained_ckpt}")
+    print(f"noTrans模式: {cfg.no_trans}")
     print(f"保存目录: {save_dir}")
     print("=" * 50)
     
@@ -71,16 +76,17 @@ def main():
         return
     
     # 创建模型
-    model = VelocityContactModule(cfg)
-    model = model.to(cfg.device)
+    device = torch.device(cfg.device)
+    model = HumanPoseModule(cfg, device, no_trans=cfg.no_trans)
+    model = model.to(device)
     print(f"模型参数量: {sum(p.numel() for p in model.parameters())}")
     
     # 创建损失函数
     loss_weights = getattr(cfg, 'loss_weights', {})
-    loss_fn = VelocityContactLoss(weights=loss_weights)
+    loss_fn = HumanPoseLoss(weights=loss_weights, no_trans=cfg.no_trans)
     
     # 创建训练器
-    trainer = VelocityContactTrainer(cfg, model, loss_fn, train_loader, test_loader)
+    trainer = HumanPoseTrainer(cfg, model, loss_fn, train_loader, test_loader)
     
     # 开始训练
     model = trainer.train()

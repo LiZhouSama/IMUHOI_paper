@@ -218,12 +218,10 @@ def _compute_acc_from_pos(pos: np.ndarray, dt: float) -> np.ndarray:
 def _parse_noitom_sensors(csv_path: str, sensor_order: List[str], gravity_scale: float) -> Dict[str, SensorSequence]:
     header, rows = _load_raw_csv(csv_path)
     sensors = {}
-    dt = 1.0 / NOITOM_SRC_FPS
     for name in sensor_order:
-        joint_name = SENSOR_JOINT_MAP.get(name, name)
-        indices = _resolve_bone_joint_indices(header, name, joint_name)
-        pos_np, quat_np = _read_bone_joint_series(rows, indices)
-        acc_np = smooth_imu_acceleration(_compute_acc_from_pos(pos_np, dt), smooth_n=4, frame_rate=NOITOM_SRC_FPS)
+        indices = _resolve_sensor_indices(header, name)
+        acc_np, quat_np = _read_sensor_series(rows, indices, gravity_scale)
+        acc_np = smooth_imu_acceleration(acc_np, smooth_n=4, frame_rate=NOITOM_SRC_FPS)
         acc_np, quat_np = _resample_sensor(acc_np, quat_np, NOITOM_SRC_FPS)
         rot_np = transforms.quaternion_to_matrix(torch.from_numpy(quat_np)).numpy()
         sensors[name] = SensorSequence(name=name, acc=acc_np, quat=quat_np, rot=rot_np)
@@ -231,14 +229,13 @@ def _parse_noitom_sensors(csv_path: str, sensor_order: List[str], gravity_scale:
 
 
 # ===================== Noitom 物体数据处理 =====================
-def _apply_local_coordinate_transform(acc: np.ndarray, quat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """应用局部坐标系调整，使传感器 Z 轴对齐到 Y 轴"""
-    rot = transforms.quaternion_to_matrix(torch.from_numpy(quat)).numpy()
-    R_fix = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=np.float32)
-    rot_new = np.einsum("tij,jk->tik", rot, R_fix)
-    quat_new = transforms.matrix_to_quaternion(torch.from_numpy(rot_new)).numpy()
-    return acc, quat_new
-
+# def _apply_local_coordinate_transform(acc: np.ndarray, quat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+#     """应用局部坐标系调整，使传感器 Z 轴对齐到 Y 轴"""
+#     rot = transforms.quaternion_to_matrix(torch.from_numpy(quat)).numpy()
+#     R_fix = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=np.float32)
+#     rot_new = np.einsum("tij,jk->tik", rot, R_fix)
+#     quat_new = transforms.matrix_to_quaternion(torch.from_numpy(rot_new)).numpy()
+#     return acc, quat_new
 
 def _load_noitom_object(csv_path: str, sensor_name: str, gravity_scale: float) -> SensorSequence:
     """加载 Noitom 物体 IMU 数据 (Sensor 模式)"""
@@ -277,6 +274,11 @@ def _build_human_features(sensor_order: List[str], processed: Dict[str, Dict[str
     acc_tensor = torch.tensor(acc_stack, dtype=torch.float32)
     ori_tensor = torch.tensor(ori_stack, dtype=torch.float32)
 
+    # Normalize each sensor's orientation by its own first frame (T-pose) so t=0 becomes identity
+    first_rot = ori_tensor[0]                         # [num_sensors, 3, 3]
+    first_rot_inv = first_rot.transpose(1, 2)         # inverse of rotation matrices
+    ori_tensor = torch.matmul(first_rot_inv.unsqueeze(0), ori_tensor)
+
     root_R = ori_tensor[:, 0]
     acc_rel = torch.cat((acc_tensor[:, :1], acc_tensor[:, 1:] - acc_tensor[:, :1]), dim=1)
     imu_acc = torch.matmul(acc_rel, root_R)
@@ -313,7 +315,7 @@ def _build_data_dict(human_imu: torch.Tensor, obj_imu: torch.Tensor) -> Dict[str
         "v_init": torch.zeros(bs, len(_SENSOR_VEL_NAMES), 3),
         "p_init": p_init,
         "trans_init": torch.tensor([[0.0, 1.2, 0.0]]).repeat(bs, 1),
-        "obj_trans_init": torch.tensor([[0, 0.28, 0.10]]).repeat(bs, 1),
+        "obj_trans_init": torch.tensor([[0, 0.27, 0]]).repeat(bs, 1),
         "obj_vel_init": torch.zeros(bs, 3),
         "hand_vel_glb_init": torch.zeros(bs, 2, 3),
         "contact_init": torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32),
@@ -364,8 +366,8 @@ def create_demo_overview_visualization(save_path: str, hip_acc_raw: np.ndarray, 
 # ===================== 主流程 =====================
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="生成 IMUHOI StageNet demo data_dict (Noitom Only)")
-    parser.add_argument("--human-csv", default="noitom/7IMU/output/wine003_human.csv", help="Noitom 人体 IMU CSV")
-    parser.add_argument("--obj-csv", default="noitom/7IMU/output/wine003_obj.csv", help="Noitom 物体 IMU CSV (LeftFoot)")
+    parser.add_argument("--human-csv", default="noitom/7IMU/output/raw_imu002_human.csv", help="Noitom 人体 IMU CSV")
+    parser.add_argument("--obj-csv", default="noitom/7IMU/output/raw_imu002_obj.csv", help="Noitom 物体 IMU CSV (LeftFoot)")
     parser.add_argument("--output", default="noitom/7IMU/demo_data_dict.pt", help="data_dict 输出路径")
     parser.add_argument("--start-sec", type=float, default=5.0, help="截取起始时间 (秒)")
     parser.add_argument("--visualize", default=True, help="生成可视化")

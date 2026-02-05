@@ -114,6 +114,49 @@ def flatten_lstm_parameters(module):
 
 
 # ============ 数据处理 ============
+def central_diff(tensor: torch.Tensor, dt: float) -> torch.Tensor:
+    """使用中心差分计算一阶导数，支持任意最后一维"""
+    if tensor.shape[0] <= 1:
+        return torch.zeros_like(tensor)
+    vel = torch.zeros_like(tensor)
+    vel[1:-1] = (tensor[2:] - tensor[:-2]) / (2.0 * dt)
+    vel[0] = (tensor[1] - tensor[0]) / dt
+    vel[-1] = (tensor[-1] - tensor[-2]) / dt
+    return vel
+
+
+def smooth_acceleration(position: torch.Tensor, fps: float, smooth_n: int = 4) -> torch.Tensor:
+    """
+    平滑二阶差分（TransPose风格）以计算加速度。
+    position: [T, ..., 3]
+    """
+    if position.shape[0] <= 2:
+        return torch.zeros_like(position)
+
+    original_shape = position.shape
+    pos_flat = position.reshape(position.shape[0], -1)
+
+    mid = smooth_n // 2
+    fps_squared = fps * fps
+
+    acc = torch.stack([
+        (pos_flat[i] + pos_flat[i + 2] - 2 * pos_flat[i + 1]) * fps_squared
+        for i in range(0, pos_flat.shape[0] - 2)
+    ])
+    acc = torch.cat((torch.zeros_like(acc[:1]), acc, torch.zeros_like(acc[:1])))
+
+    if mid != 0 and acc.shape[0] > smooth_n * 2:
+        acc[smooth_n:-smooth_n] = torch.stack([
+            (pos_flat[i] + pos_flat[i + smooth_n * 2] - 2 * pos_flat[i + smooth_n]) * fps_squared / (smooth_n ** 2)
+            for i in range(0, pos_flat.shape[0] - smooth_n * 2)
+        ])
+
+    acc = acc.reshape(original_shape)
+    return acc
+
+# backward-compatible aliases
+_central_diff = central_diff
+_smooth_acceleration = smooth_acceleration
 
 def build_model_input_dict(batch, cfg, device, add_noise=True):
     """
