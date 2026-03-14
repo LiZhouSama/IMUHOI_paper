@@ -197,6 +197,137 @@ def _format_matrix(R: np.ndarray) -> str:
     return np.array2string(R, precision=4, suppress_small=True)
 
 
+def _compute_r_fix_from_tpose(R_sensor: np.ndarray, R_bone: np.ndarray, tpose_idx: np.ndarray) -> np.ndarray:
+    # Assumption B: R_bone ~= R_sensor * R_fix  => R_fix ~= R_sensor^T * R_bone
+    delta = np.einsum("nij,njk->nik", np.transpose(R_sensor, (0, 2, 1)), R_bone)
+    return _mean_rotation(delta[tpose_idx])
+
+
+def _compute_error_angles(R_sensor: np.ndarray, R_bone: np.ndarray, R_fix: np.ndarray) -> np.ndarray:
+    # err = (R_sensor * R_fix)^T * R_bone
+    R_pred = np.einsum("nij,jk->nik", R_sensor, R_fix)
+    err = np.einsum("nij,njk->nik", np.transpose(R_pred, (0, 2, 1)), R_bone)
+    return _rotation_angle_deg(err)
+
+
+def _downsample_xy(x: np.ndarray, y: np.ndarray, max_points: int = 2000) -> Tuple[np.ndarray, np.ndarray]:
+    if len(x) <= max_points:
+        return x, y
+    step = int(np.ceil(len(x) / max_points))
+    return x[::step], y[::step]
+
+
+def _write_svg_plot(plot_path: str,
+                    error_curves: Dict[str, np.ndarray],
+                    time_axis: np.ndarray,
+                    tpose_ranges: Dict[str, np.ndarray],
+                    start_frame: int,
+                    tpose_frames: int) -> None:
+    names = list(error_curves.keys())
+    if not names:
+        return
+    cols = 2
+    rows = (len(names) + cols - 1) // cols
+    subplot_w, subplot_h = 600, 220
+    margin_l, margin_r, margin_t, margin_b = 50, 20, 30, 35
+    width = cols * subplot_w + margin_l + margin_r
+    height = rows * subplot_h + margin_t + margin_b
+
+    t_min, t_max = float(time_axis[0]), float(time_axis[-1]) if len(time_axis) > 1 else float(time_axis[0] + 1.0)
+    global_max = max(float(np.max(v)) for v in error_curves.values())
+    y_max = max(5.0, global_max * 1.1)
+
+    def x_map(t, col):
+        x0 = margin_l + col * subplot_w
+        return x0 + (t - t_min) / (t_max - t_min) * (subplot_w - 10)
+
+    def y_map(a, row):
+        y0 = margin_t + row * subplot_h
+        return y0 + (subplot_h - 20) - (a / y_max) * (subplot_h - 30)
+
+    svg = []
+    svg.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">')
+    svg.append('<rect width="100%" height="100%" fill="white"/>')
+    svg.append(f'<text x="{margin_l}" y="{margin_t - 10}" font-size="14">R_bone vs R_sensor * R_fix error curves</text>')
+
+    for idx, name in enumerate(names):
+        row, col = divmod(idx, cols)
+        x0 = margin_l + col * subplot_w
+        y0 = margin_t + row * subplot_h
+        svg.append(f'<rect x="{x0}" y="{y0}" width="{subplot_w - 10}" height="{subplot_h - 20}" fill="none" stroke="#888"/>')
+        svg.append(f'<text x="{x0 + 5}" y="{y0 + 14}" font-size="12">{name} error (deg)</text>')
+
+        # T-pose span
+        if tpose_frames > 0:
+            t0 = t_min
+            t1 = (tpose_frames - 1 + start_frame) / float(NOITOM_SRC_FPS)
+        else:
+            idxs = tpose_ranges.get(name, np.array([]))
+            if idxs.size > 0:
+                t0 = (idxs.min() + start_frame) / float(NOITOM_SRC_FPS)
+                t1 = (idxs.max() + start_frame) / float(NOITOM_SRC_FPS)
+            else:
+                t0 = t1 = None
+        if t0 is not None and t1 is not None and t1 > t0:
+            x_left = x_map(t0, col)
+            x_right = x_map(t1, col)
+            y_top = y0 + 5
+            svg.append(f'<rect x="{x_left:.1f}" y="{y_top:.1f}" width="{(x_right - x_left):.1f}" '
+                       f'height="{subplot_h - 30:.1f}" fill="orange" fill-opacity="0.15" stroke="none"/>')
+
+        # Curve
+        angles = error_curves[name]
+        tx, ty = _downsample_xy(time_axis[:len(angles)], angles)
+        pts = " ".join(f"{x_map(t, col):.2f},{y_map(a, row):.2f}" for t, a in zip(tx, ty))
+        svg.append(f'<polyline points="{pts}" fill="none" stroke="#1f77b4" stroke-width="1"/>')
+
+        # Y-axis labels
+        svg.append(f'<text x="{x0 + 2}" y="{y0 + subplot_h - 5}" font-size="10">0</text>')
+        svg.append(f'<text x="{x0 + 2}" y="{y0 + 18}" font-size="10">{y_max:.1f}</text>')
+
+        # X-axis labels
+        svg.append(f'<text x="{x0 + 2}" y="{y0 + subplot_h - 8}" font-size="10">{t_min:.1f}s</text>')
+        svg.append(f'<text x="{x0 + subplot_w - 45}" y="{y0 + subplot_h - 8}" font-size="10">{t_max:.1f}s</text>')
+
+    svg.append("</svg>")
+    with open(plot_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(svg))
+
+
+def _fit_world_mount_right(R_sensor: np.ndarray,
+                           R_bone: np.ndarray,
+                           tpose_idx: np.ndarray,
+                           iters: int = 8) -> Tuple[np.ndarray, np.ndarray]:
+    # Solve R_bone ≈ R_world * R_sensor * R_mount
+    # R_world shared, R_mount per sensor.
+    R_world = np.eye(3, dtype=np.float64)
+    R_mount = np.eye(3, dtype=np.float64)
+    idx = tpose_idx
+    Rs = R_sensor[idx]
+    Rb = R_bone[idx]
+    for _ in range(iters):
+        # R_mount <- mean( (R_world * R_sensor)^T * R_bone )
+        delta_m = np.einsum("nij,njk->nik",
+                            np.transpose(np.einsum("ij,njk->nik", R_world, Rs), (0, 2, 1)),
+                            Rb)
+        R_mount = _mean_rotation(delta_m)
+        # R_world <- mean( R_bone * (R_sensor * R_mount)^T )
+        delta_w = np.einsum("nij,njk->nik",
+                            Rb,
+                            np.transpose(np.einsum("nij,jk->nik", Rs, R_mount), (0, 2, 1)))
+        R_world = _mean_rotation(delta_w)
+    return R_world, R_mount
+
+
+def _compute_error_angles_world_mount(R_sensor: np.ndarray,
+                                      R_bone: np.ndarray,
+                                      R_world: np.ndarray,
+                                      R_mount: np.ndarray) -> np.ndarray:
+    R_pred = np.einsum("ij,njk->nik", R_world, np.einsum("nij,jk->nik", R_sensor, R_mount))
+    err = np.einsum("nij,njk->nik", np.transpose(R_pred, (0, 2, 1)), R_bone)
+    return _rotation_angle_deg(err)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare Bone-Quat vs Sensor-Quat alignment (Noitom CSV)")
     parser.add_argument("--csv", default="noitom/7IMU/output/raw_imu002_human.csv",
@@ -207,6 +338,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tpose-angle-deg", type=float, default=5.0, help="Auto-detect T-pose threshold (deg)")
     parser.add_argument("--fallback-frames", type=int, default=30, help="Fallback frames if auto-detect finds none")
     parser.add_argument("--max-frames", type=int, default=-1, help="Optional cap on total frames")
+    parser.add_argument("--plot", action="store_true", help="Save error curve plot (R_bone vs R_sensor*R_fix)")
+    parser.add_argument("--plot-out", default="test/compare_noitom_bone_sensor_error.svg",
+                        help="Output path for error curve plot (SVG)")
+    parser.add_argument("--fit-world-mount", action="store_true",
+                        help="Fit R_world (shared) and R_mount (per sensor) for R_bone ≈ R_world * R_sensor * R_mount")
+    parser.add_argument("--wm-iters", type=int, default=8, help="Iterations for world/mount fitting")
     return parser.parse_args()
 
 
@@ -219,6 +356,11 @@ def main() -> None:
     print(f"Sensors: {DEFAULT_SENSOR_ORDER}")
     print(f"Start sec: {args.start_sec}, duration sec: {args.duration_sec}")
     print(f"T-pose frames: {args.tpose_frames} (auto if 0), angle thresh: {args.tpose_angle_deg}")
+
+    error_curves = {}
+    tpose_ranges = {}
+    time_axis = None
+    mw_world = None
 
     for sensor_name in DEFAULT_SENSOR_ORDER:
         joint_name = SENSOR_JOINT_MAP.get(sensor_name, sensor_name)
@@ -288,6 +430,35 @@ def main() -> None:
         print(f"Best axis-perm angle (deg): {best_perm_ang_b:.3f}")
         if best_perm_b is not None:
             print(f"Best axis-perm matrix: { _format_matrix(best_perm_b) }")
+
+        R_fix = _compute_r_fix_from_tpose(R_sensor, R_bone, tpose_idx)
+        err_angles = _compute_error_angles(R_sensor, R_bone, R_fix)
+        error_curves[sensor_name] = err_angles
+        tpose_ranges[sensor_name] = tpose_idx
+
+        if time_axis is None or len(time_axis) != n:
+            time_axis = (np.arange(n) + start_frame) / float(NOITOM_SRC_FPS)
+
+        print(f"R_fix (T-pose, assumption B): { _format_matrix(R_fix) }")
+
+        if args.fit_world_mount:
+            R_world, R_mount = _fit_world_mount_right(R_sensor, R_bone, tpose_idx, iters=args.wm_iters)
+            if mw_world is None:
+                mw_world = R_world
+            err_wm = _compute_error_angles_world_mount(R_sensor, R_bone, R_world, R_mount)
+            print("Fit: R_bone ~= R_world * R_sensor * R_mount")
+            print(f"R_world: { _format_matrix(R_world) }")
+            print(f"R_mount: { _format_matrix(R_mount) }")
+            print(f"World/Mount err mean/std/max (deg): {err_wm.mean():.3f}/{err_wm.std():.3f}/{err_wm.max():.3f}")
+
+    if args.plot and error_curves:
+        out_path = args.plot_out
+        if not out_path.lower().endswith(".svg"):
+            base, _ = os.path.splitext(out_path)
+            out_path = f"{base}.svg"
+        _write_svg_plot(out_path, error_curves, time_axis, tpose_ranges,
+                        int(max(0.0, args.start_sec) * NOITOM_SRC_FPS), args.tpose_frames)
+        print(f"Saved SVG plot: {out_path}")
 
     print("")
     print("Done.")

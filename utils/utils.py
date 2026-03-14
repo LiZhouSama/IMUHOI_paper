@@ -76,13 +76,18 @@ def load_smpl_model(smpl_path: str, device: torch.device):
     return smpl_model.to(device)
 
 
-def load_checkpoint(model, checkpoint_path, device, strict=True):
+def load_checkpoint(model, checkpoint_path, device, strict=True, use_ema=True):
     """加载检查点"""
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    state_dict = checkpoint.get('module_state_dict', checkpoint.get('model_state_dict', checkpoint))
+    state_dict = checkpoint
+    if isinstance(checkpoint, dict):
+        if use_ema and checkpoint.get('ema_state_dict') is not None:
+            state_dict = checkpoint['ema_state_dict']
+        else:
+            state_dict = checkpoint.get('module_state_dict', checkpoint.get('model_state_dict', checkpoint))
     model.load_state_dict(state_dict, strict=strict)
     print(f"加载检查点: {checkpoint_path}")
-    return checkpoint.get('epoch', 0)
+    return checkpoint.get('epoch', 0) if isinstance(checkpoint, dict) else 0
 
 
 def save_checkpoint(model, optimizer, epoch, save_path, loss, additional_info=None):

@@ -1,6 +1,5 @@
 """
 HumanPoseModule独立训练脚本 (Stage 1)
-可与VelocityContactModule同时训练
 支持--no_trans参数禁用根节点位移预测
 """
 from __future__ import annotations
@@ -47,6 +46,8 @@ class HumanPoseTrainer(BaseTrainer):
         use_gt_targets: bool = True,
         force_inference: bool = False,
         sample_steps: int | None = None,
+        sampler: str | None = None,
+        eta: float | None = None,
     ):
         """模型前向传播（统一由HumanPoseModule内部根据no_trans处理）"""
         gt_arg = batch if use_gt_targets else None

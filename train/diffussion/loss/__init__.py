@@ -1,13 +1,10 @@
 """
-IMUHOI损失函数模块
+IMUHOI loss modules for DiT path.
 """
-from .velocity_contact_loss import VelocityContactLoss
 from .human_pose_loss import HumanPoseLoss
-from .object_trans_loss import ObjectTransLoss
+from .interaction_loss import InteractionLoss
 
 __all__ = [
-    'VelocityContactLoss',
-    'HumanPoseLoss',
-    'ObjectTransLoss',
+    "HumanPoseLoss",
+    "InteractionLoss",
 ]
-

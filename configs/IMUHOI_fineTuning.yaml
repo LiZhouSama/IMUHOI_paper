@@ -8,7 +8,7 @@ use_tensorboard: True
 use_multi_gpu: True
 device: "cuda:0"
 gpus: [0]
-model_arch: "rnn"  # 可选: rnn, dit
+model_arch: "dit"  # 可选: rnn, dit
 
 # ============ DiT超参数(仅在model_arch=dit时使用) ============
 dit:
@@ -21,11 +21,21 @@ dit:
   dit_use_time_embed: true
   dit_use_noise: true
   dit_max_seq_len: 256
-  dit_x_start_mode: "gt"   # gt: 训练时对GT加噪；seed: 兼容旧版seed输入
-  ot_variant: "direct"        # direct 或 fk_gating
-  ot_gating_hidden: 64
-  ot_gating_temperature: 1.0
-  ot_gating_prior_beta: 5.0
+  dit_inference_steps: 100
+  dit_inference_sampler: "ddim"
+  dit_inference_eta: 0.0
+
+# ============ 交互模块训练配置 ============
+interaction_training:
+  freeze_ratio: 0.8
+  joint_phase_lr_factor: 0.2
+  hp_aux_weight: 0.0
+
+# ============ 评估与EMA ============
+ema_decay: 0.999
+eval_ddim_steps: 50
+eval_sampler: "ddim"
+eval_eta: 0.0
 
 # ============ 全局常量 ============
 FRAME_RATE: 30
@@ -99,21 +109,20 @@ loss_weights:
   root_trans: 1.0
   hand_pos: 1.0
   
-  # Stage 2: VelocityContact
-  obj_vel: 1.0
-  hand_vel: 1.0
-  hand_contact_cond: 1.0
-  
-  # Stage 3: ObjectTrans
+  # Interaction (merged VC + OT)
+  interaction_boundary: 0.1
+  interaction_order: 1.0
   obj_trans: 1.0
-  lhand_obj_direction: 0.1
-  rhand_obj_direction: 0.1
-  lhand_lb: 0.1
-  rhand_lb: 0.1
+  contact_logits: 1.0
+  geometry_dir_l: 0.1
+  geometry_dir_r: 0.1
+  geometry_len_l: 0.1
+  geometry_len_r: 0.1
   hoi_error_l: 0.2
   hoi_error_r: 0.2
   obj_vel_cons: 0.1
   obj_acc_cons: 0.01
+  diffusion_eps: 1.0
 
 # ============ 窗口配置 ============
 train:

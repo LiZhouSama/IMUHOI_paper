@@ -1,5 +1,5 @@
 """
-Unified IMUHOI model built on the DiT modules.
+Unified IMUHOI model (DiT path): HumanPose + Interaction.
 """
 from __future__ import annotations
 
@@ -10,20 +10,12 @@ import torch
 import torch.nn as nn
 from pytorch3d.transforms import rotation_6d_to_matrix
 
-from .velocity_contact import VelocityContactModule
 from .human_pose import HumanPoseModule
-from .object_trans import ObjectTransModule
-from .object_trans_fk import ObjectTransModuleFK
+from .interaction import InteractionModule
 
 
 class IMUHOIModel(nn.Module):
-    """
-    IMUHOI model using the diffusion transformer stack.
-    Modules:
-      - HumanPoseModule (Stage 1)
-      - VelocityContactModule (Stage 2)
-      - ObjectTransModule (Stage 3)
-    """
+    """DiT IMUHOI stack with merged interaction module."""
 
     @staticmethod
     def _fk_obj_trans_baseline_hard(
@@ -83,7 +75,7 @@ class IMUHOIModel(nn.Module):
                 if new != -1:
                     current = new
                     hand0 = pred_hand_positions[b, t, current, :]
-                    R0 = obj_rotm[b, t]
+                    r0 = obj_rotm[b, t]
                     vec_world = obj_pos - hand0
                     dist0 = torch.norm(vec_world)
                     if dist0 > 1e-6:
@@ -91,12 +83,12 @@ class IMUHOIModel(nn.Module):
                     else:
                         unit_world = z_unit
                         dist0 = default_len
-                    dir_local = R0.transpose(0, 1) @ unit_world
+                    dir_local = r0.transpose(0, 1) @ unit_world
                     dist = dist0
                 elif (not has_contact) and has_contact_another:
                     current = 1 - current
                     hand0 = pred_hand_positions[b, t, current, :]
-                    R0 = obj_rotm[b, t]
+                    r0 = obj_rotm[b, t]
                     vec_world = obj_pos - hand0
                     dist0 = torch.norm(vec_world)
                     if dist0 > 1e-6:
@@ -104,7 +96,7 @@ class IMUHOIModel(nn.Module):
                     else:
                         unit_world = z_unit
                         dist0 = default_len
-                    dir_local = R0.transpose(0, 1) @ unit_world
+                    dir_local = r0.transpose(0, 1) @ unit_world
                     dist = dist0
                 elif (not has_contact) and current != -1:
                     current = -1
@@ -114,8 +106,8 @@ class IMUHOIModel(nn.Module):
                 if current == -1:
                     computed_obj_trans[b, t] = obj_pos
                 else:
-                    Rt = obj_rotm[b, t]
-                    direction_world = Rt @ dir_local
+                    rt = obj_rotm[b, t]
+                    direction_world = rt @ dir_local
                     obj_pos = pred_hand_positions[b, t, current, :] + direction_world * dist
                     computed_obj_trans[b, t] = obj_pos
 
@@ -127,31 +119,98 @@ class IMUHOIModel(nn.Module):
         self.device = device
         self.no_trans = no_trans
 
-        self.velocity_contact_module = VelocityContactModule(cfg)
         self.human_pose_module = HumanPoseModule(cfg, device, no_trans=no_trans)
-        ot_variant = "direct"
-        dit_cfg = getattr(cfg, "dit", {})
-        if isinstance(dit_cfg, dict):
-            ot_variant = dit_cfg.get("ot_variant", ot_variant)
-        ot_variant = getattr(cfg, "ot_variant", ot_variant) or ot_variant
-        ot_variant = ot_variant.lower()
-        if ot_variant == "fk_gating":
-            self.object_trans_module = ObjectTransModuleFK(cfg)
+        self.interaction_module = InteractionModule(cfg)
+
+    def _build_hp_input(self, data_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        hp_input = {
+            "human_imu": data_dict["human_imu"],
+            "v_init": data_dict["v_init"],
+            "p_init": data_dict["p_init"],
+        }
+        if self.no_trans:
+            hp_input["trans_gt"] = data_dict["trans_gt"]
         else:
-            self.object_trans_module = ObjectTransModule(cfg)
+            hp_input["trans_init"] = data_dict["trans_init"]
+        return hp_input
+
+    def _run_hp(
+        self,
+        hp_input: Dict[str, torch.Tensor],
+        gt_targets: Optional[Dict[str, torch.Tensor]],
+        *,
+        detach_hp: bool,
+        sample_steps: Optional[int],
+    ) -> Dict[str, torch.Tensor]:
+        if detach_hp:
+            with torch.no_grad():
+                orig_mode = getattr(self.human_pose_module, "dit_x_start_mode", None)
+                orig_noise = getattr(self.human_pose_module, "use_diffusion_noise", None)
+                if hasattr(self.human_pose_module, "dit_x_start_mode"):
+                    self.human_pose_module.dit_x_start_mode = "seed"
+                if hasattr(self.human_pose_module, "use_diffusion_noise"):
+                    self.human_pose_module.use_diffusion_noise = False
+                try:
+                    hp_out = self.human_pose_module(hp_input, gt_targets=None)
+                finally:
+                    if hasattr(self.human_pose_module, "dit_x_start_mode") and orig_mode is not None:
+                        self.human_pose_module.dit_x_start_mode = orig_mode
+                    if hasattr(self.human_pose_module, "use_diffusion_noise") and orig_noise is not None:
+                        self.human_pose_module.use_diffusion_noise = orig_noise
+                return hp_out
+
+        if not self.training:
+            with torch.no_grad():
+                return self.human_pose_module.inference(hp_input, sample_steps=sample_steps)
+
+        # Joint phase: use HP prediction path (seed mode, no diffusion noise) to avoid GT-conditioning mismatch.
+        orig_mode = getattr(self.human_pose_module, "dit_x_start_mode", None)
+        orig_noise = getattr(self.human_pose_module, "use_diffusion_noise", None)
+        if hasattr(self.human_pose_module, "dit_x_start_mode"):
+            self.human_pose_module.dit_x_start_mode = "seed"
+        if hasattr(self.human_pose_module, "use_diffusion_noise"):
+            self.human_pose_module.use_diffusion_noise = False
+        try:
+            hp_out = self.human_pose_module(hp_input, gt_targets=None)
+        finally:
+            if hasattr(self.human_pose_module, "dit_x_start_mode") and orig_mode is not None:
+                self.human_pose_module.dit_x_start_mode = orig_mode
+            if hasattr(self.human_pose_module, "use_diffusion_noise") and orig_noise is not None:
+                self.human_pose_module.use_diffusion_noise = orig_noise
+        return hp_out
 
     def load_pretrained_modules(self, module_paths: Dict[str, str], strict: bool = True):
         from utils.utils import load_checkpoint
 
+        alias = {
+            "human_pose": "human_pose",
+            "interaction": "interaction",
+            # migration aliases from old two-stage modules
+            "velocity_contact": "interaction",
+            "object_trans": "interaction",
+        }
+
         for name, path in module_paths.items():
-            if path and os.path.exists(path):
-                module = getattr(self, f"{name}_module", None)
-                if module is not None:
-                    load_checkpoint(module, path, self.device, strict=strict)
-                    print(f"Loaded {name} from {path}")
-            else:
-                if path:
-                    print(f"Warning: {name} checkpoint not found at {path}")
+            mapped = alias.get(name)
+            if mapped is None:
+                print(f"Warning: unknown pretrained module key '{name}', skipping")
+                continue
+            if not path:
+                continue
+            if not os.path.exists(path):
+                print(f"Warning: checkpoint for {mapped} not found at {path}")
+                continue
+
+            module = getattr(self, f"{mapped}_module", None)
+            if module is None:
+                print(f"Warning: module '{mapped}_module' not found")
+                continue
+
+            try:
+                load_checkpoint(module, path, self.device, strict=strict)
+                print(f"Loaded {mapped} from {path}")
+            except Exception as exc:
+                print(f"Warning: failed to load '{name}' checkpoint into '{mapped}': {exc}")
 
     def forward(
         self,
@@ -159,75 +218,51 @@ class IMUHOIModel(nn.Module):
         use_object_data: bool = True,
         compute_fk: bool = False,
         gt_targets: Optional[Dict[str, torch.Tensor]] = None,
-        teacher_forcing: bool = False,
-        joint_train: bool = False,
         force_inference: bool = False,
+        detach_hp: bool = False,
+        sample_steps: int | None = None,
+        sampler: str | None = None,
+        eta: float | None = None,
+        **_,
     ) -> Dict[str, torch.Tensor]:
         if force_inference or (not self.training):
             return self.inference(
                 data_dict,
                 use_object_data=use_object_data,
                 compute_fk=compute_fk,
+                sample_steps=sample_steps,
+                sampler=sampler,
+                eta=eta,
             )
 
         human_imu = data_dict["human_imu"]
         batch_size, seq_len = human_imu.shape[:2]
+        results: Dict[str, torch.Tensor] = {}
 
-        results = {}
-
-        hp_input_dict = {
-            "human_imu": human_imu,
-            "v_init": data_dict["v_init"],
-            "p_init": data_dict["p_init"],
-        }
-        if self.no_trans:
-            hp_input_dict["trans_gt"] = data_dict["trans_gt"]
-        else:
-            hp_input_dict["trans_init"] = data_dict["trans_init"]
-
-        hp_out = self.human_pose_module(hp_input_dict, gt_targets=gt_targets)
-        results.update(hp_out)
-
-        tf_active = bool(teacher_forcing and self.training and (not joint_train))
-
-        vc_input_dict = {
-            "human_imu": human_imu,
-            "obj_imu": data_dict["obj_imu"],
-            "hand_vel_glb_init": data_dict["hand_vel_glb_init"],
-            "obj_vel_init": data_dict["obj_vel_init"],
-            "contact_init": data_dict.get("contact_init"),
-            "hp_out": hp_out,
-        }
-        vc_out = self.velocity_contact_module(
-            vc_input_dict,
-            hp_out=hp_out,
-            gt_targets=gt_targets,
-            teacher_forcing=tf_active,
+        hp_input = self._build_hp_input(data_dict)
+        hp_out = self._run_hp(
+            hp_input,
+            gt_targets,
+            detach_hp=detach_hp,
+            sample_steps=sample_steps,
         )
-        results.update(vc_out)
+        results.update(hp_out)
 
         has_object = data_dict.get("has_object")
         if use_object_data and (has_object is None or has_object.any()):
-            ot_out = self.object_trans_module(
-                hp_out["pred_hand_glb_pos"],
-                vc_out["pred_hand_contact_prob"],
-                data_dict["obj_trans_init"],
-                obj_imu=data_dict["obj_imu"],
-                human_imu=human_imu,
-                obj_vel_input=vc_out["pred_obj_vel"],
-                contact_init=data_dict.get("contact_init"),
-                has_object_mask=has_object,
+            interaction_out = self.interaction_module(
+                data_dict,
+                hp_out=hp_out,
                 gt_targets=gt_targets,
-                teacher_forcing=tf_active,
             )
-            results.update(ot_out)
+            results.update(interaction_out)
 
             if compute_fk:
                 obj_imu = data_dict["obj_imu"]
                 obj_rot6d = obj_imu[..., 3:9]
                 obj_rotm = rotation_6d_to_matrix(obj_rot6d.reshape(-1, 6)).reshape(batch_size, seq_len, 3, 3)
                 results["pred_obj_trans_fk"] = self._fk_obj_trans_baseline_hard(
-                    vc_out["pred_hand_contact_prob"],
+                    results["pred_hand_contact_prob"],
                     hp_out["pred_hand_glb_pos"],
                     obj_rotm,
                     data_dict["obj_trans_init"],
@@ -243,69 +278,34 @@ class IMUHOIModel(nn.Module):
         use_object_data: bool = True,
         compute_fk: bool = False,
         sample_steps: int | None = None,
+        sampler: str | None = None,
+        eta: float | None = None,
     ) -> Dict[str, torch.Tensor]:
         human_imu = data_dict["human_imu"]
         batch_size, seq_len = human_imu.shape[:2]
+        results: Dict[str, torch.Tensor] = {}
 
-        results = {}
-
-        hp_input_dict = {
-            "human_imu": human_imu,
-            "v_init": data_dict["v_init"],
-            "p_init": data_dict["p_init"],
-        }
-        if self.no_trans:
-            hp_input_dict["trans_gt"] = data_dict["trans_gt"]
-        else:
-            hp_input_dict["trans_init"] = data_dict["trans_init"]
-
-        hp_out = self.human_pose_module.inference(hp_input_dict, sample_steps=sample_steps)
+        hp_input = self._build_hp_input(data_dict)
+        hp_out = self.human_pose_module.inference(hp_input, sample_steps=sample_steps)
         results.update(hp_out)
-
-        vc_input_dict = {
-            "human_imu": human_imu,
-            "obj_imu": data_dict["obj_imu"],
-            "hand_vel_glb_init": data_dict["hand_vel_glb_init"],
-            "obj_vel_init": data_dict["obj_vel_init"],
-            "contact_init": data_dict.get("contact_init"),
-            "hp_out": hp_out,
-        }
-        vc_out = self.velocity_contact_module.inference(vc_input_dict, hp_out=hp_out, sample_steps=sample_steps)
-        results.update(vc_out)
 
         has_object = data_dict.get("has_object")
         if use_object_data and (has_object is None or has_object.any()):
-            if hasattr(self.object_trans_module, "inference"):
-                ot_out = self.object_trans_module.inference(
-                    hp_out["pred_hand_glb_pos"],
-                    vc_out["pred_hand_contact_prob"],
-                    data_dict["obj_trans_init"],
-                    obj_imu=data_dict["obj_imu"],
-                    human_imu=human_imu,
-                    obj_vel_input=vc_out["pred_obj_vel"],
-                    contact_init=data_dict.get("contact_init"),
-                    has_object_mask=has_object,
-                    sample_steps=sample_steps,
-                )
-            else:
-                ot_out = self.object_trans_module(
-                    hp_out["pred_hand_glb_pos"],
-                    vc_out["pred_hand_contact_prob"],
-                    data_dict["obj_trans_init"],
-                    obj_imu=data_dict["obj_imu"],
-                    human_imu=human_imu,
-                    obj_vel_input=vc_out["pred_obj_vel"],
-                    contact_init=data_dict.get("contact_init"),
-                    has_object_mask=has_object,
-                )
-            results.update(ot_out)
+            interaction_out = self.interaction_module.inference(
+                data_dict,
+                hp_out=hp_out,
+                sample_steps=sample_steps,
+                sampler=sampler,
+                eta=eta,
+            )
+            results.update(interaction_out)
 
             if compute_fk:
                 obj_imu = data_dict["obj_imu"]
                 obj_rot6d = obj_imu[..., 3:9]
                 obj_rotm = rotation_6d_to_matrix(obj_rot6d.reshape(-1, 6)).reshape(batch_size, seq_len, 3, 3)
                 results["pred_obj_trans_fk"] = self._fk_obj_trans_baseline_hard(
-                    vc_out["pred_hand_contact_prob"],
+                    results["pred_hand_contact_prob"],
                     hp_out["pred_hand_glb_pos"],
                     obj_rotm,
                     data_dict["obj_trans_init"],
@@ -323,8 +323,7 @@ def load_model(
 ) -> IMUHOIModel:
     from utils.utils import flatten_lstm_parameters
 
-    model = IMUHOIModel(config, device, no_trans=no_trans)
-    model = model.to(device)
+    model = IMUHOIModel(config, device, no_trans=no_trans).to(device)
 
     pretrained_modules = {}
     if module_paths:
@@ -342,9 +341,8 @@ def load_model(
 
     if pretrained_modules:
         print("Loading pretrained modules:")
-        model.load_pretrained_modules(pretrained_modules)
+        model.load_pretrained_modules(pretrained_modules, strict=False)
 
     flatten_lstm_parameters(model)
     model.eval()
-
     return model

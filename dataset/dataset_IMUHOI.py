@@ -169,7 +169,17 @@ def compute_obj_direction_supervision(position_global, obj_trans, obj_rot,
     return result
 
 class IMUDataset(Dataset):
-    def __init__(self, data_dir, window_size=60, debug=False, min_obj_contact_frames=10, full_sequence=False, imu_noise_cfg=None, simulate_imu_noise=True):
+    def __init__(
+        self,
+        data_dir,
+        window_size=60,
+        debug=False,
+        min_obj_contact_frames=10,
+        full_sequence=False,
+        imu_noise_cfg=None,
+        simulate_imu_noise=True,
+        sequence_paths=None,
+    ):
         """
         IMU数据集 - 每个epoch为每个序列随机采样一个窗口
         Args:
@@ -196,15 +206,26 @@ class IMUDataset(Dataset):
         self.simulate_imu_noise = simulate_imu_noise
         self.imu_noise_cfg = merge_noise_cfg(imu_noise_cfg)
 
-        # 查找所有目录中的序列文件
+        # 查找所有目录中的序列文件，或使用显式传入的序列文件列表
         self.sequence_files = []
-        for data_dir_path in self.data_dirs:
-            if os.path.exists(data_dir_path):
-                dir_files = glob.glob(os.path.join(data_dir_path, "*.pt"))
-                self.sequence_files.extend(dir_files)
-                print(f"从目录 {data_dir_path} 找到 {len(dir_files)} 个序列文件")
-            else:
-                print(f"警告: 目录 {data_dir_path} 不存在，跳过")
+        if sequence_paths is not None:
+            if isinstance(sequence_paths, str):
+                sequence_paths = [sequence_paths]
+            for seq_path in sequence_paths:
+                seq_path_abs = os.path.abspath(os.path.normpath(seq_path))
+                if os.path.isfile(seq_path_abs) and seq_path_abs.lower().endswith(".pt"):
+                    self.sequence_files.append(seq_path_abs)
+                else:
+                    print(f"警告: 无效的序列文件路径，已跳过: {seq_path}")
+            print(f"使用显式序列列表，共 {len(self.sequence_files)} 个文件")
+        else:
+            for data_dir_path in self.data_dirs:
+                if os.path.exists(data_dir_path):
+                    dir_files = glob.glob(os.path.join(data_dir_path, "*.pt"))
+                    self.sequence_files.extend(dir_files)
+                    print(f"从目录 {data_dir_path} 找到 {len(dir_files)} 个序列文件")
+                else:
+                    print(f"警告: 目录 {data_dir_path} 不存在，跳过")
         
         print(f"总共找到 {len(self.sequence_files)} 个序列文件")
 
