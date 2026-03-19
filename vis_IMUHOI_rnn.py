@@ -76,8 +76,9 @@ HAND_TRAJ_COLORS = {
 
 GT_HUMAN_COLOR = (118/255, 147/255, 248/255, 0.9)
 GT_OBJECT_COLOR = (186/255, 161/255, 246/255, 0.9)
-_SMPL_PARENTS = [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19, 20, 21]
 
+PRED_HUMAN_COLOR = (246 / 255, 153 / 255, 19 / 255, 153/255)
+PRED_OBJECT_COLOR = (255 / 255, 82 / 255, 0 / 255, 153/255)
 
 def compute_virtual_bone_info(wrist_pos, obj_trans, obj_rot_mat):
     """Compute virtual bone length and direction."""
@@ -229,39 +230,6 @@ def _add_overlay_meshes(viewer, verts_seq, faces_np, frame_ids, base_name, base_
         viewer.scene.add(mesh)
 
 
-def _get_human_pose_module(model):
-    module = getattr(model, "human_pose_module", None)
-    if module is not None:
-        return module
-    wrapped = getattr(model, "module", None)
-    if wrapped is not None:
-        return getattr(wrapped, "human_pose_module", None)
-    return None
-
-
-def _global_to_local_rotmat(global_rotmats, parents):
-    if global_rotmats.dim() != 4 or global_rotmats.shape[-2:] != (3, 3):
-        raise ValueError(f"Expected [T, J, 3, 3], got {tuple(global_rotmats.shape)}")
-
-    seq_len, num_joints = global_rotmats.shape[:2]
-    local_rotmats = torch.zeros_like(global_rotmats)
-    local_rotmats[:, 0] = global_rotmats[:, 0]
-
-    for i in range(1, num_joints):
-        parent_idx = int(parents[i]) if i < len(parents) else 0
-        parent_idx = max(0, min(parent_idx, num_joints - 1))
-        parent_rot = global_rotmats[:, parent_idx]
-        local_rotmats[:, i] = torch.matmul(parent_rot.transpose(-1, -2), global_rotmats[:, i])
-
-    if _IGNORED_INDICES:
-        valid_ignored = [idx for idx in _IGNORED_INDICES if idx < num_joints]
-        if valid_ignored:
-            eye = torch.eye(3, device=global_rotmats.device, dtype=global_rotmats.dtype).view(1, 1, 3, 3)
-            local_rotmats[:, valid_ignored] = eye.expand(seq_len, len(valid_ignored), 3, 3)
-
-    return local_rotmats
-
-
 def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root, 
                          show_objects=True, vis_gt_only=False, show_foot_contact=False, 
                          show_obj_traj=False, show_hand_traj=False, use_fk=False, compare_3=False, 
@@ -397,52 +365,28 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
         if not vis_gt_only:
             try:
                 model_input = build_model_input_dict(batch_device, config, device, add_noise=False)
+                compute_fk_flag = bool(use_fk or compare_3)
                 model_arch = str(getattr(config, "model_arch", "rnn")).lower()
-                want_object_predictions = bool(
-                    has_object_bool and (show_objects or show_obj_traj or compare_3 or use_fk)
-                )
-                compute_fk_flag = bool((use_fk or compare_3) and want_object_predictions)
-
-                def _run_model_inference(use_object_data, compute_fk):
-                    if model_arch == "dit":
-                        return model.inference(
-                            model_input,
-                            gt_targets=batch_device,
-                            use_object_data=use_object_data,
-                            compute_fk=compute_fk,
-                        )
-                    return model(model_input, use_object_data=use_object_data, compute_fk=compute_fk)
-
-                try:
-                    pred_dict = _run_model_inference(
-                        use_object_data=want_object_predictions,
+                if model_arch == "dit":
+                    pred_dict = model.inference(
+                        model_input,
+                        gt_targets=batch_device,
+                        use_object_data=True,
                         compute_fk=compute_fk_flag,
                     )
-                except Exception as exc:
-                    if want_object_predictions:
-                        print(f"Model inference with object branch failed, fallback to human-only: {exc}")
-                        pred_dict = _run_model_inference(use_object_data=False, compute_fk=False)
-                    else:
-                        raise
+                else:
+                    pred_dict = model(model_input, use_object_data=True, compute_fk=compute_fk_flag)
             except Exception as exc:
                 print(f"Model inference failed: {exc}")
                 pred_dict = None
 
         if pred_dict is not None:
-            human_module = _get_human_pose_module(model)
             p_pred_seq = pred_dict.get("p_pred")
             if p_pred_seq is not None:
                 p_pred_seq = p_pred_seq[bs].to(device)
-            pred_full_pose_rotmat_seq = pred_dict.get("pred_full_pose_rotmat")
-            if pred_full_pose_rotmat_seq is not None:
-                pred_full_pose_rotmat_seq = pred_full_pose_rotmat_seq[bs].to(device)
             
             if no_trans:
-                if trans_batch is not None:
-                    pred_root_trans_seq = trans_batch[bs].to(device)
-                else:
-                    pred_root_trans_all = pred_dict.get("root_trans_pred")
-                    pred_root_trans_seq = pred_root_trans_all[bs].to(device) if pred_root_trans_all is not None else None
+                pred_root_trans_seq = trans_batch[bs] if trans_batch is not None else None
             else:
                 pred_root_trans_all = pred_dict.get("root_trans_pred")
                 pred_root_trans_seq = pred_root_trans_all[bs].to(device) if pred_root_trans_all is not None else None
@@ -471,52 +415,16 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                     pred_obj_trans_imu_seq = obj_trans_init.unsqueeze(0) + disp
                 except Exception:
                     pass
-
-            if (
-                pred_full_pose_rotmat_seq is not None
-                and pred_root_trans_seq is not None
-            ):
+            
+            if p_pred_seq is not None and pred_root_trans_seq is not None and model.human_pose_module is not None:
                 try:
-                    full_glb = pred_full_pose_rotmat_seq
-                    if full_glb.dim() != 4 or full_glb.shape[0] != T:
-                        raise ValueError(
-                            f"Invalid pred_full_pose_rotmat shape: {tuple(full_glb.shape)}, expected [{T}, J, 3, 3]"
-                        )
-
-                    if human_module is not None and hasattr(human_module, "_global2local"):
-                        parents = human_module.smpl_parents.tolist()
-                        local_rot = human_module._global2local(full_glb, parents)
-                    else:
-                        local_rot = _global_to_local_rotmat(full_glb, _SMPL_PARENTS)
-
-                    pose_axis = transforms.matrix_to_axis_angle(local_rot.reshape(-1, 3, 3)).reshape(
-                        T, full_glb.shape[1], 3
-                    )
-                    root_axis = pose_axis[:, 0, :]
-                    pose_body_axis = pose_axis[:, 1:22, :].reshape(T, -1)
-                    smpl_pred = smpl_model(
-                        pose_body=pose_body_axis,
-                        root_orient=root_axis,
-                        trans=pred_root_trans_seq
-                    )
-                    verts_pred_seq = smpl_pred.v
-                    Jtr_pred_seq = smpl_pred.Jtr
-                except Exception as exc:
-                    print(f"Predicted SMPL reconstruction from pred_full_pose_rotmat failed: {exc}")
-
-            if (
-                verts_pred_seq is None
-                and p_pred_seq is not None
-                and pred_root_trans_seq is not None
-                and human_module is not None
-            ):
-                try:
-                    reduced_pose = p_pred_seq.reshape(T, len(_REDUCED_POSE_NAMES), 6)
+                    reduced_pose = p_pred_seq.view(T, len(_REDUCED_POSE_NAMES), 6)
                     orientation_6d = human_imu_batch[bs, :, :, -6:]
                     orientation_mat = transforms.rotation_6d_to_matrix(
                         orientation_6d.reshape(-1, 6)
                     ).reshape(T, human_imu_batch.shape[2], 3, 3)
                     orientation_subset = orientation_mat[:, :len(_SENSOR_ROT_INDICES), :, :]
+                    human_module = model.human_pose_module
                     full_glb = human_module._reduced_glb_6d_to_full_glb_mat(
                         reduced_pose,
                         orientation_subset.reshape(T, len(_SENSOR_ROT_INDICES), 3, 3)
@@ -536,15 +444,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                     verts_pred_seq = smpl_pred.v
                     Jtr_pred_seq = smpl_pred.Jtr
                 except Exception as exc:
-                    print(f"Predicted SMPL reconstruction from p_pred failed: {exc}")
-
-            if Jtr_pred_seq is None:
-                pred_joints_global_all = pred_dict.get("pred_joints_global")
-                if pred_joints_global_all is not None:
-                    try:
-                        Jtr_pred_seq = pred_joints_global_all[bs].to(device)
-                    except Exception:
-                        pass
+                    print(f"Predicted SMPL reconstruction failed: {exc}")
 
         if pred_offset_np is not None:
             pred_offset = torch.tensor(pred_offset_np, device=device, dtype=torch.float32)
@@ -623,13 +523,13 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
             if overlay_mode:
                 _add_overlay_meshes(
                     viewer, verts_pred_shifted, faces_gt_np, overlay_frame_ids,
-                    "Pred-Human", (0.9, 0.2, 0.2), overlay_alpha_values, device
+                    "Pred-Human", PRED_HUMAN_COLOR, overlay_alpha_values, device
                 )
             else:
                 verts_pred_yup = torch.matmul(verts_pred_shifted, R_yup.T.to(device))
                 pred_human_mesh = Meshes(
                     verts_pred_yup.detach().cpu().numpy(), faces_gt_np,
-                    name="Pred-Human", color=(0.9, 0.2, 0.2, 0.8),
+                    name="Pred-Human", color=PRED_HUMAN_COLOR,
                     gui_affine=False, is_selectable=False
                 )
                 viewer.scene.add(pred_human_mesh)
@@ -655,13 +555,13 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
             if overlay_mode:
                 _add_overlay_meshes(
                     viewer, pred_obj_verts_shifted, obj_faces_np, overlay_frame_ids,
-                    f"Pred-{obj_name}", (0.9, 0.2, 0.2), overlay_alpha_values, device
+                    f"Pred-{obj_name}", PRED_OBJECT_COLOR, overlay_alpha_values, device
                 )
             else:
                 pred_obj_verts_yup = torch.matmul(pred_obj_verts_shifted, R_yup.T.to(device))
                 pred_obj_mesh = Meshes(
                     pred_obj_verts_yup.detach().cpu().numpy(), obj_faces_np,
-                    name=f"Pred-{obj_name}", color=(0.9, 0.2, 0.2, 0.8),
+                    name=f"Pred-{obj_name}", color=PRED_OBJECT_COLOR,
                     gui_affine=False, is_selectable=False
                 )
                 viewer.scene.add(pred_obj_mesh)
@@ -877,9 +777,9 @@ class InteractiveViewer(Viewer):
 
 def main():
     parser = argparse.ArgumentParser(description='Interactive IMUHOI Visualization Tool')
-    parser.add_argument('--config', type=str, default='configs/IMUHOI_train.yaml', help='Path to config file')
+    parser.add_argument('--config', type=str, default='configs/IMUHOI_train_rnn.yaml', help='Path to config file')
     parser.add_argument('--smpl_model_path', type=str, default=None, help='Path to SMPL model file')
-    parser.add_argument('--test_data_dir', type=str, default='process/processed_split_data_OMOMO/debug', help='Test data directory or a single .pt sequence file')
+    parser.add_argument('--test_data_dir', type=str, default='process/processed_split_data_OMOMO/test', help='Test data directory or a single .pt sequence file')
     parser.add_argument('--obj_geo_root', type=str, default='datasets/OMOMO/captured_objects', help='Root directory of object geometry files')
     parser.add_argument('--num_workers', type=int, default=0, help='DataLoader workers')
     parser.add_argument('--no_objects', action='store_true', help='Disable object mesh rendering')
@@ -931,7 +831,8 @@ def main():
             data_dir=test_data_input,
             window_size=test_window_size,
             debug=dataset_debug,
-            full_sequence=True
+            full_sequence=True,
+            simulate_imu_noise=True
         )
     elif os.path.isfile(test_data_input) and test_data_input.lower().endswith(".pt"):
         target_pt = os.path.normcase(os.path.normpath(os.path.abspath(test_data_input)))
@@ -944,6 +845,7 @@ def main():
             debug=dataset_debug,
             full_sequence=True,
             sequence_paths=[target_pt],
+            simulate_imu_noise=True
         )
         if len(test_dataset.sequence_info) != 1:
             try:

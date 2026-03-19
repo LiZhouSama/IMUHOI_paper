@@ -106,13 +106,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input_dir",
         type=str,
-        default="process/processed_split_data_IMHD",
+        default="process/processed_split_data_BEHAVE",
         help="输入数据目录，包含待分割的pt文件"
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="process/processed_split_data_IMHD",
+        default="process/processed_split_data_BEHAVE",
         help="输出目录，将在此目录下创建train和test子文件夹"
     )
     parser.add_argument(

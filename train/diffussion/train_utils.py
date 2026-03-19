@@ -15,8 +15,12 @@ from easydict import EasyDict as edict
 from torch import optim
 from torch.cuda.amp.grad_scaler import GradScaler
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard.writer import SummaryWriter
 from tqdm import tqdm
+
+try:
+    from torch.utils.tensorboard.writer import SummaryWriter
+except Exception:
+    SummaryWriter = None
 
 from dataset.dataset_IMUHOI import IMUDataset
 from utils.utils import (
@@ -57,7 +61,7 @@ def get_base_args():
     parser.add_argument("--pretrained_ckpt", type=str, default=None, help="预训练权重路径")
     parser.add_argument("--debug", action="store_true", help="调试模式")
     parser.add_argument("--no_trans", action="store_true", help="禁用根节点位移预测")
-    parser.add_argument("--model_arch", type=str, choices=["rnn", "dit"], default=None, help="选择模型架构(rnn/dit)")
+    parser.add_argument("--model_arch", type=str, choices=["rnn", "dit"], default="dit", help="选择模型架构(rnn/dit)")
     return parser
 
 
@@ -143,6 +147,7 @@ def create_dataloaders(cfg, project_root=None):
         data_dir=train_paths,
         window_size=cfg.train.window,
         debug=cfg.debug,
+        simulate_imu_noise=False,
     )
 
     train_loader = DataLoader(
@@ -162,6 +167,7 @@ def create_dataloaders(cfg, project_root=None):
             data_dir=test_paths,
             window_size=cfg.test.window,
             debug=cfg.debug,
+            simulate_imu_noise=False,
         )
         if len(test_dataset) > 0:
             test_loader = DataLoader(
@@ -258,9 +264,12 @@ class BaseTrainer:
 
         self.writer = None
         if cfg.use_tensorboard and not cfg.debug:
-            log_dir = os.path.join(cfg.save_dir, "tensorboard_logs")
-            self.writer = SummaryWriter(log_dir=log_dir)
-            print(f"TensorBoard logs: {log_dir}")
+            if SummaryWriter is None:
+                print("Warning: TensorBoard is unavailable, skipping SummaryWriter.")
+            else:
+                log_dir = os.path.join(cfg.save_dir, "tensorboard_logs")
+                self.writer = SummaryWriter(log_dir=log_dir)
+                print(f"TensorBoard logs: {log_dir}")
 
         self.best_loss = float("inf")
         self.n_iter = 0
@@ -311,7 +320,16 @@ class BaseTrainer:
         """默认的前向封装，可被子类重写"""
         gt_arg = batch if use_gt_targets else None
         if force_inference and hasattr(self.model, "inference"):
-            return self.model.inference(data_dict, sample_steps=sample_steps, sampler=sampler, eta=eta)
+            try:
+                return self.model.inference(
+                    data_dict,
+                    gt_targets=batch,
+                    sample_steps=sample_steps,
+                    sampler=sampler,
+                    eta=eta,
+                )
+            except TypeError:
+                return self.model.inference(data_dict, sample_steps=sample_steps, sampler=sampler, eta=eta)
         try:
             return self.model(data_dict, gt_targets=gt_arg)
         except TypeError:

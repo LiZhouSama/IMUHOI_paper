@@ -113,10 +113,12 @@ class InteractionTrainer(BaseTrainer):
         eta: float | None = None,
     ):
         gt_arg = batch if use_gt_targets else None
+        warmup_targets = batch if isinstance(batch, dict) else gt_arg
 
         if force_inference:
             return self.model.inference(
                 data_dict,
+                gt_targets=warmup_targets,
                 use_object_data=True,
                 compute_fk=False,
                 sample_steps=sample_steps,

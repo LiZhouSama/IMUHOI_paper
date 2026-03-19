@@ -1,6 +1,7 @@
 import os
 import sys
 import importlib.util
+import types
 
 import torch
 
@@ -78,3 +79,48 @@ def test_predict_x0_from_eps_inverse_relation():
     x0_recon = model.predict_x0_from_eps(x_t, t, noise)
 
     assert torch.allclose(x0, x0_recon, atol=1e-5)
+
+
+def test_sampling_path_supports_backprop():
+    torch.manual_seed(7)
+    model = _make_model().train()
+    cond = torch.randn(2, 8, 16)
+
+    out = model.sample(cond=cond, x_start=None, steps=6, sampler="ddim", eta=0.0)
+    loss = out.square().mean()
+    loss.backward()
+
+    has_grad = any(p.grad is not None and torch.any(p.grad != 0) for p in model.parameters())
+    assert has_grad
+
+
+def test_sample_inpaint_reuses_single_known_noise_within_one_reverse_pass():
+    torch.manual_seed(123)
+    model = _make_model().eval()
+    cond = torch.randn(2, 10, 16)
+    x_input = torch.randn(2, 10, 8)
+    x_start = torch.randn(2, 10, 8)
+    inpaint_mask = torch.zeros_like(x_input, dtype=torch.bool)
+    inpaint_mask[:, :, :4] = True
+
+    known_noise_ptrs = []
+    q_sample_raw = model.q_sample
+
+    def _q_sample_spy(self, x0, t, noise=None):
+        if noise is not None and x0.data_ptr() == x_input.data_ptr():
+            known_noise_ptrs.append(noise.data_ptr())
+        return q_sample_raw(x0, t, noise=noise)
+
+    model.q_sample = types.MethodType(_q_sample_spy, model)
+    _ = model.sample_inpaint(
+        x_input=x_input,
+        inpaint_mask=inpaint_mask,
+        cond=cond,
+        x_start=x_start,
+        steps=8,
+        sampler="ddim",
+        eta=0.0,
+    )
+
+    assert len(known_noise_ptrs) >= 2
+    assert len(set(known_noise_ptrs)) == 1

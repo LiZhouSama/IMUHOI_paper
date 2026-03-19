@@ -185,11 +185,19 @@ def evaluate_model(
             
             compute_fk = evaluate_objects and compare_three
             try:
-                pred_dict = model.inference(
-                    data_dict,
-                    use_object_data=True,
-                    compute_fk=compute_fk,
-                )
+                if str(getattr(config, "model_arch", "rnn")).lower() == "dit":
+                    pred_dict = model.inference(
+                        data_dict,
+                        gt_targets=batch_device,
+                        use_object_data=True,
+                        compute_fk=compute_fk,
+                    )
+                else:
+                    pred_dict = model.inference(
+                        data_dict,
+                        use_object_data=True,
+                        compute_fk=compute_fk,
+                    )
             except Exception as exc:
                 print(f"Model inference failed on batch {batch_idx}: {exc}")
                 continue

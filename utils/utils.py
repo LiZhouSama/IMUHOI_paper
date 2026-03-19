@@ -85,7 +85,33 @@ def load_checkpoint(model, checkpoint_path, device, strict=True, use_ema=True):
             state_dict = checkpoint['ema_state_dict']
         else:
             state_dict = checkpoint.get('module_state_dict', checkpoint.get('model_state_dict', checkpoint))
-    model.load_state_dict(state_dict, strict=strict)
+    if strict:
+        model.load_state_dict(state_dict, strict=True)
+    else:
+        model_state = model.state_dict()
+        filtered_state = {}
+        skipped_shape = []
+        for key, value in state_dict.items():
+            mapped_key = key
+            if mapped_key not in model_state and mapped_key.startswith('module.') and mapped_key[7:] in model_state:
+                mapped_key = mapped_key[7:]
+            elif mapped_key not in model_state and f'module.{mapped_key}' in model_state:
+                mapped_key = f'module.{mapped_key}'
+
+            if mapped_key not in model_state:
+                continue
+            if model_state[mapped_key].shape != value.shape:
+                skipped_shape.append((key, tuple(value.shape), tuple(model_state[mapped_key].shape)))
+                continue
+            filtered_state[mapped_key] = value
+
+        missing, unexpected = model.load_state_dict(filtered_state, strict=False)
+        if skipped_shape:
+            print(f"加载检查点时跳过 {len(skipped_shape)} 个shape不匹配参数")
+        if missing:
+            print(f"加载检查点缺失参数数量: {len(missing)}")
+        if unexpected:
+            print(f"加载检查点多余参数数量: {len(unexpected)}")
     print(f"加载检查点: {checkpoint_path}")
     return checkpoint.get('epoch', 0) if isinstance(checkpoint, dict) else 0
 
@@ -176,27 +202,37 @@ def build_model_input_dict(batch, cfg, device, add_noise=True):
     Returns:
         dict: 模型输入字典
     """
-    skip_extra_noise = batch.get('imu_noise_applied', False)
-    if isinstance(skip_extra_noise, torch.Tensor):
-        skip_extra_noise = bool(skip_extra_noise.flatten()[0].item())
-    else:
-        skip_extra_noise = bool(skip_extra_noise)
-
     human_imu = batch['human_imu'].to(device)
     bs, seq = human_imu.shape[:2]
     dtype = human_imu.dtype
+
+    skip_extra_noise = batch.get('imu_noise_applied', False)
+    if isinstance(skip_extra_noise, torch.Tensor):
+        skip_mask = skip_extra_noise.to(device=device, dtype=torch.bool).flatten()
+    elif isinstance(skip_extra_noise, (list, tuple, np.ndarray)):
+        skip_mask = torch.as_tensor(skip_extra_noise, device=device, dtype=torch.bool).flatten()
+    else:
+        skip_mask = torch.tensor([bool(skip_extra_noise)], device=device, dtype=torch.bool)
+    if skip_mask.numel() == 1 and bs > 1:
+        skip_mask = skip_mask.expand(bs)
+    elif skip_mask.numel() != bs:
+        skip_mask = skip_mask[:1].expand(bs)
+    skip_mask_human = skip_mask.view(bs, *([1] * (human_imu.dim() - 1)))
     
     # 添加噪声
     imu_noise_std = getattr(cfg, 'imu_noise_std', 0.1)
-    if add_noise and (not skip_extra_noise) and imu_noise_std > 0:
-        human_imu = human_imu + torch.randn_like(human_imu) * imu_noise_std
+    if add_noise and imu_noise_std > 0:
+        human_noise = torch.randn_like(human_imu) * imu_noise_std
+        human_imu = torch.where(skip_mask_human, human_imu, human_imu + human_noise)
     
     obj_imu = batch.get('obj_imu')
     if isinstance(obj_imu, torch.Tensor):
         obj_imu = obj_imu.to(device)
         obj_noise_std = getattr(cfg, 'obj_imu_noise_std', 0.1)
-        if add_noise and (not skip_extra_noise) and obj_noise_std > 0:
-            obj_imu = obj_imu + torch.randn_like(obj_imu) * obj_noise_std
+        if add_noise and obj_noise_std > 0:
+            skip_mask_obj = skip_mask.view(bs, *([1] * (obj_imu.dim() - 1)))
+            obj_noise = torch.randn_like(obj_imu) * obj_noise_std
+            obj_imu = torch.where(skip_mask_obj, obj_imu, obj_imu + obj_noise)
     else:
         obj_feat_dim = getattr(cfg, 'obj_imu_dim', 9)
         obj_imu = torch.zeros(bs, seq, obj_feat_dim, device=device, dtype=dtype)

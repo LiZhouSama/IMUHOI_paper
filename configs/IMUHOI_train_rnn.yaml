@@ -2,13 +2,13 @@
 # 通过命令行 --no_trans 参数切换模式
 
 # ============ 基本配置 ============
-save_dir: "outputs/IMUHOI"
+save_dir: "outputs/IMUHOI_DiT"
 body_model_path: datasets/smpl_models/smplh/male/model.npz
 use_tensorboard: True
 use_multi_gpu: True
 device: "cuda:0"
 gpus: [0]
-model_arch: "dit"  # 可选: rnn, dit
+model_arch: "rnn"  # 可选: rnn, dit
 
 # ============ DiT超参数(仅在model_arch=dit时使用) ============
 dit:
@@ -20,12 +20,14 @@ dit:
   dit_timesteps: 1000
   dit_use_time_embed: true
   dit_use_noise: true
+  dit_prediction_type: "x0"
   dit_max_seq_len: 256
-  dit_inference_steps: 100
+  dit_inference_steps: 20
   dit_inference_sampler: "ddim"
   dit_inference_eta: 0.0
+  dit_enable_root_correction: true
+  dit_root_contact_vel_threshold: 0.15
   formulation: "residual"
-  dit_residual_inference_mode: "oneshot"
 
 # ============ 交互模块训练配置 ============
 interaction_training:
@@ -42,7 +44,7 @@ interaction:
 
 # ============ 评估与EMA ============
 ema_decay: 0.999
-eval_ddim_steps: 50
+eval_ddim_steps: 10
 eval_sampler: "ddim"
 eval_eta: 0.0
 
@@ -60,9 +62,9 @@ REDUCED_POSE_NAMES: ['LeftHip', 'RightHip', 'Spine1', 'Spine2', 'Spine3', 'Neck'
 
 # ============ 训练超参数 ============
 epoch: 300
-batch_size: 60
+batch_size: 120
 lr: 0.0002
-weight_decay: 0.0001
+weight_decay: 0.00001
 milestones: [100, 200]
 gamma: 0.2
 seed: 42
@@ -71,7 +73,7 @@ num_workers: 12
 # ============ 特征维度 ============
 num_human_imus: 6
 imu_dim: 9
-num_joints: 22
+num_joints: 24
 joint_dim: 6
 vel_scale: 3
 
@@ -87,7 +89,7 @@ hand_contact_distance: 0.1
 
 # ============ 要使用的数据集 ============
 # 修改此项来选择训练数据
-train_datasets: ["imhd"]  # 可选: behave, imhd, omomo, amass
+train_datasets: ["omomo"]  # 可选: behave, imhd, omomo, amass
 
 # ============ 数据集路径 ============
 datasets:
@@ -118,8 +120,8 @@ loss_weights:
   simple_root_trans: 1.0
   vel_smooth: 0.5
   fk_joint: 1.0
-  drift: 1.0
-  foot_slide: 0.1
+  drift: 10
+  foot_slide: 1
   diffusion_x0: 1.0
   hand_pos: 1.0
   
@@ -140,7 +142,14 @@ loss_weights:
 
 # ============ 窗口配置 ============
 train:
-  window: 120
+  window: 60
 
 test:
-  window: 120
+  window: 60
+
+# ============ 预训练模块路径（可选）============
+# 取消注释以使用预训练权重
+pretrained_modules:
+  human_pose: "outputs/IMUHOI/joint_train_01112057/best_human_pose.pt"
+  velocity_contact: "outputs/IMUHOI/joint_train_01112057/best_velocity_contact.pt"
+  object_trans: "outputs/IMUHOI/joint_train_01112057/best_object_trans.pt"

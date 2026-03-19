@@ -208,7 +208,12 @@ def run_inference(
 
     with torch.no_grad():
         if cfg.model_arch == 'dit':
-            outputs = model.inference(data_dict, use_object_data=use_object_data, compute_fk=compute_fk)
+            outputs = model.inference(
+                data_dict,
+                gt_targets=data_dict,
+                use_object_data=use_object_data,
+                compute_fk=compute_fk,
+            )
         else:
             outputs = model(data_dict, use_object_data=use_object_data, compute_fk=compute_fk)
     print("[demo] Model forward pass complete.")

@@ -31,7 +31,6 @@ class InteractionModule(nn.Module):
         self.obj_trans_dim = 3
         self.contact_dim = 3
         self.boundary_dim = 2
-        self.target_dim = self.obj_trans_dim + self.contact_dim + self.boundary_dim
 
         self.human_imu_dim = self.num_human_imus * self.imu_dim
         self.pose_dim = self.num_joints * 6
@@ -46,14 +45,32 @@ class InteractionModule(nn.Module):
         )
 
         dit_cfg = getattr(cfg, "dit", {})
+        interaction_cfg = getattr(cfg, "interaction", {})
 
         def _dit_param(name, default):
             if isinstance(dit_cfg, dict) and name in dit_cfg:
                 return dit_cfg[name]
             return getattr(cfg, name, default)
 
+        def _interaction_param(name, default):
+            if isinstance(interaction_cfg, dict) and name in interaction_cfg:
+                return interaction_cfg[name]
+            return getattr(cfg, name, default)
+
         max_seq_len = _dit_param("dit_max_seq_len", getattr(getattr(cfg, "train", {}), "window", 256))
         self.use_diffusion_noise = bool(_dit_param("dit_use_noise", True))
+        self.dit_formulation = str(_dit_param("formulation", "standard")).lower()
+        if self.dit_formulation not in {"standard", "residual"}:
+            raise ValueError(f"Unsupported dit formulation: {self.dit_formulation}")
+        self.head_mode = str(_interaction_param("head_mode", "unified")).lower()
+        if self.head_mode not in {"unified", "split"}:
+            raise ValueError(f"Unsupported interaction head mode: {self.head_mode}")
+
+        if self.head_mode == "split":
+            self.target_dim = self.obj_trans_dim
+        else:
+            self.target_dim = self.obj_trans_dim + self.contact_dim + self.boundary_dim
+
         self.inference_steps = _dit_param("dit_inference_steps", None)
         self.inference_steps = int(self.inference_steps) if self.inference_steps is not None else None
         self.inference_sampler = str(_dit_param("dit_inference_sampler", "ddim")).lower()
@@ -71,6 +88,18 @@ class InteractionModule(nn.Module):
             timesteps=_dit_param("dit_timesteps", 1000),
             use_time_embed=_dit_param("dit_use_time_embed", True),
         )
+
+        if self.head_mode == "split":
+            cls_hidden = int(_interaction_param("cls_hidden_dim", _dit_param("dit_d_model", 256)))
+            self.cls_in_proj = nn.Linear(self.cond_dim + self.obj_trans_dim, cls_hidden)
+            self.cls_temporal = nn.Sequential(
+                nn.Conv1d(cls_hidden, cls_hidden, kernel_size=3, padding=1),
+                nn.SiLU(),
+                nn.Conv1d(cls_hidden, cls_hidden, kernel_size=3, padding=1),
+                nn.SiLU(),
+            )
+            self.contact_head = nn.Conv1d(cls_hidden, self.contact_dim, kernel_size=1)
+            self.boundary_head = nn.Conv1d(cls_hidden, self.boundary_dim, kernel_size=1)
 
     def _denormalize_imu(self, human_imu: torch.Tensor) -> torch.Tensor:
         """Convert relative IMU to world-frame aligned representation."""
@@ -232,14 +261,17 @@ class InteractionModule(nn.Module):
             dim=-1,
         )
 
-        x_seed = torch.cat(
-            [
-                obj_trans_init_seq,
-                contact_init_seq,
-                torch.zeros(batch_size, seq_len, self.boundary_dim, device=device, dtype=dtype),
-            ],
-            dim=-1,
-        )
+        if self.head_mode == "split":
+            x_seed = obj_trans_init_seq
+        else:
+            x_seed = torch.cat(
+                [
+                    obj_trans_init_seq,
+                    contact_init_seq,
+                    torch.zeros(batch_size, seq_len, self.boundary_dim, device=device, dtype=dtype),
+                ],
+                dim=-1,
+            )
 
         context = {
             "batch_size": batch_size,
@@ -297,18 +329,23 @@ class InteractionModule(nn.Module):
 
         return torch.cat([obj_trans_gt, contact_gt, boundary_gt], dim=-1)
 
-    def _decode_outputs(self, pred_feats: torch.Tensor, context: dict) -> dict:
+    def _predict_contact_boundary(self, cond: torch.Tensor, pred_obj_trans: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        cls_in = torch.cat([cond, pred_obj_trans], dim=-1)
+        h = self.cls_in_proj(cls_in).transpose(1, 2)
+        h = self.cls_temporal(h)
+        contact_logits = self.contact_head(h).transpose(1, 2)
+        boundary_logits = self.boundary_head(h).transpose(1, 2)
+        return contact_logits, boundary_logits
+
+    def _decode_outputs(
+        self,
+        pred_obj_trans: torch.Tensor,
+        contact_logits: torch.Tensor,
+        boundary_logits: torch.Tensor,
+        context: dict,
+    ) -> dict:
         batch_size = context["batch_size"]
         seq_len = context["seq_len"]
-        device = context["device"]
-        dtype = context["dtype"]
-
-        offset = 0
-        pred_obj_trans = pred_feats[..., offset : offset + self.obj_trans_dim]
-        offset += self.obj_trans_dim
-        contact_logits = pred_feats[..., offset : offset + self.contact_dim]
-        offset += self.contact_dim
-        boundary_logits = pred_feats[..., offset : offset + self.boundary_dim]
 
         contact_prob = torch.sigmoid(contact_logits)
         boundary_prob = torch.sigmoid(boundary_logits)
@@ -358,11 +395,36 @@ class InteractionModule(nn.Module):
         if self.training and gt_targets is None:
             raise ValueError("InteractionModule training requires gt_targets")
 
-        x_start = self._build_x_start(gt_targets, context) if gt_targets is not None else x_seed
         add_noise = bool(self.training and self.use_diffusion_noise)
 
-        pred_feats, aux = self.dit(cond, x_start=x_start, add_noise=add_noise)
-        outputs = self._decode_outputs(pred_feats, context)
+        if self.head_mode == "split":
+            x_gt_abs = self._build_x_start(gt_targets, context)[..., : self.obj_trans_dim] if gt_targets is not None else x_seed
+            if self.dit_formulation == "residual":
+                x_start = x_gt_abs - x_seed
+                pred_residual, aux = self.dit(cond, x_start=x_start, add_noise=add_noise)
+                pred_obj_trans = x_seed + pred_residual
+                aux["x_seed"] = x_seed
+                aux["residual_target"] = x_start
+                aux["residual_pred"] = pred_residual
+            else:
+                pred_obj_trans, aux = self.dit(cond, x_start=x_gt_abs, add_noise=add_noise)
+            contact_logits, boundary_logits = self._predict_contact_boundary(cond, pred_obj_trans)
+        else:
+            x_gt_abs = self._build_x_start(gt_targets, context) if gt_targets is not None else x_seed
+            if self.dit_formulation == "residual":
+                x_start = x_gt_abs - x_seed
+                pred_residual, aux = self.dit(cond, x_start=x_start, add_noise=add_noise)
+                pred_feats = x_seed + pred_residual
+                aux["x_seed"] = x_seed
+                aux["residual_target"] = x_start
+                aux["residual_pred"] = pred_residual
+            else:
+                pred_feats, aux = self.dit(cond, x_start=x_gt_abs, add_noise=add_noise)
+            pred_obj_trans = pred_feats[..., : self.obj_trans_dim]
+            contact_logits = pred_feats[..., self.obj_trans_dim : self.obj_trans_dim + self.contact_dim]
+            boundary_logits = pred_feats[..., self.obj_trans_dim + self.contact_dim :]
+
+        outputs = self._decode_outputs(pred_obj_trans, contact_logits, boundary_logits, context)
         outputs["diffusion_aux"] = aux
         return outputs
 
@@ -383,12 +445,30 @@ class InteractionModule(nn.Module):
         sampler_name = self.inference_sampler if sampler is None else str(sampler).lower()
         eta_val = self.inference_eta if eta is None else float(eta)
 
-        pred_feats = self.dit.sample(cond=cond, x_start=x_seed, steps=steps, sampler=sampler_name, eta=eta_val)
-        outputs = self._decode_outputs(pred_feats, context)
+        if self.head_mode == "split":
+            if self.dit_formulation == "residual":
+                pred_residual = self.dit.sample(cond=cond, x_start=None, steps=steps, sampler=sampler_name, eta=eta_val)
+                pred_obj_trans = x_seed + pred_residual
+            else:
+                pred_obj_trans = self.dit.sample(cond=cond, x_start=x_seed, steps=steps, sampler=sampler_name, eta=eta_val)
+            contact_logits, boundary_logits = self._predict_contact_boundary(cond, pred_obj_trans)
+        else:
+            if self.dit_formulation == "residual":
+                pred_residual = self.dit.sample(cond=cond, x_start=None, steps=steps, sampler=sampler_name, eta=eta_val)
+                pred_feats = x_seed + pred_residual
+            else:
+                pred_feats = self.dit.sample(cond=cond, x_start=x_seed, steps=steps, sampler=sampler_name, eta=eta_val)
+            pred_obj_trans = pred_feats[..., : self.obj_trans_dim]
+            contact_logits = pred_feats[..., self.obj_trans_dim : self.obj_trans_dim + self.contact_dim]
+            boundary_logits = pred_feats[..., self.obj_trans_dim + self.contact_dim :]
+
+        outputs = self._decode_outputs(pred_obj_trans, contact_logits, boundary_logits, context)
         outputs["diffusion_aux"] = {
             "inference_steps": steps,
             "sampler": sampler_name,
             "eta": eta_val,
+            "formulation": self.dit_formulation,
+            "head_mode": self.head_mode,
         }
         return outputs
 

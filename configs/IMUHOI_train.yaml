@@ -20,20 +20,31 @@ dit:
   dit_timesteps: 1000
   dit_use_time_embed: true
   dit_use_noise: true
+  dit_prediction_type: "x0"
   dit_max_seq_len: 256
-  dit_inference_steps: 100
+  dit_inference_steps: 20
   dit_inference_sampler: "ddim"
   dit_inference_eta: 0.0
+  dit_enable_root_correction: true
+  dit_root_contact_vel_threshold: 0.15
+  formulation: "residual"
 
 # ============ 交互模块训练配置 ============
 interaction_training:
   freeze_ratio: 0.8
   joint_phase_lr_factor: 0.2
   hp_aux_weight: 0.0
+  hp_train_sample_steps: 20
+  hp_train_sampler: "ddim"
+  hp_train_eta: 0.0
+
+# ============ 交互模块结构配置 ============
+interaction:
+  head_mode: "split"
 
 # ============ 评估与EMA ============
 ema_decay: 0.999
-eval_ddim_steps: 50
+eval_ddim_steps: 10
 eval_sampler: "ddim"
 eval_eta: 0.0
 
@@ -51,9 +62,9 @@ REDUCED_POSE_NAMES: ['LeftHip', 'RightHip', 'Spine1', 'Spine2', 'Spine3', 'Neck'
 
 # ============ 训练超参数 ============
 epoch: 300
-batch_size: 80
-lr: 0.002
-weight_decay: 0.0001
+batch_size: 120
+lr: 0.0002
+weight_decay: 0.00001
 milestones: [100, 200]
 gamma: 0.2
 seed: 42
@@ -102,11 +113,16 @@ datasets:
 # ============ 损失权重 ============
 loss_weights:
   # Stage 1: HumanPose
-  vel_root: 1.0
-  pose_reduced: 10.0  
-  root_vel_local: 1.0
-  root_vel: 1.0
-  root_trans: 1.0
+  simple_vel: 1.0
+  simple_pose: 10.0
+  simple_root_vel_local: 1.0
+  simple_root_vel: 1.0
+  simple_root_trans: 1.0
+  vel_smooth: 0.5
+  fk_joint: 1.0
+  drift: 10
+  foot_slide: 1
+  diffusion_x0: 1.0
   hand_pos: 1.0
   
   # Interaction (merged VC + OT)
@@ -126,13 +142,13 @@ loss_weights:
 
 # ============ 窗口配置 ============
 train:
-  window: 120
+  window: 60
 
 test:
-  window: 120
+  window: 60
 
 # ============ 预训练模块路径（可选）============
 # 取消注释以使用预训练权重
 pretrained_modules:
-  human_pose: "outputs/IMUHOI/joint_train_01112057/best_human_pose.pt"
+  human_pose: "outputs/IMUHOI_DiT/human_pose_03191842/best.pt"
   interaction: "outputs/IMUHOI/joint_train_01112057/best_interaction.pt"
