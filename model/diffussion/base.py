@@ -457,6 +457,45 @@ class ConditionalDiT(nn.Module):
 
         return x_t
 
+    def sample_inpaint_x0(
+        self,
+        x_input: torch.Tensor,
+        inpaint_mask: torch.Tensor,
+        *,
+        cond: Optional[torch.Tensor] = None,
+        steps: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Iterative x0 inpainting used by autoregressive sliding-window inference.
+
+        Algorithm:
+            x_t <- x_input
+            for t in reverse_schedule:
+                x0_pred <- model(x_t, t, cond)
+                x_t <- mask * x_input + (1-mask) * x0_pred
+        """
+        if x_input.dim() != 3:
+            raise ValueError(f"x_input must be [B,T,D], got {x_input.shape}")
+        if inpaint_mask.shape != x_input.shape:
+            raise ValueError(f"inpaint_mask shape mismatch: {inpaint_mask.shape} vs {x_input.shape}")
+
+        batch = x_input.shape[0]
+        device = x_input.device
+        dtype = x_input.dtype
+        mask_bool = inpaint_mask.to(device=device, dtype=torch.bool)
+
+        cond_use = self._normalize_cond(cond, x_input)
+        total_steps = self.timesteps if steps is None else int(steps)
+        schedule = self._build_sampling_timesteps(total_steps)
+
+        x_t = x_input.to(device=device, dtype=dtype)
+        for t_cur in schedule.tolist():
+            t_batch = torch.full((batch,), int(t_cur), device=device, dtype=torch.long)
+            x0_pred, _, _ = self.predict(x_t=x_t, t=t_batch, cond=cond_use)
+            x_t = torch.where(mask_bool, x_input, x0_pred)
+
+        return x_t
+
     def sample_inpaint(
         self,
         x_input: torch.Tensor,

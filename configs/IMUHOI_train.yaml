@@ -25,8 +25,9 @@ dit:
   dit_inference_steps: 20
   dit_inference_sampler: "ddim"
   dit_inference_eta: 0.0
+  dit_test_use_gt_warmup: true
   dit_enable_root_correction: true
-  dit_root_contact_vel_threshold: 0.15
+  dit_root_correction_contact_threshold: 0.5
   formulation: "residual"
 
 # ============ 交互模块训练配置 ============
@@ -48,18 +49,6 @@ eval_ddim_steps: 10
 eval_sampler: "ddim"
 eval_eta: 0.0
 
-# ============ 全局常量 ============
-FRAME_RATE: 30
-SENSOR_POS_INDICES: [0, 7, 8, 15, 20, 21]
-SENSOR_ROT_INDICES: [0, 4, 5, 15, 18, 19]
-VEL_SELECTION_INDICES: [0, 7, 8, 15, 20, 21]
-REDUCED_INDICES: [1, 2, 3, 6, 9, 12, 13, 14, 16, 17]
-IGNORED_INDICES: [7, 8, 10, 11, 20, 21, 22, 23]
-SENSOR_NAMES: ['Root', 'LeftLowerLeg', 'RightLowerLeg', 'Head', 'LeftForeArm', 'RightForeArm']
-SENSOR_VEL_NAMES: ['Root', 'LeftFoot', 'RightFoot', 'Head', 'LeftHand', 'RightHand']
-REDUCED_POSE_NAMES: ['LeftHip', 'RightHip', 'Spine1', 'Spine2', 'Spine3', 'Neck', 
-                     'LeftCollar', 'RightCollar', 'LeftShoulder', 'RightShoulder']
-
 # ============ 训练超参数 ============
 epoch: 300
 batch_size: 120
@@ -74,18 +63,10 @@ num_workers: 12
 num_human_imus: 6
 imu_dim: 9
 num_joints: 24
-joint_dim: 6
-vel_scale: 3
 
 # ============ 噪声配置 ============
 imu_noise_std: 0.3
 obj_imu_noise_std: 0.3
-
-# ============ 物体参数 ============
-obj_imu_change_threshold: 0.1
-obj_contact_threshold: 0.3
-obj_rot_weight: 0.5
-hand_contact_distance: 0.1
 
 # ============ 要使用的数据集 ============
 # 修改此项来选择训练数据
@@ -113,17 +94,12 @@ datasets:
 # ============ 损失权重 ============
 loss_weights:
   # Stage 1: HumanPose
-  simple_vel: 1.0
   simple_pose: 10.0
-  simple_root_vel_local: 1.0
-  simple_root_vel: 1.0
-  simple_root_trans: 1.0
   vel_smooth: 0.5
   fk_joint: 1.0
-  drift: 10
-  foot_slide: 1
+  drift: 1
+  foot_slide: 100
   diffusion_x0: 1.0
-  hand_pos: 1.0
   
   # Interaction (merged VC + OT)
   interaction_boundary: 0.1
@@ -140,6 +116,13 @@ loss_weights:
   obj_acc_cons: 0.01
   diffusion_eps: 1.0
 
+# ============ Test指标权重 ============
+test_metric_weights:
+  mpjre_mse: 1.0
+  root_trans_err_mm: 1.0
+  jitter_local_fk_mm: 1.0
+  root_jitter_mm: 1.0
+
 # ============ 窗口配置 ============
 train:
   window: 60
@@ -150,5 +133,5 @@ test:
 # ============ 预训练模块路径（可选）============
 # 取消注释以使用预训练权重
 pretrained_modules:
-  human_pose: "outputs/IMUHOI_DiT/human_pose_03191842/best.pt"
+  human_pose: "outputs/IMUHOI_DiT/human_pose_03202004/best.pt"
   interaction: "outputs/IMUHOI/joint_train_01112057/best_interaction.pt"

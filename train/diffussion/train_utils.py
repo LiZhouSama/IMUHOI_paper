@@ -143,11 +143,25 @@ def create_dataloaders(cfg, project_root=None):
 
     print(f"训练数据路径: {train_paths}")
 
+    train_cfg = getattr(cfg, "train", {})
+    test_cfg = getattr(cfg, "test", {})
+    train_full_sequence = (
+        train_cfg.get("full_sequence", False)
+        if isinstance(train_cfg, dict)
+        else getattr(train_cfg, "full_sequence", False)
+    )
+    test_full_sequence = (
+        test_cfg.get("full_sequence", False)
+        if isinstance(test_cfg, dict)
+        else getattr(test_cfg, "full_sequence", False)
+    )
+
     train_dataset = IMUDataset(
         data_dir=train_paths,
         window_size=cfg.train.window,
         debug=cfg.debug,
         simulate_imu_noise=False,
+        full_sequence=bool(train_full_sequence),
     )
 
     train_loader = DataLoader(
@@ -168,6 +182,7 @@ def create_dataloaders(cfg, project_root=None):
             window_size=cfg.test.window,
             debug=cfg.debug,
             simulate_imu_noise=False,
+            full_sequence=bool(test_full_sequence),
         )
         if len(test_dataset) > 0:
             test_loader = DataLoader(

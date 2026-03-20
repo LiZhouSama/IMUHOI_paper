@@ -1,41 +1,48 @@
 """
-DiffusionPoser-style HumanPose module.
+Stage-1 HumanPose diffusion module.
 
-Key design choices:
-- State variable is a sequence window, not per-frame direct regression.
-- IMU observations are part of the diffusion state and are enforced via hard inpainting masks.
-- Denoiser predicts x0 directly (clean sample), without explicit height conditioning.
+Training:
+- Full-window denoising only: x -> z_t -> x0_pred over all frames.
+- No autoregressive rollout, no teacher forcing, no training-time masks.
+
+Inference:
+- Autoregressive sliding-window inpainting.
+- History frames are fixed.
+- Current frame only keeps observed dimensions fixed.
+- Unknown dimensions are iteratively refined with x0 projection.
 """
 from __future__ import annotations
+
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from human_body_prior.body_model.body_model import BodyModel
-from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_axis_angle, matrix_to_rotation_6d
+from pytorch3d.transforms import matrix_to_axis_angle, matrix_to_rotation_6d, rotation_6d_to_matrix
 
 from .base import ConditionalDiT
 from configs import (
     FRAME_RATE,
-    _SENSOR_NAMES,
-    _SENSOR_VEL_NAMES,
-    _REDUCED_POSE_NAMES,
-    _REDUCED_INDICES,
     _IGNORED_INDICES,
+    _REDUCED_INDICES,
+    _SENSOR_NAMES,
     _SENSOR_ROT_INDICES,
 )
 
 
 class HumanPoseModule(nn.Module):
-    """Diffusion Transformer for Stage-1 pose reconstruction with inpainting guidance."""
+    """Diffusion Transformer for Stage-1 human pose reconstruction."""
 
     def __init__(self, cfg, device, no_trans: bool = False):
         super().__init__()
         self.device = device
-        self.no_trans = no_trans
+        self.no_trans = bool(no_trans)
+
         self.num_joints = int(getattr(cfg, "num_joints", 24))
         self.num_human_imus = int(getattr(cfg, "num_human_imus", len(_SENSOR_NAMES)))
         self.imu_dim = int(getattr(cfg, "imu_dim", 9))
         self.fps = float(getattr(cfg, "frame_rate", FRAME_RATE))
+
         self.hand_joint_indices = (20, 21)
         self.foot_joint_indices = (7, 8)
         self.smpl_parents = torch.tensor(
@@ -43,57 +50,61 @@ class HumanPoseModule(nn.Module):
             dtype=torch.long,
         )
 
-        # Match legacy velocity ordering: [Root, LFoot, RFoot, Head, Root, Head, LHand, RHand].
-        self.velocity_order = [0, 1, 2, 3, 0, 3, 4, 5]
-        self.v_dim = len(self.velocity_order) * 3
-        self.p_dim = len(_REDUCED_POSE_NAMES) * 6
-        self.root_dim = 0 if no_trans else 3  # root velocity (local)
-        self.motion_dim = self.v_dim + self.p_dim + self.root_dim
+        # Feature definition per frame:
+        # x_frame = [R_all_joints_global, a_imu6, delta_p_xz, p_y, b_foot2]
+        self.rot_dim = self.num_joints * 6
+        self.acc_dim = self.num_human_imus * 3
+        self.delta_p_dim = 0 if self.no_trans else 2
+        self.py_dim = 0 if self.no_trans else 1
+        self.contact_dim = 2
 
-        self.imu_feat_dim = self.num_human_imus * self.imu_dim
-        self.target_dim = self.imu_feat_dim + self.motion_dim
+        start = 0
+        self.rot_slice = slice(start, start + self.rot_dim)
+        start += self.rot_dim
+        self.acc_slice = slice(start, start + self.acc_dim)
+        start += self.acc_dim
+        self.delta_p_slice = slice(start, start + self.delta_p_dim)
+        start += self.delta_p_dim
+        self.py_slice = slice(start, start + self.py_dim)
+        start += self.py_dim
+        self.contact_slice = slice(start, start + self.contact_dim)
+        start += self.contact_dim
+        self.target_dim = start
 
-        dit_cfg = getattr(cfg, "dit", {})
+        # Observed dims at inference: IMU-joint rotations + IMU accelerations.
+        observed_dim_mask = torch.zeros(self.target_dim, dtype=torch.bool)
+        for j in _SENSOR_ROT_INDICES:
+            rot_j = slice(j * 6, (j + 1) * 6)
+            observed_dim_mask[rot_j] = True
+        observed_dim_mask[self.acc_slice] = True
 
-        def _dit_param(name, default):
-            if isinstance(dit_cfg, dict) and name in dit_cfg:
-                return dit_cfg[name]
-            return getattr(cfg, name, default)
-
-        if isinstance(dit_cfg, dict):
-            for removed_key in ("dit_train_current_mode", "dit_inference_mode"):
-                if removed_key in dit_cfg:
-                    raise ValueError(
-                        f"'{removed_key}' has been removed. "
-                        "Stage-1 now uses fixed K-step rollout training and autoregressive inference only."
-                    )
-        for removed_key in ("dit_train_current_mode", "dit_inference_mode"):
-            if hasattr(cfg, removed_key):
-                raise ValueError(
-                    f"'{removed_key}' has been removed. "
-                    "Please delete it from config and use the fixed Stage-1 rollout pipeline."
-                )
+        unknown_dim_mask = ~observed_dim_mask
+        self.register_buffer("observed_dim_mask", observed_dim_mask, persistent=False)
+        self.register_buffer("unknown_dim_mask", unknown_dim_mask, persistent=False)
 
         train_cfg = getattr(cfg, "train", {})
         test_cfg = getattr(cfg, "test", {})
         train_window = train_cfg.get("window") if isinstance(train_cfg, dict) else getattr(train_cfg, "window", None)
         test_window = test_cfg.get("window") if isinstance(test_cfg, dict) else getattr(test_cfg, "window", None)
         self.window_size = int(test_window if test_window is not None else train_window)
-        if self.window_size < 2:
-            raise ValueError(f"window_size must be >= 2, got {self.window_size}")
-        self.warmup_len = self.window_size - 1
+        if self.window_size < 1:
+            raise ValueError(f"window_size must be >= 1, got {self.window_size}")
 
-        max_seq_len = _dit_param("dit_max_seq_len", self.window_size)
+        dit_cfg = getattr(cfg, "dit", {})
+
+        def _dit_param(name: str, default):
+            if isinstance(dit_cfg, dict) and name in dit_cfg:
+                return dit_cfg[name]
+            return getattr(cfg, name, default)
+
         self.use_diffusion_noise = bool(_dit_param("dit_use_noise", True))
         self.inference_steps = _dit_param("dit_inference_steps", None)
-        if self.inference_steps is not None:
-            self.inference_steps = int(self.inference_steps)
-        self.inference_sampler = str(_dit_param("dit_inference_sampler", "ddim")).lower()
-        self.inference_eta = float(_dit_param("dit_inference_eta", 0.0))
-
-        self.enable_root_correction = bool(_dit_param("dit_enable_root_correction", True))
-        self.root_contact_vel_threshold = float(_dit_param("dit_root_contact_vel_threshold", 0.15))
-        self.train_rollout_k = 30
+        self.inference_steps = int(self.inference_steps) if self.inference_steps is not None else None
+        self.enable_root_correction = bool((not self.no_trans) and _dit_param("dit_enable_root_correction", False))
+        self.root_correction_contact_threshold = float(_dit_param("dit_root_correction_contact_threshold", 0.5))
+        self.root_correction_contact_threshold = min(max(self.root_correction_contact_threshold, 0.0), 1.0)
+        # Test-time option: seed autoregressive inference with GT warmup frames.
+        self.test_use_gt_warmup = bool(_dit_param("dit_test_use_gt_warmup", True))
 
         prediction_type = str(_dit_param("dit_prediction_type", "x0")).lower()
         if prediction_type not in {"x0", "eps"}:
@@ -101,13 +112,13 @@ class HumanPoseModule(nn.Module):
 
         self.dit = ConditionalDiT(
             target_dim=self.target_dim,
-            cond_dim=0,  # no explicit condition branch; observations are injected via inpainting
+            cond_dim=0,
             d_model=_dit_param("dit_d_model", 256),
             nhead=_dit_param("dit_nhead", 8),
             num_layers=_dit_param("dit_num_layers", 6),
             dim_feedforward=_dit_param("dit_dim_feedforward", 1024),
             dropout=_dit_param("dit_dropout", 0.1),
-            max_seq_len=max_seq_len,
+            max_seq_len=_dit_param("dit_max_seq_len", max(self.window_size, 256)),
             timesteps=_dit_param("dit_timesteps", 1000),
             use_time_embed=_dit_param("dit_use_time_embed", True),
             prediction_type=prediction_type,
@@ -118,6 +129,7 @@ class HumanPoseModule(nn.Module):
         body_model_path = getattr(cfg, "body_model_path", None)
         if body_model_path is None:
             raise ValueError("body_model_path is not set")
+
         try:
             self.body_model = BodyModel(bm_fname=body_model_path, num_betas=16)
             self.body_model.eval()
@@ -125,627 +137,676 @@ class HumanPoseModule(nn.Module):
                 param.requires_grad_(False)
             self.body_model_device = torch.device("cpu")
         except Exception as exc:
-            print(f"加载Body Model失败: {exc}")
-            exit()
-
-    def _reduced_glb_6d_to_full_glb_mat(self, glb_reduced_pose, orientation):
-        root_rotation = orientation[:, 0]
-        reduced_rot = rotation_6d_to_matrix(glb_reduced_pose.reshape(-1, 6)).reshape(
-            glb_reduced_pose.shape[0], len(_REDUCED_POSE_NAMES), 3, 3
-        )
-        reduced_rot_global = torch.matmul(root_rotation.unsqueeze(1), reduced_rot)
-        orientation_global = orientation.clone()
-        orientation_global[:, 1:] = torch.matmul(root_rotation.unsqueeze(1), orientation[:, 1:])
-        dtype = glb_reduced_pose.dtype
-        device = glb_reduced_pose.device
-        full_pose = torch.eye(3, device=device, dtype=dtype).view(1, 1, 3, 3).repeat(
-            glb_reduced_pose.shape[0], self.num_joints, 1, 1
-        )
-        full_pose[:, _REDUCED_INDICES] = reduced_rot_global
-        full_pose[:, _SENSOR_ROT_INDICES] = orientation_global
-        ignored_parents = self.smpl_parents[_IGNORED_INDICES]
-        full_pose[:, _IGNORED_INDICES] = full_pose[:, ignored_parents]
-        return full_pose
-
-    def _global2local(self, global_rotmats, parents):
-        batch_size, num_joints, _, _ = global_rotmats.shape
-        local_rotmats = torch.zeros_like(global_rotmats)
-        local_rotmats[:, 0] = global_rotmats[:, 0]
-        for i in range(1, num_joints):
-            parent_idx = parents[i]
-            R_parent = global_rotmats[:, parent_idx]
-            R_parent_inv = R_parent.transpose(-1, -2)
-            local_rotmats[:, i] = torch.matmul(R_parent_inv, global_rotmats[:, i])
-        local_rotmats[:, _IGNORED_INDICES] = torch.eye(
-            3, device=global_rotmats.device, dtype=global_rotmats.dtype
-        ).view(1, 1, 3, 3).repeat(batch_size, len(_IGNORED_INDICES), 1, 1)
-        return local_rotmats
-
-    def _compute_fk_joints_batched(self, glb_p_out_tensor: torch.Tensor, orientation: torch.Tensor):
-        if self.body_model is None:
-            return None
-
-        batch_size, seq_len = glb_p_out_tensor.shape[:2]
-        device = glb_p_out_tensor.device
-        BT = batch_size * seq_len
-
-        glb_pose = glb_p_out_tensor.reshape(BT, len(_REDUCED_POSE_NAMES), 6)
-        orientation = orientation[:, :, : len(_SENSOR_ROT_INDICES)].reshape(BT, len(_SENSOR_ROT_INDICES), 3, 3)
-        full_glb = self._reduced_glb_6d_to_full_glb_mat(glb_pose, orientation)
-        local_pose = self._global2local(full_glb, self.smpl_parents.tolist())
-        pose_aa = matrix_to_axis_angle(local_pose.reshape(-1, 3, 3)).reshape(BT, self.num_joints, 3)
-
-        try:
-            with torch.no_grad():
-                body_out = self.body_model(
-                    pose_body=pose_aa[:, 1:22].reshape(BT, 63),
-                    root_orient=pose_aa[:, 0].reshape(BT, 3),
-                )
-            joints = body_out.Jtr
-            if joints.size(1) != self.num_joints:
-                if joints.size(1) > self.num_joints:
-                    joints = joints[:, : self.num_joints, :]
-                else:
-                    pad = torch.zeros(
-                        joints.size(0),
-                        self.num_joints - joints.size(1),
-                        joints.size(2),
-                        device=device,
-                        dtype=joints.dtype,
-                    )
-                    joints = torch.cat((joints, pad), dim=1)
-            return joints.reshape(batch_size, seq_len, self.num_joints, 3)
-        except Exception as exc:
-            print(f"FK计算失败: {exc}")
-            return None
-
-    def _compute_root_velocity_from_trans(self, trans: torch.Tensor):
-        if trans is None:
-            return None
-        if trans.dim() == 2:
-            trans = trans.unsqueeze(1)
-        vel = torch.zeros_like(trans)
-        if trans.size(1) > 1:
-            vel[:, 1:] = (trans[:, 1:] - trans[:, :-1]) * self.fps
-            vel[:, 0] = vel[:, 1]
-        return vel
+            raise RuntimeError(f"Failed to load BodyModel: {exc}") from exc
 
     @staticmethod
-    def _ensure_bt(tensor, batch_size, seq_len, last_shape, device, dtype):
-        full_shape = (batch_size, seq_len, *last_shape)
-        if not isinstance(tensor, torch.Tensor):
-            return torch.zeros(*full_shape, device=device, dtype=dtype)
-        out = tensor.to(device=device, dtype=dtype)
-        if out.dim() == len(last_shape) + 1:
+    def _to_bt(
+        value,
+        *,
+        batch_size: int,
+        seq_len: int,
+        trailing_shape: Tuple[int, ...],
+        device: torch.device,
+        dtype: torch.dtype,
+        default: float = 0.0,
+    ) -> torch.Tensor:
+        shape = (batch_size, seq_len, *trailing_shape)
+        if not isinstance(value, torch.Tensor):
+            return torch.full(shape, float(default), device=device, dtype=dtype)
+
+        out = value.to(device=device, dtype=dtype)
+        expected_dim = 2 + len(trailing_shape)
+        if out.dim() == expected_dim - 1:
             out = out.unsqueeze(0)
         if out.shape[0] == 1 and batch_size > 1:
             out = out.expand(batch_size, *out.shape[1:])
+
         if out.shape[0] != batch_size or out.shape[1] != seq_len:
-            return torch.zeros(*full_shape, device=device, dtype=dtype)
+            return torch.full(shape, float(default), device=device, dtype=dtype)
+
+        if len(trailing_shape) > 0 and tuple(out.shape[2:]) != trailing_shape:
+            return torch.full(shape, float(default), device=device, dtype=dtype)
+
         return out
 
-    def _prepare_inputs(self, data_dict: dict):
-        """Pack observed IMU + seed motion features."""
-        human_imu = data_dict["human_imu"]
-        v_init = data_dict["v_init"]
-        p_init = data_dict["p_init"]
-        trans_init = data_dict.get("trans_init")
-        trans_gt = data_dict.get("trans_gt")
-
-        if human_imu.dim() != 4:
-            raise ValueError(f"human_imu must be [B, T, num_imu, imu_dim], got {human_imu.shape}")
-        batch_size, seq_len, _, _ = human_imu.shape
-        device = human_imu.device
-        dtype = human_imu.dtype
-
-        if self.body_model is not None and (self.body_model_device != device):
+    def _ensure_body_model_device(self, device: torch.device):
+        if self.body_model is not None and self.body_model_device != device:
             self.body_model = self.body_model.to(device)
             self.body_model_device = device
 
-        human_flat = human_imu.reshape(batch_size, seq_len, -1)
+    def _imu_global_rotation(self, human_imu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Convert IMU orientations from root-relative format to global format."""
+        batch_size, seq_len = human_imu.shape[:2]
 
-        v_init_ordered = v_init[:, self.velocity_order, :].reshape(batch_size, len(self.velocity_order), 3)
-        v_seed = v_init_ordered.reshape(batch_size, 1, -1).expand(batch_size, seq_len, -1)
-        p_seed = p_init.reshape(batch_size, 1, -1).expand(batch_size, seq_len, -1)
-
-        root_seed = torch.zeros(batch_size, seq_len, self.root_dim, device=device, dtype=dtype)
-        motion_seed_parts = [v_seed, p_seed]
-        if not self.no_trans:
-            motion_seed_parts.append(root_seed)
-        motion_seed = torch.cat(motion_seed_parts, dim=-1)
-
-        x_seed = torch.cat((human_flat, motion_seed), dim=-1)
-
-        orientation_6d = human_imu[..., -6:]
-        orientation_mat = rotation_6d_to_matrix(orientation_6d.reshape(-1, 6)).reshape(
+        imu_rot6d = human_imu[..., 3:9]
+        imu_rotm = rotation_6d_to_matrix(imu_rot6d.reshape(-1, 6)).reshape(
             batch_size, seq_len, self.num_human_imus, 3, 3
         )
 
-        if trans_init is None:
-            trans_init_vec = torch.zeros(batch_size, 3, device=device, dtype=dtype)
-        else:
-            trans_init_vec = trans_init.to(device=device, dtype=dtype)
-            if trans_init_vec.dim() == 3 and trans_init_vec.size(1) == 1:
-                trans_init_vec = trans_init_vec[:, 0]
-            if trans_init_vec.dim() == 1:
-                trans_init_vec = trans_init_vec.unsqueeze(0).expand(batch_size, -1)
+        root_rot = imu_rotm[:, :, :1]
+        imu_rotm_global = imu_rotm.clone()
+        if self.num_human_imus > 1:
+            imu_rotm_global[:, :, 1:] = torch.matmul(root_rot, imu_rotm[:, :, 1:])
 
-        if isinstance(trans_gt, torch.Tensor):
-            trans_gt = trans_gt.to(device=device, dtype=dtype)
-            if trans_gt.dim() == 2:
-                trans_gt = trans_gt.unsqueeze(0).expand(batch_size, seq_len, 3)
+        imu_rot6d_global = matrix_to_rotation_6d(imu_rotm_global.reshape(-1, 3, 3)).reshape(
+            batch_size, seq_len, self.num_human_imus, 6
+        )
+        return imu_rotm_global, imu_rot6d_global
+
+    def _global2local(self, global_rotmats: torch.Tensor, parents) -> torch.Tensor:
+        batch_size, num_joints = global_rotmats.shape[:2]
+        local_rotmats = torch.zeros_like(global_rotmats)
+        local_rotmats[:, 0] = global_rotmats[:, 0]
+
+        for i in range(1, num_joints):
+            parent_idx = parents[i]
+            parent_rot = global_rotmats[:, parent_idx]
+            local_rotmats[:, i] = torch.matmul(parent_rot.transpose(-1, -2), global_rotmats[:, i])
+
+        eye = torch.eye(3, device=global_rotmats.device, dtype=global_rotmats.dtype).view(1, 1, 3, 3)
+        local_rotmats[:, _IGNORED_INDICES] = eye.expand(batch_size, len(_IGNORED_INDICES), -1, -1)
+        return local_rotmats
+
+    def _compute_fk_joints_from_global(self, full_global_rotmats: torch.Tensor) -> Optional[torch.Tensor]:
+        """
+        Differentiable FK via BodyModel:
+        global R -> local pose -> BodyModel(Jtr)
+        """
+        if self.body_model is None:
+            return None
+
+        batch_size, seq_len = full_global_rotmats.shape[:2]
+        bt = batch_size * seq_len
+
+        full_global = full_global_rotmats.reshape(bt, self.num_joints, 3, 3)
+        local_pose = self._global2local(full_global, self.smpl_parents.tolist())
+        pose_aa = matrix_to_axis_angle(local_pose.reshape(-1, 3, 3)).reshape(bt, self.num_joints, 3)
+
+        try:
+            body_out = self.body_model(
+                pose_body=pose_aa[:, 1:22].reshape(bt, 63),
+                root_orient=pose_aa[:, 0].reshape(bt, 3),
+            )
+            joints = body_out.Jtr
+            if joints.size(1) > self.num_joints:
+                joints = joints[:, : self.num_joints]
+            elif joints.size(1) < self.num_joints:
+                pad = torch.zeros(
+                    joints.size(0),
+                    self.num_joints - joints.size(1),
+                    3,
+                    device=joints.device,
+                    dtype=joints.dtype,
+                )
+                joints = torch.cat([joints, pad], dim=1)
+            return joints.reshape(batch_size, seq_len, self.num_joints, 3)
+        except Exception:
+            return None
+
+    def _resolve_trans_init(
+        self,
+        data_dict: Dict,
+        gt_targets: Optional[Dict],
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        trans_init = data_dict.get("trans_init")
+        if isinstance(trans_init, torch.Tensor):
+            trans_init = trans_init.to(device=device, dtype=dtype)
+            if trans_init.dim() == 3 and trans_init.size(1) == 1:
+                trans_init = trans_init[:, 0]
+            if trans_init.dim() == 1:
+                trans_init = trans_init.unsqueeze(0)
+            if trans_init.shape[0] == 1 and batch_size > 1:
+                trans_init = trans_init.expand(batch_size, -1)
+            if trans_init.shape[0] == batch_size and trans_init.shape[-1] == 3:
+                return trans_init
+
+        if isinstance(gt_targets, dict) and isinstance(gt_targets.get("trans"), torch.Tensor):
+            trans = gt_targets["trans"].to(device=device, dtype=dtype)
+            if trans.dim() == 2:
+                trans = trans.unsqueeze(0)
+            if trans.shape[0] == 1 and batch_size > 1:
+                trans = trans.expand(batch_size, -1, -1)
+            if trans.shape[0] == batch_size and trans.shape[1] > 0:
+                return trans[:, 0]
+
+        return torch.zeros(batch_size, 3, device=device, dtype=dtype)
+
+    def _build_clean_window(self, data_dict: Dict, gt_targets: Dict) -> Tuple[torch.Tensor, Dict]:
+        """Build full clean window x from GT for training."""
+        if not isinstance(gt_targets, dict):
+            raise ValueError("gt_targets must be provided for full-window diffusion training")
+
+        human_imu = data_dict["human_imu"]
+        if human_imu.dim() != 4:
+            raise ValueError(f"human_imu must be [B,T,N,D], got {human_imu.shape}")
+
+        batch_size, seq_len = human_imu.shape[:2]
+        device = human_imu.device
+        dtype = human_imu.dtype
+
+        self._ensure_body_model_device(device)
+
+        imu_rotm_global, imu_rot6d_global = self._imu_global_rotation(human_imu)
+        imu_acc_flat = human_imu[..., :3].reshape(batch_size, seq_len, -1)
+
+        rot_global = gt_targets.get("rotation_global")
+        if not isinstance(rot_global, torch.Tensor):
+            raise ValueError("gt_targets['rotation_global'] is required")
+
+        rot_global = rot_global.to(device=device, dtype=dtype)
+        if rot_global.dim() == 4:
+            rot_global = rot_global.unsqueeze(0)
+        if rot_global.shape[0] == 1 and batch_size > 1:
+            rot_global = rot_global.expand(batch_size, -1, -1, -1, -1)
+
+        if rot_global.shape[0] != batch_size or rot_global.shape[1] != seq_len:
+            raise ValueError(
+                f"rotation_global shape mismatch, got {rot_global.shape}, expected [B={batch_size},T={seq_len},J,3,3]"
+            )
+
+        joints_now = rot_global.shape[2]
+        if joints_now > self.num_joints:
+            rot_global = rot_global[:, :, : self.num_joints]
+        elif joints_now < self.num_joints:
+            eye = torch.eye(3, device=device, dtype=dtype).view(1, 1, 1, 3, 3)
+            pad = eye.expand(batch_size, seq_len, self.num_joints - joints_now, -1, -1)
+            rot_global = torch.cat([rot_global, pad], dim=2)
+
+        rot_global_6d = matrix_to_rotation_6d(rot_global.reshape(-1, 3, 3)).reshape(batch_size, seq_len, self.num_joints, 6)
+
+        # Replace IMU joints with observed IMU global rotations.
+        rot_global_6d[:, :, _SENSOR_ROT_INDICES] = imu_rot6d_global
+        rot_global = rotation_6d_to_matrix(rot_global_6d.reshape(-1, 6)).reshape(batch_size, seq_len, self.num_joints, 3, 3)
+
+        trans = self._to_bt(
+            gt_targets.get("trans"),
+            batch_size=batch_size,
+            seq_len=seq_len,
+            trailing_shape=(3,),
+            device=device,
+            dtype=dtype,
+            default=0.0,
+        )
+
+        if self.no_trans:
+            delta_p = torch.zeros(batch_size, seq_len, 0, device=device, dtype=dtype)
+            p_y = torch.zeros(batch_size, seq_len, 0, device=device, dtype=dtype)
+        else:
+            delta_p = torch.zeros(batch_size, seq_len, 2, device=device, dtype=dtype)
+            if seq_len > 1:
+                delta_p[:, 1:] = trans[:, 1:, [0, 2]] - trans[:, :-1, [0, 2]]
+            p_y = trans[:, :, 1:2]
+
+        lfoot_contact = self._to_bt(
+            gt_targets.get("lfoot_contact"),
+            batch_size=batch_size,
+            seq_len=seq_len,
+            trailing_shape=(),
+            device=device,
+            dtype=dtype,
+            default=0.0,
+        )
+        rfoot_contact = self._to_bt(
+            gt_targets.get("rfoot_contact"),
+            batch_size=batch_size,
+            seq_len=seq_len,
+            trailing_shape=(),
+            device=device,
+            dtype=dtype,
+            default=0.0,
+        )
+        b = torch.stack([lfoot_contact, rfoot_contact], dim=-1).clamp(0.0, 1.0)
+
+        x_parts = [
+            rot_global_6d.reshape(batch_size, seq_len, -1),
+            imu_acc_flat,
+        ]
+        if not self.no_trans:
+            x_parts.extend([delta_p, p_y])
+        x_parts.append(b)
+        x_clean = torch.cat(x_parts, dim=-1)
+
+        trans_init = self._resolve_trans_init(
+            data_dict,
+            gt_targets,
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
+        )
+
+        gt_joints_local = self._compute_fk_joints_from_global(rot_global)
 
         context = {
             "batch_size": batch_size,
             "seq_len": seq_len,
             "device": device,
             "dtype": dtype,
-            "human_flat": human_flat,
+            "trans_init": trans_init,
+            "trans_gt": trans,
+            "gt_joints_local": gt_joints_local,
             "human_imu": human_imu,
-            "orientation_mat": orientation_mat,
-            "motion_seed": motion_seed,
-            "trans_init": trans_init_vec,
-            "trans_gt": trans_gt,
+            "imu_rotm_global": imu_rotm_global,
         }
-        return x_seed, context
+        return x_clean, context
 
-    def _build_motion_target_from_gt(self, gt_targets: dict, context: dict):
-        """Construct clean motion target from GT labels."""
-        batch_size = context["batch_size"]
-        seq_len = context["seq_len"]
-        device = context["device"]
-        dtype = context["dtype"]
-        orientation_mat = context["orientation_mat"]
+    def _build_observed_sequence(self, data_dict: Dict, gt_targets: Optional[Dict]) -> Tuple[torch.Tensor, Dict]:
+        """Build observed-only sequence for autoregressive inference."""
+        human_imu = data_dict["human_imu"]
+        if human_imu.dim() != 4:
+            raise ValueError(f"human_imu must be [B,T,N,D], got {human_imu.shape}")
 
-        sensor_vel_root_gt = gt_targets.get("sensor_vel_root") if isinstance(gt_targets, dict) else None
-        sensor_vel_root_gt = self._ensure_bt(
-            sensor_vel_root_gt,
-            batch_size,
-            seq_len,
-            (len(_SENSOR_VEL_NAMES), 3),
-            device,
-            dtype,
+        batch_size, seq_len = human_imu.shape[:2]
+        device = human_imu.device
+        dtype = human_imu.dtype
+
+        self._ensure_body_model_device(device)
+
+        imu_rotm_global, imu_rot6d_global = self._imu_global_rotation(human_imu)
+        imu_acc_flat = human_imu[..., :3].reshape(batch_size, seq_len, -1)
+
+        observed = torch.zeros(batch_size, seq_len, self.target_dim, device=device, dtype=dtype)
+        for local_idx, joint_idx in enumerate(_SENSOR_ROT_INDICES):
+            observed[:, :, joint_idx * 6 : (joint_idx + 1) * 6] = imu_rot6d_global[:, :, local_idx]
+        observed[:, :, self.acc_slice] = imu_acc_flat
+
+        trans_init = self._resolve_trans_init(
+            data_dict,
+            gt_targets,
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
         )
-        v_gt = sensor_vel_root_gt[:, :, self.velocity_order, :].reshape(batch_size, seq_len, -1)
 
-        ori_root_reduced_gt = gt_targets.get("ori_root_reduced") if isinstance(gt_targets, dict) else None
-        ori_root_reduced_gt = self._ensure_bt(
-            ori_root_reduced_gt,
-            batch_size,
-            seq_len,
-            (len(_REDUCED_POSE_NAMES), 3, 3),
-            device,
-            dtype,
-        )
+        context = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "device": device,
+            "dtype": dtype,
+            "trans_init": trans_init,
+            "trans_gt": None,
+            "gt_joints_local": None,
+            "human_imu": human_imu,
+            "imu_rotm_global": imu_rotm_global,
+        }
+        return observed, context
 
-        p_gt_6d = matrix_to_rotation_6d(ori_root_reduced_gt.reshape(-1, 3, 3)).reshape(
-            batch_size, seq_len, len(_REDUCED_POSE_NAMES), 6
-        )
-        p_gt_flat = p_gt_6d.reshape(batch_size, seq_len, -1)
+    def _compute_root_velocity_from_trans(self, trans: torch.Tensor) -> torch.Tensor:
+        vel = torch.zeros_like(trans)
+        if trans.size(1) > 1:
+            vel[:, 1:] = (trans[:, 1:] - trans[:, :-1]) * self.fps
+            vel[:, 0] = vel[:, 1]
+        return vel
 
-        motion_parts = [v_gt, p_gt_flat]
-        if not self.no_trans:
-            root_vel_gt = gt_targets.get("root_vel") if isinstance(gt_targets, dict) else None
-            if isinstance(root_vel_gt, torch.Tensor):
-                root_vel_gt = root_vel_gt.to(device=device, dtype=dtype)
-                if root_vel_gt.dim() == 2:
-                    root_vel_gt = root_vel_gt.unsqueeze(0)
-                if root_vel_gt.shape[0] == 1 and batch_size > 1:
-                    root_vel_gt = root_vel_gt.expand(batch_size, -1, -1)
-            else:
-                root_vel_gt = None
-
-            if root_vel_gt is None or root_vel_gt.shape[0] != batch_size:
-                trans_full_gt = gt_targets.get("trans") if isinstance(gt_targets, dict) else None
-                if isinstance(trans_full_gt, torch.Tensor):
-                    trans_full_gt = trans_full_gt.to(device=device, dtype=dtype)
-                root_vel_gt = self._compute_root_velocity_from_trans(trans_full_gt)
-                if root_vel_gt is None:
-                    root_vel_gt = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
-
-            root_R = orientation_mat[:, :, 0]
-            root_vel_local_gt = torch.matmul(root_R.transpose(-1, -2), root_vel_gt.unsqueeze(-1)).squeeze(-1)
-            motion_parts.append(root_vel_local_gt)
-
-        return torch.cat(motion_parts, dim=-1)
-
-    def set_train_rollout_k(self, rollout_k: int):
-        rollout_k = int(rollout_k)
-        if rollout_k <= 0:
-            raise ValueError(f"rollout_k must be positive, got {rollout_k}")
-        self.train_rollout_k = rollout_k
-
-    def _build_step_inpaint(
+    def _apply_root_correction_step(
         self,
-        history_feats: torch.Tensor,
-        human_flat: torch.Tensor,
-        frame_idx: int,
-    ):
-        """Build inpainting input/mask for one autoregressive frame."""
-        x_input = history_feats.clone()
-        inpaint_mask = torch.ones_like(x_input, dtype=torch.bool)
-        idx = max(0, min(int(frame_idx), x_input.shape[1] - 1))
-        prev_idx = max(idx - 1, 0)
+        *,
+        prev_frame: torch.Tensor,
+        curr_frame: torch.Tensor,
+        prev_root_pos: torch.Tensor,
+        curr_root_xz: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Inference-only root correction on current frame delta_p x/z."""
+        if self.no_trans or (not self.enable_root_correction) or self.delta_p_dim < 2:
+            return curr_frame, curr_root_xz
 
-        # Observed IMU at current frame is fixed.
-        x_input[:, idx, : self.imu_feat_dim] = human_flat[:, idx]
-        # Unknown motion is initialized from previous frame reconstruction.
-        x_input[:, idx, self.imu_feat_dim :] = history_feats[:, prev_idx, self.imu_feat_dim :]
-        # Only current-frame motion dims are allowed to change.
-        inpaint_mask[:, idx, self.imu_feat_dim :] = False
+        batch_size = curr_frame.shape[0]
+        device = curr_frame.device
+        dtype = curr_frame.dtype
 
-        unknown_mask = ~inpaint_mask
-        unknown_motion_mask = unknown_mask[..., self.imu_feat_dim :]
-        return x_input, inpaint_mask, unknown_mask, unknown_motion_mask
+        curr_root_pos = torch.zeros(batch_size, 3, device=device, dtype=dtype)
+        curr_root_pos[:, 0] = curr_root_xz[:, 0]
+        curr_root_pos[:, 2] = curr_root_xz[:, 1]
+        curr_root_pos[:, 1] = curr_frame[:, self.py_slice].squeeze(-1)
 
-    def _correct_root_translation(self, root_trans: torch.Tensor, joints_local: torch.Tensor):
-        """Contact-aware root correction to reduce foot sliding drift."""
-        if root_trans is None or joints_local is None or root_trans.size(1) < 2:
-            return root_trans
+        rot_prev = rotation_6d_to_matrix(prev_frame[:, self.rot_slice].reshape(-1, 6)).reshape(
+            batch_size, self.num_joints, 3, 3
+        )
+        rot_curr = rotation_6d_to_matrix(curr_frame[:, self.rot_slice].reshape(-1, 6)).reshape(
+            batch_size, self.num_joints, 3, 3
+        )
+        rot_pair = torch.stack([rot_prev, rot_curr], dim=1)
 
-        trans_corr = root_trans.clone()
-        batch_size, seq_len = trans_corr.shape[:2]
+        joints_local_pair = self._compute_fk_joints_from_global(rot_pair)
+        if joints_local_pair is None:
+            return curr_frame, curr_root_xz
 
-        for t in range(1, seq_len):
-            foot_prev = joints_local[:, t - 1, self.foot_joint_indices, :] + trans_corr[:, t - 1].unsqueeze(1)
-            foot_curr = joints_local[:, t, self.foot_joint_indices, :] + trans_corr[:, t].unsqueeze(1)
+        foot_prev_local = joints_local_pair[:, 0, self.foot_joint_indices, :]  # [B,2,3]
+        foot_curr_local = joints_local_pair[:, 1, self.foot_joint_indices, :]  # [B,2,3]
+        foot_prev_world = foot_prev_local + prev_root_pos.unsqueeze(1)
+        foot_curr_world = foot_curr_local + curr_root_pos.unsqueeze(1)
+        foot_disp_xz = foot_curr_world[..., [0, 2]] - foot_prev_world[..., [0, 2]]  # [B,2,2]
 
-            foot_vel = (foot_curr - foot_prev) * self.fps
-            foot_speed = torch.norm(foot_vel, dim=-1)  # [B,2]
-            contact_mask = foot_speed < self.root_contact_vel_threshold
-            contact_weight = contact_mask.float()
+        contact_prob = torch.sigmoid(curr_frame[:, self.contact_slice])  # [B,2]
+        contact_mask = contact_prob >= self.root_correction_contact_threshold
+        contact_count = contact_mask.sum(dim=1, keepdim=True)  # [B,1]
+        valid = contact_count.squeeze(-1) > 0
+        if not bool(valid.any()):
+            return curr_frame, curr_root_xz
 
-            denom = contact_weight.sum(dim=-1, keepdim=True).clamp_min(1.0)
-            drift = ((foot_curr - foot_prev) * contact_weight.unsqueeze(-1)).sum(dim=1) / denom
-            has_contact = (contact_weight.sum(dim=-1, keepdim=True) > 0).float()
-            correction = drift * has_contact
+        avg_disp_xz = torch.zeros(batch_size, 2, device=device, dtype=dtype)
+        masked_disp = foot_disp_xz * contact_mask.unsqueeze(-1).to(dtype=dtype)
+        avg_disp_xz[valid] = masked_disp[valid].sum(dim=1) / contact_count[valid].to(dtype=dtype)
 
-            # Apply correction from current frame onward for continuity.
-            trans_corr[:, t:] = trans_corr[:, t:] - correction.unsqueeze(1)
+        corrected = curr_frame.clone()
+        corrected_delta_xz = corrected[:, self.delta_p_slice] - avg_disp_xz
+        corrected[:, self.delta_p_slice] = corrected_delta_xz
+        corrected_root_xz = prev_root_pos[:, [0, 2]] + corrected_delta_xz
+        return corrected, corrected_root_xz
 
-        return trans_corr
-
-    def _decode_outputs(self, pred_feats: torch.Tensor, context: dict):
-        """Decode window feature prediction into structured outputs."""
+    def _decode_outputs(self, x_pred: torch.Tensor, context: Dict) -> Dict:
         batch_size = context["batch_size"]
         seq_len = context["seq_len"]
         device = context["device"]
         dtype = context["dtype"]
-        orientation_mat = context["orientation_mat"]
         trans_init = context["trans_init"]
-        trans_gt = context["trans_gt"]
 
-        imu_feat_pred = pred_feats[..., : self.imu_feat_dim]
-        motion_pred = pred_feats[..., self.imu_feat_dim :]
+        rot_6d = x_pred[:, :, self.rot_slice].reshape(batch_size, seq_len, self.num_joints, 6)
+        rot_mat = rotation_6d_to_matrix(rot_6d.reshape(-1, 6)).reshape(batch_size, seq_len, self.num_joints, 3, 3)
 
-        offset = 0
-        v_pred = motion_pred[..., offset : offset + self.v_dim]
-        offset += self.v_dim
-        p_pred_flat = motion_pred[..., offset : offset + self.p_dim]
-        offset += self.p_dim
-
-        root_vel_local_pred = None
-        if not self.no_trans:
-            root_vel_local_pred = motion_pred[..., offset : offset + 3]
-
-        v_pred = v_pred.view(batch_size, seq_len, len(self.velocity_order), 3)
-        p_pred = p_pred_flat.view(batch_size, seq_len, len(_REDUCED_POSE_NAMES), 6)
-
-        root_R = orientation_mat[:, :, 0]
+        acc_pred = x_pred[:, :, self.acc_slice].reshape(batch_size, seq_len, self.num_human_imus, 3)
 
         if self.no_trans:
-            if trans_gt is None:
-                trans_gt = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
-            root_trans_pred = trans_gt
-            root_vel_pred = self._compute_root_velocity_from_trans(root_trans_pred)
-            root_vel_local_pred = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
+            delta_p_pred = torch.zeros(batch_size, seq_len, 0, device=device, dtype=dtype)
+            p_y_pred = torch.zeros(batch_size, seq_len, 0, device=device, dtype=dtype)
+            root_trans_pred = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
         else:
-            root_vel_local_pred = root_vel_local_pred.view(batch_size, seq_len, 3)
-            root_vel_pred = torch.matmul(root_R, root_vel_local_pred.unsqueeze(-1)).squeeze(-1)
-            root_trans_delta = torch.cumsum(root_vel_pred, dim=1) / self.fps
-            root_trans_pred = root_trans_delta + trans_init.unsqueeze(1)
+            delta_p_pred = x_pred[:, :, self.delta_p_slice]
+            p_y_pred = x_pred[:, :, self.py_slice]
 
-        joints_pos = None
-        full_glb_rotmats = None
-        full_glb_rot6d = None
-        if self.body_model is not None:
-            joints_pos = self._compute_fk_joints_batched(p_pred, orientation_mat.clone())
-            try:
-                BT = batch_size * seq_len
-                glb_pose_flat = p_pred.reshape(BT, len(_REDUCED_POSE_NAMES), 6)
-                orientation_flat = orientation_mat[:, :, : len(_SENSOR_ROT_INDICES)].reshape(
-                    BT, len(_SENSOR_ROT_INDICES), 3, 3
-                )
-                full_glb_rotmats_flat = self._reduced_glb_6d_to_full_glb_mat(glb_pose_flat, orientation_flat)
-                full_glb_rotmats = full_glb_rotmats_flat.reshape(batch_size, seq_len, self.num_joints, 3, 3)
-                full_glb_rot6d = matrix_to_rotation_6d(full_glb_rotmats_flat.reshape(-1, 3, 3)).reshape(
-                    batch_size, seq_len, self.num_joints, 6
-                )
-            except Exception as exc:
-                print(f"Failed to compute full pose rotations: {exc}")
-                full_glb_rotmats = None
-                full_glb_rot6d = None
+            xz = torch.cumsum(delta_p_pred, dim=1)
+            xz = xz + trans_init[:, [0, 2]].unsqueeze(1)
+            root_trans_pred = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
+            root_trans_pred[:, :, 0] = xz[:, :, 0]
+            root_trans_pred[:, :, 2] = xz[:, :, 1]
+            root_trans_pred[:, :, 1] = p_y_pred.squeeze(-1)
 
-        if self.enable_root_correction and (not self.no_trans) and joints_pos is not None:
-            root_trans_pred = self._correct_root_translation(root_trans_pred, joints_pos)
-            root_vel_pred = self._compute_root_velocity_from_trans(root_trans_pred)
-            if root_vel_pred is None:
-                root_vel_pred = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
-            root_vel_local_pred = torch.matmul(root_R.transpose(-1, -2), root_vel_pred.unsqueeze(-1)).squeeze(-1)
+        b_pred = x_pred[:, :, self.contact_slice]
+        b_prob_pred = torch.sigmoid(b_pred)
 
-        if joints_pos is not None:
-            lhand = joints_pos[:, :, self.hand_joint_indices[0], :] + root_trans_pred
-            rhand = joints_pos[:, :, self.hand_joint_indices[1], :] + root_trans_pred
-            pred_hand_glb_pos = torch.stack((lhand, rhand), dim=2)
-        else:
-            pred_hand_glb_pos = torch.zeros(batch_size, seq_len, 2, 3, device=device, dtype=dtype)
+        root_vel_pred = self._compute_root_velocity_from_trans(root_trans_pred)
+        root_rot = rot_mat[:, :, 0]
+        root_vel_local_pred = torch.matmul(root_rot.transpose(-1, -2), root_vel_pred.unsqueeze(-1)).squeeze(-1)
 
-        results = {
-            "pred_imu_feat": imu_feat_pred,
-            "v_pred": v_pred.reshape(batch_size, seq_len, -1),
+        reduced_global = rot_mat[:, :, _REDUCED_INDICES]
+        reduced_root = torch.matmul(root_rot.unsqueeze(2).transpose(-1, -2), reduced_global)
+        p_pred = matrix_to_rotation_6d(reduced_root.reshape(-1, 3, 3)).reshape(
+            batch_size, seq_len, len(_REDUCED_INDICES), 6
+        )
+
+        pred_joints_local = self._compute_fk_joints_from_global(rot_mat)
+        if pred_joints_local is None:
+            pred_joints_local = torch.zeros(batch_size, seq_len, self.num_joints, 3, device=device, dtype=dtype)
+
+        pred_joints_global = pred_joints_local + root_trans_pred.unsqueeze(2)
+        pred_hand_glb_pos = torch.stack(
+            [
+                pred_joints_global[:, :, self.hand_joint_indices[0]],
+                pred_joints_global[:, :, self.hand_joint_indices[1]],
+            ],
+            dim=2,
+        )
+
+        pred_imu_feat = torch.cat(
+            [
+                acc_pred.reshape(batch_size, seq_len, -1),
+                rot_6d[:, :, _SENSOR_ROT_INDICES].reshape(batch_size, seq_len, -1),
+            ],
+            dim=-1,
+        )
+
+        out = {
+            "x_pred": x_pred,
+            "R_pred_6d": rot_6d,
+            "R_pred_rotmat": rot_mat,
+            "a_pred": acc_pred,
+            "delta_p_pred": delta_p_pred,
+            "p_y_pred": p_y_pred,
+            "b_pred": b_pred,
+            "b_prob_pred": b_prob_pred,
+            "pred_imu_feat": pred_imu_feat,
+            "v_pred": torch.zeros(batch_size, seq_len, 0, device=device, dtype=dtype),
             "p_pred": p_pred,
+            "pred_full_pose_rotmat": rot_mat,
+            "pred_full_pose_6d": rot_6d,
+            "pred_joints_local": pred_joints_local,
+            "pred_joints_global": pred_joints_global,
             "pred_hand_glb_pos": pred_hand_glb_pos,
+            "root_vel_local_pred": root_vel_local_pred,
             "root_vel_pred": root_vel_pred,
             "root_trans_pred": root_trans_pred,
         }
 
-        if not self.no_trans:
-            results["root_vel_local_pred"] = root_vel_local_pred
+        if context.get("gt_joints_local") is not None:
+            out["gt_joints_local"] = context["gt_joints_local"]
+        if context.get("trans_gt") is not None:
+            out["gt_root_trans"] = context["trans_gt"]
 
-        if joints_pos is not None:
-            results["pred_joints_local"] = joints_pos
-            results["pred_joints_global"] = joints_pos + root_trans_pred.unsqueeze(2)
-        else:
-            results["pred_joints_local"] = torch.zeros(
-                batch_size, seq_len, self.num_joints, 3, device=device, dtype=dtype
-            )
-            results["pred_joints_global"] = torch.zeros_like(results["pred_joints_local"])
+        return out
 
-        if full_glb_rotmats is not None:
-            results["pred_full_pose_rotmat"] = full_glb_rotmats
-            results["pred_full_pose_6d"] = full_glb_rot6d
-        else:
-            results["pred_full_pose_rotmat"] = torch.zeros(
-                batch_size, seq_len, self.num_joints, 3, 3, device=device, dtype=dtype
-            )
-            results["pred_full_pose_6d"] = torch.zeros(
-                batch_size, seq_len, self.num_joints, 6, device=device, dtype=dtype
-            )
-
-        return results
-
-    def forward(self, data_dict: dict, gt_targets: dict | None = None):
-        """Training forward with K-step autoregressive rollout."""
-        if self.training and gt_targets is None:
-            raise ValueError("Training forward requires gt_targets")
-
-        x_seed, context = self._prepare_inputs(data_dict)
-        human_flat = context["human_flat"]
-
+    def forward(self, data_dict: Dict, gt_targets: Optional[Dict] = None):
+        """Training forward: full-window denoising only."""
         if gt_targets is None:
-            motion_target = context["motion_seed"]
-        else:
-            motion_target = self._build_motion_target_from_gt(gt_targets, context)
+            raise ValueError("HumanPoseModule forward requires gt_targets for training")
 
-        x_target = torch.cat((human_flat, motion_target), dim=-1)
+        x_clean, context = self._build_clean_window(data_dict, gt_targets)
+        add_noise = bool(self.training and self.use_diffusion_noise)
 
-        seq_len = int(context["seq_len"])
-        if seq_len < 2:
-            raise ValueError("Sequence length must be >= 2 for K-step rollout training.")
+        x0_pred, aux = self.dit(
+            cond=None,
+            x_start=x_clean,
+            add_noise=add_noise,
+        )
 
-        effective_k = min(int(self.train_rollout_k), seq_len - 1)
-        if effective_k < 1:
-            raise ValueError(
-                f"Effective rollout_k must be >= 1, got {effective_k}. "
-                f"(requested={self.train_rollout_k}, seq_len={seq_len})"
-            )
-        rollout_start = seq_len - effective_k
-
-        recon_history = x_seed.clone()
-        recon_history[..., : self.imu_feat_dim] = human_flat
-        recon_history[:, :rollout_start, self.imu_feat_dim :] = motion_target[:, :rollout_start]
-        recon_for_loss = recon_history.clone()
-
-        batch_size = int(context["batch_size"])
-        device = context["device"]
-        motion_slice = slice(self.imu_feat_dim, None)
-        rollout_frames = torch.arange(rollout_start, seq_len, device=device, dtype=torch.long)
-        rollout_t = []
-
-        last_t = None
-        last_x_t = None
-        last_x_input = None
-        last_x0_pred = None
-        last_eps_pred = None
-        last_model_out = None
-
-        for frame_idx in rollout_frames.tolist():
-            x_input, inpaint_mask_step, _, _ = self._build_step_inpaint(
-                recon_history,
-                human_flat,
-                frame_idx,
-            )
-
-            if self.use_diffusion_noise:
-                t = torch.randint(
-                    0,
-                    self.dit.timesteps,
-                    (batch_size,),
-                    device=device,
-                    dtype=torch.long,
-                )
-                x_t_noisy = self.dit.q_sample(x_target, t, noise=torch.randn_like(x_target))
-                known_noisy = self.dit.q_sample(x_input, t, noise=torch.randn_like(x_input))
-                x_t = torch.where(inpaint_mask_step, known_noisy, x_t_noisy)
-            else:
-                t = torch.zeros(batch_size, device=device, dtype=torch.long)
-                x_t = x_input
-
-            x0_pred, eps_pred, model_out = self.dit.predict(x_t=x_t, t=t, cond=None)
-            x0_projected_step = torch.where(inpaint_mask_step, x_input, x0_pred)
-
-            step_motion = x0_projected_step[:, frame_idx, motion_slice]
-            # Detach while writing history to avoid cross-step BPTT.
-            recon_history[:, frame_idx, motion_slice] = step_motion.detach()
-            recon_history[:, frame_idx, : self.imu_feat_dim] = human_flat[:, frame_idx]
-            # Keep non-detached step predictions for loss accumulation.
-            recon_for_loss[:, frame_idx, motion_slice] = step_motion
-            recon_for_loss[:, frame_idx, : self.imu_feat_dim] = human_flat[:, frame_idx]
-
-            rollout_t.append(t)
-            last_t = t
-            last_x_t = x_t
-            last_x_input = x_input
-            last_x0_pred = x0_pred
-            last_eps_pred = eps_pred
-            last_model_out = model_out
-
-        rollout_frame_mask = torch.zeros(batch_size, seq_len, device=device, dtype=torch.bool)
-        rollout_frame_mask[:, rollout_start:] = True
-        unknown_mask = torch.zeros_like(x_target, dtype=torch.bool)
-        unknown_mask[:, rollout_start:, self.imu_feat_dim :] = True
-        unknown_motion_mask = unknown_mask[..., self.imu_feat_dim :]
-        inpaint_mask = ~unknown_mask
-
-        if rollout_t:
-            rollout_t_tensor = torch.stack(rollout_t, dim=1)
-        else:
-            rollout_t_tensor = torch.zeros(batch_size, 0, device=device, dtype=torch.long)
-
-        results = self._decode_outputs(recon_for_loss, context)
-        results["diffusion_aux"] = {
-            "t": last_t,
-            "x_t": last_x_t,
-            "x0_target": x_target,
-            "x0_pred": last_x0_pred,
-            "x0_projected": recon_for_loss,
-            "eps_pred": last_eps_pred,
-            "model_out": last_model_out,
-            "inpaint_mask": inpaint_mask,
-            "unknown_mask": unknown_mask,
-            "unknown_motion_mask": unknown_motion_mask,
-            "x_input": last_x_input,
-            "rollout_k": int(effective_k),
-            "rollout_start_idx": int(rollout_start),
-            "rollout_frame_mask": rollout_frame_mask,
-            "rollout_frame_indices": rollout_frames,
-            "rollout_t": rollout_t_tensor,
-            "rollout_detach_history": True,
+        outputs = self._decode_outputs(x0_pred, context)
+        outputs["diffusion_aux"] = {
+            **aux,
+            "x0_target": x_clean,
+            "x0_pred": x0_pred,
+            "observed_dim_mask": self.observed_dim_mask,
+            "unknown_dim_mask": self.unknown_dim_mask,
             "prediction_type": self.dit.prediction_type,
         }
-        return results
+        return outputs
 
-    def _infer_autoregressive(
+    def _autoregressive_inference(
         self,
-        x_seed: torch.Tensor,
-        context: dict,
-        gt_motion: torch.Tensor,
+        observed_seq: torch.Tensor,
         *,
+        trans_init: torch.Tensor,
         steps: int,
-        sampler_name: str,
-        eta_val: float,
+        warmup_seq: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Autoregressive rollout with GT warmup history."""
-        human_flat = context["human_flat"]
-        batch_size, seq_len = x_seed.shape[:2]
-        warmup_len = self.warmup_len
+        """Autoregressive sliding-window inference with inpainting."""
+        batch_size, seq_len, feat_dim = observed_seq.shape
+        device = observed_seq.device
+        dtype = observed_seq.dtype
 
-        if seq_len <= warmup_len:
-            raise ValueError(
-                f"Sequence length {seq_len} is too short for warmup_len={warmup_len}. "
-                "Need T > window_size - 1."
-            )
+        window = self.window_size
+        if window < 1:
+            raise ValueError(f"window_size must be >= 1, got {window}")
 
-        recon = x_seed.clone()
-        recon[..., : self.imu_feat_dim] = human_flat
-        recon[:, :warmup_len, self.imu_feat_dim :] = gt_motion[:, :warmup_len]
+        unknown_idx = torch.nonzero(self.unknown_dim_mask.to(device=device), as_tuple=False).flatten()
+        unknown_dim = int(unknown_idx.numel())
 
-        for frame_idx in range(warmup_len, seq_len):
-            x_input, inpaint_mask, _, _ = self._build_step_inpaint(recon, human_flat, frame_idx)
+        history = torch.zeros(batch_size, 0, feat_dim, device=device, dtype=dtype)
+        if isinstance(warmup_seq, torch.Tensor):
+            if warmup_seq.dim() != 3 or warmup_seq.shape[0] != batch_size or warmup_seq.shape[-1] != feat_dim:
+                raise ValueError(
+                    f"warmup_seq shape mismatch, got {warmup_seq.shape}, expected [B={batch_size},T_w,{feat_dim}]"
+                )
+            if warmup_seq.shape[1] >= seq_len:
+                raise ValueError(
+                    f"warmup_seq is too long for autoregressive rollout: T_w={warmup_seq.shape[1]} vs seq_len={seq_len}"
+                )
+            history = warmup_seq.to(device=device, dtype=dtype).clone()
 
-            pred_full = self.dit.sample_inpaint(
+        last_unknown = torch.zeros(batch_size, unknown_dim, device=device, dtype=dtype)
+        prev_root_pos = trans_init.to(device=device, dtype=dtype)
+        if prev_root_pos.dim() == 1:
+            prev_root_pos = prev_root_pos.unsqueeze(0).expand(batch_size, -1)
+
+        if history.size(1) > 0:
+            if unknown_dim > 0:
+                last_unknown = history[:, -1, unknown_idx]
+
+            if not self.no_trans and self.delta_p_dim >= 2:
+                warmup_delta_xz = history[:, :, self.delta_p_slice]
+                warmup_xz = torch.cumsum(warmup_delta_xz, dim=1) + prev_root_pos[:, [0, 2]].unsqueeze(1)
+                prev_root_pos = prev_root_pos.clone()
+                prev_root_pos[:, 0] = warmup_xz[:, -1, 0]
+                prev_root_pos[:, 2] = warmup_xz[:, -1, 1]
+                if self.py_dim > 0:
+                    prev_root_pos[:, 1] = history[:, -1, self.py_slice].squeeze(-1)
+
+        for frame_idx in range(int(history.size(1)), seq_len):
+            current = observed_seq[:, frame_idx].clone()
+            if unknown_dim > 0:
+                current[:, unknown_idx] = last_unknown
+
+            if window > 1:
+                hist = history[:, -(window - 1) :] if history.size(1) > 0 else history
+                hist_len = int(hist.size(1))
+                if hist_len < (window - 1):
+                    pad_count = (window - 1) - hist_len
+                    if hist_len > 0:
+                        pad_src = hist[:, :1]
+                    else:
+                        pad_src = current.unsqueeze(1)
+                    pad = pad_src.expand(batch_size, pad_count, feat_dim)
+                    hist = torch.cat([pad, hist], dim=1)
+                x_input = torch.cat([hist, current.unsqueeze(1)], dim=1)
+            else:
+                x_input = current.unsqueeze(1)
+
+            inpaint_mask = torch.ones_like(x_input, dtype=torch.bool)
+            if unknown_dim > 0:
+                inpaint_mask[:, -1, unknown_idx] = False
+
+            x_out = self.dit.sample_inpaint_x0(
                 x_input=x_input,
                 inpaint_mask=inpaint_mask,
                 cond=None,
-                x_start=x_input,
                 steps=steps,
-                sampler=sampler_name,
-                eta=eta_val,
             )
 
-            recon[:, frame_idx, self.imu_feat_dim :] = pred_full[:, frame_idx, self.imu_feat_dim :]
-            recon[:, frame_idx, : self.imu_feat_dim] = human_flat[:, frame_idx]
+            current_pred = x_out[:, -1]
+            if unknown_dim > 0:
+                last_unknown = current_pred[:, unknown_idx]
+                current[:, unknown_idx] = last_unknown
 
-        return recon
+            if not self.no_trans and self.delta_p_dim >= 2:
+                curr_delta_xz = current[:, self.delta_p_slice]
+                curr_root_xz = prev_root_pos[:, [0, 2]] + curr_delta_xz
+                if self.enable_root_correction and frame_idx > 0 and history.size(1) > 0:
+                    corrected_current, corrected_root_xz = self._apply_root_correction_step(
+                        prev_frame=history[:, -1],
+                        curr_frame=current,
+                        prev_root_pos=prev_root_pos,
+                        curr_root_xz=curr_root_xz,
+                    )
+                    current = corrected_current
+                    curr_root_xz = corrected_root_xz
+                    if unknown_dim > 0:
+                        last_unknown = current[:, unknown_idx]
+
+                curr_root_pos = prev_root_pos.clone()
+                curr_root_pos[:, 0] = curr_root_xz[:, 0]
+                curr_root_pos[:, 2] = curr_root_xz[:, 1]
+                if self.py_dim > 0:
+                    curr_root_pos[:, 1] = current[:, self.py_slice].squeeze(-1)
+                prev_root_pos = curr_root_pos
+
+            history = torch.cat([history, current.unsqueeze(1)], dim=1)
+
+        return history
 
     @torch.no_grad()
     def inference(
         self,
-        data_dict: dict,
-        gt_targets: dict | None = None,
-        sample_steps: int | None = None,
-        sampler: str | None = None,
-        eta: float | None = None,
+        data_dict: Dict,
+        gt_targets: Optional[Dict] = None,
+        sample_steps: Optional[int] = None,
+        sampler: Optional[str] = None,
+        eta: Optional[float] = None,
     ):
-        """Inference with GT-warmup autoregressive rollout."""
-        if gt_targets is None:
-            raise ValueError("Stage-1 inference requires gt_targets for GT warmup history.")
-        if not isinstance(gt_targets.get("sensor_vel_root"), torch.Tensor):
-            raise ValueError("gt_targets['sensor_vel_root'] is required for Stage-1 GT warmup.")
-        if not isinstance(gt_targets.get("ori_root_reduced"), torch.Tensor):
-            raise ValueError("gt_targets['ori_root_reduced'] is required for Stage-1 GT warmup.")
-        if (not self.no_trans) and (
-            not isinstance(gt_targets.get("root_vel"), torch.Tensor)
-            and not isinstance(gt_targets.get("trans"), torch.Tensor)
-        ):
-            raise ValueError("gt_targets must provide 'root_vel' or 'trans' for Stage-1 GT warmup.")
+        """Inference with autoregressive sliding-window inpainting."""
+        del sampler, eta  # Inference uses x0 iterative inpainting only.
 
-        x_seed, context = self._prepare_inputs(data_dict)
-        gt_motion = self._build_motion_target_from_gt(gt_targets, context)
-        steps = sample_steps if sample_steps is not None else self.inference_steps
+        observed_seq, context = self._build_observed_sequence(data_dict, gt_targets)
+
+        steps = self.inference_steps if sample_steps is None else int(sample_steps)
         if steps is None:
             steps = self.dit.timesteps
         steps = int(steps)
 
-        sampler_name = self.inference_sampler if sampler is None else str(sampler).lower()
-        eta_val = self.inference_eta if eta is None else float(eta)
-        pred_full = self._infer_autoregressive(
-            x_seed,
-            context,
-            gt_motion=gt_motion,
-            steps=steps,
-            sampler_name=sampler_name,
-            eta_val=eta_val,
-        )
+        warmup_seq = None
+        warmup_len = 0
+        seq_len = int(observed_seq.shape[1])
+        if (
+            (not self.training)
+            and self.test_use_gt_warmup
+            and isinstance(gt_targets, dict)
+            and isinstance(gt_targets.get("rotation_global"), torch.Tensor)
+        ):
+            gt_clean_seq, _ = self._build_clean_window(data_dict, gt_targets)
+            max_warmup = max(seq_len, 1) - 1
+            warmup_len = min(max(self.window_size - 1, 0), max_warmup)
+            if warmup_len > 0:
+                warmup_seq = gt_clean_seq[:, :warmup_len]
 
-        results = self._decode_outputs(pred_full, context)
-        results["diffusion_aux"] = {
+        pred_seq = self._autoregressive_inference(
+            observed_seq,
+            trans_init=context["trans_init"],
+            steps=steps,
+            warmup_seq=warmup_seq,
+        )
+        outputs = self._decode_outputs(pred_seq, context)
+        outputs["diffusion_aux"] = {
             "inference_steps": steps,
-            "sampler": sampler_name,
-            "eta": eta_val,
             "window_size": self.window_size,
-            "warmup_len": self.warmup_len,
+            "warmup_len": int(warmup_len),
+            "warmup_mode": "gt_prefix" if warmup_len > 0 else "none",
+            "observed_dim_mask": self.observed_dim_mask,
+            "unknown_dim_mask": self.unknown_dim_mask,
             "prediction_type": self.dit.prediction_type,
+            "inference_mode": "autoregressive_inpaint_x0",
+            "root_correction_enabled": bool(self.enable_root_correction and (not self.no_trans)),
+            "root_correction_contact_threshold": float(self.root_correction_contact_threshold),
         }
-        return results
+        return outputs
 
     @staticmethod
     def empty_output(
-        batch_size: int, seq_len: int, device: torch.device, no_trans: bool = False, num_joints: int = 24
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+        no_trans: bool = False,
+        num_joints: int = 24,
     ):
-        results = {
-            "pred_imu_feat": torch.zeros(batch_size, seq_len, len(_SENSOR_NAMES) * 9, device=device),
-            "v_pred": torch.zeros(batch_size, seq_len, len(_SENSOR_VEL_NAMES) * 3, device=device),
-            "p_pred": torch.zeros(batch_size, seq_len, len(_REDUCED_POSE_NAMES), 6, device=device),
-            "pred_hand_glb_pos": torch.zeros(batch_size, seq_len, 2, 3, device=device),
-            "root_vel_pred": torch.zeros(batch_size, seq_len, 3, device=device),
-            "root_trans_pred": torch.zeros(batch_size, seq_len, 3, device=device),
-            "pred_joints_local": torch.zeros(batch_size, seq_len, num_joints, 3, device=device),
-            "pred_joints_global": torch.zeros(batch_size, seq_len, num_joints, 3, device=device),
+        rot_dim = num_joints * 6
+        return {
+            "x_pred": torch.zeros(batch_size, seq_len, rot_dim + 18 + (0 if no_trans else 3) + 2, device=device),
+            "R_pred_6d": torch.zeros(batch_size, seq_len, num_joints, 6, device=device),
+            "R_pred_rotmat": torch.zeros(batch_size, seq_len, num_joints, 3, 3, device=device),
+            "a_pred": torch.zeros(batch_size, seq_len, 6, 3, device=device),
+            "delta_p_pred": torch.zeros(batch_size, seq_len, 0 if no_trans else 2, device=device),
+            "p_y_pred": torch.zeros(batch_size, seq_len, 0 if no_trans else 1, device=device),
+            "b_pred": torch.zeros(batch_size, seq_len, 2, device=device),
+            "b_prob_pred": torch.zeros(batch_size, seq_len, 2, device=device),
+            "pred_imu_feat": torch.zeros(batch_size, seq_len, 6 * 9, device=device),
+            "v_pred": torch.zeros(batch_size, seq_len, 0, device=device),
+            "p_pred": torch.zeros(batch_size, seq_len, len(_REDUCED_INDICES), 6, device=device),
             "pred_full_pose_rotmat": torch.zeros(batch_size, seq_len, num_joints, 3, 3, device=device),
             "pred_full_pose_6d": torch.zeros(batch_size, seq_len, num_joints, 6, device=device),
+            "pred_joints_local": torch.zeros(batch_size, seq_len, num_joints, 3, device=device),
+            "pred_joints_global": torch.zeros(batch_size, seq_len, num_joints, 3, device=device),
+            "pred_hand_glb_pos": torch.zeros(batch_size, seq_len, 2, 3, device=device),
+            "root_vel_local_pred": torch.zeros(batch_size, seq_len, 3, device=device),
+            "root_vel_pred": torch.zeros(batch_size, seq_len, 3, device=device),
+            "root_trans_pred": torch.zeros(batch_size, seq_len, 3, device=device),
             "diffusion_aux": {},
         }
-        if not no_trans:
-            results["root_vel_local_pred"] = torch.zeros(batch_size, seq_len, 3, device=device)
-        return results
