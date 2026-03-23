@@ -398,6 +398,10 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
             try:
                 model_input = build_model_input_dict(batch_device, config, device, add_noise=False)
                 model_arch = str(getattr(config, "model_arch", "rnn")).lower()
+                interaction_human_source = str(getattr(viewer, "interaction_human_source", "pred")).lower()
+                if interaction_human_source not in {"pred", "gt"}:
+                    interaction_human_source = "pred"
+                interaction_use_human_pred = interaction_human_source != "gt"
                 want_object_predictions = bool(
                     has_object_bool and (show_objects or show_obj_traj or compare_3 or use_fk)
                 )
@@ -410,6 +414,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                             gt_targets=batch_device,
                             use_object_data=use_object_data,
                             compute_fk=compute_fk,
+                            interaction_use_human_pred=interaction_use_human_pred,
                         )
                     return model(model_input, use_object_data=use_object_data, compute_fk=compute_fk)
 
@@ -453,6 +458,8 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                 pred_obj_trans_fk_seq = pred_dict["pred_obj_trans_fk"][bs].to(device)
 
             pred_hand_contact_prob_all = pred_dict.get("pred_hand_contact_prob")
+            if pred_hand_contact_prob_all is None:
+                pred_hand_contact_prob_all = pred_dict.get("contact_prob_pred")
             if pred_hand_contact_prob_all is not None:
                 pred_hand_contact_prob_seq = pred_hand_contact_prob_all[bs].to(device)
                 if pred_hand_contact_prob_seq.shape[-1] >= 2:
@@ -784,7 +791,7 @@ class InteractiveViewer(Viewer):
     def __init__(self, data_list, model, smpl_model, config, device, obj_geo_root, 
                  show_objects=True, vis_gt_only=False, show_foot_contact=False,
                  show_obj_traj=False, show_hand_traj=False, use_fk=False, compare_3=False, 
-                 pred_offset=None, no_trans=False, overlay_frames=None, **kwargs):
+                 pred_offset=None, no_trans=False, overlay_frames=None, interaction_human_source="pred", **kwargs):
         super().__init__(**kwargs)
         self.data_list = data_list
         self.current_index = 0
@@ -803,6 +810,7 @@ class InteractiveViewer(Viewer):
         self.pred_offset = pred_offset
         self.no_trans = no_trans
         self.overlay_frames = overlay_frames
+        self.interaction_human_source = str(interaction_human_source).lower()
         self.virtual_bone_info = {'has_data': False}
         
         self.visualize_current_sequence()
@@ -889,6 +897,13 @@ def main():
     parser.add_argument('--show_hand_traj', action='store_true', help='Show hand contact trajectory')
     parser.add_argument('--use_fk', action='store_true', help='Enable FK branch')
     parser.add_argument('--compare_3', action='store_true', help='Compare three object branches')
+    parser.add_argument(
+        '--interaction_human_source',
+        type=str,
+        default='pred',
+        choices=['pred', 'gt'],
+        help='Human source for interaction branch: pred=use HumanPose output, gt=use GT human states',
+    )
     parser.add_argument('--limit_sequences', type=int, default=None, help='Limit number of loaded sequences')
     parser.add_argument('--pred_offset', type=float, nargs=3, default=[3.0, 0.0, 0.0], help='Prediction translation offset')
     parser.add_argument('--overlay_frames', type=int, nargs='+', default=None, help='Overlay selected 0-based frames in one scene')
@@ -898,6 +913,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     print(f"Mode: {'noTrans' if args.no_trans else 'Normal'}")
+    print(f"Interaction human source: {args.interaction_human_source}")
 
     print(f"Loading config from: {args.config}")
     config = load_config(args.config)
@@ -931,6 +947,7 @@ def main():
             data_dir=test_data_input,
             window_size=test_window_size,
             debug=dataset_debug,
+            simulate_imu_noise=True,
             full_sequence=True
         )
     elif os.path.isfile(test_data_input) and test_data_input.lower().endswith(".pt"):
@@ -943,6 +960,7 @@ def main():
             window_size=test_window_size,
             debug=dataset_debug,
             full_sequence=True,
+            simulate_imu_noise=True,
             sequence_paths=[target_pt],
         )
         if len(test_dataset.sequence_info) != 1:
@@ -1028,6 +1046,7 @@ def main():
         pred_offset=pred_offset_np,
         no_trans=args.no_trans,
         overlay_frames=args.overlay_frames,
+        interaction_human_source=args.interaction_human_source,
         window_size=(1920, 1080)
     )
     

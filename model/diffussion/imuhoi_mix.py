@@ -1,16 +1,27 @@
 """
-Stage-1 HumanPose diffusion module.
+Unified IMUHOI diffusion module (single DiT).
+
+Feature definition per frame:
+    x_frame = (
+        R_{human+obj},
+        a_{human+obj},
+        delta_p_root_2d,
+        p_root_y,
+        b_foot_contact,
+        contact_prob_hand,
+        v_bone_dir,
+        l_bone_len,
+        delta_p_obj,
+    )
 
 Training:
-- Full-window denoising only: x -> z_t -> x0_pred over all frames.
-- No autoregressive rollout, no teacher forcing, no training-time masks.
+- Full-window denoising only.
 
 Inference:
 - Autoregressive sliding-window inpainting.
-- History frames are fixed.
-- Current frame only keeps observed dimensions fixed.
-- Unknown dimensions are refined with configurable inpainting backend
-  (`sample_inpaint_x0` or `sample_inpaint`).
+- Observed dims are IMU-only:
+  - human IMU-joint rotations + human IMU accelerations
+  - object IMU rotation + object IMU acceleration
 """
 from __future__ import annotations
 
@@ -31,8 +42,8 @@ from configs import (
 )
 
 
-class HumanPoseModule(nn.Module):
-    """Diffusion Transformer for Stage-1 human pose reconstruction."""
+class IMUHOIMixModule(nn.Module):
+    """Single DiT for joint human pose + interaction reconstruction."""
 
     def __init__(self, cfg, device, no_trans: bool = False):
         super().__init__()
@@ -42,6 +53,7 @@ class HumanPoseModule(nn.Module):
         self.num_joints = int(getattr(cfg, "num_joints", 24))
         self.num_human_imus = int(getattr(cfg, "num_human_imus", len(_SENSOR_NAMES)))
         self.imu_dim = int(getattr(cfg, "imu_dim", 9))
+        self.obj_imu_dim = int(getattr(cfg, "obj_imu_dim", self.imu_dim))
         self.fps = float(getattr(cfg, "frame_rate", FRAME_RATE))
 
         self.hand_joint_indices = (20, 21)
@@ -51,13 +63,24 @@ class HumanPoseModule(nn.Module):
             dtype=torch.long,
         )
 
-        # Feature definition per frame:
-        # x_frame = [R_all_joints_global, a_imu6, delta_p_xz, p_y, b_foot2]
-        self.rot_dim = self.num_joints * 6
-        self.acc_dim = self.num_human_imus * 3
+        # x_frame = [R_{human+obj}, a_{human+obj}, delta_p_root_2d, p_root_y, b,
+        #            contact_prob, v_bone, l_bone, delta_p_obj]
+        self.human_rot_dim = self.num_joints * 6
+        self.obj_rot_dim = 6
+        self.rot_dim = self.human_rot_dim + self.obj_rot_dim
+
+        self.human_acc_dim = self.num_human_imus * 3
+        self.obj_acc_dim = 3
+        self.acc_dim = self.human_acc_dim + self.obj_acc_dim
+
         self.delta_p_dim = 0 if self.no_trans else 2
         self.py_dim = 0 if self.no_trans else 1
+        self.b_dim = 2
+
         self.contact_dim = 2
+        self.bone_dir_dim = 6
+        self.bone_len_dim = 2
+        self.delta_p_obj_dim = 3
 
         start = 0
         self.rot_slice = slice(start, start + self.rot_dim)
@@ -68,15 +91,27 @@ class HumanPoseModule(nn.Module):
         start += self.delta_p_dim
         self.py_slice = slice(start, start + self.py_dim)
         start += self.py_dim
+        self.b_slice = slice(start, start + self.b_dim)
+        start += self.b_dim
         self.contact_slice = slice(start, start + self.contact_dim)
         start += self.contact_dim
+        self.bone_dir_slice = slice(start, start + self.bone_dir_dim)
+        start += self.bone_dir_dim
+        self.bone_len_slice = slice(start, start + self.bone_len_dim)
+        start += self.bone_len_dim
+        self.delta_p_obj_slice = slice(start, start + self.delta_p_obj_dim)
+        start += self.delta_p_obj_dim
         self.target_dim = start
 
-        # Observed dims at inference: IMU-joint rotations + IMU accelerations.
+        # Observed dims at inference (IMU-only):
+        # - human IMU-joint rotations
+        # - object rotation from object IMU
+        # - human/object accelerations
         observed_dim_mask = torch.zeros(self.target_dim, dtype=torch.bool)
         for j in _SENSOR_ROT_INDICES:
             rot_j = slice(j * 6, (j + 1) * 6)
             observed_dim_mask[rot_j] = True
+        observed_dim_mask[self.human_rot_dim : self.rot_dim] = True
         observed_dim_mask[self.acc_slice] = True
 
         unknown_dim_mask = ~observed_dim_mask
@@ -101,6 +136,7 @@ class HumanPoseModule(nn.Module):
         self.use_diffusion_noise = bool(_dit_param("dit_use_noise", True))
         self.inference_steps = _dit_param("dit_inference_steps", None)
         self.inference_steps = int(self.inference_steps) if self.inference_steps is not None else None
+
         inference_type_raw = str(_dit_param("dit_inference_type", "sample_inpaint_x0")).lower()
         if inference_type_raw in {"sample_inpaint_x0", "inpaint_x0", "x0"}:
             self.inference_type = "sample_inpaint_x0"
@@ -118,7 +154,6 @@ class HumanPoseModule(nn.Module):
         self.enable_root_correction = bool((not self.no_trans) and _dit_param("dit_enable_root_correction", False))
         self.root_correction_contact_threshold = float(_dit_param("dit_root_correction_contact_threshold", 0.5))
         self.root_correction_contact_threshold = min(max(self.root_correction_contact_threshold, 0.0), 1.0)
-        # Test-time option: seed autoregressive inference with GT warmup frames.
         self.test_use_gt_warmup = bool(_dit_param("dit_test_use_gt_warmup", True))
 
         prediction_type = str(_dit_param("dit_prediction_type", "x0")).lower()
@@ -184,13 +219,109 @@ class HumanPoseModule(nn.Module):
 
         return out
 
+    @staticmethod
+    def _prepare_has_object_mask(
+        has_object,
+        *,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if has_object is None:
+            return torch.ones(batch_size, seq_len, device=device, dtype=torch.bool)
+
+        if isinstance(has_object, torch.Tensor):
+            mask = has_object.to(device=device, dtype=torch.bool)
+        else:
+            mask = torch.as_tensor(has_object, device=device, dtype=torch.bool)
+
+        if mask.dim() == 0:
+            mask = mask.view(1)
+        if mask.dim() == 1:
+            if mask.shape[0] == 1 and batch_size > 1:
+                mask = mask.expand(batch_size)
+            if mask.shape[0] != batch_size:
+                mask = mask[:1].expand(batch_size)
+            mask = mask.view(batch_size, 1).expand(batch_size, seq_len)
+        elif mask.dim() == 2:
+            if mask.shape[0] == 1 and batch_size > 1:
+                mask = mask.expand(batch_size, mask.shape[1])
+            if mask.shape[0] != batch_size:
+                mask = mask[:1].expand(batch_size, mask.shape[1])
+            if mask.shape[1] == 1 and seq_len > 1:
+                mask = mask.expand(batch_size, seq_len)
+            elif mask.shape[1] != seq_len:
+                mask = mask[:, :1].expand(batch_size, seq_len)
+        else:
+            mask = mask.reshape(batch_size, -1)
+            if mask.shape[1] == 1:
+                mask = mask.expand(batch_size, seq_len)
+            else:
+                mask = mask[:, :seq_len]
+                if mask.shape[1] < seq_len:
+                    pad = mask[:, -1:].expand(batch_size, seq_len - mask.shape[1])
+                    mask = torch.cat([mask, pad], dim=1)
+
+        return mask
+
+    def _prepare_human_imu(self, human_imu: torch.Tensor) -> torch.Tensor:
+        if human_imu.dim() != 4:
+            raise ValueError(f"human_imu must be [B,T,N,D], got {human_imu.shape}")
+
+        batch_size, seq_len = human_imu.shape[:2]
+        device = human_imu.device
+        dtype = human_imu.dtype
+
+        out = human_imu
+        if out.shape[2] > self.num_human_imus:
+            out = out[:, :, : self.num_human_imus]
+        elif out.shape[2] < self.num_human_imus:
+            pad = torch.zeros(
+                batch_size,
+                seq_len,
+                self.num_human_imus - out.shape[2],
+                out.shape[3],
+                device=device,
+                dtype=dtype,
+            )
+            out = torch.cat([out, pad], dim=2)
+
+        if out.shape[3] < 9:
+            pad = torch.zeros(batch_size, seq_len, self.num_human_imus, 9 - out.shape[3], device=device, dtype=dtype)
+            out = torch.cat([out, pad], dim=3)
+        elif out.shape[3] > 9:
+            out = out[..., :9]
+
+        return out
+
+    def _prepare_obj_imu(self, obj_imu, *, batch_size: int, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if not isinstance(obj_imu, torch.Tensor):
+            return torch.zeros(batch_size, seq_len, 9, device=device, dtype=dtype)
+
+        out = obj_imu.to(device=device, dtype=dtype)
+        if out.dim() == 4:
+            out = out.reshape(batch_size, seq_len, -1)
+        if out.dim() != 3:
+            return torch.zeros(batch_size, seq_len, 9, device=device, dtype=dtype)
+        if out.shape[0] == 1 and batch_size > 1:
+            out = out.expand(batch_size, -1, -1)
+        if out.shape[0] != batch_size or out.shape[1] != seq_len:
+            return torch.zeros(batch_size, seq_len, 9, device=device, dtype=dtype)
+
+        if out.shape[-1] < 9:
+            pad = torch.zeros(batch_size, seq_len, 9 - out.shape[-1], device=device, dtype=dtype)
+            out = torch.cat([out, pad], dim=-1)
+        elif out.shape[-1] > 9:
+            out = out[..., :9]
+
+        return out
+
     def _ensure_body_model_device(self, device: torch.device):
         if self.body_model is not None and self.body_model_device != device:
             self.body_model = self.body_model.to(device)
             self.body_model_device = device
 
     def _imu_global_rotation(self, human_imu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Convert IMU orientations from root-relative format to global format."""
         batch_size, seq_len = human_imu.shape[:2]
 
         imu_rot6d = human_imu[..., 3:9]
@@ -223,10 +354,6 @@ class HumanPoseModule(nn.Module):
         return local_rotmats
 
     def _compute_fk_joints_from_global(self, full_global_rotmats: torch.Tensor) -> Optional[torch.Tensor]:
-        """
-        Differentiable FK via BodyModel:
-        global R -> local pose -> BodyModel(Jtr)
-        """
         if self.body_model is None:
             return None
 
@@ -290,12 +417,43 @@ class HumanPoseModule(nn.Module):
 
         return torch.zeros(batch_size, 3, device=device, dtype=dtype)
 
+    def _resolve_obj_trans_init(
+        self,
+        data_dict: Dict,
+        gt_targets: Optional[Dict],
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        obj_trans_init = data_dict.get("obj_trans_init")
+        if isinstance(obj_trans_init, torch.Tensor):
+            obj_trans_init = obj_trans_init.to(device=device, dtype=dtype)
+            if obj_trans_init.dim() == 3 and obj_trans_init.size(1) == 1:
+                obj_trans_init = obj_trans_init[:, 0]
+            if obj_trans_init.dim() == 1:
+                obj_trans_init = obj_trans_init.unsqueeze(0)
+            if obj_trans_init.shape[0] == 1 and batch_size > 1:
+                obj_trans_init = obj_trans_init.expand(batch_size, -1)
+            if obj_trans_init.shape[0] == batch_size and obj_trans_init.shape[-1] == 3:
+                return obj_trans_init
+
+        if isinstance(gt_targets, dict) and isinstance(gt_targets.get("obj_trans"), torch.Tensor):
+            obj_trans = gt_targets["obj_trans"].to(device=device, dtype=dtype)
+            if obj_trans.dim() == 2:
+                obj_trans = obj_trans.unsqueeze(0)
+            if obj_trans.shape[0] == 1 and batch_size > 1:
+                obj_trans = obj_trans.expand(batch_size, -1, -1)
+            if obj_trans.shape[0] == batch_size and obj_trans.shape[1] > 0:
+                return obj_trans[:, 0]
+
+        return torch.zeros(batch_size, 3, device=device, dtype=dtype)
+
     def _build_clean_window(self, data_dict: Dict, gt_targets: Dict) -> Tuple[torch.Tensor, Dict]:
-        """Build full clean window x from GT for training."""
         if not isinstance(gt_targets, dict):
             raise ValueError("gt_targets must be provided for full-window diffusion training")
 
-        human_imu = data_dict["human_imu"]
+        human_imu = self._prepare_human_imu(data_dict["human_imu"])
         if human_imu.dim() != 4:
             raise ValueError(f"human_imu must be [B,T,N,D], got {human_imu.shape}")
 
@@ -306,7 +464,17 @@ class HumanPoseModule(nn.Module):
         self._ensure_body_model_device(device)
 
         imu_rotm_global, imu_rot6d_global = self._imu_global_rotation(human_imu)
-        imu_acc_flat = human_imu[..., :3].reshape(batch_size, seq_len, -1)
+        human_acc = human_imu[..., :3].reshape(batch_size, seq_len, -1)
+
+        obj_imu = self._prepare_obj_imu(
+            data_dict.get("obj_imu"),
+            batch_size=batch_size,
+            seq_len=seq_len,
+            device=device,
+            dtype=dtype,
+        )
+        obj_rot6d = obj_imu[..., 3:9]
+        obj_acc = obj_imu[..., :3]
 
         rot_global = gt_targets.get("rotation_global")
         if not isinstance(rot_global, torch.Tensor):
@@ -317,7 +485,6 @@ class HumanPoseModule(nn.Module):
             rot_global = rot_global.unsqueeze(0)
         if rot_global.shape[0] == 1 and batch_size > 1:
             rot_global = rot_global.expand(batch_size, -1, -1, -1, -1)
-
         if rot_global.shape[0] != batch_size or rot_global.shape[1] != seq_len:
             raise ValueError(
                 f"rotation_global shape mismatch, got {rot_global.shape}, expected [B={batch_size},T={seq_len},J,3,3]"
@@ -332,10 +499,17 @@ class HumanPoseModule(nn.Module):
             rot_global = torch.cat([rot_global, pad], dim=2)
 
         rot_global_6d = matrix_to_rotation_6d(rot_global.reshape(-1, 3, 3)).reshape(batch_size, seq_len, self.num_joints, 6)
-
-        # Replace IMU joints with observed IMU global rotations.
         rot_global_6d[:, :, _SENSOR_ROT_INDICES] = imu_rot6d_global
         rot_global = rotation_6d_to_matrix(rot_global_6d.reshape(-1, 6)).reshape(batch_size, seq_len, self.num_joints, 3, 3)
+
+        rot_human_obj = torch.cat(
+            [
+                rot_global_6d.reshape(batch_size, seq_len, -1),
+                obj_rot6d,
+            ],
+            dim=-1,
+        )
+        acc_human_obj = torch.cat([human_acc, obj_acc], dim=-1)
 
         trans = self._to_bt(
             gt_targets.get("trans"),
@@ -356,36 +530,143 @@ class HumanPoseModule(nn.Module):
                 delta_p[:, 1:] = trans[:, 1:, [0, 2]] - trans[:, :-1, [0, 2]]
             p_y = trans[:, :, 1:2]
 
-        lfoot_contact = self._to_bt(
-            gt_targets.get("lfoot_contact"),
-            batch_size=batch_size,
-            seq_len=seq_len,
-            trailing_shape=(),
-            device=device,
-            dtype=dtype,
-            default=0.0,
-        )
-        rfoot_contact = self._to_bt(
-            gt_targets.get("rfoot_contact"),
-            batch_size=batch_size,
-            seq_len=seq_len,
-            trailing_shape=(),
-            device=device,
-            dtype=dtype,
-            default=0.0,
-        )
-        b = torch.stack([lfoot_contact, rfoot_contact], dim=-1).clamp(0.0, 1.0)
+        b = torch.stack(
+            [
+                self._to_bt(
+                    gt_targets.get("lfoot_contact"),
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    trailing_shape=(),
+                    device=device,
+                    dtype=dtype,
+                    default=0.0,
+                ),
+                self._to_bt(
+                    gt_targets.get("rfoot_contact"),
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    trailing_shape=(),
+                    device=device,
+                    dtype=dtype,
+                    default=0.0,
+                ),
+            ],
+            dim=-1,
+        ).clamp(0.0, 1.0)
 
-        x_parts = [
-            rot_global_6d.reshape(batch_size, seq_len, -1),
-            imu_acc_flat,
-        ]
+        contact_prob = torch.stack(
+            [
+                self._to_bt(
+                    gt_targets.get("lhand_contact"),
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    trailing_shape=(),
+                    device=device,
+                    dtype=dtype,
+                    default=0.0,
+                ),
+                self._to_bt(
+                    gt_targets.get("rhand_contact"),
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    trailing_shape=(),
+                    device=device,
+                    dtype=dtype,
+                    default=0.0,
+                ),
+            ],
+            dim=-1,
+        ).clamp(0.0, 1.0)
+
+        bone_dir = torch.cat(
+            [
+                self._to_bt(
+                    gt_targets.get("lhand_obj_direction"),
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    trailing_shape=(3,),
+                    device=device,
+                    dtype=dtype,
+                    default=0.0,
+                ),
+                self._to_bt(
+                    gt_targets.get("rhand_obj_direction"),
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    trailing_shape=(3,),
+                    device=device,
+                    dtype=dtype,
+                    default=0.0,
+                ),
+            ],
+            dim=-1,
+        )
+
+        bone_len = torch.stack(
+            [
+                self._to_bt(
+                    gt_targets.get("lhand_lb"),
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    trailing_shape=(),
+                    device=device,
+                    dtype=dtype,
+                    default=0.0,
+                ),
+                self._to_bt(
+                    gt_targets.get("rhand_lb"),
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    trailing_shape=(),
+                    device=device,
+                    dtype=dtype,
+                    default=0.0,
+                ),
+            ],
+            dim=-1,
+        )
+
+        obj_trans = self._to_bt(
+            gt_targets.get("obj_trans"),
+            batch_size=batch_size,
+            seq_len=seq_len,
+            trailing_shape=(3,),
+            device=device,
+            dtype=dtype,
+            default=0.0,
+        )
+        delta_p_obj = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
+        if seq_len > 1:
+            delta_p_obj[:, 1:] = obj_trans[:, 1:] - obj_trans[:, :-1]
+
+        has_object_mask = self._prepare_has_object_mask(
+            data_dict.get("has_object") if isinstance(data_dict, dict) else None,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            device=device,
+        )
+
+        # Keep object-related terms zero for no-object frames/samples.
+        obj_mask = has_object_mask.to(device=device, dtype=dtype).unsqueeze(-1)
+        contact_prob = contact_prob * obj_mask
+        bone_dir = bone_dir * obj_mask
+        bone_len = bone_len * obj_mask
+        delta_p_obj = delta_p_obj * obj_mask
+
+        x_parts = [rot_human_obj, acc_human_obj]
         if not self.no_trans:
             x_parts.extend([delta_p, p_y])
-        x_parts.append(b)
+        x_parts.extend([b, contact_prob, bone_dir, bone_len, delta_p_obj])
         x_clean = torch.cat(x_parts, dim=-1)
 
         trans_init = self._resolve_trans_init(
+            data_dict,
+            gt_targets,
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
+        )
+        obj_trans_init = self._resolve_obj_trans_init(
             data_dict,
             gt_targets,
             batch_size=batch_size,
@@ -401,16 +682,18 @@ class HumanPoseModule(nn.Module):
             "device": device,
             "dtype": dtype,
             "trans_init": trans_init,
+            "obj_trans_init": obj_trans_init,
             "trans_gt": trans,
+            "obj_trans_gt": obj_trans,
             "gt_joints_local": gt_joints_local,
             "human_imu": human_imu,
             "imu_rotm_global": imu_rotm_global,
+            "has_object_mask": has_object_mask,
         }
         return x_clean, context
 
     def _build_observed_sequence(self, data_dict: Dict, gt_targets: Optional[Dict]) -> Tuple[torch.Tensor, Dict]:
-        """Build observed-only sequence for autoregressive inference."""
-        human_imu = data_dict["human_imu"]
+        human_imu = self._prepare_human_imu(data_dict["human_imu"])
         if human_imu.dim() != 4:
             raise ValueError(f"human_imu must be [B,T,N,D], got {human_imu.shape}")
 
@@ -421,12 +704,23 @@ class HumanPoseModule(nn.Module):
         self._ensure_body_model_device(device)
 
         imu_rotm_global, imu_rot6d_global = self._imu_global_rotation(human_imu)
-        imu_acc_flat = human_imu[..., :3].reshape(batch_size, seq_len, -1)
+        human_acc = human_imu[..., :3].reshape(batch_size, seq_len, -1)
+
+        obj_imu = self._prepare_obj_imu(
+            data_dict.get("obj_imu"),
+            batch_size=batch_size,
+            seq_len=seq_len,
+            device=device,
+            dtype=dtype,
+        )
+        obj_rot6d = obj_imu[..., 3:9]
+        obj_acc = obj_imu[..., :3]
 
         observed = torch.zeros(batch_size, seq_len, self.target_dim, device=device, dtype=dtype)
         for local_idx, joint_idx in enumerate(_SENSOR_ROT_INDICES):
             observed[:, :, joint_idx * 6 : (joint_idx + 1) * 6] = imu_rot6d_global[:, :, local_idx]
-        observed[:, :, self.acc_slice] = imu_acc_flat
+        observed[:, :, self.human_rot_dim : self.rot_dim] = obj_rot6d
+        observed[:, :, self.acc_slice] = torch.cat([human_acc, obj_acc], dim=-1)
 
         trans_init = self._resolve_trans_init(
             data_dict,
@@ -435,6 +729,31 @@ class HumanPoseModule(nn.Module):
             device=device,
             dtype=dtype,
         )
+        obj_trans_init = self._resolve_obj_trans_init(
+            data_dict,
+            gt_targets,
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
+        )
+        has_object_mask = self._prepare_has_object_mask(
+            data_dict.get("has_object") if isinstance(data_dict, dict) else None,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            device=device,
+        )
+
+        obj_trans_gt = None
+        if isinstance(gt_targets, dict):
+            obj_trans_gt = self._to_bt(
+                gt_targets.get("obj_trans"),
+                batch_size=batch_size,
+                seq_len=seq_len,
+                trailing_shape=(3,),
+                device=device,
+                dtype=dtype,
+                default=0.0,
+            )
 
         context = {
             "batch_size": batch_size,
@@ -442,10 +761,13 @@ class HumanPoseModule(nn.Module):
             "device": device,
             "dtype": dtype,
             "trans_init": trans_init,
+            "obj_trans_init": obj_trans_init,
             "trans_gt": None,
+            "obj_trans_gt": obj_trans_gt,
             "gt_joints_local": None,
             "human_imu": human_imu,
             "imu_rotm_global": imu_rotm_global,
+            "has_object_mask": has_object_mask,
         }
         return observed, context
 
@@ -464,7 +786,6 @@ class HumanPoseModule(nn.Module):
         prev_root_pos: torch.Tensor,
         curr_root_xz: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Inference-only root correction on current frame delta_p x/z."""
         if self.no_trans or (not self.enable_root_correction) or self.delta_p_dim < 2:
             return curr_frame, curr_root_xz
 
@@ -477,10 +798,10 @@ class HumanPoseModule(nn.Module):
         curr_root_pos[:, 2] = curr_root_xz[:, 1]
         curr_root_pos[:, 1] = curr_frame[:, self.py_slice].squeeze(-1)
 
-        rot_prev = rotation_6d_to_matrix(prev_frame[:, self.rot_slice].reshape(-1, 6)).reshape(
+        rot_prev = rotation_6d_to_matrix(prev_frame[:, : self.human_rot_dim].reshape(-1, 6)).reshape(
             batch_size, self.num_joints, 3, 3
         )
-        rot_curr = rotation_6d_to_matrix(curr_frame[:, self.rot_slice].reshape(-1, 6)).reshape(
+        rot_curr = rotation_6d_to_matrix(curr_frame[:, : self.human_rot_dim].reshape(-1, 6)).reshape(
             batch_size, self.num_joints, 3, 3
         )
         rot_pair = torch.stack([rot_prev, rot_curr], dim=1)
@@ -489,15 +810,15 @@ class HumanPoseModule(nn.Module):
         if joints_local_pair is None:
             return curr_frame, curr_root_xz
 
-        foot_prev_local = joints_local_pair[:, 0, self.foot_joint_indices, :]  # [B,2,3]
-        foot_curr_local = joints_local_pair[:, 1, self.foot_joint_indices, :]  # [B,2,3]
+        foot_prev_local = joints_local_pair[:, 0, self.foot_joint_indices, :]
+        foot_curr_local = joints_local_pair[:, 1, self.foot_joint_indices, :]
         foot_prev_world = foot_prev_local + prev_root_pos.unsqueeze(1)
         foot_curr_world = foot_curr_local + curr_root_pos.unsqueeze(1)
-        foot_disp_xz = foot_curr_world[..., [0, 2]] - foot_prev_world[..., [0, 2]]  # [B,2,2]
+        foot_disp_xz = foot_curr_world[..., [0, 2]] - foot_prev_world[..., [0, 2]]
 
-        contact_prob = torch.sigmoid(curr_frame[:, self.contact_slice])  # [B,2]
+        contact_prob = torch.sigmoid(curr_frame[:, self.b_slice])
         contact_mask = contact_prob >= self.root_correction_contact_threshold
-        contact_count = contact_mask.sum(dim=1, keepdim=True)  # [B,1]
+        contact_count = contact_mask.sum(dim=1, keepdim=True)
         valid = contact_count.squeeze(-1) > 0
         if not bool(valid.any()):
             return curr_frame, curr_root_xz
@@ -518,11 +839,17 @@ class HumanPoseModule(nn.Module):
         device = context["device"]
         dtype = context["dtype"]
         trans_init = context["trans_init"]
+        obj_trans_init = context["obj_trans_init"]
+        has_object_mask = context.get("has_object_mask")
 
-        rot_6d = x_pred[:, :, self.rot_slice].reshape(batch_size, seq_len, self.num_joints, 6)
-        rot_mat = rotation_6d_to_matrix(rot_6d.reshape(-1, 6)).reshape(batch_size, seq_len, self.num_joints, 3, 3)
+        rot_human_obj = x_pred[:, :, self.rot_slice]
+        rot_human_6d = rot_human_obj[:, :, : self.human_rot_dim].reshape(batch_size, seq_len, self.num_joints, 6)
+        obj_rot_6d = rot_human_obj[:, :, self.human_rot_dim : self.rot_dim]
+        rot_human_mat = rotation_6d_to_matrix(rot_human_6d.reshape(-1, 6)).reshape(batch_size, seq_len, self.num_joints, 3, 3)
 
-        acc_pred = x_pred[:, :, self.acc_slice].reshape(batch_size, seq_len, self.num_human_imus, 3)
+        acc_human_obj = x_pred[:, :, self.acc_slice]
+        acc_human = acc_human_obj[:, :, : self.human_acc_dim].reshape(batch_size, seq_len, self.num_human_imus, 3)
+        acc_obj = acc_human_obj[:, :, self.human_acc_dim :]
 
         if self.no_trans:
             delta_p_pred = torch.zeros(batch_size, seq_len, 0, device=device, dtype=dtype)
@@ -539,20 +866,46 @@ class HumanPoseModule(nn.Module):
             root_trans_pred[:, :, 2] = xz[:, :, 1]
             root_trans_pred[:, :, 1] = p_y_pred.squeeze(-1)
 
-        b_pred = x_pred[:, :, self.contact_slice]
+        b_pred = x_pred[:, :, self.b_slice]
         b_prob_pred = torch.sigmoid(b_pred)
 
+        contact_prob = x_pred[:, :, self.contact_slice]
+        bone_dir = x_pred[:, :, self.bone_dir_slice].reshape(batch_size, seq_len, 2, 3)
+        bone_len = x_pred[:, :, self.bone_len_slice].reshape(batch_size, seq_len, 2)
+        delta_p_obj = x_pred[:, :, self.delta_p_obj_slice]
+
+        if isinstance(has_object_mask, torch.Tensor):
+            obj_mask = has_object_mask.to(device=device, dtype=dtype).unsqueeze(-1)
+            contact_prob = contact_prob * obj_mask
+            bone_dir = bone_dir * obj_mask.unsqueeze(-1)
+            bone_len = bone_len * obj_mask
+            delta_p_obj = delta_p_obj * obj_mask
+
+        pred_obj_trans = torch.cumsum(delta_p_obj, dim=1) + obj_trans_init.unsqueeze(1)
+        if isinstance(has_object_mask, torch.Tensor):
+            pred_obj_trans = pred_obj_trans * has_object_mask.to(device=device, dtype=dtype).unsqueeze(-1)
+
+        pred_obj_vel = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
+        pred_obj_acc = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
+        if seq_len > 1:
+            pred_obj_vel[:, 1:] = (pred_obj_trans[:, 1:] - pred_obj_trans[:, :-1]) * self.fps
+            pred_obj_vel[:, 0] = pred_obj_vel[:, 1]
+        if seq_len > 2:
+            pred_obj_acc[:, 2:] = (
+                pred_obj_trans[:, 2:] - 2.0 * pred_obj_trans[:, 1:-1] + pred_obj_trans[:, :-2]
+            ) * (self.fps ** 2)
+
         root_vel_pred = self._compute_root_velocity_from_trans(root_trans_pred)
-        root_rot = rot_mat[:, :, 0]
+        root_rot = rot_human_mat[:, :, 0]
         root_vel_local_pred = torch.matmul(root_rot.transpose(-1, -2), root_vel_pred.unsqueeze(-1)).squeeze(-1)
 
-        reduced_global = rot_mat[:, :, _REDUCED_INDICES]
+        reduced_global = rot_human_mat[:, :, _REDUCED_INDICES]
         reduced_root = torch.matmul(root_rot.unsqueeze(2).transpose(-1, -2), reduced_global)
         p_pred = matrix_to_rotation_6d(reduced_root.reshape(-1, 3, 3)).reshape(
             batch_size, seq_len, len(_REDUCED_INDICES), 6
         )
 
-        pred_joints_local = self._compute_fk_joints_from_global(rot_mat)
+        pred_joints_local = self._compute_fk_joints_from_global(rot_human_mat)
         if pred_joints_local is None:
             pred_joints_local = torch.zeros(batch_size, seq_len, self.num_joints, 3, device=device, dtype=dtype)
 
@@ -567,45 +920,65 @@ class HumanPoseModule(nn.Module):
 
         pred_imu_feat = torch.cat(
             [
-                acc_pred.reshape(batch_size, seq_len, -1),
-                rot_6d[:, :, _SENSOR_ROT_INDICES].reshape(batch_size, seq_len, -1),
+                acc_human.reshape(batch_size, seq_len, -1),
+                rot_human_6d[:, :, _SENSOR_ROT_INDICES].reshape(batch_size, seq_len, -1),
+                acc_obj,
+                obj_rot_6d,
             ],
             dim=-1,
         )
 
         out = {
             "x_pred": x_pred,
-            "R_pred_6d": rot_6d,
-            "R_pred_rotmat": rot_mat,
-            "a_pred": acc_pred,
+            "rot_human_obj_pred": rot_human_obj,
+            "acc_human_obj_pred": acc_human_obj,
+            "R_pred_6d": rot_human_6d,
+            "R_pred_rotmat": rot_human_mat,
+            "a_pred": acc_human,
             "delta_p_pred": delta_p_pred,
             "p_y_pred": p_y_pred,
             "b_pred": b_pred,
             "b_prob_pred": b_prob_pred,
+            "contact_prob_pred": contact_prob,
+            "bone_dir_pred": bone_dir,
+            "bone_len_pred": bone_len,
+            "delta_p_obj_pred": delta_p_obj,
             "pred_imu_feat": pred_imu_feat,
             "v_pred": torch.zeros(batch_size, seq_len, 0, device=device, dtype=dtype),
             "p_pred": p_pred,
-            "pred_full_pose_rotmat": rot_mat,
-            "pred_full_pose_6d": rot_6d,
+            "pred_full_pose_rotmat": rot_human_mat,
+            "pred_full_pose_6d": rot_human_6d,
             "pred_joints_local": pred_joints_local,
             "pred_joints_global": pred_joints_global,
             "pred_hand_glb_pos": pred_hand_glb_pos,
             "root_vel_local_pred": root_vel_local_pred,
             "root_vel_pred": root_vel_pred,
             "root_trans_pred": root_trans_pred,
+            "pred_obj_trans": pred_obj_trans,
+            "pred_obj_vel": pred_obj_vel,
+            "pred_obj_vel_from_posdiff": pred_obj_vel,
+            "pred_obj_acc_from_posdiff": pred_obj_acc,
+            "pred_lhand_obj_direction": bone_dir[:, :, 0],
+            "pred_rhand_obj_direction": bone_dir[:, :, 1],
+            "pred_lhand_lb": bone_len[:, :, 0],
+            "pred_rhand_lb": bone_len[:, :, 1],
+            "obj_trans_init": obj_trans_init,
+            "has_object": has_object_mask,
         }
 
         if context.get("gt_joints_local") is not None:
             out["gt_joints_local"] = context["gt_joints_local"]
         if context.get("trans_gt") is not None:
             out["gt_root_trans"] = context["trans_gt"]
+        if context.get("obj_trans_gt") is not None:
+            out["gt_obj_trans"] = context["obj_trans_gt"]
 
         return out
 
     def forward(self, data_dict: Dict, gt_targets: Optional[Dict] = None):
         """Training forward: full-window denoising only."""
         if gt_targets is None:
-            raise ValueError("HumanPoseModule forward requires gt_targets for training")
+            raise ValueError("IMUHOIMixModule forward requires gt_targets for training")
 
         x_clean, context = self._build_clean_window(data_dict, gt_targets)
         add_noise = bool(self.training and self.use_diffusion_noise)
@@ -638,7 +1011,6 @@ class HumanPoseModule(nn.Module):
         eta: float,
         warmup_seq: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Autoregressive sliding-window inference with inpainting."""
         batch_size, seq_len, feat_dim = observed_seq.shape
         device = observed_seq.device
         dtype = observed_seq.dtype
@@ -762,7 +1134,6 @@ class HumanPoseModule(nn.Module):
         sampler: Optional[str] = None,
         eta: Optional[float] = None,
     ):
-        """Inference with autoregressive sliding-window inpainting."""
         observed_seq, context = self._build_observed_sequence(data_dict, gt_targets)
 
         steps = self.inference_steps if sample_steps is None else int(sample_steps)
@@ -801,12 +1172,14 @@ class HumanPoseModule(nn.Module):
             warmup_seq=warmup_seq,
         )
         outputs = self._decode_outputs(pred_seq, context)
+
         if self.inference_type == "sample_inpaint":
             aux_sampler = sampler_name
             aux_eta = eta_val
         else:
             aux_sampler = None
             aux_eta = None
+
         outputs["diffusion_aux"] = {
             "inference_steps": steps,
             "window_size": self.window_size,
@@ -831,18 +1204,29 @@ class HumanPoseModule(nn.Module):
         device: torch.device,
         no_trans: bool = False,
         num_joints: int = 24,
+        num_human_imus: int = 6,
     ):
-        rot_dim = num_joints * 6
+        human_rot_dim = num_joints * 6
+        rot_dim = human_rot_dim + 6
+        acc_dim = num_human_imus * 3 + 3
+        trans_dim = 0 if no_trans else 3
+        target_dim = rot_dim + acc_dim + trans_dim + 2 + 2 + 6 + 2 + 3
         return {
-            "x_pred": torch.zeros(batch_size, seq_len, rot_dim + 18 + (0 if no_trans else 3) + 2, device=device),
+            "x_pred": torch.zeros(batch_size, seq_len, target_dim, device=device),
+            "rot_human_obj_pred": torch.zeros(batch_size, seq_len, rot_dim, device=device),
+            "acc_human_obj_pred": torch.zeros(batch_size, seq_len, acc_dim, device=device),
             "R_pred_6d": torch.zeros(batch_size, seq_len, num_joints, 6, device=device),
             "R_pred_rotmat": torch.zeros(batch_size, seq_len, num_joints, 3, 3, device=device),
-            "a_pred": torch.zeros(batch_size, seq_len, 6, 3, device=device),
+            "a_pred": torch.zeros(batch_size, seq_len, num_human_imus, 3, device=device),
             "delta_p_pred": torch.zeros(batch_size, seq_len, 0 if no_trans else 2, device=device),
             "p_y_pred": torch.zeros(batch_size, seq_len, 0 if no_trans else 1, device=device),
             "b_pred": torch.zeros(batch_size, seq_len, 2, device=device),
             "b_prob_pred": torch.zeros(batch_size, seq_len, 2, device=device),
-            "pred_imu_feat": torch.zeros(batch_size, seq_len, 6 * 9, device=device),
+            "contact_prob_pred": torch.zeros(batch_size, seq_len, 2, device=device),
+            "bone_dir_pred": torch.zeros(batch_size, seq_len, 2, 3, device=device),
+            "bone_len_pred": torch.zeros(batch_size, seq_len, 2, device=device),
+            "delta_p_obj_pred": torch.zeros(batch_size, seq_len, 3, device=device),
+            "pred_imu_feat": torch.zeros(batch_size, seq_len, num_human_imus * 9 + 9, device=device),
             "v_pred": torch.zeros(batch_size, seq_len, 0, device=device),
             "p_pred": torch.zeros(batch_size, seq_len, len(_REDUCED_INDICES), 6, device=device),
             "pred_full_pose_rotmat": torch.zeros(batch_size, seq_len, num_joints, 3, 3, device=device),
@@ -853,5 +1237,15 @@ class HumanPoseModule(nn.Module):
             "root_vel_local_pred": torch.zeros(batch_size, seq_len, 3, device=device),
             "root_vel_pred": torch.zeros(batch_size, seq_len, 3, device=device),
             "root_trans_pred": torch.zeros(batch_size, seq_len, 3, device=device),
+            "pred_obj_trans": torch.zeros(batch_size, seq_len, 3, device=device),
+            "pred_obj_vel": torch.zeros(batch_size, seq_len, 3, device=device),
+            "pred_obj_vel_from_posdiff": torch.zeros(batch_size, seq_len, 3, device=device),
+            "pred_obj_acc_from_posdiff": torch.zeros(batch_size, seq_len, 3, device=device),
+            "pred_lhand_obj_direction": torch.zeros(batch_size, seq_len, 3, device=device),
+            "pred_rhand_obj_direction": torch.zeros(batch_size, seq_len, 3, device=device),
+            "pred_lhand_lb": torch.zeros(batch_size, seq_len, device=device),
+            "pred_rhand_lb": torch.zeros(batch_size, seq_len, device=device),
+            "obj_trans_init": torch.zeros(batch_size, 3, device=device),
+            "has_object": torch.ones(batch_size, seq_len, device=device, dtype=torch.bool),
             "diffusion_aux": {},
         }

@@ -22,8 +22,9 @@ dit:
   dit_use_noise: true
   dit_max_seq_len: 256
   dit_inference_steps: 100
-  dit_inference_sampler: "ddim"
-  dit_inference_eta: 0.0
+  dit_inference_type: "sample_inpaint_x0"  # sample_inpaint_x0 | sample_inpaint
+  dit_inference_sampler: "ddim"  # recommended: ddim
+  dit_inference_eta: 0.0  # recommended for AR stability; try 0.1 with diffusion mode for more stochasticity
   formulation: "residual"
   dit_residual_inference_mode: "oneshot"
 

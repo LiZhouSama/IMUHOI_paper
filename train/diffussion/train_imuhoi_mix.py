@@ -1,5 +1,5 @@
 """
-InteractionModule standalone training script (Stage 2).
+IMUHOIMixModule standalone training script (Unified DiT).
 """
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ import torch
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
 
-from model import InteractionModule
-from train.diffussion.loss.interaction_loss import InteractionLoss
+from model import IMUHOIMixModule
+from train.diffussion.loss.imuhoi_mix_loss import IMUHOIMixLoss
 from train.diffussion.train_utils import (
     BaseTrainer,
     create_dataloaders,
@@ -27,12 +27,16 @@ from train.diffussion.train_utils import (
 
 def get_args():
     parser = get_base_args()
-    parser.description = "InteractionModule training (Stage 2)"
+    parser.description = "IMUHOIMixModule training (Unified DiT)"
     return parser.parse_args()
 
 
-class InteractionTrainer(BaseTrainer):
-    """Trainer for Stage-2 Interaction diffusion model."""
+class IMUHOIMixTrainer(BaseTrainer):
+    """Trainer for unified IMUHOI mix diffusion model."""
+
+    def __init__(self, cfg, model, loss_fn, train_loader, test_loader=None):
+        super().__init__(cfg, model, loss_fn, train_loader, test_loader)
+        self.no_trans = cfg.no_trans
 
     def model_forward(
         self,
@@ -60,18 +64,21 @@ def main():
     args = get_args()
     cfg = merge_config(args)
 
-    # Interaction training is DiT-only.
+    # Mix training is DiT-only.
     cfg.model_arch = "dit"
 
     setup_seed(cfg.seed)
     cfg = setup_device(cfg)
-    save_dir = create_save_dir(cfg, "interaction")
+    save_dir = create_save_dir(cfg, "imuhoi_mix")
+
+    mode_str = "noTrans" if cfg.no_trans else "normal"
 
     print("=" * 50)
-    print("Stage 2: InteractionModule training")
+    print(f"Unified: IMUHOIMixModule training ({mode_str})")
     print(f"device: {cfg.device}")
     print(f"batch size: {cfg.batch_size}")
     print(f"epochs: {cfg.epoch}")
+    print(f"noTrans: {cfg.no_trans}")
     print(f"save dir: {save_dir}")
     print("=" * 50)
 
@@ -81,14 +88,14 @@ def main():
         return
 
     device = torch.device(cfg.device)
-    model = InteractionModule(cfg).to(device)
+    model = IMUHOIMixModule(cfg, device, no_trans=cfg.no_trans).to(device)
     print(f"model params: {sum(p.numel() for p in model.parameters())}")
 
     loss_weights = getattr(cfg, "loss_weights", {})
     test_metric_weights = getattr(cfg, "test_metric_weights", {})
-    loss_fn = InteractionLoss(weights=loss_weights, test_metric_weights=test_metric_weights)
+    loss_fn = IMUHOIMixLoss(weights=loss_weights, test_metric_weights=test_metric_weights, no_trans=cfg.no_trans)
 
-    trainer = InteractionTrainer(cfg, model, loss_fn, train_loader, test_loader)
+    trainer = IMUHOIMixTrainer(cfg, model, loss_fn, train_loader, test_loader)
     trainer.train()
 
     print(f"\nTraining complete. Model saved to: {save_dir}")

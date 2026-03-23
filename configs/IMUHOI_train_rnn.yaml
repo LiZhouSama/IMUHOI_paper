@@ -23,8 +23,9 @@ dit:
   dit_prediction_type: "x0"
   dit_max_seq_len: 256
   dit_inference_steps: 20
-  dit_inference_sampler: "ddim"
-  dit_inference_eta: 0.0
+  dit_inference_type: "sample_inpaint_x0"  # sample_inpaint_x0 | sample_inpaint
+  dit_inference_sampler: "ddim"  # recommended: ddim
+  dit_inference_eta: 0.0  # recommended for AR stability; try 0.1 with diffusion mode for more stochasticity
   dit_enable_root_correction: true
   dit_root_contact_vel_threshold: 0.15
   formulation: "residual"

@@ -479,7 +479,6 @@ class ConditionalDiT(nn.Module):
         if inpaint_mask.shape != x_input.shape:
             raise ValueError(f"inpaint_mask shape mismatch: {inpaint_mask.shape} vs {x_input.shape}")
 
-        batch = x_input.shape[0]
         device = x_input.device
         dtype = x_input.dtype
         mask_bool = inpaint_mask.to(device=device, dtype=torch.bool)
@@ -488,12 +487,28 @@ class ConditionalDiT(nn.Module):
         total_steps = self.timesteps if steps is None else int(steps)
         schedule = self._build_sampling_timesteps(total_steps)
 
-        x_t = x_input.to(device=device, dtype=dtype)
-        for t_cur in schedule.tolist():
-            t_batch = torch.full((batch,), int(t_cur), device=device, dtype=torch.long)
-            x0_pred, _, _ = self.predict(x_t=x_t, t=t_batch, cond=cond_use)
-            x_t = torch.where(mask_bool, x_input, x0_pred)
+        x_input_use = x_input.to(device=device, dtype=dtype)
+        return self._sample_inpaint_x0_loop(
+            x_input=x_input_use,
+            inpaint_mask=mask_bool,
+            cond=cond_use,
+            schedule=schedule,
+        )
 
+    def _sample_inpaint_x0_loop(
+        self,
+        x_input: torch.Tensor,
+        inpaint_mask: torch.Tensor,
+        cond: Optional[torch.Tensor],
+        schedule: torch.Tensor,
+    ) -> torch.Tensor:
+        """Shared iterative x0-refinement loop for inpainting."""
+        batch = x_input.shape[0]
+        x_t = x_input
+        for t_cur in schedule.tolist():
+            t_batch = torch.full((batch,), int(t_cur), device=x_input.device, dtype=torch.long)
+            x0_pred, _, _ = self.predict(x_t=x_t, t=t_batch, cond=cond)
+            x_t = torch.where(inpaint_mask, x_input, x0_pred)
         return x_t
 
     def sample_inpaint(
@@ -521,11 +536,7 @@ class ConditionalDiT(nn.Module):
         if inpaint_mask.shape != x_input.shape:
             raise ValueError(f"inpaint_mask shape mismatch: {inpaint_mask.shape} vs {x_input.shape}")
 
-        sampler = str(sampler).lower()
-        if sampler not in {"ddim", "ddpm"}:
-            raise ValueError(f"sampler must be 'ddim' or 'ddpm', got {sampler}")
-
-        batch, seq_len, _ = x_input.shape
+        batch = x_input.shape[0]
         device = x_input.device
         dtype = x_input.dtype
 
@@ -535,16 +546,22 @@ class ConditionalDiT(nn.Module):
         total_steps = self.timesteps if steps is None else int(steps)
         schedule = self._build_sampling_timesteps(total_steps)
 
-        base_start = x_input if x_start is None else x_start.to(device=device, dtype=dtype)
+        x_input_use = x_input.to(device=device, dtype=dtype)
+
+        sampler = str(sampler).lower()
+        if sampler not in {"ddim", "ddpm"}:
+            raise ValueError(f"sampler must be 'ddim' or 'ddpm', got {sampler}")
+
+        base_start = x_input_use if x_start is None else x_start.to(device=device, dtype=dtype)
         # Keep one fixed noise realization for known constraints during one reverse pass.
         # Re-sampling this per step makes the conditioning itself jitter across timesteps.
-        known_noise = torch.randn_like(x_input)
+        known_noise = torch.randn_like(x_input_use)
 
         # Initialize at highest noise level, then enforce known region.
         t0 = int(schedule[0].item())
         t0_batch = torch.full((batch,), t0, device=device, dtype=torch.long)
         x_t = self.q_sample(base_start, t0_batch, noise=torch.randn_like(base_start))
-        known_noisy = self.q_sample(x_input, t0_batch, noise=known_noise)
+        known_noisy = self.q_sample(x_input_use, t0_batch, noise=known_noise)
         x_t = torch.where(mask_bool, known_noisy, x_t)
 
         for idx, t_cur in enumerate(schedule.tolist()):
@@ -552,11 +569,11 @@ class ConditionalDiT(nn.Module):
             t_batch = torch.full((batch,), t_cur, device=device, dtype=torch.long)
 
             # Re-impose known constraints at current noise level.
-            known_noisy_cur = self.q_sample(x_input, t_batch, noise=known_noise)
+            known_noisy_cur = self.q_sample(x_input_use, t_batch, noise=known_noise)
             x_t = torch.where(mask_bool, known_noisy_cur, x_t)
 
             x0_pred, _, _ = self.predict(x_t=x_t, t=t_batch, cond=cond_use)
-            x0_guided = torch.where(mask_bool, x_input, x0_pred)
+            x0_guided = torch.where(mask_bool, x_input_use, x0_pred)
 
             if t_next < 0:
                 x_t = x0_guided
@@ -574,7 +591,7 @@ class ConditionalDiT(nn.Module):
             )
 
             t_next_batch = torch.full((batch,), t_next, device=device, dtype=torch.long)
-            known_noisy_next = self.q_sample(x_input, t_next_batch, noise=known_noise)
+            known_noisy_next = self.q_sample(x_input_use, t_next_batch, noise=known_noise)
             x_t = torch.where(mask_bool, known_noisy_next, x_next)
 
         return x_t

@@ -23,25 +23,12 @@ dit:
   dit_prediction_type: "x0"
   dit_max_seq_len: 256
   dit_inference_steps: 20
-  dit_inference_sampler: "ddim"
-  dit_inference_eta: 0.0
+  dit_inference_type: "sample_inpaint"  # sample_inpaint_x0 | sample_inpaint
+  dit_inference_sampler: "ddim"  # recommended: ddim
+  dit_inference_eta: 0.0  # recommended for AR stability; try 0.1 with diffusion mode for more stochasticity
   dit_test_use_gt_warmup: true
   dit_enable_root_correction: true
   dit_root_correction_contact_threshold: 0.5
-  formulation: "residual"
-
-# ============ 交互模块训练配置 ============
-interaction_training:
-  freeze_ratio: 0.8
-  joint_phase_lr_factor: 0.2
-  hp_aux_weight: 0.0
-  hp_train_sample_steps: 20
-  hp_train_sampler: "ddim"
-  hp_train_eta: 0.0
-
-# ============ 交互模块结构配置 ============
-interaction:
-  head_mode: "split"
 
 # ============ 评估与EMA ============
 ema_decay: 0.999
@@ -101,27 +88,22 @@ loss_weights:
   foot_slide: 100
   diffusion_x0: 1.0
   
-  # Interaction (merged VC + OT)
-  interaction_boundary: 0.1
-  interaction_order: 1.0
-  obj_trans: 1.0
-  contact_logits: 1.0
-  geometry_dir_l: 0.1
-  geometry_dir_r: 0.1
-  geometry_len_l: 0.1
-  geometry_len_r: 0.1
-  hoi_error_l: 0.2
-  hoi_error_r: 0.2
-  obj_vel_cons: 0.1
-  obj_acc_cons: 0.01
-  diffusion_eps: 1.0
+  # Stage 2: Interaction
+  Loss_simple: 1.0
+  Loss_drift_obj: 1.0
+  Loss_jitter_obj: 1000
 
 # ============ Test指标权重 ============
 test_metric_weights:
+  # Stage 1: HumanPose
   mpjre_mse: 1.0
   root_trans_err_mm: 1.0
   jitter_local_fk_mm: 1.0
   root_jitter_mm: 1.0
+
+  # Stage 2: Interaction
+  obj_pos_mse: 1.0
+  obj_pos_jitter_mm: 1.0
 
 # ============ 窗口配置 ============
 train:
@@ -134,4 +116,4 @@ test:
 # 取消注释以使用预训练权重
 pretrained_modules:
   human_pose: "outputs/IMUHOI_DiT/human_pose_03202004/best.pt"
-  interaction: "outputs/IMUHOI/joint_train_01112057/best_interaction.pt"
+  interaction: "outputs/IMUHOI_DiT/interaction_03220349/best.pt"

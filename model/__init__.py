@@ -39,6 +39,13 @@ def InteractionModule(cfg, *args, **kwargs):
     raise RuntimeError("InteractionModule is only available for model_arch='dit'.")
 
 
+def IMUHOIMixModule(cfg, *args, **kwargs):
+    arch = _resolve_arch(cfg)
+    if arch == "dit":
+        return _dit.IMUHOIMixModule(cfg, *args, **kwargs)
+    raise RuntimeError("IMUHOIMixModule is only available for model_arch='dit'.")
+
+
 def VelocityContactModule(cfg, *args, **kwargs):
     arch = _resolve_arch(cfg)
     if arch == "dit":
@@ -80,6 +87,7 @@ __all__ = [
     "ARCH_CHOICES",
     "HumanPoseModule",
     "InteractionModule",
+    "IMUHOIMixModule",
     "VelocityContactModule",
     "ObjectTransModule",
     "IMUHOIModel",
