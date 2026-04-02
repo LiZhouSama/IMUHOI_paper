@@ -7,11 +7,12 @@ Feature definition per frame:
         a_{human+obj},
         delta_p_root_2d,
         p_root_y,
+        p_hands,
         b_foot_contact,
         contact_prob_hand,
         v_bone_dir,
         l_bone_len,
-        delta_p_obj,
+        p_obj,
     )
 
 Training:
@@ -63,8 +64,8 @@ class IMUHOIMixModule(nn.Module):
             dtype=torch.long,
         )
 
-        # x_frame = [R_{human+obj}, a_{human+obj}, delta_p_root_2d, p_root_y, b,
-        #            contact_prob, v_bone, l_bone, delta_p_obj]
+        # x_frame = [R_{human+obj}, a_{human+obj}, delta_p_root_2d, p_root_y, p_hands,
+        #            b, contact_prob, v_bone, l_bone, p_obj]
         self.human_rot_dim = self.num_joints * 6
         self.obj_rot_dim = 6
         self.rot_dim = self.human_rot_dim + self.obj_rot_dim
@@ -75,12 +76,13 @@ class IMUHOIMixModule(nn.Module):
 
         self.delta_p_dim = 0 if self.no_trans else 2
         self.py_dim = 0 if self.no_trans else 1
+        self.hands_dim = 6
         self.b_dim = 2
 
         self.contact_dim = 2
         self.bone_dir_dim = 6
         self.bone_len_dim = 2
-        self.delta_p_obj_dim = 3
+        self.p_obj_dim = 3
 
         start = 0
         self.rot_slice = slice(start, start + self.rot_dim)
@@ -91,6 +93,8 @@ class IMUHOIMixModule(nn.Module):
         start += self.delta_p_dim
         self.py_slice = slice(start, start + self.py_dim)
         start += self.py_dim
+        self.hands_slice = slice(start, start + self.hands_dim)
+        start += self.hands_dim
         self.b_slice = slice(start, start + self.b_dim)
         start += self.b_dim
         self.contact_slice = slice(start, start + self.contact_dim)
@@ -99,9 +103,12 @@ class IMUHOIMixModule(nn.Module):
         start += self.bone_dir_dim
         self.bone_len_slice = slice(start, start + self.bone_len_dim)
         start += self.bone_len_dim
-        self.delta_p_obj_slice = slice(start, start + self.delta_p_obj_dim)
-        start += self.delta_p_obj_dim
+        self.p_obj_slice = slice(start, start + self.p_obj_dim)
+        start += self.p_obj_dim
         self.target_dim = start
+        # Backward-compatible aliases for older call sites.
+        self.delta_p_obj_dim = self.p_obj_dim
+        self.delta_p_obj_slice = self.p_obj_slice
 
         # Observed dims at inference (IMU-only):
         # - human IMU-joint rotations
@@ -155,6 +162,10 @@ class IMUHOIMixModule(nn.Module):
         self.root_correction_contact_threshold = float(_dit_param("dit_root_correction_contact_threshold", 0.5))
         self.root_correction_contact_threshold = min(max(self.root_correction_contact_threshold, 0.0), 1.0)
         self.test_use_gt_warmup = bool(_dit_param("dit_test_use_gt_warmup", True))
+        test_warmup_len = _dit_param("dit_test_warmup_len", None)
+        self.test_warmup_len = None if test_warmup_len is None else int(test_warmup_len)
+        if self.test_warmup_len is not None and self.test_warmup_len < 0:
+            raise ValueError(f"dit_test_warmup_len must be >= 0 or None, got {self.test_warmup_len}")
 
         prediction_type = str(_dit_param("dit_prediction_type", "x0")).lower()
         if prediction_type not in {"x0", "eps"}:
@@ -520,6 +531,44 @@ class IMUHOIMixModule(nn.Module):
             dtype=dtype,
             default=0.0,
         )
+        gt_joints_local = self._compute_fk_joints_from_global(rot_global)
+
+        # Hand global positions in x_frame: prefer GT joints, fallback to FK+trans, then zeros.
+        p_hands = None
+        position_global = gt_targets.get("position_global")
+        if isinstance(position_global, torch.Tensor):
+            position_global = position_global.to(device=device, dtype=dtype)
+            if position_global.dim() == 3:
+                position_global = position_global.unsqueeze(0)
+            if position_global.shape[0] == 1 and batch_size > 1:
+                position_global = position_global.expand(batch_size, -1, -1, -1)
+            if (
+                position_global.shape[0] == batch_size
+                and position_global.shape[1] == seq_len
+                and position_global.shape[-1] == 3
+                and position_global.shape[2] > max(self.hand_joint_indices)
+            ):
+                p_hands = torch.stack(
+                    [
+                        position_global[:, :, self.hand_joint_indices[0]],
+                        position_global[:, :, self.hand_joint_indices[1]],
+                    ],
+                    dim=2,
+                )
+
+        if not isinstance(p_hands, torch.Tensor):
+            if isinstance(gt_joints_local, torch.Tensor) and gt_joints_local.shape[2] > max(self.hand_joint_indices):
+                p_hands = torch.stack(
+                    [
+                        gt_joints_local[:, :, self.hand_joint_indices[0]],
+                        gt_joints_local[:, :, self.hand_joint_indices[1]],
+                    ],
+                    dim=2,
+                )
+                p_hands = p_hands + trans.unsqueeze(2)
+            else:
+                p_hands = torch.zeros(batch_size, seq_len, 2, 3, device=device, dtype=dtype)
+        p_hands_flat = p_hands.reshape(batch_size, seq_len, -1)
 
         if self.no_trans:
             delta_p = torch.zeros(batch_size, seq_len, 0, device=device, dtype=dtype)
@@ -635,9 +684,7 @@ class IMUHOIMixModule(nn.Module):
             dtype=dtype,
             default=0.0,
         )
-        delta_p_obj = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
-        if seq_len > 1:
-            delta_p_obj[:, 1:] = obj_trans[:, 1:] - obj_trans[:, :-1]
+        p_obj = obj_trans
 
         has_object_mask = self._prepare_has_object_mask(
             data_dict.get("has_object") if isinstance(data_dict, dict) else None,
@@ -651,12 +698,12 @@ class IMUHOIMixModule(nn.Module):
         contact_prob = contact_prob * obj_mask
         bone_dir = bone_dir * obj_mask
         bone_len = bone_len * obj_mask
-        delta_p_obj = delta_p_obj * obj_mask
+        p_obj = p_obj * obj_mask
 
         x_parts = [rot_human_obj, acc_human_obj]
         if not self.no_trans:
             x_parts.extend([delta_p, p_y])
-        x_parts.extend([b, contact_prob, bone_dir, bone_len, delta_p_obj])
+        x_parts.extend([p_hands_flat, b, contact_prob, bone_dir, bone_len, p_obj])
         x_clean = torch.cat(x_parts, dim=-1)
 
         trans_init = self._resolve_trans_init(
@@ -673,8 +720,6 @@ class IMUHOIMixModule(nn.Module):
             device=device,
             dtype=dtype,
         )
-
-        gt_joints_local = self._compute_fk_joints_from_global(rot_global)
 
         context = {
             "batch_size": batch_size,
@@ -869,19 +914,20 @@ class IMUHOIMixModule(nn.Module):
         b_pred = x_pred[:, :, self.b_slice]
         b_prob_pred = torch.sigmoid(b_pred)
 
+        p_hands_pred = x_pred[:, :, self.hands_slice].reshape(batch_size, seq_len, 2, 3)
         contact_prob = x_pred[:, :, self.contact_slice]
         bone_dir = x_pred[:, :, self.bone_dir_slice].reshape(batch_size, seq_len, 2, 3)
         bone_len = x_pred[:, :, self.bone_len_slice].reshape(batch_size, seq_len, 2)
-        delta_p_obj = x_pred[:, :, self.delta_p_obj_slice]
+        p_obj = x_pred[:, :, self.p_obj_slice]
 
         if isinstance(has_object_mask, torch.Tensor):
             obj_mask = has_object_mask.to(device=device, dtype=dtype).unsqueeze(-1)
             contact_prob = contact_prob * obj_mask
             bone_dir = bone_dir * obj_mask.unsqueeze(-1)
             bone_len = bone_len * obj_mask
-            delta_p_obj = delta_p_obj * obj_mask
+            p_obj = p_obj * obj_mask
 
-        pred_obj_trans = torch.cumsum(delta_p_obj, dim=1) + obj_trans_init.unsqueeze(1)
+        pred_obj_trans = p_obj
         if isinstance(has_object_mask, torch.Tensor):
             pred_obj_trans = pred_obj_trans * has_object_mask.to(device=device, dtype=dtype).unsqueeze(-1)
 
@@ -910,7 +956,7 @@ class IMUHOIMixModule(nn.Module):
             pred_joints_local = torch.zeros(batch_size, seq_len, self.num_joints, 3, device=device, dtype=dtype)
 
         pred_joints_global = pred_joints_local + root_trans_pred.unsqueeze(2)
-        pred_hand_glb_pos = torch.stack(
+        pred_hand_glb_pos_fk = torch.stack(
             [
                 pred_joints_global[:, :, self.hand_joint_indices[0]],
                 pred_joints_global[:, :, self.hand_joint_indices[1]],
@@ -939,10 +985,12 @@ class IMUHOIMixModule(nn.Module):
             "p_y_pred": p_y_pred,
             "b_pred": b_pred,
             "b_prob_pred": b_prob_pred,
+            "p_hands_pred": p_hands_pred,
             "contact_prob_pred": contact_prob,
             "bone_dir_pred": bone_dir,
             "bone_len_pred": bone_len,
-            "delta_p_obj_pred": delta_p_obj,
+            "p_obj_pred": p_obj,
+            "delta_p_obj_pred": p_obj,
             "pred_imu_feat": pred_imu_feat,
             "v_pred": torch.zeros(batch_size, seq_len, 0, device=device, dtype=dtype),
             "p_pred": p_pred,
@@ -950,7 +998,8 @@ class IMUHOIMixModule(nn.Module):
             "pred_full_pose_6d": rot_human_6d,
             "pred_joints_local": pred_joints_local,
             "pred_joints_global": pred_joints_global,
-            "pred_hand_glb_pos": pred_hand_glb_pos,
+            "pred_hand_glb_pos": pred_hand_glb_pos_fk,
+            "pred_hand_glb_pos_fk": pred_hand_glb_pos_fk,
             "root_vel_local_pred": root_vel_local_pred,
             "root_vel_pred": root_vel_pred,
             "root_trans_pred": root_trans_pred,
@@ -1158,7 +1207,9 @@ class IMUHOIMixModule(nn.Module):
         ):
             gt_clean_seq, _ = self._build_clean_window(data_dict, gt_targets)
             max_warmup = max(seq_len, 1) - 1
-            warmup_len = min(max(self.window_size - 1, 0), max_warmup)
+            max_window_warmup = max(self.window_size - 1, 0)
+            cfg_warmup = max_window_warmup if self.test_warmup_len is None else self.test_warmup_len
+            warmup_len = min(max(cfg_warmup, 0), max_window_warmup, max_warmup)
             if warmup_len > 0:
                 warmup_seq = gt_clean_seq[:, :warmup_len]
 
@@ -1210,7 +1261,7 @@ class IMUHOIMixModule(nn.Module):
         rot_dim = human_rot_dim + 6
         acc_dim = num_human_imus * 3 + 3
         trans_dim = 0 if no_trans else 3
-        target_dim = rot_dim + acc_dim + trans_dim + 2 + 2 + 6 + 2 + 3
+        target_dim = rot_dim + acc_dim + trans_dim + 6 + 2 + 2 + 6 + 2 + 3
         return {
             "x_pred": torch.zeros(batch_size, seq_len, target_dim, device=device),
             "rot_human_obj_pred": torch.zeros(batch_size, seq_len, rot_dim, device=device),
@@ -1222,9 +1273,11 @@ class IMUHOIMixModule(nn.Module):
             "p_y_pred": torch.zeros(batch_size, seq_len, 0 if no_trans else 1, device=device),
             "b_pred": torch.zeros(batch_size, seq_len, 2, device=device),
             "b_prob_pred": torch.zeros(batch_size, seq_len, 2, device=device),
+            "p_hands_pred": torch.zeros(batch_size, seq_len, 2, 3, device=device),
             "contact_prob_pred": torch.zeros(batch_size, seq_len, 2, device=device),
             "bone_dir_pred": torch.zeros(batch_size, seq_len, 2, 3, device=device),
             "bone_len_pred": torch.zeros(batch_size, seq_len, 2, device=device),
+            "p_obj_pred": torch.zeros(batch_size, seq_len, 3, device=device),
             "delta_p_obj_pred": torch.zeros(batch_size, seq_len, 3, device=device),
             "pred_imu_feat": torch.zeros(batch_size, seq_len, num_human_imus * 9 + 9, device=device),
             "v_pred": torch.zeros(batch_size, seq_len, 0, device=device),
@@ -1234,6 +1287,7 @@ class IMUHOIMixModule(nn.Module):
             "pred_joints_local": torch.zeros(batch_size, seq_len, num_joints, 3, device=device),
             "pred_joints_global": torch.zeros(batch_size, seq_len, num_joints, 3, device=device),
             "pred_hand_glb_pos": torch.zeros(batch_size, seq_len, 2, 3, device=device),
+            "pred_hand_glb_pos_fk": torch.zeros(batch_size, seq_len, 2, 3, device=device),
             "root_vel_local_pred": torch.zeros(batch_size, seq_len, 3, device=device),
             "root_vel_pred": torch.zeros(batch_size, seq_len, 3, device=device),
             "root_trans_pred": torch.zeros(batch_size, seq_len, 3, device=device),

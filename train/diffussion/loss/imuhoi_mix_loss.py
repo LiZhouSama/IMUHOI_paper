@@ -7,7 +7,7 @@ Train loss terms:
 - fk
 - drift
 - slide
-- drift_obj
+- vel_obj
 - jitter_obj
 
 Test metrics:
@@ -28,7 +28,7 @@ from pytorch3d.transforms import matrix_to_rotation_6d
 class IMUHOIMixLoss:
     """Combined HumanPose + Interaction loss with single simple term."""
 
-    LOSS_KEYS = ("simple", "vel", "fk", "drift", "slide", "drift_obj", "jitter_obj")
+    LOSS_KEYS = ("simple", "vel", "fk", "drift", "slide", "vel_obj", "jitter_obj")
     TEST_LOSS_KEYS = (
         "mpjre_mse",
         "root_trans_err_mm",
@@ -44,7 +44,7 @@ class IMUHOIMixLoss:
         "fk": ("fk", "L_FK", "fk_joint"),
         "drift": ("drift", "L_drift"),
         "slide": ("slide", "L_slide", "foot_slide"),
-        "drift_obj": ("drift_obj", "Loss_drift_obj", "L_drift_obj"),
+        "vel_obj": ("vel_obj", "Loss_vel_obj", "L_vel_obj", "drift_obj", "Loss_drift_obj", "L_drift_obj"),
         "jitter_obj": ("jitter_obj", "Loss_jitter_obj", "L_jitter_obj"),
     }
 
@@ -214,12 +214,15 @@ class IMUHOIMixLoss:
 
         # Object terms (masked by has_object).
         has_object_mask = self._prepare_has_object_mask(batch.get("has_object"), batch_size, seq_len, device=device)
-        has_object_sample = has_object_mask.any(dim=1)
-
-        delta_p_obj_pred = pred_dict.get("delta_p_obj_pred") if isinstance(pred_dict, dict) else None
         pred_obj_trans = pred_dict.get("pred_obj_trans") if isinstance(pred_dict, dict) else None
+        p_obj_pred = pred_dict.get("p_obj_pred") if isinstance(pred_dict, dict) else None
+        delta_p_obj_pred = pred_dict.get("delta_p_obj_pred") if isinstance(pred_dict, dict) else None
+        pred_obj_vel = pred_dict.get("pred_obj_vel") if isinstance(pred_dict, dict) else None
 
-        if isinstance(delta_p_obj_pred, torch.Tensor):
+        if not isinstance(pred_obj_trans, torch.Tensor) and isinstance(p_obj_pred, torch.Tensor):
+            pred_obj_trans = p_obj_pred
+
+        if not isinstance(pred_obj_trans, torch.Tensor) and isinstance(delta_p_obj_pred, torch.Tensor):
             delta_p_obj_pred = delta_p_obj_pred.to(device=device, dtype=dtype)
             if delta_p_obj_pred.dim() == 2:
                 delta_p_obj_pred = delta_p_obj_pred.unsqueeze(0)
@@ -232,41 +235,66 @@ class IMUHOIMixLoss:
                 if obj_trans_init.shape[0] == 1 and batch_size > 1:
                     obj_trans_init = obj_trans_init.expand(batch_size, -1)
             else:
-                obj_trans_gt = batch.get("obj_trans")
-                if isinstance(obj_trans_gt, torch.Tensor):
-                    obj_trans_gt = obj_trans_gt.to(device=device, dtype=dtype)
-                    if obj_trans_gt.dim() == 2:
-                        obj_trans_gt = obj_trans_gt.unsqueeze(0)
-                    if obj_trans_gt.shape[0] == 1 and batch_size > 1:
-                        obj_trans_gt = obj_trans_gt.expand(batch_size, -1, -1)
-                    if obj_trans_gt.shape[0] == batch_size and obj_trans_gt.shape[1] > 0:
-                        obj_trans_init = obj_trans_gt[:, 0]
-                    else:
-                        obj_trans_init = torch.zeros(batch_size, 3, device=device, dtype=dtype)
-                else:
-                    obj_trans_init = torch.zeros(batch_size, 3, device=device, dtype=dtype)
+                obj_trans_gt_for_init = batch.get("obj_trans")
+                if isinstance(obj_trans_gt_for_init, torch.Tensor):
+                    obj_trans_gt_for_init = obj_trans_gt_for_init.to(device=device, dtype=dtype)
+                    if obj_trans_gt_for_init.dim() == 2:
+                        obj_trans_gt_for_init = obj_trans_gt_for_init.unsqueeze(0)
+                    if obj_trans_gt_for_init.shape[0] == 1 and batch_size > 1:
+                        obj_trans_gt_for_init = obj_trans_gt_for_init.expand(batch_size, -1, -1)
+                    if obj_trans_gt_for_init.shape[0] == batch_size and obj_trans_gt_for_init.shape[1] > 0:
+                        obj_trans_init = obj_trans_gt_for_init[:, 0]
 
-            pred_obj_trans_from_delta = self._integrate_obj_trans(delta_p_obj_pred, obj_trans_init)
-            if not isinstance(pred_obj_trans, torch.Tensor):
-                pred_obj_trans = pred_obj_trans_from_delta
-
-            obj_trans_gt = batch.get("obj_trans")
-            if isinstance(obj_trans_gt, torch.Tensor):
-                obj_trans_gt = obj_trans_gt.to(device=device, dtype=dtype)
-                if obj_trans_gt.dim() == 2:
-                    obj_trans_gt = obj_trans_gt.unsqueeze(0)
-                if obj_trans_gt.shape[0] == 1 and batch_size > 1:
-                    obj_trans_gt = obj_trans_gt.expand(batch_size, -1, -1)
-                if obj_trans_gt.shape[:2] == (batch_size, seq_len):
-                    valid = has_object_sample
-                    if valid.any():
-                        losses["drift_obj"] = F.mse_loss(
-                            pred_obj_trans_from_delta[valid, -1],
-                            obj_trans_gt[valid, -1],
-                        )
+            if isinstance(obj_trans_init, torch.Tensor) and obj_trans_init.shape[0] == batch_size:
+                pred_obj_trans = self._integrate_obj_trans(delta_p_obj_pred, obj_trans_init)
 
         if isinstance(pred_obj_trans, torch.Tensor):
             pred_obj_trans = pred_obj_trans.to(device=device, dtype=dtype)
+            if pred_obj_trans.dim() == 2:
+                pred_obj_trans = pred_obj_trans.unsqueeze(0)
+
+        if isinstance(pred_obj_vel, torch.Tensor):
+            pred_obj_vel = pred_obj_vel.to(device=device, dtype=dtype)
+            if pred_obj_vel.dim() == 2:
+                pred_obj_vel = pred_obj_vel.unsqueeze(0)
+        elif isinstance(pred_obj_trans, torch.Tensor):
+            pred_obj_vel = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
+            if pred_obj_trans.shape[:2] == (batch_size, seq_len) and seq_len > 1:
+                pred_obj_vel[:, 1:] = pred_obj_trans[:, 1:] - pred_obj_trans[:, :-1]
+                pred_obj_vel[:, 0] = pred_obj_vel[:, 1]
+
+        obj_trans_gt = batch.get("obj_trans")
+        if isinstance(obj_trans_gt, torch.Tensor):
+            obj_trans_gt = obj_trans_gt.to(device=device, dtype=dtype)
+            if obj_trans_gt.dim() == 2:
+                obj_trans_gt = obj_trans_gt.unsqueeze(0)
+            if obj_trans_gt.shape[0] == 1 and batch_size > 1:
+                obj_trans_gt = obj_trans_gt.expand(batch_size, -1, -1)
+
+        obj_vel_gt = batch.get("obj_vel")
+        if isinstance(obj_vel_gt, torch.Tensor):
+            obj_vel_gt = obj_vel_gt.to(device=device, dtype=dtype)
+            if obj_vel_gt.dim() == 2:
+                obj_vel_gt = obj_vel_gt.unsqueeze(0)
+            if obj_vel_gt.shape[0] == 1 and batch_size > 1:
+                obj_vel_gt = obj_vel_gt.expand(batch_size, -1, -1)
+        elif isinstance(obj_trans_gt, torch.Tensor):
+            obj_vel_gt = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
+            if obj_trans_gt.shape[:2] == (batch_size, seq_len) and seq_len > 1:
+                obj_vel_gt[:, 1:] = obj_trans_gt[:, 1:] - obj_trans_gt[:, :-1]
+                obj_vel_gt[:, 0] = obj_vel_gt[:, 1]
+
+        if (
+            isinstance(pred_obj_vel, torch.Tensor)
+            and isinstance(obj_vel_gt, torch.Tensor)
+            and pred_obj_vel.shape[:2] == (batch_size, seq_len)
+            and obj_vel_gt.shape[:2] == (batch_size, seq_len)
+        ):
+            vel_mask = has_object_mask.unsqueeze(-1).expand(-1, -1, 3)
+            if vel_mask.any():
+                losses["vel_obj"] = F.mse_loss(pred_obj_vel[vel_mask], obj_vel_gt[vel_mask])
+
+        if isinstance(pred_obj_trans, torch.Tensor):
             if pred_obj_trans.shape[:2] == (batch_size, seq_len) and seq_len > 2:
                 acc = pred_obj_trans[:, 2:] - 2.0 * pred_obj_trans[:, 1:-1] + pred_obj_trans[:, :-2]
                 center_mask = has_object_mask[:, 2:]
@@ -282,7 +310,7 @@ class IMUHOIMixLoss:
             "fk": 1.0,
             "drift": 0.1,
             "slide": 1.0,
-            "drift_obj": 1.0,
+            "vel_obj": 1.0,
             "jitter_obj": 1.0,
         }
 
@@ -358,6 +386,13 @@ class IMUHOIMixLoss:
                 pred_obj_trans = pred_obj_trans.unsqueeze(0)
 
         if not isinstance(pred_obj_trans, torch.Tensor):
+            p_obj_pred = pred_dict.get("p_obj_pred") if isinstance(pred_dict, dict) else None
+            if isinstance(p_obj_pred, torch.Tensor):
+                pred_obj_trans = p_obj_pred.to(device=device, dtype=dtype)
+                if pred_obj_trans.dim() == 2:
+                    pred_obj_trans = pred_obj_trans.unsqueeze(0)
+
+        if not isinstance(pred_obj_trans, torch.Tensor):
             delta_p_obj_pred = pred_dict.get("delta_p_obj_pred") if isinstance(pred_dict, dict) else None
             obj_trans_init = pred_dict.get("obj_trans_init") if isinstance(pred_dict, dict) else None
             if isinstance(delta_p_obj_pred, torch.Tensor):
@@ -400,7 +435,7 @@ class IMUHOIMixLoss:
                 valid = has_object_mask.unsqueeze(-1).expand(-1, -1, 3)
                 if valid.any():
                     sq_err = (pred_obj_trans - obj_trans_gt) ** 2
-                    metrics["obj_pos_mse"] = sq_err[valid].mean() * (1000.0 ** 2)
+                    metrics["obj_pos_mse"] = sq_err[valid].mean() 
 
                 if seq_len > 2:
                     acc = pred_obj_trans[:, 2:] - 2.0 * pred_obj_trans[:, 1:-1] + pred_obj_trans[:, :-2]

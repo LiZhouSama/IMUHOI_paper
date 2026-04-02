@@ -320,6 +320,18 @@ def build_model_input_dict(batch, cfg, device, add_noise=True):
         return value
     
     has_object = _prepare_has_object(batch.get('has_object'))
+    obj_points_count = int(getattr(cfg, "mesh_downsample_points", 256))
+    obj_points_canonical_val = batch.get('obj_points_canonical')
+    if isinstance(obj_points_canonical_val, torch.Tensor):
+        obj_points_canonical = obj_points_canonical_val.to(device=device, dtype=dtype)
+        if obj_points_canonical.dim() == 2:
+            obj_points_canonical = obj_points_canonical.unsqueeze(0)
+        if obj_points_canonical.shape[0] == 1 and bs > 1:
+            obj_points_canonical = obj_points_canonical.expand(bs, -1, -1)
+        if obj_points_canonical.shape[0] != bs or obj_points_canonical.shape[-1] != 3:
+            obj_points_canonical = torch.zeros(bs, obj_points_count, 3, device=device, dtype=dtype)
+    else:
+        obj_points_canonical = torch.zeros(bs, obj_points_count, 3, device=device, dtype=dtype)
     
     return {
         'human_imu': human_imu,
@@ -333,6 +345,12 @@ def build_model_input_dict(batch, cfg, device, add_noise=True):
         'hand_vel_glb_init': hand_vel_glb_init,
         'contact_init': contact_init,
         'has_object': has_object,
+        # object metadata for mesh-prior teacher/cache path
+        'obj_name': batch.get('obj_name'),
+        'obj_points_canonical': obj_points_canonical,
+        'seq_file': batch.get('seq_file'),
+        'window_start': batch.get('window_start'),
+        'window_end': batch.get('window_end'),
     }
 
 

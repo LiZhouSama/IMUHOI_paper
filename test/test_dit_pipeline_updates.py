@@ -52,11 +52,13 @@ except Exception:
     sys.modules["human_body_prior.body_model"] = body_model_pkg
     sys.modules["human_body_prior.body_model.body_model"] = body_model_mod
 
+from pytorch3d.transforms import matrix_to_rotation_6d
 from model.diffussion.interaction import InteractionModule
 from model.diffussion.human_pose import HumanPoseModule
 import model.diffussion.human_pose as human_pose_mod
 from model.diffussion.imuhoi_model import IMUHOIModel
 from train.diffussion.loss.human_pose_loss import HumanPoseLoss
+from train.diffussion.loss.interaction_loss import InteractionLoss
 from train.diffussion.train_human_pose import HumanPoseTrainer
 from utils.utils import build_model_input_dict, load_checkpoint
 
@@ -112,18 +114,40 @@ def test_build_model_input_dict_uses_sample_level_noise_mask():
     assert not torch.allclose(out["obj_imu"][1], torch.zeros_like(out["obj_imu"][1]))
 
 
-def test_interaction_split_head_forward_keeps_output_contract():
-    torch.manual_seed(0)
+def test_build_model_input_dict_passes_object_metadata():
     cfg = _make_cfg()
-    module = InteractionModule(cfg).train()
-    bs, seq = 2, 8
+    device = torch.device("cpu")
+    bs, seq = 2, 4
+    batch = {
+        "human_imu": torch.zeros(bs, seq, cfg.num_human_imus, cfg.imu_dim),
+        "obj_imu": torch.zeros(bs, seq, cfg.obj_imu_dim),
+        "obj_name": ["mug", "bottle"],
+        "seq_file": ["s1.pt", "s2.pt"],
+        "window_start": torch.tensor([3, 7]),
+        "window_end": torch.tensor([63, 67]),
+    }
+    out = build_model_input_dict(batch, cfg, device, add_noise=False)
+    assert out["obj_name"] == ["mug", "bottle"]
+    assert out["seq_file"] == ["s1.pt", "s2.pt"]
+    assert torch.equal(out["window_start"], torch.tensor([3, 7]))
+    assert torch.equal(out["window_end"], torch.tensor([63, 67]))
+
+
+def _make_interaction_inputs(cfg, bs=2, seq=8, has_object=True):
+    eye = torch.eye(3).view(1, 1, 3, 3).expand(bs, seq, 3, 3).clone()
+    obj_rot6d = matrix_to_rotation_6d(eye.reshape(-1, 3, 3)).reshape(bs, seq, 6)
+    has_object_tensor = torch.full((bs,), bool(has_object), dtype=torch.bool)
 
     data_dict = {
         "human_imu": torch.randn(bs, seq, cfg.num_human_imus, cfg.imu_dim),
         "obj_imu": torch.randn(bs, seq, cfg.obj_imu_dim),
         "obj_trans_init": torch.randn(bs, 3),
         "contact_init": torch.zeros(bs, 3),
-        "has_object": torch.ones(bs, dtype=torch.bool),
+        "has_object": has_object_tensor,
+        "obj_name": [f"obj_{i}" for i in range(bs)],
+        "seq_file": [f"seq_{i}.pt" for i in range(bs)],
+        "window_start": torch.arange(bs, dtype=torch.long),
+        "window_end": torch.arange(bs, dtype=torch.long) + seq,
     }
     hp_out = {
         "pred_hand_glb_pos": torch.randn(bs, seq, 2, 3),
@@ -132,18 +156,142 @@ def test_interaction_split_head_forward_keeps_output_contract():
     }
     gt_targets = {
         "obj_trans": torch.randn(bs, seq, 3),
+        "obj_rot": obj_rot6d,
+        "obj_scale": torch.ones(bs, seq),
         "lhand_contact": torch.randint(0, 2, (bs, seq), dtype=torch.float32),
         "rhand_contact": torch.randint(0, 2, (bs, seq), dtype=torch.float32),
         "obj_contact": torch.randint(0, 2, (bs, seq), dtype=torch.float32),
         "interaction_start_gauss": torch.zeros(bs, seq),
         "interaction_end_gauss": torch.zeros(bs, seq),
     }
+    return data_dict, hp_out, gt_targets
+
+
+def test_interaction_split_head_forward_keeps_output_contract():
+    torch.manual_seed(0)
+    cfg = _make_cfg()
+    module = InteractionModule(cfg).train()
+    bs, seq = 2, 8
+    data_dict, hp_out, gt_targets = _make_interaction_inputs(cfg, bs=bs, seq=seq, has_object=True)
 
     out = module(data_dict, hp_out=hp_out, gt_targets=gt_targets)
     assert out["pred_obj_trans"].shape == (bs, seq, 3)
-    assert out["pred_hand_contact_logits"].shape == (bs, seq, 3)
-    assert out["pred_interaction_boundary_logits"].shape == (bs, seq, 2)
-    assert out["diffusion_aux"]["eps_pred"].shape == (bs, seq, 3)
+    assert out["contact_prob_pred"].shape == (bs, seq, 2)
+    assert out["bone_dir_pred"].shape == (bs, seq, 2, 3)
+    assert out["object_prior_aux"]["z_q_obs"].shape[0] == bs
+    assert out["diffusion_aux"]["object_code_idx_pred"].shape == (bs,)
+    assert module.dit.cond_dim == module.code_dim
+
+
+def test_interaction_inference_obs_prior_outputs_code_index():
+    torch.manual_seed(1)
+    cfg = _make_cfg()
+    module = InteractionModule(cfg).eval()
+    bs, seq = 2, 6
+    data_dict, hp_out, _ = _make_interaction_inputs(cfg, bs=bs, seq=seq, has_object=True)
+    out = module.inference(data_dict, hp_out=hp_out, gt_targets=None, sample_steps=2)
+    assert out["pred_obj_trans"].shape == (bs, seq, 3)
+    assert out["diffusion_aux"]["object_code_idx_pred"].shape == (bs,)
+    assert out["object_prior_aux"]["z_q_obs"].shape == (bs, module.code_dim)
+
+
+def test_interaction_no_object_forces_null_condition():
+    torch.manual_seed(2)
+    cfg = _make_cfg()
+    cfg.cond_mode_probs = [1.0, 0.0, 0.0]
+    module = InteractionModule(cfg).train()
+    bs, seq = 2, 6
+    data_dict, hp_out, gt_targets = _make_interaction_inputs(cfg, bs=bs, seq=seq, has_object=False)
+    out = module(data_dict, hp_out=hp_out, gt_targets=gt_targets)
+    prior = out["object_prior_aux"]
+    assert bool((prior["mode"] == 2).all())
+    expected_null = module.null_object_code.expand(bs, -1).to(prior["cond"].dtype)
+    assert torch.allclose(prior["cond"], expected_null, atol=1e-6)
+
+
+def test_interaction_mesh_loader_failure_falls_back_to_obs():
+    torch.manual_seed(3)
+    cfg = _make_cfg()
+    cfg.cond_mode_probs = [1.0, 0.0, 0.0]
+    module = InteractionModule(cfg).train()
+    bs, seq = 2, 6
+    data_dict, hp_out, gt_targets = _make_interaction_inputs(cfg, bs=bs, seq=seq, has_object=True)
+
+    def _broken_loader(*_args, **_kwargs):
+        raise RuntimeError("mock mesh loader failure")
+
+    module._get_load_object_geometry = lambda: _broken_loader
+    out = module(data_dict, hp_out=hp_out, gt_targets=gt_targets)
+    prior = out["object_prior_aux"]
+    assert bool((prior["mesh_valid_mask"] == 0).all())
+    # mesh mode should fallback to obs mode when teacher is unavailable
+    assert bool((prior["mode"] == 1).all())
+
+
+def test_interaction_metadata_mismatch_disables_mesh_teacher():
+    torch.manual_seed(4)
+    cfg = _make_cfg()
+    cfg.cond_mode_probs = [1.0, 0.0, 0.0]
+    module = InteractionModule(cfg).train()
+    bs, seq = 2, 6
+    data_dict, hp_out, gt_targets = _make_interaction_inputs(cfg, bs=bs, seq=seq, has_object=True)
+    data_dict["obj_name"] = ["only_one_name"]  # mismatch with batch size
+
+    out = module(data_dict, hp_out=hp_out, gt_targets=gt_targets)
+    prior = out["object_prior_aux"]
+    assert bool(prior["mesh_dp_mismatch"].all())
+    assert bool((prior["mesh_valid_mask"] == 0).all())
+    assert bool((prior["mode"] == 1).all())
+
+
+def test_interaction_loss_prior_terms_with_and_without_aux():
+    torch.manual_seed(5)
+    loss_fn = InteractionLoss(
+        weights={
+            "Loss_simple": 1.0,
+            "Loss_vel_obj": 0.0,
+            "Loss_jitter_obj": 0.0,
+            "Loss_align": 1.0,
+            "Loss_code_cls": 1.0,
+            "Loss_commit": 0.1,
+        }
+    )
+
+    bs, seq, target_dim = 2, 6, 16
+    batch = {
+        "human_imu": torch.zeros(bs, seq, 6, 9),
+        "has_object": torch.ones(bs, dtype=torch.bool),
+        "obj_trans": torch.zeros(bs, seq, 3),
+        "obj_vel": torch.zeros(bs, seq, 3),
+    }
+    pred_base = {
+        "x_pred": torch.zeros(bs, seq, target_dim),
+        "pred_obj_trans": torch.zeros(bs, seq, 3),
+        "pred_obj_vel": torch.zeros(bs, seq, 3),
+        "diffusion_aux": {"x0_target": torch.zeros(bs, seq, target_dim)},
+    }
+    pred_with_aux = {
+        **pred_base,
+        "object_prior_aux": {
+            "z_e_obs": torch.randn(bs, 8),
+            "z_e_mesh": torch.randn(bs, 8),
+            "z_q_mesh": torch.randn(bs, 8),
+            "code_idx_mesh": torch.tensor([1, 2], dtype=torch.long),
+            "code_logits_obs": torch.randn(bs, 16),
+            "mesh_valid_mask": torch.ones(bs, dtype=torch.bool),
+            "vq_beta": torch.tensor(0.25),
+        },
+    }
+
+    _, losses_with_aux, _ = loss_fn(pred_with_aux, batch, torch.device("cpu"))
+    assert losses_with_aux["align"].item() > 0.0
+    assert losses_with_aux["code_cls"].item() > 0.0
+    assert losses_with_aux["commit"].item() > 0.0
+
+    _, losses_no_aux, _ = loss_fn(pred_base, batch, torch.device("cpu"))
+    assert losses_no_aux["align"].item() == 0.0
+    assert losses_no_aux["code_cls"].item() == 0.0
+    assert losses_no_aux["commit"].item() == 0.0
 
 
 def test_load_checkpoint_strict_false_skips_shape_mismatch(tmp_path):
@@ -274,6 +422,7 @@ def _make_hp_inputs(bs, seq, device):
     gt_targets = {
         "sensor_vel_root": torch.randn(bs, seq, 6, 3, device=device),
         "ori_root_reduced": eye.expand(bs, seq, 10, 3, 3).clone(),
+        "rotation_global": eye.expand(bs, seq, 24, 3, 3).clone(),
         "root_vel": torch.randn(bs, seq, 3, device=device),
         "trans": torch.randn(bs, seq, 3, device=device),
     }
@@ -491,6 +640,22 @@ def test_human_pose_inference_reports_warmup_len():
 
     assert out["root_trans_pred"].shape[:2] == (bs, seq)
     assert out["diffusion_aux"]["warmup_len"] == 4
+    assert out["diffusion_aux"]["window_size"] == 5
+
+
+def test_human_pose_inference_uses_configured_warmup_len():
+    torch.manual_seed(3)
+    cfg = _make_hp_cfg(window=5)
+    cfg.dit["dit_test_warmup_len"] = 2
+    model = _make_hp_model(cfg)
+    model.eval()
+
+    bs, seq = 1, 6
+    data_dict, gt_targets = _make_hp_inputs(bs, seq, torch.device("cpu"))
+    out = model.inference(data_dict, gt_targets=gt_targets, sample_steps=2)
+
+    assert out["root_trans_pred"].shape[:2] == (bs, seq)
+    assert out["diffusion_aux"]["warmup_len"] == 2
     assert out["diffusion_aux"]["window_size"] == 5
 
 

@@ -120,6 +120,10 @@ class HumanPoseModule(nn.Module):
         self.root_correction_contact_threshold = min(max(self.root_correction_contact_threshold, 0.0), 1.0)
         # Test-time option: seed autoregressive inference with GT warmup frames.
         self.test_use_gt_warmup = bool(_dit_param("dit_test_use_gt_warmup", True))
+        test_warmup_len = _dit_param("dit_test_warmup_len", None)
+        self.test_warmup_len = None if test_warmup_len is None else int(test_warmup_len)
+        if self.test_warmup_len is not None and self.test_warmup_len < 0:
+            raise ValueError(f"dit_test_warmup_len must be >= 0 or None, got {self.test_warmup_len}")
 
         prediction_type = str(_dit_param("dit_prediction_type", "x0")).lower()
         if prediction_type not in {"x0", "eps"}:
@@ -787,7 +791,9 @@ class HumanPoseModule(nn.Module):
         ):
             gt_clean_seq, _ = self._build_clean_window(data_dict, gt_targets)
             max_warmup = max(seq_len, 1) - 1
-            warmup_len = min(max(self.window_size - 1, 0), max_warmup)
+            max_window_warmup = max(self.window_size - 1, 0)
+            cfg_warmup = max_window_warmup if self.test_warmup_len is None else self.test_warmup_len
+            warmup_len = min(max(cfg_warmup, 0), max_window_warmup, max_warmup)
             if warmup_len > 0:
                 warmup_seq = gt_clean_seq[:, :warmup_len]
 

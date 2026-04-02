@@ -13,6 +13,7 @@ import trimesh
 import glob
 
 contact_threh = 0.25
+_CANONICAL_OBJ_POINTS_CACHE = {}
 
 def compute_improved_contact_labels(obj_trans, obj_rot, obj_scale, position_global_full_gt_world, 
                                   obj_mesh_dir, obj_name, device, T):
@@ -199,7 +200,7 @@ def compute_improved_contact_labels(obj_trans, obj_rot, obj_scale, position_glob
     return lhand_contact, rhand_contact, obj_contact
 
 def load_object_geometry(obj_name, obj_rot, obj_trans, obj_scale=None, obj_geo_root='./datasets/OMOMO/captured_objects', device='cpu'):
-    """ 加载物体几何体并应用变换 (OMOMO 方式) """
+    """加载物体几何体并应用变换，返回变换后的顶点与面片。"""
     if obj_name is None:
         print("Warning: Object name is None, cannot load geometry.")
         return None, None
@@ -222,6 +223,53 @@ def load_object_geometry(obj_name, obj_rot, obj_trans, obj_scale=None, obj_geo_r
     )  # [T, N_v, 3]
     return transformed_verts, obj_mesh_faces
 
+
+def load_canonical_points_from_mesh_path(obj_mesh_path, sample_count=256, device='cpu'):
+    """Load canonical object points [N,3] centered at mesh centroid."""
+    key = (os.path.abspath(obj_mesh_path), int(sample_count))
+    cached = _CANONICAL_OBJ_POINTS_CACHE.get(key)
+    if isinstance(cached, torch.Tensor):
+        return cached.to(device=device)
+
+    mesh = trimesh.load_mesh(obj_mesh_path)
+    obj_mesh_verts_np = np.asarray(mesh.vertices, dtype=np.float32)
+    centroid = obj_mesh_verts_np.mean(axis=0)
+    obj_mesh_verts_np = obj_mesh_verts_np - centroid
+    mesh.vertices = obj_mesh_verts_np
+    sampled_points_np, _ = trimesh.sample.sample_surface(mesh, int(sample_count))
+    points = torch.from_numpy(sampled_points_np.astype(np.float32))
+    _CANONICAL_OBJ_POINTS_CACHE[key] = points
+    return points.to(device=device)
+
+
+def load_object_canonical_points(
+    obj_name,
+    obj_geo_root='./datasets/OMOMO/captured_objects',
+    sample_count=256,
+    device='cpu',
+):
+    """Resolve mesh path and return canonical object points [N,3]."""
+    if obj_name is None:
+        return None
+
+    obj_mesh_path = os.path.join(obj_geo_root, f"{obj_name}_cleaned_simplified.obj")
+    if not os.path.exists(obj_mesh_path):
+        obj_mesh_path = os.path.join(obj_geo_root, f"{obj_name}_simplified_transformed.obj")
+    if not os.path.exists(obj_mesh_path):
+        ply_candidates = sorted(glob.glob(os.path.join(obj_geo_root, obj_name, "*.ply")))
+        if ply_candidates:
+            obj_mesh_path = ply_candidates[0]
+    if not os.path.exists(obj_mesh_path):
+        obj_mesh_path = os.path.join(obj_geo_root, f"{obj_name}.obj")
+    if not os.path.exists(obj_mesh_path):
+        return None
+
+    try:
+        return load_canonical_points_from_mesh_path(obj_mesh_path, sample_count=sample_count, device=device)
+    except Exception:
+        return None
+
+
 def apply_transformation_to_obj_geometry(obj_mesh_path, obj_rot, obj_trans, scale=None, device='cpu'):
     """
     应用变换到物体顶点 (遵循 hand_foot_dataset.py 的逻辑: Rotate -> Scale -> Translate)
@@ -235,12 +283,14 @@ def apply_transformation_to_obj_geometry(obj_mesh_path, obj_rot, obj_trans, scal
 
     返回:
         transformed_obj_verts: 变换后的顶点 [T, Nv, 3] (torch tensor on device)
+        obj_mesh_faces: 网格面片 [Nf, 3] (numpy array)
     """
     try:
         mesh = trimesh.load_mesh(obj_mesh_path)
         obj_mesh_verts_np = np.asarray(mesh.vertices) # Nv X 3
         centroid = obj_mesh_verts_np.mean(axis=0)
         obj_mesh_verts_np = obj_mesh_verts_np - centroid  # 适配BEHAVE TODO:不确定对其他数据集是否有效
+        mesh.vertices = obj_mesh_verts_np
         obj_mesh_faces = np.asarray(mesh.faces) # Nf X 3
 
         obj_mesh_verts = torch.from_numpy(obj_mesh_verts_np).float().to(device) # Nv X 3
@@ -252,39 +302,38 @@ def apply_transformation_to_obj_geometry(obj_mesh_path, obj_rot, obj_trans, scal
             seq_scale = None
 
         T = seq_trans.shape[0]
-        ori_obj_verts = obj_mesh_verts[None].repeat(T, 1, 1) # T X Nv X 3
+        def _apply_seq_transform(points):
+            points_seq = points[None].repeat(T, 1, 1) # T X N X 3
 
-        # --- 遵循参考代码的顺序：Rotate -> Scale -> Translate ---
-        
-        # 1. 旋转 (Rotate)
-        # Transpose vertices for matmul: T X 3 X Nv
-        verts_rotated = torch.bmm(seq_rot_mat, ori_obj_verts.transpose(1, 2))
-        # Result shape: T X 3 X Nv
+            # --- 遵循参考代码的顺序：Rotate -> Scale -> Translate ---
 
-        # 2. 缩放 (Scale)
-        # 准备 scale tensor for broadcasting: T -> T X 1 X 1
-        if seq_scale is not None:
-            scale_factor = seq_scale.unsqueeze(-1).unsqueeze(-1)
-            verts_scaled = scale_factor * verts_rotated
-        else:
-            verts_scaled = verts_rotated # No scaling
-        # Result shape: T X 3 X Nv
+            # 1. 旋转 (Rotate): T X 3 X N
+            points_rotated = torch.bmm(seq_rot_mat, points_seq.transpose(1, 2))
 
-        # 3. 平移 (Translate)
-        # 准备 translation tensor for broadcasting: T X 3 -> T X 3 X 1
-        trans_vector = seq_trans.unsqueeze(-1)
-        verts_translated = verts_scaled + trans_vector
-        # Result shape: T X 3 X Nv
+            # 2. 缩放 (Scale)
+            if seq_scale is not None:
+                scale_factor = seq_scale.unsqueeze(-1).unsqueeze(-1)
+                points_scaled = scale_factor * points_rotated
+            else:
+                points_scaled = points_rotated
 
-        # 4. Transpose back to T X Nv X 3
-        transformed_obj_verts = verts_translated.transpose(1, 2)
+            # 3. 平移 (Translate)
+            trans_vector = seq_trans.unsqueeze(-1)
+            points_translated = points_scaled + trans_vector
+
+            # 4. 转回 T X N X 3
+            return points_translated.transpose(1, 2)
+
+        transformed_obj_verts = _apply_seq_transform(obj_mesh_verts) # T X Nv X 3
 
     except Exception as e:
         print(f"应用变换到物体几何体失败: {e}")
         import traceback
         traceback.print_exc()
         # 返回设备上的虚拟数据
-        transformed_obj_verts = torch.zeros((obj_trans.shape[0] if obj_trans is not None else 1, 1, 3), device=device)
+        T = obj_trans.shape[0] if obj_trans is not None else 1
+        transformed_obj_verts = torch.zeros((T, 1, 3), device=device)
+        obj_mesh_faces = np.zeros((0, 3), dtype=np.int64)
 
     return transformed_obj_verts, obj_mesh_faces
 
@@ -334,7 +383,17 @@ def compute_foot_contact_labels(position_global_full_gt_world, foot_velocity_thr
     
     return lfoot_contact, rfoot_contact
 
-def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=None, bps_points=None, obj_mesh_dir=None):
+def process_sequence(
+    seq_data,
+    seq_key,
+    save_dir,
+    bm,
+    device='cuda',
+    bps_dir=None,
+    bps_points=None,
+    obj_mesh_dir=None,
+    obj_points_count: int = 256,
+):
     import pytorch3d.transforms as transforms
     """处理单个序列并保存为pt文件"""
     smpl_init_input = {
@@ -456,6 +515,7 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
     
         # 提取物体名称
         object_name = seq_name.split("_")[1] if "_" in seq_name else "unknown"
+        has_object = bool(seq_data.get("has_object", True))
 
         # --- 改进的接触检测算法 ---
         lhand_contact, rhand_contact, obj_contact = compute_improved_contact_labels(
@@ -464,9 +524,20 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
         )
         # --- 接触检测结束 ---
 
+        # 预存canonical点云（可选）
+        canonical_points = None
+        if has_object and obj_mesh_dir:
+            canonical_points = load_object_canonical_points(
+                object_name,
+                obj_geo_root=obj_mesh_dir,
+                sample_count=int(max(1, obj_points_count)),
+                device="cpu",
+            )
+
         # 构建物体数据字典
         obj_data = {
             "obj_name": object_name,
+            "has_object": has_object,
             "obj_scale": obj_scale.cpu(),
             "obj_trans": obj_trans.cpu(),
             "obj_rot": obj_rot.cpu(),
@@ -475,6 +546,9 @@ def process_sequence(seq_data, seq_key, save_dir, bm, device='cuda', bps_dir=Non
             "rhand_contact": rhand_contact.cpu(), # 基于距离
             "obj_contact": obj_contact.cpu()      # 基于运动
         }
+        if isinstance(canonical_points, torch.Tensor) and canonical_points.dim() == 2 and canonical_points.shape[-1] == 3:
+            obj_data["obj_points_canonical"] = canonical_points.half().cpu()
+            obj_data["obj_points_sample_count"] = int(canonical_points.shape[0])
     
     # 组装输出数据
     data = {
@@ -759,13 +833,29 @@ def main(args):
     print("开始处理训练序列...")
     
     for seq_key in tqdm(data_dict_train, desc="处理训练序列"):
-        process_sequence(data_dict_train[seq_key], seq_key, args.save_dir_train, bm_male, device=device, obj_mesh_dir=args.obj_mesh_dir)
+        process_sequence(
+            data_dict_train[seq_key],
+            seq_key,
+            args.save_dir_train,
+            bm_male,
+            device=device,
+            obj_mesh_dir=args.obj_mesh_dir,
+            obj_points_count=args.obj_points_count,
+        )
     
     print(f"训练序列处理完成，结果保存在：{args.save_dir_train}")
 
     print("开始处理测试序列...")
     for seq_key in tqdm(data_dict_test, desc="处理测试序列"):
-        process_sequence(data_dict_test[seq_key], seq_key, args.save_dir_test, bm_male, device=device, obj_mesh_dir=args.obj_mesh_dir)
+        process_sequence(
+            data_dict_test[seq_key],
+            seq_key,
+            args.save_dir_test,
+            bm_male,
+            device=device,
+            obj_mesh_dir=args.obj_mesh_dir,
+            obj_points_count=args.obj_points_count,
+        )
     
     print(f"测试序列处理完成，结果保存在：{args.save_dir_test}")
     print("所有数据处理完成!")
@@ -777,14 +867,16 @@ if __name__ == "__main__":
                         help="输入数据集路径(.p文件)")
     parser.add_argument("--data_path_test", type=str, default="datasets/OMOMO/test_diffusion_manip_seq_joints24.p",
                         help="输入数据集路径(.p文件)")
-    parser.add_argument("--save_dir_train", type=str, default="process/processed_split_data_OMOMO/train",
+    parser.add_argument("--save_dir_train", type=str, default="process/processed_split_data_OMOMO_bps/train",
                         help="输出数据保存目录")
-    parser.add_argument("--save_dir_test", type=str, default="process/processed_split_data_OMOMO/test",
+    parser.add_argument("--save_dir_test", type=str, default="process/processed_split_data_OMOMO_bps/test",
                         help="输出数据保存目录")
-    parser.add_argument("--support_dir", type=str, default="body_models",
+    parser.add_argument("--support_dir", type=str, default="datasets/smpl_models",
                         help="SMPL模型目录")
     parser.add_argument("--obj_mesh_dir", type=str, default="datasets/OMOMO/captured_objects",
                         help="物体网格目录")
+    parser.add_argument("--obj_points_count", type=int, default=256,
+                        help="canonical物体点云点数（保存到pt）")
     parser.add_argument("--process_amass", action="store_true",
                         help="是否处理AMASS数据集")
     parser.add_argument("--amass_dir", type=str, default="/mnt/d/a_WORK/Projects/PhD/datasets/AMASS_SMPL_H",

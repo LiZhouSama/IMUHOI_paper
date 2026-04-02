@@ -12,7 +12,11 @@ from human_body_prior.body_model.body_model import BodyModel
 from human_body_prior.tools.rotation_tools import local2global_pose
 import pytorch3d.transforms as transforms
 
-from preprocess import compute_improved_contact_labels, compute_foot_contact_labels
+from preprocess import (
+    compute_improved_contact_labels,
+    compute_foot_contact_labels,
+    load_canonical_points_from_mesh_path,
+)
 
 DEFAULT_CHUNK_LEN = 1500      # 视显存/机型可调
 
@@ -208,7 +212,8 @@ def compute_foot_floor_offset(
 def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_root: str,
                             object_names: List[str], device: torch.device,
                             output_dir: str, frame_trim: Optional[int] = None,
-                            smpl_batch: int = 256) -> None:
+                            smpl_batch: int = 256,
+                            obj_points_count: int = 256) -> None:
     seq_name = os.path.basename(seq_dir.rstrip(os.sep))
     smpl_path = os.path.join(seq_dir, "smpl_fit_all.npz")
     obj_path = os.path.join(seq_dir, "object_fit_all.npz")
@@ -246,6 +251,11 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
     mesh_path = resolve_object_mesh(object_name, objects_root)
     mesh_dir = os.path.dirname(mesh_path)
     mesh_basename = os.path.splitext(os.path.basename(mesh_path))[0]
+    canonical_points = load_canonical_points_from_mesh_path(
+        mesh_path,
+        sample_count=int(max(1, obj_points_count)),
+        device="cpu",
+    )
     bm = bm_loader.get(gender)
     smpl_init_input = {
             "root_orient": torch.zeros_like(torch.from_numpy(poses[:, :3].reshape(-1, 3)).to(device).float()),
@@ -369,6 +379,9 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
         "betas": torch.from_numpy(betas_raw).float(),
         "obj_name": object_name,
         "obj_mesh_name": mesh_basename,
+        "obj_points_canonical": canonical_points.half().cpu(),
+        "obj_points_sample_count": int(canonical_points.shape[0]),
+        "has_object": True,
         "obj_scale": obj_scale_cpu,
         "obj_trans": obj_trans_cpu,
         "obj_rot": obj_rot_cpu,
@@ -409,6 +422,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=None, help="Force computation device (cpu or cuda)")
     parser.add_argument("--smpl_batch", type=int, default=256, help="Batch size for SMPL forward pass")
     parser.add_argument(
+        "--obj_points_count",
+        type=int,
+        default=256,
+        help="Number of canonical object points to save per sequence.",
+    )
+    parser.add_argument(
         "--num_betas",
         type=int,
         default=16,
@@ -443,6 +462,7 @@ def main() -> None:
             args.output_dir,
             args.frame_trim,
             args.smpl_batch,
+            args.obj_points_count,
         )
 
 

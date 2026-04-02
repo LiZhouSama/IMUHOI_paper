@@ -13,14 +13,116 @@ Inference:
 """
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from pytorch3d.transforms import matrix_to_rotation_6d
+import torch.nn.functional as F
+from pytorch3d.transforms import matrix_to_rotation_6d, rotation_6d_to_matrix
 
 from .base import ConditionalDiT
 from configs import FRAME_RATE, _SENSOR_NAMES
+
+
+class _SequenceTransformerEncoder(nn.Module):
+    """Transformer encoder that maps [B,T,C] to a single [B,D] token."""
+
+    def __init__(
+        self,
+        *,
+        in_dim: int,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        dropout: float,
+        out_dim: int,
+    ):
+        super().__init__()
+        self.in_proj = nn.Linear(in_dim, d_model)
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_model * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=max(int(num_layers), 1))
+        self.out_proj = nn.Linear(d_model, out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.in_proj(x)
+        h = self.encoder(h)
+        h = h.mean(dim=1)
+        return self.out_proj(h)
+
+
+class _MeshPriorEncoder(nn.Module):
+    """PointNet frame encoder + temporal aggregator for mesh prior token."""
+
+    def __init__(
+        self,
+        *,
+        point_dim: int,
+        d_model: int,
+        out_dim: int,
+        temporal_model: str = "gru",
+        temporal_layers: int = 2,
+        temporal_kernel_size: int = 3,
+        temporal_dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.point_mlp = nn.Sequential(
+            nn.Linear(point_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+        )
+        self.frame_norm = nn.LayerNorm(d_model)
+
+        self.temporal_model = str(temporal_model).lower()
+        layers = max(int(temporal_layers), 1)
+        if self.temporal_model == "gru":
+            self.temporal_encoder = nn.GRU(
+                input_size=d_model,
+                hidden_size=d_model,
+                num_layers=layers,
+                batch_first=True,
+                dropout=float(max(temporal_dropout, 0.0)) if layers > 1 else 0.0,
+            )
+        elif self.temporal_model == "tcn":
+            kernel = int(max(1, temporal_kernel_size))
+            if kernel % 2 == 0:
+                kernel += 1
+            tcn_blocks = []
+            for _ in range(layers):
+                tcn_blocks.append(
+                    nn.Sequential(
+                        nn.Conv1d(d_model, d_model, kernel_size=kernel, padding=kernel // 2),
+                        nn.GELU(),
+                        nn.Dropout(float(max(temporal_dropout, 0.0))),
+                    )
+                )
+            self.temporal_encoder = nn.ModuleList(tcn_blocks)
+        else:
+            raise ValueError(f"Unsupported mesh temporal_model: {temporal_model}")
+        self.out_proj = nn.Linear(d_model, out_dim)
+
+    def forward(self, point_seq: torch.Tensor) -> torch.Tensor:
+        # point_seq: [B,T,N,3]
+        frame_tokens = self.point_mlp(point_seq).amax(dim=2)
+        frame_tokens = self.frame_norm(frame_tokens)
+
+        if self.temporal_model == "gru":
+            _, h_n = self.temporal_encoder(frame_tokens)
+            seq_token = h_n[-1]
+        else:
+            h = frame_tokens.transpose(1, 2)
+            for block in self.temporal_encoder:
+                h = h + block(h)
+            temporal_tokens = h.transpose(1, 2)
+            seq_token = temporal_tokens.mean(dim=1)
+        return self.out_proj(seq_token)
 
 
 class InteractionModule(nn.Module):
@@ -112,14 +214,69 @@ class InteractionModule(nn.Module):
         self.inference_eta = max(self.inference_eta, 0.0)
 
         self.test_use_gt_warmup = bool(_dit_param("dit_test_use_gt_warmup", True))
+        test_warmup_len = _dit_param("dit_test_warmup_len", None)
+        self.test_warmup_len = None if test_warmup_len is None else int(test_warmup_len)
+        if self.test_warmup_len is not None and self.test_warmup_len < 0:
+            raise ValueError(f"dit_test_warmup_len must be >= 0 or None, got {self.test_warmup_len}")
 
         prediction_type = str(_dit_param("dit_prediction_type", "x0")).lower()
         if prediction_type not in {"x0", "eps"}:
             prediction_type = "x0"
 
+        # Object-prior condition settings.
+        self.code_dim = int(getattr(cfg, "object_code_dim", 128))
+        self.num_codes = int(getattr(cfg, "num_object_codes", 128))
+        self.object_geo_root = str(getattr(cfg, "object_geo_root", "datasets/OMOMO/captured_objects"))
+        self.mesh_downsample_points = int(max(1, getattr(cfg, "mesh_downsample_points", 256)))
+        self.vq_commit_beta = float(getattr(cfg, "vq_commit_beta", 0.25))
+
+        prior_hidden = int(getattr(cfg, "prior_encoder_hidden_dim", 256))
+        prior_heads = int(getattr(cfg, "prior_encoder_heads", 8))
+        prior_layers = int(getattr(cfg, "prior_encoder_layers", 2))
+        prior_dropout = float(getattr(cfg, "prior_encoder_dropout", 0.1))
+        mesh_temporal_model = str(getattr(cfg, "mesh_temporal_model", "gru")).lower()
+        mesh_temporal_layers = int(getattr(cfg, "mesh_temporal_layers", prior_layers))
+        mesh_temporal_kernel_size = int(getattr(cfg, "mesh_temporal_kernel_size", 3))
+        mesh_temporal_dropout = float(getattr(cfg, "mesh_temporal_dropout", prior_dropout))
+
+        mode_probs_cfg = getattr(cfg, "cond_mode_probs", [0.4, 0.4, 0.2])
+        if not isinstance(mode_probs_cfg, (list, tuple)) or len(mode_probs_cfg) != 3:
+            mode_probs_cfg = [0.4, 0.4, 0.2]
+        cond_mode_probs = torch.tensor(mode_probs_cfg, dtype=torch.float32)
+        if float(cond_mode_probs.sum().item()) <= 0.0:
+            cond_mode_probs = torch.tensor([0.4, 0.4, 0.2], dtype=torch.float32)
+        cond_mode_probs = cond_mode_probs / cond_mode_probs.sum().clamp_min(1e-8)
+        self.register_buffer("cond_mode_probs", cond_mode_probs, persistent=False)
+
+        self.mesh_encoder = _MeshPriorEncoder(
+            point_dim=3,
+            d_model=prior_hidden,
+            out_dim=self.code_dim,
+            temporal_model=mesh_temporal_model,
+            temporal_layers=mesh_temporal_layers,
+            temporal_kernel_size=mesh_temporal_kernel_size,
+            temporal_dropout=mesh_temporal_dropout,
+        )
+        self.obs_encoder = _SequenceTransformerEncoder(
+            in_dim=self.rot_dim + self.acc_dim + self.hands_dim,
+            d_model=prior_hidden,
+            nhead=prior_heads,
+            num_layers=prior_layers,
+            dropout=prior_dropout,
+            out_dim=self.code_dim,
+        )
+
+        self.object_codebook = nn.Embedding(self.num_codes, self.code_dim)
+        nn.init.normal_(self.object_codebook.weight, mean=0.0, std=0.02)
+        self.null_object_code = nn.Parameter(torch.zeros(1, self.code_dim))
+
+        self._mesh_point_cloud_cache: Dict[str, torch.Tensor] = {}
+        self._load_object_geometry_fn = None
+        self._mesh_loader_failed = False
+
         self.dit = ConditionalDiT(
             target_dim=self.target_dim,
-            cond_dim=0,
+            cond_dim=self.code_dim,
             d_model=_dit_param("dit_d_model", 256),
             nhead=_dit_param("dit_nhead", 8),
             num_layers=_dit_param("dit_num_layers", 6),
@@ -510,6 +667,413 @@ class InteractionModule(nn.Module):
             "delta_p_obj": delta_p_obj,
         }
 
+    @staticmethod
+    def _as_string_list(value, *, batch_size: int) -> Tuple[List[str], bool]:
+        if isinstance(value, str):
+            return [value], batch_size == 1
+        if isinstance(value, (list, tuple)):
+            out = [str(v) for v in value]
+            return out, len(out) == batch_size
+        return [], False
+
+    @staticmethod
+    def _as_int_list(value, *, batch_size: int) -> Tuple[List[int], bool]:
+        if isinstance(value, torch.Tensor):
+            arr = value.detach().cpu().view(-1).tolist()
+            out = [int(v) for v in arr]
+            return out, len(out) == batch_size
+        if isinstance(value, (list, tuple)):
+            out = [int(v) for v in value]
+            return out, len(out) == batch_size
+        if isinstance(value, (int, float)):
+            return [int(value)], batch_size == 1
+        return [], False
+
+    def _get_load_object_geometry(self):
+        if self._mesh_loader_failed:
+            return None
+        if self._load_object_geometry_fn is not None:
+            return self._load_object_geometry_fn
+        try:
+            from process.preprocess import load_object_geometry
+        except Exception:
+            self._mesh_loader_failed = True
+            return None
+        self._load_object_geometry_fn = load_object_geometry
+        return self._load_object_geometry_fn
+
+    def _resolve_obj_rot_mats(
+        self,
+        obj_rot,
+        *,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if not isinstance(obj_rot, torch.Tensor):
+            return None
+
+        rot = obj_rot.to(device=device, dtype=dtype)
+        if rot.dim() == 2 and rot.shape[-1] == 6:
+            rot = rot.unsqueeze(0)
+        if rot.dim() == 3 and rot.shape[-1] == 6:
+            if rot.shape[0] == 1 and batch_size > 1:
+                rot = rot.expand(batch_size, -1, -1)
+            if rot.shape[0] != batch_size or rot.shape[1] != seq_len:
+                return None
+            return rotation_6d_to_matrix(rot.reshape(-1, 6)).reshape(batch_size, seq_len, 3, 3)
+
+        if rot.dim() == 3 and rot.shape[-2:] == (3, 3):
+            rot = rot.unsqueeze(0)
+        if rot.dim() == 4 and rot.shape[-2:] == (3, 3):
+            if rot.shape[0] == 1 and batch_size > 1:
+                rot = rot.expand(batch_size, -1, -1, -1)
+            if rot.shape[0] == batch_size and rot.shape[1] == seq_len:
+                return rot
+
+        return None
+
+    def _downsample_points(self, points: torch.Tensor) -> torch.Tensor:
+        # points: [T,N,3]
+        if points.dim() != 3 or points.shape[-1] != 3:
+            return points
+        num_points = int(points.shape[1])
+        if num_points <= self.mesh_downsample_points:
+            return points
+        idx = torch.linspace(
+            0,
+            max(num_points - 1, 0),
+            steps=self.mesh_downsample_points,
+            device=points.device,
+            dtype=torch.float32,
+        ).long()
+        return points[:, idx]
+
+    def _quantize_to_codebook(self, z_e: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # z_e: [B,D]
+        codebook = self.object_codebook.weight.to(device=z_e.device, dtype=z_e.dtype)  # [K,D]
+        dist = (
+            z_e.pow(2).sum(dim=1, keepdim=True)
+            - 2.0 * z_e @ codebook.t()
+            + codebook.pow(2).sum(dim=1, keepdim=True).t()
+        )
+        code_idx = dist.argmin(dim=1)
+        z_q = F.embedding(code_idx, codebook)
+        logits = -dist
+        return z_q, code_idx, dist, logits
+
+    def _encode_observation_prior(self, feats: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        obs_seq = torch.cat(
+            [
+                feats["rot_human_obj"],
+                feats["acc_human_obj"],
+                feats["hands_flat"],
+            ],
+            dim=-1,
+        )
+        z_e_obs = self.obs_encoder(obs_seq)
+        z_q_obs, code_idx_obs, _, logits_obs = self._quantize_to_codebook(z_e_obs)
+        return {
+            "z_e_obs": z_e_obs,
+            "z_q_obs": z_q_obs,
+            "code_idx_obs": code_idx_obs,
+            "code_logits_obs": logits_obs,
+        }
+
+    def _encode_mesh_prior(
+        self,
+        data_dict: Dict,
+        gt_targets: Optional[Dict],
+        *,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        sample_has_object: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        z_e_mesh = torch.zeros(batch_size, self.code_dim, device=device, dtype=dtype)
+        z_q_mesh = torch.zeros(batch_size, self.code_dim, device=device, dtype=dtype)
+        code_idx_mesh = torch.full((batch_size,), -1, device=device, dtype=torch.long)
+        code_logits_mesh = torch.zeros(batch_size, self.num_codes, device=device, dtype=dtype)
+        mesh_valid_mask = torch.zeros(batch_size, device=device, dtype=torch.bool)
+        mesh_dp_mismatch = torch.zeros(batch_size, device=device, dtype=torch.bool)
+
+        if not isinstance(gt_targets, dict):
+            return {
+                "z_e_mesh": z_e_mesh,
+                "z_q_mesh": z_q_mesh,
+                "code_idx_mesh": code_idx_mesh,
+                "code_logits_mesh": code_logits_mesh,
+                "mesh_valid_mask": mesh_valid_mask,
+                "mesh_dp_mismatch": mesh_dp_mismatch,
+            }
+
+        obj_names, obj_name_ok = self._as_string_list(data_dict.get("obj_name"), batch_size=batch_size)
+        if not obj_name_ok:
+            # Typical DataParallel behavior: non-tensor list metadata is replicated, not sharded.
+            mesh_dp_mismatch.fill_(True)
+            return {
+                "z_e_mesh": z_e_mesh,
+                "z_q_mesh": z_q_mesh,
+                "code_idx_mesh": code_idx_mesh,
+                "code_logits_mesh": code_logits_mesh,
+                "mesh_valid_mask": mesh_valid_mask,
+                "mesh_dp_mismatch": mesh_dp_mismatch,
+            }
+
+        seq_files, seq_ok = self._as_string_list(data_dict.get("seq_file"), batch_size=batch_size)
+        if not seq_ok:
+            seq_files = ["unknown_seq"] * batch_size
+        starts, starts_ok = self._as_int_list(data_dict.get("window_start"), batch_size=batch_size)
+        if not starts_ok:
+            starts = [-1] * batch_size
+        ends, ends_ok = self._as_int_list(data_dict.get("window_end"), batch_size=batch_size)
+        if not ends_ok:
+            ends = [-1] * batch_size
+
+        obj_rot_mats = self._resolve_obj_rot_mats(
+            gt_targets.get("obj_rot"),
+            batch_size=batch_size,
+            seq_len=seq_len,
+            device=device,
+            dtype=dtype,
+        )
+        obj_trans = self._to_bt(
+            gt_targets.get("obj_trans"),
+            batch_size=batch_size,
+            seq_len=seq_len,
+            trailing_shape=(3,),
+            device=device,
+            dtype=dtype,
+            default=0.0,
+        )
+        obj_scale = self._to_bt(
+            gt_targets.get("obj_scale"),
+            batch_size=batch_size,
+            seq_len=seq_len,
+            trailing_shape=(),
+            device=device,
+            dtype=dtype,
+            default=1.0,
+        )
+        canonical_points_batch = None
+        obj_points_canonical = data_dict.get("obj_points_canonical")
+        if isinstance(obj_points_canonical, torch.Tensor):
+            points = obj_points_canonical.to(device=device, dtype=dtype)
+            if points.dim() == 2:
+                points = points.unsqueeze(0)
+            if points.shape[0] == 1 and batch_size > 1:
+                points = points.expand(batch_size, -1, -1)
+            if points.shape[0] == batch_size and points.dim() == 3 and points.shape[-1] == 3:
+                canonical_points_batch = points
+
+        if obj_rot_mats is None:
+            return {
+                "z_e_mesh": z_e_mesh,
+                "z_q_mesh": z_q_mesh,
+                "code_idx_mesh": code_idx_mesh,
+                "code_logits_mesh": code_logits_mesh,
+                "mesh_valid_mask": mesh_valid_mask,
+                "mesh_dp_mismatch": mesh_dp_mismatch,
+            }
+
+        load_object_geometry = None
+
+        valid_points = []
+        valid_batch_idx = []
+
+        for b in range(batch_size):
+            if not bool(sample_has_object[b].item()):
+                continue
+            obj_name = obj_names[b]
+            if obj_name is None:
+                continue
+            obj_name = str(obj_name)
+            if len(obj_name) == 0 or obj_name.lower() in {"none", "unknown", "unknown_object"}:
+                continue
+
+            points = None
+            if canonical_points_batch is not None:
+                canonical_points = canonical_points_batch[b]
+                if canonical_points.dim() == 2 and canonical_points.shape[-1] == 3 and canonical_points.shape[0] > 0:
+                    points_seq = canonical_points.unsqueeze(0).expand(seq_len, -1, -1)
+                    points = torch.bmm(obj_rot_mats[b], points_seq.transpose(1, 2)).transpose(1, 2)
+                    points = points * obj_scale[b].view(seq_len, 1, 1) + obj_trans[b].unsqueeze(1)
+
+            if points is None:
+                cache_key = f"{seq_files[b]}::{starts[b]}::{ends[b]}::{obj_name}"
+                points_cpu = self._mesh_point_cloud_cache.get(cache_key)
+                if points_cpu is None:
+                    if load_object_geometry is None:
+                        load_object_geometry = self._get_load_object_geometry()
+                    if load_object_geometry is None:
+                        continue
+                    try:
+                        transformed_verts, _ = load_object_geometry(
+                            obj_name,
+                            obj_rot_mats[b].detach().cpu(),
+                            obj_trans[b].detach().cpu(),
+                            obj_scale[b].detach().cpu(),
+                            obj_geo_root=self.object_geo_root,
+                            device="cpu",
+                        )
+                    except Exception:
+                        transformed_verts = None
+                    if (
+                        isinstance(transformed_verts, torch.Tensor)
+                        and transformed_verts.dim() == 3
+                        and transformed_verts.shape[-1] == 3
+                    ):
+                        points_cpu = transformed_verts.detach().to(device="cpu", dtype=torch.float32)
+                        self._mesh_point_cloud_cache[cache_key] = points_cpu
+
+                if not isinstance(points_cpu, torch.Tensor):
+                    continue
+                points = points_cpu.to(device=device, dtype=dtype)
+
+            if points.shape[0] != seq_len:
+                if points.shape[0] > seq_len:
+                    points = points[:seq_len]
+                elif points.shape[0] > 0:
+                    pad = points[-1:].expand(seq_len - points.shape[0], -1, -1)
+                    points = torch.cat([points, pad], dim=0)
+                else:
+                    continue
+            points = self._downsample_points(points)
+
+            valid_points.append(points)
+            valid_batch_idx.append(b)
+
+        if len(valid_batch_idx) == 0:
+            return {
+                "z_e_mesh": z_e_mesh,
+                "z_q_mesh": z_q_mesh,
+                "code_idx_mesh": code_idx_mesh,
+                "code_logits_mesh": code_logits_mesh,
+                "mesh_valid_mask": mesh_valid_mask,
+                "mesh_dp_mismatch": mesh_dp_mismatch,
+            }
+
+        point_tensor = torch.stack(valid_points, dim=0)
+        z_e_valid = self.mesh_encoder(point_tensor)
+        z_q_valid, code_idx_valid, _, logits_valid = self._quantize_to_codebook(z_e_valid)
+
+        # Under autocast, mesh branch may run in bf16/fp16 while accumulators stay fp32.
+        # Align dtypes before indexed assignment to avoid dtype mismatch errors.
+        z_e_valid = z_e_valid.to(dtype=z_e_mesh.dtype)
+        z_q_valid = z_q_valid.to(dtype=z_q_mesh.dtype)
+        logits_valid = logits_valid.to(dtype=code_logits_mesh.dtype)
+
+        valid_idx_tensor = torch.as_tensor(valid_batch_idx, device=device, dtype=torch.long)
+        z_e_mesh[valid_idx_tensor] = z_e_valid
+        z_q_mesh[valid_idx_tensor] = z_q_valid
+        code_idx_mesh[valid_idx_tensor] = code_idx_valid
+        code_logits_mesh[valid_idx_tensor] = logits_valid
+        mesh_valid_mask[valid_idx_tensor] = True
+
+        return {
+            "z_e_mesh": z_e_mesh,
+            "z_q_mesh": z_q_mesh,
+            "code_idx_mesh": code_idx_mesh,
+            "code_logits_mesh": code_logits_mesh,
+            "mesh_valid_mask": mesh_valid_mask,
+            "mesh_dp_mismatch": mesh_dp_mismatch,
+        }
+
+    def _select_condition_mode(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        probs = self.cond_mode_probs.to(device=device)
+        return torch.multinomial(probs, num_samples=batch_size, replacement=True)
+
+    def _build_object_condition(
+        self,
+        data_dict: Dict,
+        gt_targets: Optional[Dict],
+        feats: Dict[str, torch.Tensor],
+        context: Dict,
+        *,
+        training: bool,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        batch_size = int(context["batch_size"])
+        seq_len = int(context["seq_len"])
+        device = context["device"]
+        dtype = context["dtype"]
+
+        has_object_mask = context.get("has_object_mask")
+        if isinstance(has_object_mask, torch.Tensor):
+            sample_has_object = has_object_mask.to(device=device, dtype=torch.bool).any(dim=1)
+        else:
+            sample_has_object = torch.ones(batch_size, device=device, dtype=torch.bool)
+
+        obs_prior = self._encode_observation_prior(feats)
+        z_e_obs = obs_prior["z_e_obs"]
+        z_q_obs = obs_prior["z_q_obs"]
+        code_idx_obs = obs_prior["code_idx_obs"]
+        code_logits_obs = obs_prior["code_logits_obs"]
+
+        mesh_prior = {
+            "z_e_mesh": torch.zeros(batch_size, self.code_dim, device=device, dtype=dtype),
+            "z_q_mesh": torch.zeros(batch_size, self.code_dim, device=device, dtype=dtype),
+            "code_idx_mesh": torch.full((batch_size,), -1, device=device, dtype=torch.long),
+            "code_logits_mesh": torch.zeros(batch_size, self.num_codes, device=device, dtype=dtype),
+            "mesh_valid_mask": torch.zeros(batch_size, device=device, dtype=torch.bool),
+            "mesh_dp_mismatch": torch.zeros(batch_size, device=device, dtype=torch.bool),
+        }
+        if training:
+            mesh_prior = self._encode_mesh_prior(
+                data_dict,
+                gt_targets,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                device=device,
+                dtype=dtype,
+                sample_has_object=sample_has_object,
+            )
+
+        z_e_mesh = mesh_prior["z_e_mesh"]
+        z_q_mesh = mesh_prior["z_q_mesh"]
+        code_idx_mesh = mesh_prior["code_idx_mesh"]
+        code_logits_mesh = mesh_prior["code_logits_mesh"]
+        mesh_valid_mask = mesh_prior["mesh_valid_mask"]
+        mesh_dp_mismatch = mesh_prior["mesh_dp_mismatch"]
+
+        null_code = self.null_object_code.to(device=device, dtype=dtype).expand(batch_size, -1)
+
+        if training:
+            # 0: mesh teacher, 1: obs student, 2: null prior
+            mode = self._select_condition_mode(batch_size, device)
+            # If mesh teacher is unavailable, fallback to obs branch.
+            mode = torch.where((mode == 0) & (~mesh_valid_mask), torch.ones_like(mode), mode)
+            # No-object sequences always use null prior.
+            mode = torch.where(sample_has_object, mode, torch.full_like(mode, 2))
+
+            cond = z_q_obs.clone()
+            cond = torch.where(mode[:, None] == 0, z_q_mesh, cond)
+            cond = torch.where(mode[:, None] == 2, null_code, cond)
+        else:
+            mode = torch.full((batch_size,), -1, device=device, dtype=torch.long)
+            cond = torch.where(sample_has_object[:, None], z_q_obs, null_code)
+
+        code_idx_obs = torch.where(sample_has_object, code_idx_obs, torch.full_like(code_idx_obs, -1))
+
+        cond_info = {
+            "mode": mode,
+            "cond": cond,
+            "z_e_mesh": z_e_mesh,
+            "z_q_mesh": z_q_mesh,
+            "code_idx_mesh": code_idx_mesh,
+            "code_logits_mesh": code_logits_mesh,
+            "mesh_valid_mask": mesh_valid_mask,
+            "mesh_dp_mismatch": mesh_dp_mismatch,
+            "z_e_obs": z_e_obs,
+            "z_q_obs": z_q_obs,
+            "code_idx_obs": code_idx_obs,
+            "code_logits_obs": code_logits_obs,
+            "sample_has_object": sample_has_object,
+            "vq_beta": torch.tensor(self.vq_commit_beta, device=device, dtype=dtype),
+        }
+        return cond, cond_info
+
     def _build_clean_window(self, data_dict: Dict, hp_out: Optional[Dict], gt_targets: Dict) -> Tuple[torch.Tensor, Dict]:
         if not isinstance(gt_targets, dict):
             raise ValueError("gt_targets must be provided for full-window diffusion training")
@@ -698,13 +1262,32 @@ class InteractionModule(nn.Module):
         x_clean, context = self._build_clean_window(data_dict, hp_out, gt_targets)
         add_noise = bool(self.training and self.use_diffusion_noise)
 
+        feats = self._build_features(
+            data_dict,
+            hp_out,
+            gt_targets,
+            batch_size=context["batch_size"],
+            seq_len=context["seq_len"],
+            device=context["device"],
+            dtype=context["dtype"],
+        )
+        cond, cond_info = self._build_object_condition(
+            data_dict,
+            gt_targets,
+            feats,
+            context,
+            training=bool(self.training),
+        )
+        cond_seq = cond.unsqueeze(1).expand(context["batch_size"], context["seq_len"], self.code_dim)
+
         x0_pred, aux = self.dit(
-            cond=None,
+            cond=cond_seq,
             x_start=x_clean,
             add_noise=add_noise,
         )
 
         outputs = self._decode_outputs(x0_pred, context)
+        outputs["object_prior_aux"] = cond_info
         outputs["diffusion_aux"] = {
             **aux,
             "x0_target": x_clean,
@@ -712,6 +1295,9 @@ class InteractionModule(nn.Module):
             "observed_dim_mask": self.observed_dim_mask,
             "unknown_dim_mask": self.unknown_dim_mask,
             "prediction_type": self.dit.prediction_type,
+            "object_code_idx_pred": cond_info["code_idx_obs"],
+            "object_code_emb_pred": cond_info["z_q_obs"],
+            "cond_mode": cond_info["mode"],
         }
         return outputs
 
@@ -719,6 +1305,7 @@ class InteractionModule(nn.Module):
         self,
         observed_seq: torch.Tensor,
         *,
+        cond_seq: torch.Tensor,
         steps: int,
         inference_type: str,
         sampler: str,
@@ -729,6 +1316,9 @@ class InteractionModule(nn.Module):
         batch_size, seq_len, feat_dim = observed_seq.shape
         device = observed_seq.device
         dtype = observed_seq.dtype
+
+        if cond_seq.dim() != 3 or cond_seq.shape[0] != batch_size or cond_seq.shape[1] != seq_len:
+            raise ValueError(f"cond_seq shape mismatch, got {cond_seq.shape}, expected [B={batch_size},T={seq_len},D]")
 
         window = self.window_size
         if window < 1:
@@ -773,6 +1363,15 @@ class InteractionModule(nn.Module):
             else:
                 x_input = current.unsqueeze(1)
 
+            if window > 1:
+                start = max(0, frame_idx - window + 1)
+                cond_window = cond_seq[:, start : frame_idx + 1]
+                if cond_window.shape[1] < x_input.shape[1]:
+                    pad = cond_window[:, :1].expand(batch_size, x_input.shape[1] - cond_window.shape[1], cond_window.shape[-1])
+                    cond_window = torch.cat([pad, cond_window], dim=1)
+            else:
+                cond_window = cond_seq[:, frame_idx : frame_idx + 1]
+
             inpaint_mask = torch.ones_like(x_input, dtype=torch.bool)
             if unknown_dim > 0:
                 inpaint_mask[:, -1, unknown_idx] = False
@@ -781,7 +1380,7 @@ class InteractionModule(nn.Module):
                 x_out = self.dit.sample_inpaint(
                     x_input=x_input,
                     inpaint_mask=inpaint_mask,
-                    cond=None,
+                    cond=cond_window,
                     x_start=x_input,
                     steps=steps,
                     sampler=sampler,
@@ -791,7 +1390,7 @@ class InteractionModule(nn.Module):
                 x_out = self.dit.sample_inpaint_x0(
                     x_input=x_input,
                     inpaint_mask=inpaint_mask,
-                    cond=None,
+                    cond=cond_window,
                     steps=steps,
                 )
 
@@ -817,6 +1416,24 @@ class InteractionModule(nn.Module):
         """Inference with autoregressive sliding-window inpainting."""
         observed_seq, context = self._build_observed_sequence(data_dict, hp_out, gt_targets)
 
+        feats = self._build_features(
+            data_dict,
+            hp_out,
+            gt_targets,
+            batch_size=context["batch_size"],
+            seq_len=context["seq_len"],
+            device=context["device"],
+            dtype=context["dtype"],
+        )
+        cond, cond_info = self._build_object_condition(
+            data_dict,
+            gt_targets,
+            feats,
+            context,
+            training=False,
+        )
+        cond_seq = cond.unsqueeze(1).expand(context["batch_size"], context["seq_len"], self.code_dim)
+
         steps = self.inference_steps if sample_steps is None else int(sample_steps)
         if steps is None:
             steps = self.dit.timesteps
@@ -839,12 +1456,15 @@ class InteractionModule(nn.Module):
         ):
             gt_clean_seq, _ = self._build_clean_window(data_dict, hp_out, gt_targets)
             max_warmup = max(seq_len, 1) - 1
-            warmup_len = min(max(self.window_size - 1, 0), max_warmup)
+            max_window_warmup = max(self.window_size - 1, 0)
+            cfg_warmup = max_window_warmup if self.test_warmup_len is None else self.test_warmup_len
+            warmup_len = min(max(cfg_warmup, 0), max_window_warmup, max_warmup)
             if warmup_len > 0:
                 warmup_seq = gt_clean_seq[:, :warmup_len]
 
         pred_seq = self._autoregressive_inference(
             observed_seq,
+            cond_seq=cond_seq,
             steps=steps,
             inference_type=self.inference_type,
             sampler=sampler_name,
@@ -853,6 +1473,7 @@ class InteractionModule(nn.Module):
         )
 
         outputs = self._decode_outputs(pred_seq, context)
+        outputs["object_prior_aux"] = cond_info
         if self.inference_type == "sample_inpaint":
             aux_sampler = sampler_name
             aux_eta = eta_val
@@ -871,6 +1492,8 @@ class InteractionModule(nn.Module):
             "inference_type": self.inference_type,
             "sampler": aux_sampler,
             "eta": aux_eta,
+            "object_code_idx_pred": cond_info["code_idx_obs"],
+            "object_code_emb_pred": cond_info["z_q_obs"],
         }
         return outputs
 

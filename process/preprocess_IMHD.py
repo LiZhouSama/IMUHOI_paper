@@ -16,7 +16,11 @@ from human_body_prior.body_model.body_model import BodyModel
 from human_body_prior.tools.rotation_tools import local2global_pose
 import pytorch3d.transforms as transforms
 
-from preprocess import compute_improved_contact_labels, compute_foot_contact_labels
+from preprocess import (
+    compute_improved_contact_labels,
+    compute_foot_contact_labels,
+    load_canonical_points_from_mesh_path,
+)
 
 DEFAULT_CHUNK_LEN = 4000
 
@@ -397,6 +401,7 @@ def process_imhd_sequence(
     output_dir: str,
     frame_trim: Optional[int] = None,
     smpl_batch: int = 256,
+    obj_points_count: int = 256,
 ) -> None:
 
     data_np, human_imu_real, obj_imu_real = load_imhd_sequence(entry.pkl_files)
@@ -441,6 +446,11 @@ def process_imhd_sequence(
     mesh_path = resolve_object_mesh(object_name, objects_root)
     mesh_dir = os.path.dirname(mesh_path)
     mesh_basename = os.path.splitext(os.path.basename(mesh_path))[0]
+    canonical_points = load_canonical_points_from_mesh_path(
+        mesh_path,
+        sample_count=int(max(1, obj_points_count)),
+        device="cpu",
+    )
     bm = bm_loader.get(gender)
 
     smpl_init_input = {
@@ -587,6 +597,9 @@ def process_imhd_sequence(
         "betas": torch.from_numpy(betas_raw).float(),
         "obj_name": object_name,
         "obj_mesh_name": mesh_basename,
+        "obj_points_canonical": canonical_points.half().cpu(),
+        "obj_points_sample_count": int(canonical_points.shape[0]),
+        "has_object": True,
         "obj_scale": obj_scale_cpu,
         "obj_trans": obj_trans_cpu,
         "obj_rot": obj_rot_cpu,
@@ -654,6 +667,12 @@ def parse_args() -> argparse.Namespace:
         default=16,
         help="Number of body shape coefficients expected by the SMPL-H model.",
     )
+    parser.add_argument(
+        "--obj_points_count",
+        type=int,
+        default=256,
+        help="Number of canonical object points to save per sequence.",
+    )
     return parser.parse_args()
 
 
@@ -683,6 +702,7 @@ def main() -> None:
                 args.output_dir,
                 frame_trim=args.frame_trim,
                 smpl_batch=args.smpl_batch,
+                obj_points_count=args.obj_points_count,
             )
         except Exception as exc:
             print(f"Failed to process {entry.seq_name}: {exc}")

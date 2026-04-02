@@ -76,6 +76,18 @@ num_joints: 22
 joint_dim: 6
 vel_scale: 3
 
+# ============ Object Prior (Interaction) ============
+object_code_dim: 128
+num_object_codes: 128
+object_geo_root: "datasets/OMOMO/captured_objects"
+prior_encoder_hidden_dim: 256
+prior_encoder_heads: 8
+prior_encoder_layers: 2
+prior_encoder_dropout: 0.1
+mesh_downsample_points: 256
+cond_mode_probs: [0.4, 0.4, 0.2]  # mesh/obs/null
+vq_commit_beta: 0.25
+
 # ============ 噪声配置 ============
 imu_noise_std: 0.3
 obj_imu_noise_std: 0.3
@@ -138,6 +150,9 @@ loss_weights:
   obj_vel_cons: 0.1
   obj_acc_cons: 0.01
   diffusion_eps: 1.0
+  Loss_align: 1.0
+  Loss_code_cls: 1.0
+  Loss_commit: 0.1
 
 # ============ 窗口配置 ============
 train:

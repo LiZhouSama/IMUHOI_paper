@@ -160,8 +160,9 @@ def create_dataloaders(cfg, project_root=None):
         data_dir=train_paths,
         window_size=cfg.train.window,
         debug=cfg.debug,
-        simulate_imu_noise=False,
+        simulate_imu_noise=True,
         full_sequence=bool(train_full_sequence),
+        obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
     )
 
     train_loader = DataLoader(
@@ -183,6 +184,7 @@ def create_dataloaders(cfg, project_root=None):
             debug=cfg.debug,
             simulate_imu_noise=False,
             full_sequence=bool(test_full_sequence),
+            obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
         )
         if len(test_dataset) > 0:
             test_loader = DataLoader(
@@ -268,7 +270,50 @@ class BaseTrainer:
         flatten_lstm_parameters(self.model)
 
         self.optimizer, self.scheduler = build_optimizer_and_scheduler(self.model, cfg)
-        self.scaler = GradScaler()
+        amp_dtype_cfg = str(getattr(cfg, "amp_dtype", "bf16")).lower()
+        use_amp_cfg = bool(getattr(cfg, "use_amp", True))
+        self.amp_enabled = bool(use_amp_cfg and self.device.type == "cuda")
+        self.amp_dtype = None
+        self.use_grad_scaler = False
+
+        if self.amp_enabled:
+            if amp_dtype_cfg in {"bf16", "bfloat16"}:
+                bf16_supported = bool(
+                    torch.cuda.is_available()
+                    and hasattr(torch.cuda, "is_bf16_supported")
+                    and torch.cuda.is_bf16_supported()
+                )
+                if bf16_supported:
+                    self.amp_dtype = torch.bfloat16
+                else:
+                    print("Warning: bf16 is not supported on this device, fallback to fp16.")
+                    self.amp_dtype = torch.float16
+                    self.use_grad_scaler = True
+            elif amp_dtype_cfg in {"fp16", "float16", "half"}:
+                self.amp_dtype = torch.float16
+                self.use_grad_scaler = True
+            else:
+                print(f"Warning: unknown amp_dtype '{amp_dtype_cfg}', fallback to bf16.")
+                bf16_supported = bool(
+                    torch.cuda.is_available()
+                    and hasattr(torch.cuda, "is_bf16_supported")
+                    and torch.cuda.is_bf16_supported()
+                )
+                if bf16_supported:
+                    self.amp_dtype = torch.bfloat16
+                else:
+                    self.amp_dtype = torch.float16
+                    self.use_grad_scaler = True
+
+        self.scaler = GradScaler(enabled=self.use_grad_scaler)
+        if self.amp_enabled:
+            amp_mode = "bf16" if self.amp_dtype == torch.bfloat16 else "fp16"
+            print(f"AMP enabled: {amp_mode} (GradScaler={self.use_grad_scaler})")
+        else:
+            if use_amp_cfg and self.device.type != "cuda":
+                print("AMP disabled: non-CUDA device.")
+            else:
+                print("AMP disabled.")
 
         if self.ema_decay > 0.0:
             self.ema_model = copy.deepcopy(self._unwrap_model(self.model)).to(self.device)
@@ -322,6 +367,14 @@ class BaseTrainer:
         finally:
             target.load_state_dict(backup_state, strict=False)
 
+    @contextmanager
+    def _autocast_scope(self):
+        if not self.amp_enabled or self.amp_dtype is None:
+            yield
+            return
+        with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
+            yield
+
     def model_forward(
         self,
         data_dict,
@@ -361,14 +414,18 @@ class BaseTrainer:
         for batch in train_iter:
             data_dict = build_model_input_dict(batch, self.cfg, self.device, add_noise=True)
 
-            self.optimizer.zero_grad()
-            pred_dict = self.model_forward(data_dict, batch=batch)
+            self.optimizer.zero_grad(set_to_none=True)
+            with self._autocast_scope():
+                pred_dict = self.model_forward(data_dict, batch=batch)
+                total_loss, losses, weighted_losses = self.loss_fn(pred_dict, batch, self.device)
 
-            total_loss, losses, weighted_losses = self.loss_fn(pred_dict, batch, self.device)
-
-            self.scaler.scale(total_loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            if self.use_grad_scaler:
+                self.scaler.scale(total_loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                total_loss.backward()
+                self.optimizer.step()
             self._update_ema()
 
             train_loss += total_loss.item()
@@ -411,20 +468,21 @@ class BaseTrainer:
 
                 for batch in test_iter:
                     data_dict = build_model_input_dict(batch, self.cfg, self.device, add_noise=False)
-                    pred_dict = self.model_forward(
-                        data_dict,
-                        batch=batch,
-                        use_gt_targets=False,
-                        force_inference=True,
-                        sample_steps=self.eval_ddim_steps,
-                        sampler=self.eval_sampler,
-                        eta=self.eval_eta,
-                    )
+                    with self._autocast_scope():
+                        pred_dict = self.model_forward(
+                            data_dict,
+                            batch=batch,
+                            use_gt_targets=False,
+                            force_inference=True,
+                            sample_steps=self.eval_ddim_steps,
+                            sampler=self.eval_sampler,
+                            eta=self.eval_eta,
+                        )
 
-                    if hasattr(self.loss_fn, "compute_test_loss"):
-                        total_loss, losses = self.loss_fn.compute_test_loss(pred_dict, batch, self.device)
-                    else:
-                        total_loss, losses, _ = self.loss_fn(pred_dict, batch, self.device)
+                        if hasattr(self.loss_fn, "compute_test_loss"):
+                            total_loss, losses = self.loss_fn.compute_test_loss(pred_dict, batch, self.device)
+                        else:
+                            total_loss, losses, _ = self.loss_fn(pred_dict, batch, self.device)
 
                     test_loss += total_loss.item()
                     for key, value in losses.items():
@@ -445,7 +503,7 @@ class BaseTrainer:
             train_loss, train_components = self.train_epoch(epoch)
             print(f"\rEpoch {epoch}, Train Loss: {train_loss:.4f}", end="")
 
-            if epoch % 10 == 0 and self.test_loader is not None:
+            if epoch % 20 == 0 and self.test_loader is not None:
                 test_loss, test_components = self.evaluate(epoch)
 
                 if test_loss is not None:

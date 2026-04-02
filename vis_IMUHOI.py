@@ -21,11 +21,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dataset.dataset_IMUHOI import IMUDataset
 from process.preprocess import load_object_geometry
-from model import IMUHOIModel, load_model
+from model import IMUHOIModel, IMUHOIMixModule, InteractionModule, load_model
 from utils.utils import (
     load_config,
     load_smpl_model,
     build_model_input_dict,
+    load_checkpoint,
 )
 from configs import (
     FRAME_RATE,
@@ -239,6 +240,57 @@ def _get_human_pose_module(model):
     return None
 
 
+def _get_pretrained_mix_path(module_paths):
+    if not isinstance(module_paths, dict):
+        return None
+    for key in ("imuhoi_mix", "mix", "imuhoi-mix"):
+        path = module_paths.get(key)
+        if path:
+            return str(path)
+    return None
+
+
+def _get_pretrained_interaction_path(module_paths):
+    if not isinstance(module_paths, dict):
+        return None
+    for key in ("interaction", "object_trans", "velocity_contact"):
+        path = module_paths.get(key)
+        if path:
+            return str(path)
+    return None
+
+
+def _unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def _infer_model_kind(model):
+    core = _unwrap_model(model)
+    name = core.__class__.__name__.lower()
+    if "imuhoimixmodule" in name:
+        return "mix"
+    if "imuhoimodel" in name:
+        return "pipeline"
+    if "interactionmodule" in name:
+        return "interaction"
+    if hasattr(core, "human_pose_module") and hasattr(core, "interaction_module"):
+        return "pipeline"
+    if hasattr(core, "mesh_encoder") and hasattr(core, "object_codebook"):
+        return "interaction"
+    return "unknown"
+
+
+def _filter_pipeline_module_paths(module_paths):
+    if not isinstance(module_paths, dict):
+        return None
+    allowed = {"human_pose", "interaction", "velocity_contact", "object_trans"}
+    out = {}
+    for key, value in module_paths.items():
+        if key in allowed:
+            out[key] = value
+    return out if out else None
+
+
 def _global_to_local_rotmat(global_rotmats, parents):
     if global_rotmats.dim() != 4 or global_rotmats.shape[-2:] != (3, 3):
         raise ValueError(f"Expected [T, J, 3, 3], got {tuple(global_rotmats.shape)}")
@@ -389,6 +441,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
         pred_obj_trans_seq = None
         pred_obj_trans_fk_seq = None
         pred_obj_trans_imu_seq = None
+        pred_hands_seq = None
         pred_hand_contact_prob_seq = None
         pred_lhand_contact_seq = None
         pred_rhand_contact_seq = None
@@ -397,7 +450,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
         if not vis_gt_only:
             try:
                 model_input = build_model_input_dict(batch_device, config, device, add_noise=False)
-                model_arch = str(getattr(config, "model_arch", "rnn")).lower()
+                model_kind = _infer_model_kind(model)
                 interaction_human_source = str(getattr(viewer, "interaction_human_source", "pred")).lower()
                 if interaction_human_source not in {"pred", "gt"}:
                     interaction_human_source = "pred"
@@ -408,7 +461,12 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                 compute_fk_flag = bool((use_fk or compare_3) and want_object_predictions)
 
                 def _run_model_inference(use_object_data, compute_fk):
-                    if model_arch == "dit":
+                    if model_kind == "mix":
+                        return model.inference(
+                            model_input,
+                            gt_targets=batch_device,
+                        )
+                    if model_kind == "pipeline":
                         return model.inference(
                             model_input,
                             gt_targets=batch_device,
@@ -416,7 +474,28 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                             compute_fk=compute_fk,
                             interaction_use_human_pred=interaction_use_human_pred,
                         )
-                    return model(model_input, use_object_data=use_object_data, compute_fk=compute_fk)
+                    if model_kind == "interaction":
+                        if interaction_use_human_pred:
+                            print("Warning: interaction-only model has no human branch; fallback to GT human context.")
+                        return model.inference(
+                            model_input,
+                            hp_out=None,
+                            gt_targets=batch_device,
+                        )
+                    # Unknown model type: try broad signature first, then simplified fallback.
+                    try:
+                        return model.inference(
+                            model_input,
+                            gt_targets=batch_device,
+                            use_object_data=use_object_data,
+                            compute_fk=compute_fk,
+                            interaction_use_human_pred=interaction_use_human_pred,
+                        )
+                    except TypeError:
+                        return model.inference(
+                            model_input,
+                            gt_targets=batch_device,
+                        )
 
                 try:
                     pred_dict = _run_model_inference(
@@ -424,7 +503,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                         compute_fk=compute_fk_flag,
                     )
                 except Exception as exc:
-                    if want_object_predictions:
+                    if want_object_predictions and model_kind == "pipeline":
                         print(f"Model inference with object branch failed, fallback to human-only: {exc}")
                         pred_dict = _run_model_inference(use_object_data=False, compute_fk=False)
                     else:
@@ -452,10 +531,32 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                 pred_root_trans_all = pred_dict.get("root_trans_pred")
                 pred_root_trans_seq = pred_root_trans_all[bs].to(device) if pred_root_trans_all is not None else None
             
-            if "pred_obj_trans" in pred_dict:
-                pred_obj_trans_seq = pred_dict["pred_obj_trans"][bs].to(device)
+            pred_obj_trans_all = pred_dict.get("pred_obj_trans")
+            if pred_obj_trans_all is None:
+                pred_obj_trans_all = pred_dict.get("p_obj_pred")
+            if isinstance(pred_obj_trans_all, torch.Tensor):
+                pred_obj_trans_seq = pred_obj_trans_all[bs].to(device)
+            elif model_input is not None:
+                delta_obj_all = pred_dict.get("delta_p_obj_pred")
+                if isinstance(delta_obj_all, torch.Tensor):
+                    try:
+                        delta_obj_seq = delta_obj_all[bs].to(device)
+                        obj_trans_init = model_input["obj_trans_init"][bs].to(device)
+                        pred_obj_trans_seq = torch.cumsum(delta_obj_seq, dim=0) + obj_trans_init.unsqueeze(0)
+                    except Exception:
+                        pred_obj_trans_seq = None
+
             if compare_3 and "pred_obj_trans_fk" in pred_dict:
                 pred_obj_trans_fk_seq = pred_dict["pred_obj_trans_fk"][bs].to(device)
+
+            pred_hands_all = pred_dict.get("p_hands_pred")
+            if pred_hands_all is None:
+                pred_hands_all = pred_dict.get("pred_hand_glb_pos")
+            if isinstance(pred_hands_all, torch.Tensor):
+                try:
+                    pred_hands_seq = pred_hands_all[bs].to(device)
+                except Exception:
+                    pred_hands_seq = None
 
             pred_hand_contact_prob_all = pred_dict.get("pred_hand_contact_prob")
             if pred_hand_contact_prob_all is None:
@@ -757,10 +858,19 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                         HAND_TRAJ_COLORS["gt_r_non_contact"], HAND_TRAJ_RADIUS, "lines"
                     )
 
-            if not vis_gt_only and Jtr_pred_seq is not None:
+            if not vis_gt_only:
+                pred_lhand_traj = None
+                pred_rhand_traj = None
+                if Jtr_pred_seq is not None:
+                    pred_lhand_traj = Jtr_pred_seq[:, lhand_idx] + pred_offset
+                    pred_rhand_traj = Jtr_pred_seq[:, rhand_idx] + pred_offset
+                elif isinstance(pred_hands_seq, torch.Tensor) and pred_hands_seq.dim() == 3 and pred_hands_seq.shape[1] >= 2:
+                    pred_lhand_traj = pred_hands_seq[:, 0] + pred_offset
+                    pred_rhand_traj = pred_hands_seq[:, 1] + pred_offset
+
                 if pred_lhand_contact_seq is not None:
                     pred_l_contact_lines, pred_l_non_contact_lines = _split_contact_segments(
-                        Jtr_pred_seq[:, lhand_idx] + pred_offset, pred_lhand_contact_seq, dash_stride=HAND_DASH_STRIDE
+                        pred_lhand_traj, pred_lhand_contact_seq, dash_stride=HAND_DASH_STRIDE
                     )
                     _add_line_node_if_nonempty(
                         viewer, pred_l_contact_lines, device, "Pred-LHandTraj-Contact",
@@ -773,7 +883,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
 
                 if pred_rhand_contact_seq is not None:
                     pred_r_contact_lines, pred_r_non_contact_lines = _split_contact_segments(
-                        Jtr_pred_seq[:, rhand_idx] + pred_offset, pred_rhand_contact_seq, dash_stride=HAND_DASH_STRIDE
+                        pred_rhand_traj, pred_rhand_contact_seq, dash_stride=HAND_DASH_STRIDE
                     )
                     _add_line_node_if_nonempty(
                         viewer, pred_r_contact_lines, device, "Pred-RHandTraj-Contact",
@@ -887,9 +997,9 @@ def main():
     parser = argparse.ArgumentParser(description='Interactive IMUHOI Visualization Tool')
     parser.add_argument('--config', type=str, default='configs/IMUHOI_train.yaml', help='Path to config file')
     parser.add_argument('--smpl_model_path', type=str, default=None, help='Path to SMPL model file')
-    parser.add_argument('--test_data_dir', type=str, default='process/processed_split_data_OMOMO/debug', help='Test data directory or a single .pt sequence file')
+    parser.add_argument('--test_data_dir', type=str, default='process/processed_split_data_OMOMO_bps/debug', help='Test data directory or a single .pt sequence file')
     parser.add_argument('--obj_geo_root', type=str, default='datasets/OMOMO/captured_objects', help='Root directory of object geometry files')
-    parser.add_argument('--num_workers', type=int, default=0, help='DataLoader workers')
+    parser.add_argument('--num_workers', type=int, default=12, help='DataLoader workers')
     parser.add_argument('--no_objects', action='store_true', help='Disable object mesh rendering')
     parser.add_argument('--vis_gt_only', action='store_true', help='Render GT only')
     parser.add_argument('--show_foot_contact', action='store_true', help='Show foot contact')
@@ -905,9 +1015,22 @@ def main():
         help='Human source for interaction branch: pred=use HumanPose output, gt=use GT human states',
     )
     parser.add_argument('--limit_sequences', type=int, default=None, help='Limit number of loaded sequences')
-    parser.add_argument('--pred_offset', type=float, nargs=3, default=[3.0, 0.0, 0.0], help='Prediction translation offset')
+    parser.add_argument('--pred_offset', type=float, nargs=3, default=[0.0, 0.0, 0.0], help='Prediction translation offset')
     parser.add_argument('--overlay_frames', type=int, nargs='+', default=None, help='Overlay selected 0-based frames in one scene')
     parser.add_argument('--no_trans', action='store_true', help='Enable noTrans mode')
+    parser.add_argument(
+        '--inference_mode',
+        type=str,
+        default='auto',
+        choices=['auto', 'pipeline', 'mix', 'interaction'],
+        help='Model inference mode: auto | pipeline(IMUHOIModel) | mix(IMUHOIMixModule) | interaction(InteractionModule).',
+    )
+    parser.add_argument(
+        '--interaction_ckpt',
+        type=str,
+        default=None,
+        help='Checkpoint path for interaction-only visualization; overrides config pretrained_modules.interaction when set.',
+    )
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -920,6 +1043,8 @@ def main():
     module_paths = None
     if hasattr(config, "pretrained_modules") and config.pretrained_modules:
         module_paths = dict(config.pretrained_modules)
+    mix_ckpt_path = _get_pretrained_mix_path(module_paths)
+    interaction_ckpt_path = args.interaction_ckpt or _get_pretrained_interaction_path(module_paths)
     
     if args.smpl_model_path:
         config.body_model_path = args.smpl_model_path
@@ -930,7 +1055,45 @@ def main():
     smpl_model_path = config.get('body_model_path', 'datasets/smpl_models/smplh/neutral/model.npz')
     smpl_model = load_smpl_model(smpl_model_path, device)
 
-    model = load_model(config, device, no_trans=args.no_trans, module_paths=module_paths)
+    selected_mode = args.inference_mode.lower()
+    if selected_mode == "auto":
+        if args.interaction_ckpt:
+            selected_mode = "interaction"
+        elif mix_ckpt_path and not interaction_ckpt_path:
+            selected_mode = "mix"
+        else:
+            selected_mode = "pipeline"
+    print(f"Inference mode: {selected_mode}")
+
+    if selected_mode == "mix":
+        if not mix_ckpt_path:
+            raise SystemExit("inference_mode='mix' requires pretrained_modules.imuhoi_mix in config.")
+        if not os.path.exists(mix_ckpt_path):
+            raise SystemExit(f"Configured pretrained_modules.imuhoi_mix not found: {mix_ckpt_path}")
+        print(f"Using IMUHOIMixModule checkpoint: {mix_ckpt_path}")
+        model = IMUHOIMixModule(config, device, no_trans=args.no_trans).to(device)
+        try:
+            ckpt_epoch = load_checkpoint(model, mix_ckpt_path, device, strict=False)
+            print(f"Loaded IMUHOI mix checkpoint (epoch {ckpt_epoch})")
+        except Exception as exc:
+            raise SystemExit(f"Failed to load mix checkpoint: {exc}")
+    elif selected_mode == "interaction":
+        if not interaction_ckpt_path:
+            raise SystemExit("inference_mode='interaction' requires --interaction_ckpt or pretrained_modules.interaction.")
+        if not os.path.exists(interaction_ckpt_path):
+            raise SystemExit(f"Interaction checkpoint not found: {interaction_ckpt_path}")
+        print(f"Using InteractionModule checkpoint: {interaction_ckpt_path}")
+        model = InteractionModule(config).to(device)
+        try:
+            ckpt_epoch = load_checkpoint(model, interaction_ckpt_path, device, strict=False)
+            print(f"Loaded interaction checkpoint (epoch {ckpt_epoch})")
+        except Exception as exc:
+            raise SystemExit(f"Failed to load interaction checkpoint: {exc}")
+    else:
+        pipeline_module_paths = _filter_pipeline_module_paths(module_paths)
+        model = load_model(config, device, no_trans=args.no_trans, module_paths=pipeline_module_paths)
+
+    model.eval()
 
     test_data_input = args.test_data_dir
     if not test_data_input or not os.path.exists(test_data_input):

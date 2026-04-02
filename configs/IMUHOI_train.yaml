@@ -12,21 +12,22 @@ model_arch: "dit"  # 可选: rnn, dit
 
 # ============ DiT超参数(仅在model_arch=dit时使用) ============
 dit:
-  dit_d_model: 256
+  dit_d_model: 512 #768 #256
   dit_nhead: 8
-  dit_num_layers: 6
-  dit_dim_feedforward: 1024
-  dit_dropout: 0.1
+  dit_num_layers: 8 #10 #6
+  dit_dim_feedforward: 2048 #3072 #1024
+  dit_dropout: 0.05
   dit_timesteps: 1000
   dit_use_time_embed: true
   dit_use_noise: true
   dit_prediction_type: "x0"
   dit_max_seq_len: 256
-  dit_inference_steps: 20
-  dit_inference_type: "sample_inpaint"  # sample_inpaint_x0 | sample_inpaint
+  dit_inference_steps: 10
+  dit_inference_type: "sample_inpaint_x0"  # sample_inpaint_x0 | sample_inpaint
   dit_inference_sampler: "ddim"  # recommended: ddim
   dit_inference_eta: 0.0  # recommended for AR stability; try 0.1 with diffusion mode for more stochasticity
   dit_test_use_gt_warmup: true
+  dit_test_warmup_len: 20  # null => window-1; set int < window to use shorter GT warmup (e.g., 20)
   dit_enable_root_correction: true
   dit_root_correction_contact_threshold: 0.5
 
@@ -37,19 +38,39 @@ eval_sampler: "ddim"
 eval_eta: 0.0
 
 # ============ 训练超参数 ============
-epoch: 300
-batch_size: 120
+epoch: 500
+batch_size: 80
 lr: 0.0002
 weight_decay: 0.00001
-milestones: [100, 200]
+milestones: [100, 200, 300, 400]
 gamma: 0.2
 seed: 42
 num_workers: 12
+
+# ============ 混合精度训练 ============
+use_amp: true
+amp_dtype: "bf16"  # bf16 | fp16
 
 # ============ 特征维度 ============
 num_human_imus: 6
 imu_dim: 9
 num_joints: 24
+
+# ============ Object Prior (Interaction) ============
+object_code_dim: 128
+num_object_codes: 128
+object_geo_root: "datasets/OMOMO/captured_objects"
+prior_encoder_hidden_dim: 256
+prior_encoder_heads: 8
+prior_encoder_layers: 2
+prior_encoder_dropout: 0.1
+mesh_downsample_points: 256
+mesh_temporal_model: "gru"  # gru | tcn
+mesh_temporal_layers: 2
+mesh_temporal_kernel_size: 3  # used when mesh_temporal_model=tcn
+mesh_temporal_dropout: 0.1
+cond_mode_probs: [0.4, 0.4, 0.2]  # mesh/obs/null
+vq_commit_beta: 0.25
 
 # ============ 噪声配置 ============
 imu_noise_std: 0.3
@@ -66,9 +87,9 @@ datasets:
     test_path: "process/processed_amass_data_0703/test"
     debug_path: "process/processed_amass_data_0703/debug"
   omomo:
-    train_path: "process/processed_split_data_OMOMO/train"
-    test_path: "process/processed_split_data_OMOMO/test"
-    debug_path: "process/processed_split_data_OMOMO/debug"
+    train_path: "process/processed_split_data_OMOMO_bps/train"
+    test_path: "process/processed_split_data_OMOMO_bps/test"
+    debug_path: "process/processed_split_data_OMOMO_bps/debug"
   imhd:
     train_path: "process/processed_seg_data_IMHD/train"
     test_path: "process/processed_seg_data_IMHD/test"
@@ -90,20 +111,23 @@ loss_weights:
   
   # Stage 2: Interaction
   Loss_simple: 1.0
-  Loss_drift_obj: 1.0
-  Loss_jitter_obj: 1000
+  Loss_vel_obj: 0.7
+  Loss_jitter_obj: 4000
+  Loss_align: 1.0
+  Loss_code_cls: 1.0
+  Loss_commit: 0.5
 
 # ============ Test指标权重 ============
 test_metric_weights:
   # Stage 1: HumanPose
-  mpjre_mse: 1.0
-  root_trans_err_mm: 1.0
-  jitter_local_fk_mm: 1.0
-  root_jitter_mm: 1.0
+  mpjre_mse: 1000
+  root_trans_err_mm: 0.1
+  jitter_local_fk_mm: 0.1
+  root_jitter_mm: 0.1
 
   # Stage 2: Interaction
-  obj_pos_mse: 1.0
-  obj_pos_jitter_mm: 1.0
+  obj_pos_rmse_mm: 1.0
+  obj_pos_jitter_mm: 5.0
 
 # ============ 窗口配置 ============
 train:
@@ -115,5 +139,7 @@ test:
 # ============ 预训练模块路径（可选）============
 # 取消注释以使用预训练权重
 pretrained_modules:
-  human_pose: "outputs/IMUHOI_DiT/human_pose_03202004/best.pt"
-  interaction: "outputs/IMUHOI_DiT/interaction_03220349/best.pt"
+  human_pose: "outputs/IMUHOI_DiT/human_pose_04011146/best.pt"
+  interaction: "outputs/IMUHOI_DiT/interaction_03312312/best.pt"
+
+  # imuhoi_mix: "outputs/IMUHOI_DiT/imuhoi_mix_03241600/best.pt"

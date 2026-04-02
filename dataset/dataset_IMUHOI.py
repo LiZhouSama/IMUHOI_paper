@@ -1,5 +1,7 @@
 import glob
 import os
+import gc
+import sys
 import torch
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
@@ -179,6 +181,7 @@ class IMUDataset(Dataset):
         imu_noise_cfg=None,
         simulate_imu_noise=True,
         sequence_paths=None,
+        obj_points_sample_count=256,
     ):
         """
         IMU数据集 - 每个epoch为每个序列随机采样一个窗口
@@ -205,6 +208,7 @@ class IMUDataset(Dataset):
         self.full_sequence = full_sequence
         self.simulate_imu_noise = simulate_imu_noise
         self.imu_noise_cfg = merge_noise_cfg(imu_noise_cfg)
+        self.obj_points_sample_count = int(max(1, obj_points_sample_count))
 
         # 查找所有目录中的序列文件，或使用显式传入的序列文件列表
         self.sequence_files = []
@@ -345,15 +349,19 @@ class IMUDataset(Dataset):
         self.sequence_info.clear()
         
         # 强制垃圾回收
-        import gc
         gc.collect()
         
         print("IMUDataset清理完成")
 
     def __del__(self):
         """析构函数，确保在对象被删除时清理共享内存"""
-        if hasattr(self, 'loaded_data') and self.loaded_data:
-            self.cleanup()
+        if getattr(sys, "meta_path", None) is None:
+            return
+        try:
+            if hasattr(self, 'loaded_data') and self.loaded_data:
+                self.cleanup()
+        except Exception:
+            pass
 
     def __len__(self):
         # 返回独立序列的数量
@@ -466,6 +474,7 @@ class IMUDataset(Dataset):
             obj_scale = torch.ones(actual_seq_len, device=device, dtype=dtype)
             obj_imu = torch.zeros(actual_seq_len, imu_dim, device=device, dtype=dtype)
             obj_vel = torch.zeros(actual_seq_len, 3, device=device, dtype=dtype)
+            obj_points_canonical = torch.zeros(self.obj_points_sample_count, 3, device=device, dtype=dtype)
 
             if has_object:
                 obj_name = seq_data.get("obj_name", "unknown_object")
@@ -487,6 +496,24 @@ class IMUDataset(Dataset):
                         obj_imu = torch.cat((obj_acc, obj_rot6d), dim=-1)
                         imu_noise_applied = True
                 obj_vel = _central_diff(obj_trans, 1.0 / FRAME_RATE)
+                obj_points_val = seq_data.get("obj_points_canonical")
+                if isinstance(obj_points_val, torch.Tensor) and obj_points_val.dim() == 2 and obj_points_val.shape[-1] == 3:
+                    points = obj_points_val.to(device=device, dtype=dtype)
+                    n_pts = int(points.shape[0])
+                    if n_pts > self.obj_points_sample_count:
+                        idx = torch.linspace(
+                            0,
+                            max(n_pts - 1, 0),
+                            steps=self.obj_points_sample_count,
+                            device=device,
+                            dtype=torch.float32,
+                        ).long()
+                        points = points[idx]
+                    elif n_pts < self.obj_points_sample_count and n_pts > 0:
+                        pad = points[-1:].expand(self.obj_points_sample_count - n_pts, -1)
+                        points = torch.cat([points, pad], dim=0)
+                    if points.shape[0] == self.obj_points_sample_count:
+                        obj_points_canonical = points
             else:
                 # 无物体时保持占位但不使用接触信息
                 obj_rot_6d = transforms.matrix_to_rotation_6d(obj_rot.reshape(-1, 3, 3)).reshape(actual_seq_len, 6)
@@ -565,6 +592,7 @@ class IMUDataset(Dataset):
                 "obj_rot": obj_rot_6d.float(),  # 使用6D表示而不是矩阵
                 "obj_scale": obj_scale.float(),
                 "obj_name": obj_name,
+                "obj_points_canonical": obj_points_canonical.float(),
 
                 "root_vel": root_vel.float(),
                 "obj_vel": obj_vel.float(),
