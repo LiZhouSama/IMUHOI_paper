@@ -40,8 +40,7 @@ OUTPUT_ROOT = PROJECT_ROOT / "outputs"
 
 def get_default_dataset_config(no_trans: bool = False):
     """获取默认数据集配置"""
-    output_subdir = "IMUHOI_noTrans" if no_trans else "IMUHOI"
-    output_path = OUTPUT_ROOT / output_subdir
+    # 保留 no_trans 参数用于与旧接口兼容
     
     return {
         # "processed_seg_data_BEHAVE": {
@@ -61,12 +60,13 @@ def get_default_dataset_config(no_trans: bool = False):
         #     },
         # },
         "processed_split_data_OMOMO": {
-            "data_dir": PROCESS_ROOT / "processed_split_data_OMOMO" / "debug",
-            "modules": {
-                "human_pose": "outputs/IMUHOI_DiT/human_pose_01201159/best.pt",
-                "velocity_contact": "outputs/IMUHOI_DiT/velocity_contact_01211542/best.pt",
-                # "object_trans": "outputs/IMUHOI_DiT/object_trans_01160252/best_object_trans.pt",
-            },
+            "data_dir": PROCESS_ROOT / "processed_split_data_OMOMO_bps" / "test",
+            # 默认不覆盖checkpoint路径，优先使用 config.pretrained_modules。
+            # 如需按数据集指定权重，可添加 modules 字段，例如：
+            # "modules": {
+            #     "human_pose": ".../human_pose/best.pt",
+            #     "interaction": ".../interaction/best.pt",
+            # }
         },
     }
 
@@ -99,6 +99,15 @@ def _build_dataset_runs(args: argparse.Namespace, default_config: dict):
 def _apply_module_overrides(config: edict, modules_override: Dict[str, Path]) -> None:
     if not modules_override:
         return
+    # New config style: top-level pretrained_modules (used by DiT pipeline / vis script).
+    current_top = {}
+    if hasattr(config, "pretrained_modules") and config.pretrained_modules:
+        current_top = dict(config.pretrained_modules)
+    for module_name, module_path in modules_override.items():
+        current_top[module_name] = str(module_path)
+    config.pretrained_modules = current_top
+
+    # Backward-compatible style: staged_training.modular_training.pretrained_modules.
     staged_cfg = getattr(config, "staged_training", None)
     if not staged_cfg:
         config.staged_training = {"modular_training": {"enabled": True, "pretrained_modules": {}}}
@@ -127,6 +136,65 @@ def _apply_module_overrides(config: edict, modules_override: Dict[str, Path]) ->
     config.staged_training = staged_cfg
 
 
+def _unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def _get_human_pose_module(model):
+    core = _unwrap_model(model)
+    module = getattr(core, "human_pose_module", None)
+    if module is not None:
+        return module
+    wrapped = getattr(core, "module", None)
+    if wrapped is not None:
+        return getattr(wrapped, "human_pose_module", None)
+    return None
+
+
+def _infer_model_kind(model):
+    core = _unwrap_model(model)
+    name = core.__class__.__name__.lower()
+    if "imuhoimixmodule" in name:
+        return "mix"
+    if "imuhoimodel" in name:
+        return "pipeline"
+    if "interactionmodule" in name:
+        return "interaction"
+    if hasattr(core, "human_pose_module") and hasattr(core, "interaction_module"):
+        return "pipeline"
+    if hasattr(core, "mesh_encoder") and hasattr(core, "object_codebook"):
+        return "interaction"
+    return "unknown"
+
+
+def _filter_pipeline_module_paths(module_paths):
+    if not isinstance(module_paths, dict):
+        return None
+    allowed = {"human_pose", "interaction", "velocity_contact", "object_trans"}
+    out = {}
+    for key, value in module_paths.items():
+        if key in allowed:
+            out[key] = value
+    return out if out else None
+
+
+def _global_to_local_rotmat(global_rotmats, parents):
+    if global_rotmats.dim() != 4 or global_rotmats.shape[-2:] != (3, 3):
+        raise ValueError(f"Expected [T, J, 3, 3], got {tuple(global_rotmats.shape)}")
+
+    seq_len, num_joints = global_rotmats.shape[:2]
+    local_rotmats = torch.zeros_like(global_rotmats)
+    local_rotmats[:, 0] = global_rotmats[:, 0]
+
+    for i in range(1, num_joints):
+        parent_idx = int(parents[i]) if i < len(parents) else 0
+        parent_idx = max(0, min(parent_idx, num_joints - 1))
+        parent_rot = global_rotmats[:, parent_idx]
+        local_rotmats[:, i] = torch.matmul(parent_rot.transpose(-1, -2), global_rotmats[:, i])
+
+    return local_rotmats
+
+
 def evaluate_model(
     model: IMUHOIModel,
     smpl_model,
@@ -136,6 +204,7 @@ def evaluate_model(
     no_trans: bool = False,
     evaluate_objects: bool = True,
     compare_three: bool = True,
+    interaction_human_source: str = "pred",
 ):
     """评估模型"""
     metrics = {
@@ -183,24 +252,70 @@ def evaluate_model(
                 print(f"Failed to build model input (batch {batch_idx}): {exc}")
                 continue
             
-            compute_fk = evaluate_objects and compare_three
-            try:
-                if str(getattr(config, "model_arch", "rnn")).lower() == "dit":
-                    pred_dict = model.inference(
+            model_kind = _infer_model_kind(model)
+            source = str(interaction_human_source).lower()
+            if source not in {"pred", "gt"}:
+                source = "pred"
+            interaction_use_human_pred = source != "gt"
+            want_object_predictions = bool(evaluate_objects)
+            compute_fk = bool(compare_three and want_object_predictions)
+
+            def _run_model_inference(use_object_data, compute_fk_flag):
+                if model_kind == "mix":
+                    return model.inference(
                         data_dict,
                         gt_targets=batch_device,
-                        use_object_data=True,
-                        compute_fk=compute_fk,
                     )
-                else:
-                    pred_dict = model.inference(
+                if model_kind == "pipeline":
+                    return model.inference(
                         data_dict,
-                        use_object_data=True,
-                        compute_fk=compute_fk,
+                        gt_targets=batch_device,
+                        use_object_data=use_object_data,
+                        compute_fk=compute_fk_flag,
+                        interaction_use_human_pred=interaction_use_human_pred,
                     )
+                if model_kind == "interaction":
+                    if interaction_use_human_pred:
+                        print("Warning: interaction-only model has no human branch; fallback to GT human context.")
+                    return model.inference(
+                        data_dict,
+                        hp_out=None,
+                        gt_targets=batch_device,
+                    )
+                # Unknown model type: try broad signature, then simplified.
+                try:
+                    return model.inference(
+                        data_dict,
+                        gt_targets=batch_device,
+                        use_object_data=use_object_data,
+                        compute_fk=compute_fk_flag,
+                        interaction_use_human_pred=interaction_use_human_pred,
+                    )
+                except TypeError:
+                    return model.inference(
+                        data_dict,
+                        gt_targets=batch_device,
+                    )
+
+            try:
+                pred_dict = _run_model_inference(
+                    use_object_data=want_object_predictions,
+                    compute_fk_flag=compute_fk,
+                )
             except Exception as exc:
-                print(f"Model inference failed on batch {batch_idx}: {exc}")
-                continue
+                if want_object_predictions and model_kind == "pipeline":
+                    try:
+                        print(
+                            f"Model inference with object branch failed on batch {batch_idx}, "
+                            f"fallback to human-only: {exc}"
+                        )
+                        pred_dict = _run_model_inference(use_object_data=False, compute_fk_flag=False)
+                    except Exception as inner_exc:
+                        print(f"Model inference failed on batch {batch_idx}: {inner_exc}")
+                        continue
+                else:
+                    print(f"Model inference failed on batch {batch_idx}: {exc}")
+                    continue
             
             human_imu = data_dict["human_imu"]
             batch_size, seq_len = human_imu.shape[:2]
@@ -241,51 +356,101 @@ def evaluate_model(
                 
                 gt_joints_all = gt_smpl_out.Jtr
                 
-                # 预测输出
-                p_pred_seq = pred_dict.get("p_pred")
-                if p_pred_seq is None:
-                    continue
-                
-                p_pred_seq = p_pred_seq[sample_idx]
-                reduced_pose = p_pred_seq.view(T, len(_REDUCED_POSE_NAMES), 6)
-                
-                orientation_6d = human_imu_seq[:, :, -6:]
-                orientation_mat = t3d.rotation_6d_to_matrix(orientation_6d.reshape(-1, 6)).reshape(
-                    T, human_imu_seq.shape[1], 3, 3
-                )
-                orientation_subset = orientation_mat[:, :len(_SENSOR_ROT_INDICES), :, :]
-                
-                human_module = model.human_pose_module
-                full_glb = human_module._reduced_glb_6d_to_full_glb_mat(
-                    reduced_pose,
-                    orientation_subset.reshape(T, len(_SENSOR_ROT_INDICES), 3, 3),
-                )
-                parents = human_module.smpl_parents.tolist()
-                local_rot = human_module._global2local(full_glb, parents)
-                pose_axis_full = t3d.matrix_to_axis_angle(local_rot.reshape(-1, 3, 3)).reshape(
-                    T, full_glb.shape[1], 3
-                )
-                pred_root_axis = pose_axis_full[:, 0, :]
-                pred_body_axis = pose_axis_full[:, 1:22, :]
-                
                 # 确定使用的trans
                 if no_trans:
                     pred_trans = gt_trans_seq
                 else:
                     pred_root_trans_all = pred_dict.get("root_trans_pred")
                     pred_trans = pred_root_trans_all[sample_idx] if pred_root_trans_all is not None else gt_trans_seq
-                
-                try:
-                    pred_smpl_out = smpl_model(
-                        root_orient=pred_root_axis,
-                        pose_body=pred_body_axis.reshape(T, -1),
-                        trans=pred_trans,
-                    )
-                except Exception as exc:
-                    print(f"SMPL forward failed for prediction: {exc}")
+
+                human_module = _get_human_pose_module(model)
+                pred_joints_all = None
+                pred_body_axis = None
+
+                pred_full_pose_rotmat_all = pred_dict.get("pred_full_pose_rotmat")
+                pred_full_pose_rotmat_seq = (
+                    pred_full_pose_rotmat_all[sample_idx]
+                    if isinstance(pred_full_pose_rotmat_all, torch.Tensor)
+                    else None
+                )
+
+                if pred_full_pose_rotmat_seq is not None and pred_trans is not None:
+                    try:
+                        full_glb = pred_full_pose_rotmat_seq
+                        if full_glb.dim() != 4 or full_glb.shape[0] != T:
+                            raise ValueError(
+                                f"Invalid pred_full_pose_rotmat shape: {tuple(full_glb.shape)}, expected [{T}, J, 3, 3]"
+                            )
+
+                        if human_module is not None and hasattr(human_module, "_global2local"):
+                            parents = human_module.smpl_parents.tolist()
+                            local_rot = human_module._global2local(full_glb, parents)
+                        else:
+                            default_parents = [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19, 20, 21]
+                            local_rot = _global_to_local_rotmat(full_glb, default_parents)
+
+                        pose_axis_full = t3d.matrix_to_axis_angle(local_rot.reshape(-1, 3, 3)).reshape(
+                            T, full_glb.shape[1], 3
+                        )
+                        pred_root_axis = pose_axis_full[:, 0, :]
+                        pred_body_axis = pose_axis_full[:, 1:22, :]
+                        pred_smpl_out = smpl_model(
+                            root_orient=pred_root_axis,
+                            pose_body=pred_body_axis.reshape(T, -1),
+                            trans=pred_trans,
+                        )
+                        pred_joints_all = pred_smpl_out.Jtr
+                    except Exception as exc:
+                        print(f"Predicted SMPL reconstruction from pred_full_pose_rotmat failed: {exc}")
+
+                p_pred_all = pred_dict.get("p_pred")
+                p_pred_seq = p_pred_all[sample_idx] if isinstance(p_pred_all, torch.Tensor) else None
+                if (
+                    pred_joints_all is None
+                    and p_pred_seq is not None
+                    and pred_trans is not None
+                    and human_module is not None
+                    and hasattr(human_module, "_reduced_glb_6d_to_full_glb_mat")
+                    and hasattr(human_module, "_global2local")
+                    and hasattr(human_module, "smpl_parents")
+                ):
+                    try:
+                        reduced_pose = p_pred_seq.reshape(T, len(_REDUCED_POSE_NAMES), 6)
+                        orientation_6d = human_imu_seq[:, :, -6:]
+                        orientation_mat = t3d.rotation_6d_to_matrix(orientation_6d.reshape(-1, 6)).reshape(
+                            T, human_imu_seq.shape[1], 3, 3
+                        )
+                        orientation_subset = orientation_mat[:, :len(_SENSOR_ROT_INDICES), :, :]
+                        full_glb = human_module._reduced_glb_6d_to_full_glb_mat(
+                            reduced_pose,
+                            orientation_subset.reshape(T, len(_SENSOR_ROT_INDICES), 3, 3),
+                        )
+                        parents = human_module.smpl_parents.tolist()
+                        local_rot = human_module._global2local(full_glb, parents)
+                        pose_axis_full = t3d.matrix_to_axis_angle(local_rot.reshape(-1, 3, 3)).reshape(
+                            T, full_glb.shape[1], 3
+                        )
+                        pred_root_axis = pose_axis_full[:, 0, :]
+                        pred_body_axis = pose_axis_full[:, 1:22, :]
+                        pred_smpl_out = smpl_model(
+                            root_orient=pred_root_axis,
+                            pose_body=pred_body_axis.reshape(T, -1),
+                            trans=pred_trans,
+                        )
+                        pred_joints_all = pred_smpl_out.Jtr
+                    except Exception as exc:
+                        print(f"Predicted SMPL reconstruction from p_pred failed: {exc}")
+
+                if pred_joints_all is None:
+                    pred_joints_global_all = pred_dict.get("pred_joints_global")
+                    if isinstance(pred_joints_global_all, torch.Tensor):
+                        try:
+                            pred_joints_all = pred_joints_global_all[sample_idx]
+                        except Exception:
+                            pred_joints_all = None
+
+                if pred_joints_all is None:
                     continue
-                
-                pred_joints_all = pred_smpl_out.Jtr
                 
                 # --- MPJPE ---
                 pred_joints_eval = pred_joints_all[:, :num_eval_joints, :]
@@ -296,8 +461,11 @@ def evaluate_model(
                 metrics["mpjpe"].append(joint_distances.mean().item() * 100.0)
                 
                 # --- MPJRE ---
-                rot_error = torch.mean(torch.absolute(gt_body_axis - pred_body_axis)) * 57.2958
-                metrics["mpjre_angle"].append(rot_error.item())
+                if pred_body_axis is not None:
+                    rot_error = torch.mean(torch.absolute(gt_body_axis - pred_body_axis)) * 57.2958
+                    metrics["mpjre_angle"].append(rot_error.item())
+                else:
+                    metrics["mpjre_angle"].append(float("nan"))
                 
                 # --- Root Trans Error (非noTrans模式) ---
                 if not no_trans and "root_trans_pred" in pred_dict:
@@ -349,6 +517,8 @@ def evaluate_model(
                 gt_obj_contact_seq = gt_obj_contact[sample_idx].bool() if gt_obj_contact is not None else None
                 
                 pred_obj_trans_fusion = pred_dict.get("pred_obj_trans")
+                if pred_obj_trans_fusion is None:
+                    pred_obj_trans_fusion = pred_dict.get("p_obj_pred")
                 pred_obj_trans_fusion = pred_obj_trans_fusion[sample_idx] if pred_obj_trans_fusion is not None else None
                 
                 pred_obj_trans_fk = pred_dict.get("pred_obj_trans_fk")
@@ -428,11 +598,21 @@ def evaluate_model(
                 
                 # --- Contact F1 ---
                 pred_hand_contact_prob = pred_dict.get("pred_hand_contact_prob")
+                if pred_hand_contact_prob is None:
+                    pred_hand_contact_prob = pred_dict.get("contact_prob_pred")
                 if pred_hand_contact_prob is not None:
                     pred_hand_contact_prob = pred_hand_contact_prob[sample_idx]
+                    if pred_hand_contact_prob.shape[-1] < 2:
+                        continue
                     pred_lhand = (pred_hand_contact_prob[:, 0] > 0.5).long().cpu().numpy()
                     pred_rhand = (pred_hand_contact_prob[:, 1] > 0.5).long().cpu().numpy()
-                    pred_objc = (pred_hand_contact_prob[:, 2] > 0.5).long().cpu().numpy()
+                    pred_objc = None
+                    if pred_hand_contact_prob.shape[-1] >= 3:
+                        pred_objc = (pred_hand_contact_prob[:, 2] > 0.5).long().cpu().numpy()
+                    else:
+                        # Two-stage DiT interaction predicts left/right hand contacts only.
+                        # Keep object-contact metric by falling back to union of two hands.
+                        pred_objc = np.logical_or(pred_lhand > 0, pred_rhand > 0).astype(int)
                     
                     if gt_lhand_contact_seq is not None:
                         gt_lhand = gt_lhand_contact_seq.cpu().numpy().astype(int)
@@ -475,11 +655,19 @@ def main():
     parser.add_argument("--no_eval_objects", action="store_true", help="跳过物体相关指标")
     parser.add_argument("--compare_3", action="store_true", help="比较FK/IMU方法")
     parser.add_argument("--model_arch", type=str, choices=["rnn", "dit"], default=None, help="选择模型架构")
+    parser.add_argument(
+        "--interaction_human_source",
+        type=str,
+        default="pred",
+        choices=["pred", "gt"],
+        help="Interaction分支人体来源: pred=使用HumanPose预测, gt=使用GT人体状态",
+    )
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     print(f"Mode: {'noTrans' if args.no_trans else 'Normal'}")
+    print(f"Interaction human source: {args.interaction_human_source}")
     
     default_config = get_default_dataset_config(args.no_trans)
     
@@ -502,8 +690,14 @@ def main():
             config.debug = False
         
         modules_override = dataset_cfg.get("modules")
+        module_paths = None
+        if hasattr(config, "pretrained_modules") and config.pretrained_modules:
+            module_paths = dict(config.pretrained_modules)
         if modules_override:
             _apply_module_overrides(config, modules_override)
+            module_paths = dict(config.pretrained_modules) if getattr(config, "pretrained_modules", None) else module_paths
+        if str(getattr(config, "model_arch", "rnn")).lower() == "dit":
+            module_paths = _filter_pipeline_module_paths(module_paths)
         
         if args.smpl_model_path:
             config.body_model_path = args.smpl_model_path
@@ -515,7 +709,7 @@ def main():
             print(f"[Eval] Skipping '{dataset_name}': {exc}")
             continue
         
-        model = load_model(config, device, no_trans=args.no_trans)
+        model = load_model(config, device, no_trans=args.no_trans, module_paths=module_paths)
         
         data_dir_default = dataset_cfg.get("data_dir")
         if data_dir_default is None and not args.test_data_dir:
@@ -568,6 +762,7 @@ def main():
             no_trans=args.no_trans,
             evaluate_objects=not args.no_eval_objects,
             compare_three=args.compare_3,
+            interaction_human_source=args.interaction_human_source,
         )
         
         eval_duration = time.time() - eval_start_time
