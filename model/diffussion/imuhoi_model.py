@@ -12,6 +12,7 @@ from pytorch3d.transforms import rotation_6d_to_matrix
 
 from .human_pose import HumanPoseModule
 from .interaction import InteractionModule
+from .interaction_VQ import InteractionVQModule
 
 
 class IMUHOIModel(nn.Module):
@@ -118,45 +119,14 @@ class IMUHOIModel(nn.Module):
         self.cfg = cfg
         self.device = device
         self.no_trans = bool(no_trans)
-
-        inter_cfg = getattr(cfg, "interaction_training", {})
-
-        def _inter_param(name: str, default):
-            if isinstance(inter_cfg, dict) and name in inter_cfg:
-                return inter_cfg[name]
-            return getattr(cfg, name, default)
-
-        source_cfg = _inter_param("interaction_human_source", None)
-        if source_cfg is not None:
-            self.default_interaction_use_human_pred = self._parse_human_source(source_cfg)
-        else:
-            self.default_interaction_use_human_pred = bool(_inter_param("interaction_use_human_pred", True))
+        self.interaction_variant = str(getattr(cfg, "interaction_variant", "continuous")).lower()
 
         self.human_pose_module = HumanPoseModule(cfg, device, no_trans=no_trans)
-        self.interaction_module = InteractionModule(cfg)
-
-    @staticmethod
-    def _parse_human_source(source) -> bool:
-        """Return True for using HumanPose prediction, False for using GT human states."""
-        if isinstance(source, bool):
-            return bool(source)
-        source_norm = str(source).strip().lower()
-        if source_norm in {"pred", "hp", "human_pred", "human_output", "prediction"}:
-            return True
-        if source_norm in {"gt", "ground_truth", "target"}:
-            return False
-        raise ValueError(f"Unknown interaction human source: {source}")
-
-    def _resolve_use_human_pred(
-        self,
-        interaction_use_human_pred: Optional[bool],
-        interaction_human_source: Optional[str],
-    ) -> bool:
-        if interaction_human_source is not None:
-            return self._parse_human_source(interaction_human_source)
-        if interaction_use_human_pred is not None:
-            return bool(interaction_use_human_pred)
-        return bool(self.default_interaction_use_human_pred)
+        if self.interaction_variant == "vq":
+            self.interaction_module = InteractionVQModule(cfg)
+        else:
+            self.interaction_variant = "continuous"
+            self.interaction_module = InteractionModule(cfg)
 
     @staticmethod
     def _has_any_object(has_object) -> bool:
@@ -242,35 +212,44 @@ class IMUHOIModel(nn.Module):
     def load_pretrained_modules(self, module_paths: Dict[str, str], strict: bool = True):
         from utils.utils import load_checkpoint
 
-        alias = {
-            "human_pose": "human_pose",
-            "interaction": "interaction",
-            # migration aliases from old two-stage modules
-            "velocity_contact": "interaction",
-            "object_trans": "interaction",
-        }
-
         for name, path in module_paths.items():
-            mapped = alias.get(name)
-            if mapped is None:
-                print(f"Warning: unknown pretrained module key '{name}', skipping")
-                continue
             if not path:
                 continue
             if not os.path.exists(path):
-                print(f"Warning: checkpoint for {mapped} not found at {path}")
+                print(f"Warning: checkpoint for {name} not found at {path}")
                 continue
 
-            module = getattr(self, f"{mapped}_module", None)
+            module = None
+            if name == "human_pose":
+                module = self.human_pose_module
+            elif name in {"interaction", "velocity_contact", "object_trans"}:
+                module = self.interaction_module
+            elif name == "interaction_vq":
+                module = self.interaction_module if self.interaction_variant == "vq" else None
+            elif name == "interaction_vq_obs":
+                module = getattr(self.interaction_module, "obs_token_diffusion", None)
+            elif name == "cond_vq":
+                obs_module = getattr(self.interaction_module, "obs_token_diffusion", None)
+                module = getattr(obs_module, "tokenizer", None) if obs_module is not None else None
+            else:
+                print(f"Warning: unknown pretrained module key '{name}', skipping")
+                continue
+
             if module is None:
-                print(f"Warning: module '{mapped}_module' not found")
+                print(f"Warning: module for '{name}' not found")
                 continue
 
             try:
                 load_checkpoint(module, path, self.device, strict=strict)
-                print(f"Loaded {mapped} from {path}")
+                print(f"Loaded {name} from {path}")
+                if name == "cond_vq":
+                    module.eval()
+                    for param in module.parameters():
+                        param.requires_grad_(False)
+                elif name == "interaction_vq_obs" and hasattr(module, "freeze_all"):
+                    module.freeze_all()
             except Exception as exc:
-                print(f"Warning: failed to load '{name}' checkpoint into '{mapped}': {exc}")
+                print(f"Warning: failed to load '{name}' checkpoint: {exc}")
 
     def forward(
         self,
@@ -283,8 +262,6 @@ class IMUHOIModel(nn.Module):
         sample_steps: int | None = None,
         sampler: str | None = None,
         eta: float | None = None,
-        interaction_use_human_pred: Optional[bool] = None,
-        interaction_human_source: Optional[str] = None,
         **_,
     ) -> Dict[str, torch.Tensor]:
         if force_inference or (not self.training):
@@ -296,17 +273,10 @@ class IMUHOIModel(nn.Module):
                 sample_steps=sample_steps,
                 sampler=sampler,
                 eta=eta,
-                interaction_use_human_pred=interaction_use_human_pred,
-                interaction_human_source=interaction_human_source,
             )
 
         if gt_targets is None:
             raise ValueError("IMUHOIModel.forward requires gt_targets during training.")
-
-        use_human_pred_for_interaction = self._resolve_use_human_pred(
-            interaction_use_human_pred,
-            interaction_human_source,
-        )
 
         results: Dict[str, torch.Tensor] = {}
 
@@ -316,11 +286,9 @@ class IMUHOIModel(nn.Module):
 
         run_interaction = bool(use_object_data) and self._has_any_object(data_dict.get("has_object"))
         if run_interaction:
-            interaction_hp_out = hp_out if use_human_pred_for_interaction else None
+            interaction_hp_out = hp_out
             if detach_hp:
                 interaction_hp_out = self._detach_tensor_dict(interaction_hp_out)
-            if (interaction_hp_out is None) and (gt_targets is None):
-                raise ValueError("Interaction with GT human source requires gt_targets.")
 
             interaction_out = self.interaction_module(data_dict, hp_out=interaction_hp_out, gt_targets=gt_targets)
             self._merge_interaction_output(results, interaction_out)
@@ -334,7 +302,6 @@ class IMUHOIModel(nn.Module):
                 )
 
         results["has_object"] = data_dict.get("has_object")
-        results["interaction_human_source"] = "pred" if use_human_pred_for_interaction else "gt"
         return results
 
     @torch.no_grad()
@@ -347,17 +314,8 @@ class IMUHOIModel(nn.Module):
         sample_steps: int | None = None,
         sampler: str | None = None,
         eta: float | None = None,
-        interaction_use_human_pred: Optional[bool] = None,
-        interaction_human_source: Optional[str] = None,
         **_,
     ) -> Dict[str, torch.Tensor]:
-        use_human_pred_for_interaction = self._resolve_use_human_pred(
-            interaction_use_human_pred,
-            interaction_human_source,
-        )
-        if (not use_human_pred_for_interaction) and (gt_targets is None):
-            raise ValueError("interaction_human_source='gt' requires gt_targets in inference.")
-
         results: Dict[str, torch.Tensor] = {}
 
         hp_input = self._build_hp_input(data_dict)
@@ -372,10 +330,9 @@ class IMUHOIModel(nn.Module):
 
         run_interaction = bool(use_object_data) and self._has_any_object(data_dict.get("has_object"))
         if run_interaction:
-            interaction_hp_out = hp_out if use_human_pred_for_interaction else None
             interaction_out = self.interaction_module.inference(
                 data_dict,
-                hp_out=interaction_hp_out,
+                hp_out=hp_out,
                 gt_targets=gt_targets,
                 sample_steps=sample_steps,
                 sampler=sampler,
@@ -392,7 +349,6 @@ class IMUHOIModel(nn.Module):
                 )
 
         results["has_object"] = data_dict.get("has_object")
-        results["interaction_human_source"] = "pred" if use_human_pred_for_interaction else "gt"
         return results
 
 

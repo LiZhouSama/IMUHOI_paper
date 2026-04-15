@@ -6,8 +6,6 @@ Loss terms:
 - Loss_vel_obj
 - Loss_jitter_obj
 - Loss_align
-- Loss_code_cls
-- Loss_commit
 """
 from __future__ import annotations
 
@@ -18,7 +16,7 @@ import torch.nn.functional as F
 class InteractionLoss:
     """Stage-2 loss composition for full-window denoising."""
 
-    LOSS_KEYS = ("simple", "vel_obj", "jitter_obj", "align", "code_cls", "commit")
+    LOSS_KEYS = ("simple", "vel_obj", "jitter_obj", "align")
     TEST_LOSS_KEYS = ("obj_pos_rmse_mm", "obj_pos_jitter_mm")
 
     _WEIGHT_ALIASES = {
@@ -26,8 +24,6 @@ class InteractionLoss:
         "vel_obj": ("vel_obj", "Loss_vel_obj", "L_vel_obj", "drift_obj", "Loss_drift_obj", "L_drift_obj"),
         "jitter_obj": ("jitter_obj", "Loss_jitter_obj", "L_jitter_obj"),
         "align": ("align", "Loss_align", "L_align"),
-        "code_cls": ("code_cls", "Loss_code_cls", "L_code_cls"),
-        "commit": ("commit", "Loss_commit", "L_commit"),
     }
 
     def __init__(self, weights=None, test_metric_weights=None):
@@ -186,16 +182,12 @@ class InteractionLoss:
                 if center_mask.any():
                     losses["jitter_obj"] = (acc[center_mask] ** 2).mean()
 
-        # Object prior/codebook losses.
+        # Continuous object-prior alignment loss.
         object_prior_aux = pred_dict.get("object_prior_aux") if isinstance(pred_dict, dict) else None
         if isinstance(object_prior_aux, dict):
-            z_e_obs = object_prior_aux.get("z_e_obs")
-            z_e_mesh = object_prior_aux.get("z_e_mesh")
-            z_q_mesh = object_prior_aux.get("z_q_mesh")
-            code_idx_mesh = object_prior_aux.get("code_idx_mesh")
-            code_logits_obs = object_prior_aux.get("code_logits_obs")
+            obs_cond_feat = object_prior_aux.get("obs_cond_feat")
+            mesh_cond_feat = object_prior_aux.get("mesh_cond_feat")
             mesh_valid_mask = object_prior_aux.get("mesh_valid_mask")
-            vq_beta = object_prior_aux.get("vq_beta")
 
             sample_has_object = has_object_mask.any(dim=1)
             if isinstance(mesh_valid_mask, torch.Tensor):
@@ -205,52 +197,16 @@ class InteractionLoss:
             valid_mask = valid_mask & sample_has_object
 
             if (
-                isinstance(z_e_obs, torch.Tensor)
-                and isinstance(z_q_mesh, torch.Tensor)
-                and z_e_obs.shape == z_q_mesh.shape
-                and z_e_obs.dim() == 2
-                and z_e_obs.shape[0] == batch_size
+                isinstance(obs_cond_feat, torch.Tensor)
+                and isinstance(mesh_cond_feat, torch.Tensor)
+                and obs_cond_feat.shape == mesh_cond_feat.shape
+                and obs_cond_feat.dim() == 2
+                and obs_cond_feat.shape[0] == batch_size
                 and valid_mask.any()
             ):
-                z_e_obs = z_e_obs.to(device=device, dtype=dtype)
-                z_q_mesh = z_q_mesh.to(device=device, dtype=dtype)
-                losses["align"] = F.mse_loss(z_e_obs[valid_mask], z_q_mesh.detach()[valid_mask])
-
-            if (
-                isinstance(code_logits_obs, torch.Tensor)
-                and isinstance(code_idx_mesh, torch.Tensor)
-                and code_logits_obs.dim() == 2
-                and code_idx_mesh.dim() == 1
-                and code_logits_obs.shape[0] == batch_size
-                and code_idx_mesh.shape[0] == batch_size
-            ):
-                code_logits_obs = code_logits_obs.to(device=device, dtype=dtype)
-                code_idx_mesh = code_idx_mesh.to(device=device, dtype=torch.long)
-                cls_valid = valid_mask & (code_idx_mesh >= 0)
-                if cls_valid.any():
-                    losses["code_cls"] = F.cross_entropy(code_logits_obs[cls_valid], code_idx_mesh[cls_valid])
-
-            if (
-                isinstance(z_e_mesh, torch.Tensor)
-                and isinstance(z_q_mesh, torch.Tensor)
-                and z_e_mesh.shape == z_q_mesh.shape
-                and z_e_mesh.dim() == 2
-                and z_e_mesh.shape[0] == batch_size
-                and valid_mask.any()
-            ):
-                z_e_mesh = z_e_mesh.to(device=device, dtype=dtype)
-                z_q_mesh = z_q_mesh.to(device=device, dtype=dtype)
-                if isinstance(vq_beta, torch.Tensor):
-                    beta = float(vq_beta.detach().mean().item())
-                elif isinstance(vq_beta, (float, int)):
-                    beta = float(vq_beta)
-                else:
-                    beta = 0.25
-                beta = max(beta, 0.0)
-                losses["commit"] = (
-                    F.mse_loss(z_e_mesh.detach()[valid_mask], z_q_mesh[valid_mask])
-                    + beta * F.mse_loss(z_e_mesh[valid_mask], z_q_mesh.detach()[valid_mask])
-                )
+                obs_cond_feat = obs_cond_feat.to(device=device, dtype=dtype)
+                mesh_cond_feat = mesh_cond_feat.to(device=device, dtype=dtype)
+                losses["align"] = F.mse_loss(obs_cond_feat[valid_mask], mesh_cond_feat.detach()[valid_mask])
 
         weighted_losses = {}
         total_loss = zero.clone()
@@ -260,8 +216,6 @@ class InteractionLoss:
             "vel_obj": 1.0,
             "jitter_obj": 1.0,
             "align": 1.0,
-            "code_cls": 1.0,
-            "commit": 0.1,
         }
 
         for key in self.LOSS_KEYS:

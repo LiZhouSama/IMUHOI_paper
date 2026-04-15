@@ -17,8 +17,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from pytorch3d.transforms import matrix_to_rotation_6d, rotation_6d_to_matrix
+from pytorch3d.transforms import axis_angle_to_matrix, matrix_to_rotation_6d, rotation_6d_to_matrix
 
 from .base import ConditionalDiT
 from configs import FRAME_RATE, _SENSOR_NAMES
@@ -58,12 +57,13 @@ class _SequenceTransformerEncoder(nn.Module):
 
 
 class _MeshPriorEncoder(nn.Module):
-    """PointNet frame encoder + temporal aggregator for mesh prior token."""
+    """PointNet frame encoder + human-state fusion + temporal aggregator."""
 
     def __init__(
         self,
         *,
         point_dim: int,
+        human_state_dim: int,
         d_model: int,
         out_dim: int,
         temporal_model: str = "gru",
@@ -74,6 +74,18 @@ class _MeshPriorEncoder(nn.Module):
         super().__init__()
         self.point_mlp = nn.Sequential(
             nn.Linear(point_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+        )
+        self.human_proj = nn.Sequential(
+            nn.Linear(human_state_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+        )
+        self.frame_fuse = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
             nn.GELU(),
@@ -108,9 +120,11 @@ class _MeshPriorEncoder(nn.Module):
             raise ValueError(f"Unsupported mesh temporal_model: {temporal_model}")
         self.out_proj = nn.Linear(d_model, out_dim)
 
-    def forward(self, point_seq: torch.Tensor) -> torch.Tensor:
+    def forward(self, point_seq: torch.Tensor, human_state_seq: torch.Tensor) -> torch.Tensor:
         # point_seq: [B,T,N,3]
         frame_tokens = self.point_mlp(point_seq).amax(dim=2)
+        human_tokens = self.human_proj(human_state_seq)
+        frame_tokens = self.frame_fuse(torch.cat([frame_tokens, human_tokens], dim=-1))
         frame_tokens = self.frame_norm(frame_tokens)
 
         if self.temporal_model == "gru":
@@ -225,10 +239,8 @@ class InteractionModule(nn.Module):
 
         # Object-prior condition settings.
         self.code_dim = int(getattr(cfg, "object_code_dim", 128))
-        self.num_codes = int(getattr(cfg, "num_object_codes", 128))
         self.object_geo_root = str(getattr(cfg, "object_geo_root", "datasets/OMOMO/captured_objects"))
         self.mesh_downsample_points = int(max(1, getattr(cfg, "mesh_downsample_points", 256)))
-        self.vq_commit_beta = float(getattr(cfg, "vq_commit_beta", 0.25))
 
         prior_hidden = int(getattr(cfg, "prior_encoder_hidden_dim", 256))
         prior_heads = int(getattr(cfg, "prior_encoder_heads", 8))
@@ -250,6 +262,7 @@ class InteractionModule(nn.Module):
 
         self.mesh_encoder = _MeshPriorEncoder(
             point_dim=3,
+            human_state_dim=self.human_rot_dim + 3,
             d_model=prior_hidden,
             out_dim=self.code_dim,
             temporal_model=mesh_temporal_model,
@@ -258,7 +271,7 @@ class InteractionModule(nn.Module):
             temporal_dropout=mesh_temporal_dropout,
         )
         self.obs_encoder = _SequenceTransformerEncoder(
-            in_dim=self.rot_dim + self.acc_dim + self.hands_dim,
+            in_dim=self.human_rot_dim + 3 + 9,
             d_model=prior_hidden,
             nhead=prior_heads,
             num_layers=prior_layers,
@@ -266,8 +279,6 @@ class InteractionModule(nn.Module):
             out_dim=self.code_dim,
         )
 
-        self.object_codebook = nn.Embedding(self.num_codes, self.code_dim)
-        nn.init.normal_(self.object_codebook.weight, mean=0.0, std=0.02)
         self.null_object_code = nn.Parameter(torch.zeros(1, self.code_dim))
 
         self._mesh_point_cloud_cache: Dict[str, torch.Tensor] = {}
@@ -447,34 +458,58 @@ class InteractionModule(nn.Module):
 
         return torch.zeros(batch_size, 3, device=device, dtype=dtype)
 
-    def _resolve_human_rot6d(
+    @staticmethod
+    def _identity_rot6d(*, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        eye = torch.eye(3, device=device, dtype=dtype).reshape(1, 3, 3)
+        return matrix_to_rotation_6d(eye)[0]
+
+    def _normalize_human_pose6d(
         self,
-        hp_out: Optional[Dict],
+        pose6d,
+        *,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if not isinstance(pose6d, torch.Tensor):
+            return None
+
+        pose6d = pose6d.to(device=device, dtype=dtype)
+        if pose6d.dim() == 3 and pose6d.shape[-1] == self.human_rot_dim:
+            pose6d = pose6d.view(batch_size, seq_len, self.num_joints, 6)
+        elif pose6d.dim() == 2 and pose6d.shape[-1] == self.human_rot_dim:
+            pose6d = pose6d.unsqueeze(0).view(1, seq_len, self.num_joints, 6)
+
+        if pose6d.dim() != 4:
+            return None
+        if pose6d.shape[0] == 1 and batch_size > 1:
+            pose6d = pose6d.expand(batch_size, -1, -1, -1)
+        if pose6d.shape[0] != batch_size or pose6d.shape[1] != seq_len:
+            return None
+
+        joints_now = int(pose6d.shape[2])
+        if joints_now > self.num_joints:
+            pose6d = pose6d[:, :, : self.num_joints]
+        elif joints_now < self.num_joints:
+            identity6d = self._identity_rot6d(device=device, dtype=dtype).view(1, 1, 1, 6)
+            pad = identity6d.expand(batch_size, seq_len, self.num_joints - joints_now, 6)
+            pose6d = torch.cat([pose6d, pad], dim=2)
+        return pose6d
+
+    def _resolve_human_pose_from_gt(
+        self,
         gt_targets: Optional[Dict],
         *,
         batch_size: int,
         seq_len: int,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> torch.Tensor:
-        rot = hp_out.get("pred_full_pose_6d") if isinstance(hp_out, dict) else None
-        if isinstance(rot, torch.Tensor):
-            rot = rot.to(device=device, dtype=dtype)
-            if rot.dim() == 3 and rot.shape[-1] == self.human_rot_dim:
-                rot = rot.view(batch_size, seq_len, self.num_joints, 6)
-            if rot.dim() == 4:
-                if rot.shape[0] == 1 and batch_size > 1:
-                    rot = rot.expand(batch_size, -1, -1, -1)
-                if rot.shape[0] == batch_size and rot.shape[1] == seq_len:
-                    joints_now = rot.shape[2]
-                    if joints_now > self.num_joints:
-                        rot = rot[:, :, : self.num_joints]
-                    elif joints_now < self.num_joints:
-                        pad = torch.zeros(batch_size, seq_len, self.num_joints - joints_now, 6, device=device, dtype=dtype)
-                        rot = torch.cat([rot, pad], dim=2)
-                    return rot
+    ) -> Optional[torch.Tensor]:
+        if not isinstance(gt_targets, dict):
+            return None
 
-        rot_global = gt_targets.get("rotation_global") if isinstance(gt_targets, dict) else None
+        rot_global = gt_targets.get("rotation_global")
         if isinstance(rot_global, torch.Tensor):
             rot_global = rot_global.to(device=device, dtype=dtype)
             if rot_global.dim() == 4:
@@ -482,17 +517,112 @@ class InteractionModule(nn.Module):
             if rot_global.shape[0] == 1 and batch_size > 1:
                 rot_global = rot_global.expand(batch_size, -1, -1, -1, -1)
             if rot_global.shape[0] == batch_size and rot_global.shape[1] == seq_len and rot_global.shape[-2:] == (3, 3):
-                joints_now = rot_global.shape[2]
+                joints_now = int(rot_global.shape[2])
                 if joints_now > self.num_joints:
                     rot_global = rot_global[:, :, : self.num_joints]
                 elif joints_now < self.num_joints:
                     eye = torch.eye(3, device=device, dtype=dtype).view(1, 1, 1, 3, 3)
                     pad = eye.expand(batch_size, seq_len, self.num_joints - joints_now, -1, -1)
                     rot_global = torch.cat([rot_global, pad], dim=2)
-                rot6d = matrix_to_rotation_6d(rot_global.reshape(-1, 3, 3)).reshape(batch_size, seq_len, self.num_joints, 6)
-                return rot6d
+                return matrix_to_rotation_6d(rot_global.reshape(-1, 3, 3)).reshape(batch_size, seq_len, self.num_joints, 6)
 
-        return torch.zeros(batch_size, seq_len, self.num_joints, 6, device=device, dtype=dtype)
+        pose_aa = gt_targets.get("pose")
+        if isinstance(pose_aa, torch.Tensor):
+            pose_aa = pose_aa.to(device=device, dtype=dtype)
+            if pose_aa.dim() == 2:
+                pose_aa = pose_aa.unsqueeze(0)
+            if pose_aa.shape[0] == 1 and batch_size > 1:
+                pose_aa = pose_aa.expand(batch_size, -1, -1)
+            if pose_aa.shape[0] != batch_size or pose_aa.shape[1] != seq_len or pose_aa.shape[-1] < 3:
+                return None
+
+            joints_now = min(int(pose_aa.shape[-1] // 3), self.num_joints)
+            if joints_now < 1:
+                return None
+            pose_aa = pose_aa[..., : joints_now * 3].reshape(batch_size, seq_len, joints_now, 3)
+            rot = axis_angle_to_matrix(pose_aa.reshape(-1, 3)).reshape(batch_size, seq_len, joints_now, 3, 3)
+            pose6d = matrix_to_rotation_6d(rot.reshape(-1, 3, 3)).reshape(batch_size, seq_len, joints_now, 6)
+            if joints_now < self.num_joints:
+                identity6d = self._identity_rot6d(device=device, dtype=dtype).view(1, 1, 1, 6)
+                pad = identity6d.expand(batch_size, seq_len, self.num_joints - joints_now, 6)
+                pose6d = torch.cat([pose6d, pad], dim=2)
+            return pose6d
+
+        return None
+
+    def _resolve_human_trans(
+        self,
+        hp_out: Optional[Dict],
+        gt_targets: Optional[Dict],
+        data_dict: Dict,
+        *,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        sources = []
+        if isinstance(hp_out, dict):
+            sources.append(hp_out.get("root_trans_pred"))
+        if isinstance(gt_targets, dict):
+            sources.append(gt_targets.get("trans"))
+        sources.extend([data_dict.get("trans_gt"), data_dict.get("trans")])
+
+        for value in sources:
+            if not isinstance(value, torch.Tensor):
+                continue
+            trans = value.to(device=device, dtype=dtype)
+            if trans.dim() == 2:
+                trans = trans.unsqueeze(0)
+            if trans.shape[0] == 1 and batch_size > 1:
+                trans = trans.expand(batch_size, -1, -1)
+            if trans.shape[0] == batch_size and trans.shape[1] == seq_len and trans.shape[-1] == 3:
+                return trans
+        return None
+
+    def _resolve_human_state(
+        self,
+        data_dict: Dict,
+        hp_out: Optional[Dict],
+        gt_targets: Optional[Dict],
+        *,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        human_pose6d = self._normalize_human_pose6d(
+            hp_out.get("pred_full_pose_6d") if isinstance(hp_out, dict) else None,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            device=device,
+            dtype=dtype,
+        )
+        if human_pose6d is None:
+            human_pose6d = self._resolve_human_pose_from_gt(
+                gt_targets,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                device=device,
+                dtype=dtype,
+            )
+
+        human_trans = self._resolve_human_trans(
+            hp_out,
+            gt_targets,
+            data_dict,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            device=device,
+            dtype=dtype,
+        )
+
+        if human_pose6d is None or human_trans is None:
+            raise ValueError(
+                "Failed to resolve human state for InteractionModule cond. "
+                "Expected hp_out(pred_full_pose_6d/root_trans_pred) or gt_targets(rotation_global|pose + trans)."
+            )
+        return human_pose6d, human_trans
 
     def _resolve_hand_positions(
         self,
@@ -544,7 +674,8 @@ class InteractionModule(nn.Module):
         human_imu = self._prepare_human_imu(data_dict["human_imu"]).to(device=device, dtype=dtype)
         obj_imu = self._prepare_obj_imu(data_dict.get("obj_imu"), batch_size=batch_size, seq_len=seq_len, device=device, dtype=dtype)
 
-        human_rot6d = self._resolve_human_rot6d(
+        human_pose6d, human_trans = self._resolve_human_state(
+            data_dict,
             hp_out,
             gt_targets,
             batch_size=batch_size,
@@ -553,7 +684,8 @@ class InteractionModule(nn.Module):
             dtype=dtype,
         )
         obj_rot6d = obj_imu[..., 3:9]
-        rot_human_obj = torch.cat([human_rot6d.reshape(batch_size, seq_len, -1), obj_rot6d], dim=-1)
+        human_pose6d_flat = human_pose6d.reshape(batch_size, seq_len, -1)
+        rot_human_obj = torch.cat([human_pose6d_flat, obj_rot6d], dim=-1)
 
         human_acc = human_imu[..., :3].reshape(batch_size, seq_len, -1)
         obj_acc = obj_imu[..., :3]
@@ -656,6 +788,10 @@ class InteractionModule(nn.Module):
             delta_p_obj[:, 1:] = obj_trans[:, 1:] - obj_trans[:, :-1]
 
         return {
+            "human_pose6d": human_pose6d,
+            "human_pose6d_flat": human_pose6d_flat,
+            "human_trans": human_trans,
+            "obj_imu": obj_imu,
             "rot_human_obj": rot_human_obj,
             "acc_human_obj": acc_human_obj,
             "hands": hands,
@@ -750,41 +886,22 @@ class InteractionModule(nn.Module):
         ).long()
         return points[:, idx]
 
-    def _quantize_to_codebook(self, z_e: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # z_e: [B,D]
-        codebook = self.object_codebook.weight.to(device=z_e.device, dtype=z_e.dtype)  # [K,D]
-        dist = (
-            z_e.pow(2).sum(dim=1, keepdim=True)
-            - 2.0 * z_e @ codebook.t()
-            + codebook.pow(2).sum(dim=1, keepdim=True).t()
-        )
-        code_idx = dist.argmin(dim=1)
-        z_q = F.embedding(code_idx, codebook)
-        logits = -dist
-        return z_q, code_idx, dist, logits
-
     def _encode_observation_prior(self, feats: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         obs_seq = torch.cat(
             [
-                feats["rot_human_obj"],
-                feats["acc_human_obj"],
-                feats["hands_flat"],
+                feats["human_pose6d_flat"],
+                feats["human_trans"],
+                feats["obj_imu"],
             ],
             dim=-1,
         )
-        z_e_obs = self.obs_encoder(obs_seq)
-        z_q_obs, code_idx_obs, _, logits_obs = self._quantize_to_codebook(z_e_obs)
-        return {
-            "z_e_obs": z_e_obs,
-            "z_q_obs": z_q_obs,
-            "code_idx_obs": code_idx_obs,
-            "code_logits_obs": logits_obs,
-        }
+        return {"obs_cond_feat": self.obs_encoder(obs_seq)}
 
     def _encode_mesh_prior(
         self,
         data_dict: Dict,
         gt_targets: Optional[Dict],
+        feats: Dict[str, torch.Tensor],
         *,
         batch_size: int,
         seq_len: int,
@@ -792,19 +909,13 @@ class InteractionModule(nn.Module):
         dtype: torch.dtype,
         sample_has_object: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        z_e_mesh = torch.zeros(batch_size, self.code_dim, device=device, dtype=dtype)
-        z_q_mesh = torch.zeros(batch_size, self.code_dim, device=device, dtype=dtype)
-        code_idx_mesh = torch.full((batch_size,), -1, device=device, dtype=torch.long)
-        code_logits_mesh = torch.zeros(batch_size, self.num_codes, device=device, dtype=dtype)
+        mesh_cond_feat = torch.zeros(batch_size, self.code_dim, device=device, dtype=dtype)
         mesh_valid_mask = torch.zeros(batch_size, device=device, dtype=torch.bool)
         mesh_dp_mismatch = torch.zeros(batch_size, device=device, dtype=torch.bool)
 
         if not isinstance(gt_targets, dict):
             return {
-                "z_e_mesh": z_e_mesh,
-                "z_q_mesh": z_q_mesh,
-                "code_idx_mesh": code_idx_mesh,
-                "code_logits_mesh": code_logits_mesh,
+                "mesh_cond_feat": mesh_cond_feat,
                 "mesh_valid_mask": mesh_valid_mask,
                 "mesh_dp_mismatch": mesh_dp_mismatch,
             }
@@ -814,10 +925,7 @@ class InteractionModule(nn.Module):
             # Typical DataParallel behavior: non-tensor list metadata is replicated, not sharded.
             mesh_dp_mismatch.fill_(True)
             return {
-                "z_e_mesh": z_e_mesh,
-                "z_q_mesh": z_q_mesh,
-                "code_idx_mesh": code_idx_mesh,
-                "code_logits_mesh": code_logits_mesh,
+                "mesh_cond_feat": mesh_cond_feat,
                 "mesh_valid_mask": mesh_valid_mask,
                 "mesh_dp_mismatch": mesh_dp_mismatch,
             }
@@ -870,17 +978,16 @@ class InteractionModule(nn.Module):
 
         if obj_rot_mats is None:
             return {
-                "z_e_mesh": z_e_mesh,
-                "z_q_mesh": z_q_mesh,
-                "code_idx_mesh": code_idx_mesh,
-                "code_logits_mesh": code_logits_mesh,
+                "mesh_cond_feat": mesh_cond_feat,
                 "mesh_valid_mask": mesh_valid_mask,
                 "mesh_dp_mismatch": mesh_dp_mismatch,
             }
 
         load_object_geometry = None
+        human_state_seq = torch.cat([feats["human_pose6d_flat"], feats["human_trans"]], dim=-1)
 
         valid_points = []
+        valid_human_states = []
         valid_batch_idx = []
 
         for b in range(batch_size):
@@ -943,40 +1050,30 @@ class InteractionModule(nn.Module):
             points = self._downsample_points(points)
 
             valid_points.append(points)
+            valid_human_states.append(human_state_seq[b])
             valid_batch_idx.append(b)
 
         if len(valid_batch_idx) == 0:
             return {
-                "z_e_mesh": z_e_mesh,
-                "z_q_mesh": z_q_mesh,
-                "code_idx_mesh": code_idx_mesh,
-                "code_logits_mesh": code_logits_mesh,
+                "mesh_cond_feat": mesh_cond_feat,
                 "mesh_valid_mask": mesh_valid_mask,
                 "mesh_dp_mismatch": mesh_dp_mismatch,
             }
 
         point_tensor = torch.stack(valid_points, dim=0)
-        z_e_valid = self.mesh_encoder(point_tensor)
-        z_q_valid, code_idx_valid, _, logits_valid = self._quantize_to_codebook(z_e_valid)
+        human_state_tensor = torch.stack(valid_human_states, dim=0)
+        cond_valid = self.mesh_encoder(point_tensor, human_state_tensor)
 
         # Under autocast, mesh branch may run in bf16/fp16 while accumulators stay fp32.
         # Align dtypes before indexed assignment to avoid dtype mismatch errors.
-        z_e_valid = z_e_valid.to(dtype=z_e_mesh.dtype)
-        z_q_valid = z_q_valid.to(dtype=z_q_mesh.dtype)
-        logits_valid = logits_valid.to(dtype=code_logits_mesh.dtype)
+        cond_valid = cond_valid.to(dtype=mesh_cond_feat.dtype)
 
         valid_idx_tensor = torch.as_tensor(valid_batch_idx, device=device, dtype=torch.long)
-        z_e_mesh[valid_idx_tensor] = z_e_valid
-        z_q_mesh[valid_idx_tensor] = z_q_valid
-        code_idx_mesh[valid_idx_tensor] = code_idx_valid
-        code_logits_mesh[valid_idx_tensor] = logits_valid
+        mesh_cond_feat[valid_idx_tensor] = cond_valid
         mesh_valid_mask[valid_idx_tensor] = True
 
         return {
-            "z_e_mesh": z_e_mesh,
-            "z_q_mesh": z_q_mesh,
-            "code_idx_mesh": code_idx_mesh,
-            "code_logits_mesh": code_logits_mesh,
+            "mesh_cond_feat": mesh_cond_feat,
             "mesh_valid_mask": mesh_valid_mask,
             "mesh_dp_mismatch": mesh_dp_mismatch,
         }
@@ -1006,16 +1103,10 @@ class InteractionModule(nn.Module):
             sample_has_object = torch.ones(batch_size, device=device, dtype=torch.bool)
 
         obs_prior = self._encode_observation_prior(feats)
-        z_e_obs = obs_prior["z_e_obs"]
-        z_q_obs = obs_prior["z_q_obs"]
-        code_idx_obs = obs_prior["code_idx_obs"]
-        code_logits_obs = obs_prior["code_logits_obs"]
+        obs_cond_feat = obs_prior["obs_cond_feat"]
 
         mesh_prior = {
-            "z_e_mesh": torch.zeros(batch_size, self.code_dim, device=device, dtype=dtype),
-            "z_q_mesh": torch.zeros(batch_size, self.code_dim, device=device, dtype=dtype),
-            "code_idx_mesh": torch.full((batch_size,), -1, device=device, dtype=torch.long),
-            "code_logits_mesh": torch.zeros(batch_size, self.num_codes, device=device, dtype=dtype),
+            "mesh_cond_feat": torch.zeros(batch_size, self.code_dim, device=device, dtype=dtype),
             "mesh_valid_mask": torch.zeros(batch_size, device=device, dtype=torch.bool),
             "mesh_dp_mismatch": torch.zeros(batch_size, device=device, dtype=torch.bool),
         }
@@ -1023,6 +1114,7 @@ class InteractionModule(nn.Module):
             mesh_prior = self._encode_mesh_prior(
                 data_dict,
                 gt_targets,
+                feats,
                 batch_size=batch_size,
                 seq_len=seq_len,
                 device=device,
@@ -1030,10 +1122,7 @@ class InteractionModule(nn.Module):
                 sample_has_object=sample_has_object,
             )
 
-        z_e_mesh = mesh_prior["z_e_mesh"]
-        z_q_mesh = mesh_prior["z_q_mesh"]
-        code_idx_mesh = mesh_prior["code_idx_mesh"]
-        code_logits_mesh = mesh_prior["code_logits_mesh"]
+        mesh_cond_feat = mesh_prior["mesh_cond_feat"]
         mesh_valid_mask = mesh_prior["mesh_valid_mask"]
         mesh_dp_mismatch = mesh_prior["mesh_dp_mismatch"]
 
@@ -1047,30 +1136,25 @@ class InteractionModule(nn.Module):
             # No-object sequences always use null prior.
             mode = torch.where(sample_has_object, mode, torch.full_like(mode, 2))
 
-            cond = z_q_obs.clone()
-            cond = torch.where(mode[:, None] == 0, z_q_mesh, cond)
+            cond = obs_cond_feat.clone()
+            cond = torch.where(mode[:, None] == 0, mesh_cond_feat, cond)
             cond = torch.where(mode[:, None] == 2, null_code, cond)
         else:
-            mode = torch.full((batch_size,), -1, device=device, dtype=torch.long)
-            cond = torch.where(sample_has_object[:, None], z_q_obs, null_code)
-
-        code_idx_obs = torch.where(sample_has_object, code_idx_obs, torch.full_like(code_idx_obs, -1))
+            mode = torch.where(
+                sample_has_object,
+                torch.ones(batch_size, device=device, dtype=torch.long),
+                torch.full((batch_size,), 2, device=device, dtype=torch.long),
+            )
+            cond = torch.where(sample_has_object[:, None], obs_cond_feat, null_code)
 
         cond_info = {
             "mode": mode,
             "cond": cond,
-            "z_e_mesh": z_e_mesh,
-            "z_q_mesh": z_q_mesh,
-            "code_idx_mesh": code_idx_mesh,
-            "code_logits_mesh": code_logits_mesh,
+            "mesh_cond_feat": mesh_cond_feat,
             "mesh_valid_mask": mesh_valid_mask,
             "mesh_dp_mismatch": mesh_dp_mismatch,
-            "z_e_obs": z_e_obs,
-            "z_q_obs": z_q_obs,
-            "code_idx_obs": code_idx_obs,
-            "code_logits_obs": code_logits_obs,
+            "obs_cond_feat": obs_cond_feat,
             "sample_has_object": sample_has_object,
-            "vq_beta": torch.tensor(self.vq_commit_beta, device=device, dtype=dtype),
         }
         return cond, cond_info
 
@@ -1295,8 +1379,6 @@ class InteractionModule(nn.Module):
             "observed_dim_mask": self.observed_dim_mask,
             "unknown_dim_mask": self.unknown_dim_mask,
             "prediction_type": self.dit.prediction_type,
-            "object_code_idx_pred": cond_info["code_idx_obs"],
-            "object_code_emb_pred": cond_info["z_q_obs"],
             "cond_mode": cond_info["mode"],
         }
         return outputs
@@ -1492,8 +1574,7 @@ class InteractionModule(nn.Module):
             "inference_type": self.inference_type,
             "sampler": aux_sampler,
             "eta": aux_eta,
-            "object_code_idx_pred": cond_info["code_idx_obs"],
-            "object_code_emb_pred": cond_info["z_q_obs"],
+            "cond_mode": cond_info["mode"],
         }
         return outputs
 

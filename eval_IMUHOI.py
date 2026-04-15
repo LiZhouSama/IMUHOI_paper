@@ -140,6 +140,10 @@ def _unwrap_model(model):
     return model.module if hasattr(model, "module") else model
 
 
+def _get_interaction_variant(config) -> str:
+    return str(getattr(config, "interaction_variant", "continuous")).lower()
+
+
 def _get_human_pose_module(model):
     core = _unwrap_model(model)
     module = getattr(core, "human_pose_module", None)
@@ -158,19 +162,28 @@ def _infer_model_kind(model):
         return "mix"
     if "imuhoimodel" in name:
         return "pipeline"
+    if "interactionvqmodule" in name:
+        return "interaction"
     if "interactionmodule" in name:
         return "interaction"
     if hasattr(core, "human_pose_module") and hasattr(core, "interaction_module"):
         return "pipeline"
-    if hasattr(core, "mesh_encoder") and hasattr(core, "object_codebook"):
+    if hasattr(core, "mesh_encoder") and hasattr(core, "obs_encoder"):
+        return "interaction"
+    if hasattr(core, "obs_token_diffusion"):
         return "interaction"
     return "unknown"
 
 
-def _filter_pipeline_module_paths(module_paths):
+def _filter_pipeline_module_paths(module_paths, interaction_variant="continuous"):
     if not isinstance(module_paths, dict):
         return None
-    allowed = {"human_pose", "interaction", "velocity_contact", "object_trans"}
+    interaction_variant = str(interaction_variant).lower()
+    allowed = {"human_pose"}
+    if interaction_variant == "vq":
+        allowed.update({"cond_vq", "interaction_vq_obs", "interaction_vq"})
+    else:
+        allowed.update({"interaction", "velocity_contact", "object_trans"})
     out = {}
     for key, value in module_paths.items():
         if key in allowed:
@@ -204,7 +217,6 @@ def evaluate_model(
     no_trans: bool = False,
     evaluate_objects: bool = True,
     compare_three: bool = True,
-    interaction_human_source: str = "pred",
 ):
     """评估模型"""
     metrics = {
@@ -253,10 +265,6 @@ def evaluate_model(
                 continue
             
             model_kind = _infer_model_kind(model)
-            source = str(interaction_human_source).lower()
-            if source not in {"pred", "gt"}:
-                source = "pred"
-            interaction_use_human_pred = source != "gt"
             want_object_predictions = bool(evaluate_objects)
             compute_fk = bool(compare_three and want_object_predictions)
 
@@ -272,11 +280,8 @@ def evaluate_model(
                         gt_targets=batch_device,
                         use_object_data=use_object_data,
                         compute_fk=compute_fk_flag,
-                        interaction_use_human_pred=interaction_use_human_pred,
                     )
                 if model_kind == "interaction":
-                    if interaction_use_human_pred:
-                        print("Warning: interaction-only model has no human branch; fallback to GT human context.")
                     return model.inference(
                         data_dict,
                         hp_out=None,
@@ -289,7 +294,6 @@ def evaluate_model(
                         gt_targets=batch_device,
                         use_object_data=use_object_data,
                         compute_fk=compute_fk_flag,
-                        interaction_use_human_pred=interaction_use_human_pred,
                     )
                 except TypeError:
                     return model.inference(
@@ -655,19 +659,11 @@ def main():
     parser.add_argument("--no_eval_objects", action="store_true", help="跳过物体相关指标")
     parser.add_argument("--compare_3", action="store_true", help="比较FK/IMU方法")
     parser.add_argument("--model_arch", type=str, choices=["rnn", "dit"], default=None, help="选择模型架构")
-    parser.add_argument(
-        "--interaction_human_source",
-        type=str,
-        default="pred",
-        choices=["pred", "gt"],
-        help="Interaction分支人体来源: pred=使用HumanPose预测, gt=使用GT人体状态",
-    )
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     print(f"Mode: {'noTrans' if args.no_trans else 'Normal'}")
-    print(f"Interaction human source: {args.interaction_human_source}")
     
     default_config = get_default_dataset_config(args.no_trans)
     
@@ -683,6 +679,7 @@ def main():
         config = load_config(args.config)
         if args.model_arch is not None:
             config.model_arch = args.model_arch
+        interaction_variant = _get_interaction_variant(config)
         
         if args.num_workers is not None:
             config.num_workers = args.num_workers
@@ -697,7 +694,8 @@ def main():
             _apply_module_overrides(config, modules_override)
             module_paths = dict(config.pretrained_modules) if getattr(config, "pretrained_modules", None) else module_paths
         if str(getattr(config, "model_arch", "rnn")).lower() == "dit":
-            module_paths = _filter_pipeline_module_paths(module_paths)
+            module_paths = _filter_pipeline_module_paths(module_paths, interaction_variant)
+            print(f"Interaction variant: {interaction_variant}")
         
         if args.smpl_model_path:
             config.body_model_path = args.smpl_model_path
@@ -762,7 +760,6 @@ def main():
             no_trans=args.no_trans,
             evaluate_objects=not args.no_eval_objects,
             compare_three=args.compare_3,
-            interaction_human_source=args.interaction_human_source,
         )
         
         eval_duration = time.time() - eval_start_time

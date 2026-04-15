@@ -32,11 +32,25 @@ def HumanPoseModule(cfg, *args, **kwargs):
     return _rnn.HumanPoseModule(cfg, *args, **kwargs)
 
 
+def CondVQModule(cfg, *args, **kwargs):
+    arch = _resolve_arch(cfg)
+    if arch == "dit":
+        return _dit.CondVQModule(cfg, *args, **kwargs)
+    raise RuntimeError("CondVQModule is only available for model_arch='dit'.")
+
+
 def InteractionModule(cfg, *args, **kwargs):
     arch = _resolve_arch(cfg)
     if arch == "dit":
         return _dit.InteractionModule(cfg, *args, **kwargs)
     raise RuntimeError("InteractionModule is only available for model_arch='dit'.")
+
+
+def InteractionVQModule(cfg, *args, **kwargs):
+    arch = _resolve_arch(cfg)
+    if arch == "dit":
+        return _dit.InteractionVQModule(cfg, *args, **kwargs)
+    raise RuntimeError("InteractionVQModule is only available for model_arch='dit'.")
 
 
 def IMUHOIMixModule(cfg, *args, **kwargs):
@@ -85,8 +99,10 @@ def load_model(
 
 __all__ = [
     "ARCH_CHOICES",
+    "CondVQModule",
     "HumanPoseModule",
     "InteractionModule",
+    "InteractionVQModule",
     "IMUHOIMixModule",
     "VelocityContactModule",
     "ObjectTransModule",

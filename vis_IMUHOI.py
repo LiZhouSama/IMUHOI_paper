@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dataset.dataset_IMUHOI import IMUDataset
 from process.preprocess import load_object_geometry
-from model import IMUHOIModel, IMUHOIMixModule, InteractionModule, load_model
+from model import IMUHOIModel, IMUHOIMixModule, InteractionModule, InteractionVQModule, load_model
 from utils.utils import (
     load_config,
     load_smpl_model,
@@ -230,11 +230,16 @@ def _add_overlay_meshes(viewer, verts_seq, faces_np, frame_ids, base_name, base_
         viewer.scene.add(mesh)
 
 
+def _get_interaction_variant(config):
+    return str(getattr(config, "interaction_variant", "continuous")).lower()
+
+
 def _get_human_pose_module(model):
-    module = getattr(model, "human_pose_module", None)
+    core = _unwrap_model(model)
+    module = getattr(core, "human_pose_module", None)
     if module is not None:
         return module
-    wrapped = getattr(model, "module", None)
+    wrapped = getattr(core, "module", None)
     if wrapped is not None:
         return getattr(wrapped, "human_pose_module", None)
     return None
@@ -250,10 +255,15 @@ def _get_pretrained_mix_path(module_paths):
     return None
 
 
-def _get_pretrained_interaction_path(module_paths):
+def _get_pretrained_interaction_path(module_paths, interaction_variant="continuous"):
     if not isinstance(module_paths, dict):
         return None
-    for key in ("interaction", "object_trans", "velocity_contact"):
+    interaction_variant = str(interaction_variant).lower()
+    if interaction_variant == "vq":
+        key_order = ("interaction_vq", "interaction", "object_trans", "velocity_contact")
+    else:
+        key_order = ("interaction", "object_trans", "velocity_contact", "interaction_vq")
+    for key in key_order:
         path = module_paths.get(key)
         if path:
             return str(path)
@@ -271,19 +281,28 @@ def _infer_model_kind(model):
         return "mix"
     if "imuhoimodel" in name:
         return "pipeline"
+    if "interactionvqmodule" in name:
+        return "interaction"
     if "interactionmodule" in name:
         return "interaction"
     if hasattr(core, "human_pose_module") and hasattr(core, "interaction_module"):
         return "pipeline"
-    if hasattr(core, "mesh_encoder") and hasattr(core, "object_codebook"):
+    if hasattr(core, "mesh_encoder") and hasattr(core, "obs_encoder"):
+        return "interaction"
+    if hasattr(core, "obs_token_diffusion"):
         return "interaction"
     return "unknown"
 
 
-def _filter_pipeline_module_paths(module_paths):
+def _filter_pipeline_module_paths(module_paths, interaction_variant="continuous"):
     if not isinstance(module_paths, dict):
         return None
-    allowed = {"human_pose", "interaction", "velocity_contact", "object_trans"}
+    interaction_variant = str(interaction_variant).lower()
+    allowed = {"human_pose"}
+    if interaction_variant == "vq":
+        allowed.update({"cond_vq", "interaction_vq_obs", "interaction_vq"})
+    else:
+        allowed.update({"interaction", "velocity_contact", "object_trans"})
     out = {}
     for key, value in module_paths.items():
         if key in allowed:
@@ -451,10 +470,6 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
             try:
                 model_input = build_model_input_dict(batch_device, config, device, add_noise=False)
                 model_kind = _infer_model_kind(model)
-                interaction_human_source = str(getattr(viewer, "interaction_human_source", "pred")).lower()
-                if interaction_human_source not in {"pred", "gt"}:
-                    interaction_human_source = "pred"
-                interaction_use_human_pred = interaction_human_source != "gt"
                 want_object_predictions = bool(
                     has_object_bool and (show_objects or show_obj_traj or compare_3 or use_fk)
                 )
@@ -472,11 +487,8 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                             gt_targets=batch_device,
                             use_object_data=use_object_data,
                             compute_fk=compute_fk,
-                            interaction_use_human_pred=interaction_use_human_pred,
                         )
                     if model_kind == "interaction":
-                        if interaction_use_human_pred:
-                            print("Warning: interaction-only model has no human branch; fallback to GT human context.")
                         return model.inference(
                             model_input,
                             hp_out=None,
@@ -489,7 +501,6 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                             gt_targets=batch_device,
                             use_object_data=use_object_data,
                             compute_fk=compute_fk,
-                            interaction_use_human_pred=interaction_use_human_pred,
                         )
                     except TypeError:
                         return model.inference(
@@ -901,7 +912,7 @@ class InteractiveViewer(Viewer):
     def __init__(self, data_list, model, smpl_model, config, device, obj_geo_root, 
                  show_objects=True, vis_gt_only=False, show_foot_contact=False,
                  show_obj_traj=False, show_hand_traj=False, use_fk=False, compare_3=False, 
-                 pred_offset=None, no_trans=False, overlay_frames=None, interaction_human_source="pred", **kwargs):
+                 pred_offset=None, no_trans=False, overlay_frames=None, **kwargs):
         super().__init__(**kwargs)
         self.data_list = data_list
         self.current_index = 0
@@ -920,7 +931,6 @@ class InteractiveViewer(Viewer):
         self.pred_offset = pred_offset
         self.no_trans = no_trans
         self.overlay_frames = overlay_frames
-        self.interaction_human_source = str(interaction_human_source).lower()
         self.virtual_bone_info = {'has_data': False}
         
         self.visualize_current_sequence()
@@ -1007,13 +1017,6 @@ def main():
     parser.add_argument('--show_hand_traj', action='store_true', help='Show hand contact trajectory')
     parser.add_argument('--use_fk', action='store_true', help='Enable FK branch')
     parser.add_argument('--compare_3', action='store_true', help='Compare three object branches')
-    parser.add_argument(
-        '--interaction_human_source',
-        type=str,
-        default='pred',
-        choices=['pred', 'gt'],
-        help='Human source for interaction branch: pred=use HumanPose output, gt=use GT human states',
-    )
     parser.add_argument('--limit_sequences', type=int, default=None, help='Limit number of loaded sequences')
     parser.add_argument('--pred_offset', type=float, nargs=3, default=[0.0, 0.0, 0.0], help='Prediction translation offset')
     parser.add_argument('--overlay_frames', type=int, nargs='+', default=None, help='Overlay selected 0-based frames in one scene')
@@ -1023,34 +1026,35 @@ def main():
         type=str,
         default='auto',
         choices=['auto', 'pipeline', 'mix', 'interaction'],
-        help='Model inference mode: auto | pipeline(IMUHOIModel) | mix(IMUHOIMixModule) | interaction(InteractionModule).',
+        help='Model inference mode: auto | pipeline(IMUHOIModel) | mix(IMUHOIMixModule) | interaction(InteractionModule/InteractionVQModule).',
     )
     parser.add_argument(
         '--interaction_ckpt',
         type=str,
         default=None,
-        help='Checkpoint path for interaction-only visualization; overrides config pretrained_modules.interaction when set.',
+        help='Checkpoint path for interaction-only visualization; overrides config pretrained_modules.interaction or pretrained_modules.interaction_vq when set.',
     )
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     print(f"Mode: {'noTrans' if args.no_trans else 'Normal'}")
-    print(f"Interaction human source: {args.interaction_human_source}")
 
     print(f"Loading config from: {args.config}")
     config = load_config(args.config)
+    interaction_variant = _get_interaction_variant(config)
     module_paths = None
     if hasattr(config, "pretrained_modules") and config.pretrained_modules:
         module_paths = dict(config.pretrained_modules)
     mix_ckpt_path = _get_pretrained_mix_path(module_paths)
-    interaction_ckpt_path = args.interaction_ckpt or _get_pretrained_interaction_path(module_paths)
+    interaction_ckpt_path = args.interaction_ckpt or _get_pretrained_interaction_path(module_paths, interaction_variant)
     
     if args.smpl_model_path:
         config.body_model_path = args.smpl_model_path
     if args.num_workers is not None:
         config.num_workers = args.num_workers
     config.device = str(device)
+    print(f"Interaction variant: {interaction_variant}")
 
     smpl_model_path = config.get('body_model_path', 'datasets/smpl_models/smplh/neutral/model.npz')
     smpl_model = load_smpl_model(smpl_model_path, device)
@@ -1079,18 +1083,22 @@ def main():
             raise SystemExit(f"Failed to load mix checkpoint: {exc}")
     elif selected_mode == "interaction":
         if not interaction_ckpt_path:
-            raise SystemExit("inference_mode='interaction' requires --interaction_ckpt or pretrained_modules.interaction.")
+            raise SystemExit(
+                "inference_mode='interaction' requires --interaction_ckpt or the configured interaction checkpoint "
+                "(continuous: pretrained_modules.interaction, vq: pretrained_modules.interaction_vq)."
+            )
         if not os.path.exists(interaction_ckpt_path):
             raise SystemExit(f"Interaction checkpoint not found: {interaction_ckpt_path}")
-        print(f"Using InteractionModule checkpoint: {interaction_ckpt_path}")
-        model = InteractionModule(config).to(device)
+        interaction_cls = InteractionVQModule if interaction_variant == "vq" else InteractionModule
+        print(f"Using {interaction_cls.__name__} checkpoint: {interaction_ckpt_path}")
+        model = interaction_cls(config).to(device)
         try:
             ckpt_epoch = load_checkpoint(model, interaction_ckpt_path, device, strict=False)
             print(f"Loaded interaction checkpoint (epoch {ckpt_epoch})")
         except Exception as exc:
             raise SystemExit(f"Failed to load interaction checkpoint: {exc}")
     else:
-        pipeline_module_paths = _filter_pipeline_module_paths(module_paths)
+        pipeline_module_paths = _filter_pipeline_module_paths(module_paths, interaction_variant)
         model = load_model(config, device, no_trans=args.no_trans, module_paths=pipeline_module_paths)
 
     model.eval()
@@ -1209,7 +1217,6 @@ def main():
         pred_offset=pred_offset_np,
         no_trans=args.no_trans,
         overlay_frames=args.overlay_frames,
-        interaction_human_source=args.interaction_human_source,
         window_size=(1920, 1080)
     )
     

@@ -26,6 +26,9 @@ except Exception:
 
     transforms_mod.rotation_6d_to_matrix = _rotation_6d_to_matrix
     transforms_mod.matrix_to_rotation_6d = _matrix_to_rotation_6d
+    transforms_mod.axis_angle_to_matrix = lambda a: torch.eye(
+        3, device=a.device, dtype=a.dtype
+    ).view(*([1] * (a.dim() - 1)), 3, 3).expand(*a.shape[:-1], 3, 3).clone()
     transforms_mod.matrix_to_axis_angle = lambda m: torch.zeros(*m.shape[:-2], 3, device=m.device, dtype=m.dtype)
     pytorch3d_mod.transforms = transforms_mod
     sys.modules["pytorch3d"] = pytorch3d_mod
@@ -153,8 +156,10 @@ def _make_interaction_inputs(cfg, bs=2, seq=8, has_object=True):
         "pred_hand_glb_pos": torch.randn(bs, seq, 2, 3),
         "root_vel_pred": torch.randn(bs, seq, 3),
         "pred_full_pose_6d": torch.randn(bs, seq, cfg.num_joints, 6),
+        "root_trans_pred": torch.randn(bs, seq, 3),
     }
     gt_targets = {
+        "trans": torch.randn(bs, seq, 3),
         "obj_trans": torch.randn(bs, seq, 3),
         "obj_rot": obj_rot6d,
         "obj_scale": torch.ones(bs, seq),
@@ -178,8 +183,9 @@ def test_interaction_split_head_forward_keeps_output_contract():
     assert out["pred_obj_trans"].shape == (bs, seq, 3)
     assert out["contact_prob_pred"].shape == (bs, seq, 2)
     assert out["bone_dir_pred"].shape == (bs, seq, 2, 3)
-    assert out["object_prior_aux"]["z_q_obs"].shape[0] == bs
-    assert out["diffusion_aux"]["object_code_idx_pred"].shape == (bs,)
+    assert out["object_prior_aux"]["obs_cond_feat"].shape == (bs, module.code_dim)
+    assert out["object_prior_aux"]["mesh_cond_feat"].shape == (bs, module.code_dim)
+    assert out["object_prior_aux"]["cond"].shape == (bs, module.code_dim)
     assert module.dit.cond_dim == module.code_dim
 
 
@@ -191,8 +197,9 @@ def test_interaction_inference_obs_prior_outputs_code_index():
     data_dict, hp_out, _ = _make_interaction_inputs(cfg, bs=bs, seq=seq, has_object=True)
     out = module.inference(data_dict, hp_out=hp_out, gt_targets=None, sample_steps=2)
     assert out["pred_obj_trans"].shape == (bs, seq, 3)
-    assert out["diffusion_aux"]["object_code_idx_pred"].shape == (bs,)
-    assert out["object_prior_aux"]["z_q_obs"].shape == (bs, module.code_dim)
+    assert out["object_prior_aux"]["obs_cond_feat"].shape == (bs, module.code_dim)
+    assert out["object_prior_aux"]["cond"].shape == (bs, module.code_dim)
+    assert bool((out["diffusion_aux"]["cond_mode"] == 1).all())
 
 
 def test_interaction_no_object_forces_null_condition():
@@ -252,8 +259,6 @@ def test_interaction_loss_prior_terms_with_and_without_aux():
             "Loss_vel_obj": 0.0,
             "Loss_jitter_obj": 0.0,
             "Loss_align": 1.0,
-            "Loss_code_cls": 1.0,
-            "Loss_commit": 0.1,
         }
     )
 
@@ -273,25 +278,17 @@ def test_interaction_loss_prior_terms_with_and_without_aux():
     pred_with_aux = {
         **pred_base,
         "object_prior_aux": {
-            "z_e_obs": torch.randn(bs, 8),
-            "z_e_mesh": torch.randn(bs, 8),
-            "z_q_mesh": torch.randn(bs, 8),
-            "code_idx_mesh": torch.tensor([1, 2], dtype=torch.long),
-            "code_logits_obs": torch.randn(bs, 16),
+            "obs_cond_feat": torch.randn(bs, 8),
+            "mesh_cond_feat": torch.randn(bs, 8),
             "mesh_valid_mask": torch.ones(bs, dtype=torch.bool),
-            "vq_beta": torch.tensor(0.25),
         },
     }
 
     _, losses_with_aux, _ = loss_fn(pred_with_aux, batch, torch.device("cpu"))
     assert losses_with_aux["align"].item() > 0.0
-    assert losses_with_aux["code_cls"].item() > 0.0
-    assert losses_with_aux["commit"].item() > 0.0
 
     _, losses_no_aux, _ = loss_fn(pred_base, batch, torch.device("cpu"))
     assert losses_no_aux["align"].item() == 0.0
-    assert losses_no_aux["code_cls"].item() == 0.0
-    assert losses_no_aux["commit"].item() == 0.0
 
 
 def test_load_checkpoint_strict_false_skips_shape_mismatch(tmp_path):

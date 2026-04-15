@@ -1,0 +1,167 @@
+# IMUHOI VQ-only training / inference config
+# This config keeps only the parameters required by:
+# - train/diffussion/train_VQ.py
+# - train/diffussion/train_interaction_VQ.py
+# - vis_IMUHOI.py / eval_IMUHOI.py with interaction_variant="vq"
+
+# ============ Basic ============
+save_dir: "outputs/IMUHOI_DiT"
+body_model_path: datasets/smpl_models/smplh/male/model.npz
+use_tensorboard: true
+use_multi_gpu: true
+device: "cuda:0"
+gpus: [0]
+model_arch: "dit"
+interaction_variant: "vq"
+
+# ============ Shared DiT Backbone ============
+# Keep these compatible with the existing human_pose checkpoint.
+dit:
+  dit_d_model: 512
+  dit_nhead: 8
+  dit_num_layers: 8
+  dit_dim_feedforward: 2048
+  dit_dropout: 0.05
+  dit_timesteps: 1000
+  dit_use_time_embed: true
+  dit_use_noise: true
+  dit_prediction_type: "x0"
+  dit_max_seq_len: 256
+  dit_inference_steps: 20
+  dit_inference_type: "sample_inpaint_x0"
+  dit_inference_sampler: "ddim"
+  dit_inference_eta: 0.0
+  dit_test_use_gt_warmup: true
+  dit_test_warmup_len: 20
+  dit_enable_root_correction: true
+  dit_root_correction_contact_threshold: 0.5
+
+# ============ Eval / EMA ============
+ema_decay: 0.999
+eval_ddim_steps: 20
+eval_sampler: "ddim"
+eval_eta: 0.0
+
+# ============ Optimization ============
+epoch: 300
+batch_size: 200
+lr: 0.0002
+weight_decay: 0.00001
+milestones: [100, 200, 300, 400]
+gamma: 0.2
+seed: 42
+num_workers: 12
+
+# ============ AMP ============
+use_amp: true
+amp_dtype: "bf16"
+
+# ============ Feature Sizes ============
+num_human_imus: 6
+imu_dim: 9
+num_joints: 24
+
+# ============ VQ Condition / Object ============
+# Recommended changes:
+# - increase cond capacity first via object_code_dim and VQ hidden dims
+# - keep codebook size moderate for now; stage-2 token diffusion is already a real bottleneck
+object_code_dim: 192
+num_object_codes: 128
+object_geo_root: "datasets/OMOMO/captured_objects"
+mesh_downsample_points: 256
+
+# Main-stage cond mixing: bias training toward obs branch because inference uses obs cond.
+cond_mode_probs: [0.2, 0.7, 0.1]  # direct / obs / null
+
+vq_hidden_dim: 384
+vq_encoder_layers: 3
+vq_decoder_layers: 3
+vq_nhead: 8
+vq_dropout: 0.1
+vq_downsample_stride: 2
+vq_num_codebooks: 4
+
+vq_obs_cond_dim: 384
+vq_obs_d_model: 384
+vq_obs_layers: 6
+vq_obs_nhead: 8
+vq_obs_dropout: 0.1
+
+vq_commit_beta: 0.25
+d3pm_timesteps: 1000
+d3pm_sample_steps: 20
+
+# ============ Noise ============
+imu_noise_std: 0.3
+obj_imu_noise_std: 0.3
+
+# ============ Dataset Selection ============
+train_datasets: ["omomo"]
+
+# ============ Dataset Paths ============
+datasets:
+  amass:
+    train_path: "process/processed_amass_data_0703/train"
+    test_path: "process/processed_amass_data_0703/test"
+    debug_path: "process/processed_amass_data_0703/debug"
+  omomo:
+    train_path: "process/processed_split_data_OMOMO_bps/train"
+    test_path: "process/processed_split_data_OMOMO_bps/test"
+    debug_path: "process/processed_split_data_OMOMO_bps/debug"
+  imhd:
+    train_path: "process/processed_seg_data_IMHD/train"
+    test_path: "process/processed_seg_data_IMHD/test"
+    debug_path: "process/processed_seg_data_IMHD/debug"
+  behave:
+    train_path: "process/processed_seg_data_BEHAVE/train"
+    test_path: "process/processed_seg_data_BEHAVE/test"
+    debug_path: "process/processed_seg_data_BEHAVE/debug"
+
+# ============ Loss Weights ============
+loss_weights:
+  # Stage 1: cond_VQ
+  Loss_pose_recon: 2.0
+  Loss_trans_recon: 10.0
+  Loss_point_recon: 3.0
+  Loss_codebook: 0.25
+  Loss_commit: 0.1
+
+  # Stage 2: obs token diffusion
+  Loss_code_cls: 1.0
+  Loss_code_kl: 50.0
+
+  # Stage 3: main interaction DiT
+  Loss_simple: 1.0
+  Loss_vel_obj: 1.5
+  Loss_jitter_obj: 10000
+
+# ============ Validation Metrics ============
+test_metric_weights:
+  # Stage 1
+  pose_rmse: 1.0
+  trans_rmse_mm: 1.0
+  point_cd: 1.0
+
+  # Stage 3
+  obj_pos_rmse_mm: 1.0
+  obj_pos_jitter_mm: 5.0
+
+# ============ Window ============
+train:
+  window: 60
+
+test:
+  window: 60
+
+# ============ Optional Stage Defaults ============
+interaction_vq:
+  stage: "obs_diffusion"  # obs_diffusion | main_dit
+
+# ============ Pretrained Modules ============
+# human_pose can stay fixed because this config does not change its architecture.
+# The VQ checkpoints below should be updated after you retrain each stage.
+pretrained_modules:
+  human_pose: "outputs/IMUHOI_DiT/human_pose_04011146/best.pt"
+  cond_vq: "outputs/IMUHOI_DiT/cond_vq_04112155/best.pt"
+  interaction_vq_obs: "outputs/IMUHOI_DiT/interaction_vq_obs_04141716/best.pt"
+  interaction_vq: "outputs/IMUHOI_DiT/interaction_vq_04141957/best.pt"

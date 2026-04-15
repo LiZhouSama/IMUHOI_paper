@@ -70,7 +70,7 @@ mesh_temporal_model: "gru"  # gru | tcn
 mesh_temporal_layers: 2
 mesh_temporal_kernel_size: 3  # used when mesh_temporal_model=tcn
 mesh_temporal_dropout: 0.1
-cond_mode_probs: [0.6, 0.2, 0.2]  # mesh/obs/null
+cond_mode_probs: [0.4, 0.4, 0.2]  # mesh/obs/null
 
 # ============ VQ Interaction ============
 vq_hidden_dim: 256
@@ -161,7 +161,7 @@ pretrained_modules:
   human_pose: "outputs/IMUHOI_DiT/human_pose_04011146/best.pt"
   # interaction: "outputs/IMUHOI_DiT/interaction_04040210/best.pt"
   cond_vq: "outputs/IMUHOI_DiT/cond_vq_04101445/best.pt"
-  interaction_vq_obs: "outputs/IMUHOI_DiT/interaction_vq_obs_04101716/best.pt"
-  interaction_vq: "outputs/IMUHOI_DiT/interaction_vq_04111655/best.pt"
+  interaction_vq_obs: "outputs/IMUHOI_DiT/interaction_vq_obs_04101628/best.pt"
+  # interaction_vq: "outputs/IMUHOI_DiT/interaction_vq_xxxxxxxx/best.pt"
 
   # imuhoi_mix: "outputs/IMUHOI_DiT/imuhoi_mix_03241600/best.pt"
