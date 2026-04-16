@@ -12,10 +12,17 @@ from .interaction_loss import InteractionLoss
 class InteractionVQLoss:
     OBS_LOSS_KEYS = ("code_ce", "code_kl")
     OBS_TEST_KEYS = ("token_acc", "exact_match", "perplexity")
+    JOINT_EXTRA_KEYS = ("codebook", "commit", "code_ce_joint")
 
     _OBS_WEIGHT_ALIASES = {
         "code_ce": ("code_ce", "Loss_code_ce", "Loss_code_cls"),
         "code_kl": ("code_kl", "Loss_code_kl"),
+    }
+
+    _JOINT_WEIGHT_ALIASES = {
+        "codebook": ("Loss_codebook_joint", "codebook_joint"),
+        "commit": ("Loss_commit_joint", "commit_joint"),
+        "code_ce_joint": ("Loss_code_ce_joint", "code_ce_joint"),
     }
 
     def __init__(self, stage: str, weights=None, test_metric_weights=None):
@@ -23,7 +30,7 @@ class InteractionVQLoss:
         self.weights = weights or {}
         self.test_metric_weights = test_metric_weights or {}
 
-        if self.stage == "main_dit":
+        if self.stage in ("main_dit", "joint"):
             base_weights = dict(self.weights)
             base_weights.setdefault("align", 0.0)
             base_weights.setdefault("Loss_align", 0.0)
@@ -89,13 +96,69 @@ class InteractionVQLoss:
             total = total + weighted[key]
         return total, losses, weighted
 
+    def _joint_weight(self, key: str, default: float = 1.0) -> float:
+        for name in self._JOINT_WEIGHT_ALIASES.get(key, (key,)):
+            if name in self.weights:
+                return float(self.weights[name])
+        return float(default)
+
+    def _compute_joint_aux_losses(self, pred_dict, device):
+        """Compute auxiliary VQ + obs token losses for joint training."""
+        prior_aux = pred_dict.get("object_prior_aux", {}) if isinstance(pred_dict, dict) else {}
+        vq_aux = prior_aux.get("joint_vq_aux", {})
+        obs_aux = prior_aux.get("joint_obs_aux", {})
+
+        zero = torch.tensor(0.0, device=device)
+        losses = {key: zero.clone() for key in self.JOINT_EXTRA_KEYS}
+
+        # VQ codebook + commit losses
+        cb_loss = vq_aux.get("codebook_loss")
+        if isinstance(cb_loss, torch.Tensor):
+            losses["codebook"] = cb_loss.to(device=device)
+        cm_loss = vq_aux.get("commit_loss")
+        if isinstance(cm_loss, torch.Tensor):
+            losses["commit"] = cm_loss.to(device=device)
+
+        # Obs token CE from teacher-forced forward
+        obs_logits = obs_aux.get("logits")
+        obs_target = obs_aux.get("target")
+        obs_has_object = obs_aux.get("sample_has_object")
+        if isinstance(obs_logits, torch.Tensor) and isinstance(obs_target, torch.Tensor):
+            logits_flat = obs_logits.reshape(-1, obs_logits.shape[-1])
+            target_flat = obs_target.reshape(-1)
+            if isinstance(obs_has_object, torch.Tensor):
+                valid = obs_has_object.to(device=device, dtype=torch.bool).view(-1, 1, 1)
+                valid_flat = valid.expand_as(obs_target).reshape(-1)
+            else:
+                valid_flat = torch.ones_like(target_flat, dtype=torch.bool)
+            if valid_flat.any():
+                losses["code_ce_joint"] = F.cross_entropy(logits_flat[valid_flat], target_flat[valid_flat])
+
+        weighted = {}
+        total = zero.clone()
+        defaults = {"codebook": 0.1, "commit": 0.05, "code_ce_joint": 0.1}
+        for key in self.JOINT_EXTRA_KEYS:
+            w = self._joint_weight(key, defaults[key])
+            weighted[key] = losses[key] * w
+            total = total + weighted[key]
+        return total, losses, weighted
+
     def compute_loss(self, pred_dict, batch, device):
+        if self.stage == "joint":
+            # Main DiT loss
+            main_total, main_losses, main_weighted = self.main_loss.compute_loss(pred_dict, batch, device)
+            # Auxiliary joint losses
+            aux_total, aux_losses, aux_weighted = self._compute_joint_aux_losses(pred_dict, device)
+            total = main_total + aux_total
+            all_losses = {**main_losses, **aux_losses}
+            all_weighted = {**main_weighted, **aux_weighted}
+            return total, all_losses, all_weighted
         if self.stage == "main_dit":
             return self.main_loss.compute_loss(pred_dict, batch, device)
         return self._compute_obs_losses(pred_dict, device)
 
     def compute_test_loss(self, pred_dict, batch, device):
-        if self.stage == "main_dit":
+        if self.stage in ("main_dit", "joint"):
             return self.main_loss.compute_test_loss(pred_dict, batch, device)
 
         total, obs_losses, _ = self._compute_obs_losses(pred_dict, device)

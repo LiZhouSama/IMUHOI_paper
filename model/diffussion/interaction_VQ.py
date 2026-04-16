@@ -267,12 +267,69 @@ class ObsTokenDiffusionModule(nn.Module):
         for param in self.parameters():
             param.requires_grad_(False)
 
-    def tokenize_from_resolved(self, obj_points: torch.Tensor, human_pose6d: torch.Tensor, human_trans: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def soft_embed_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Convert denoiser logits to soft VQ embeddings via probability-weighted codebook lookup.
+        logits: [B, L, num_codebooks, codebook_size]
+        Returns: [B, L, code_dim]
+        """
+        probs = F.softmax(logits, dim=-1)
+        parts = []
+        for k, emb in enumerate(self.tokenizer.quantizer.codebooks):
+            parts.append(torch.matmul(probs[:, :, k, :], emb.weight))
+        return torch.cat(parts, dim=-1)
+
+    def teacher_forced_forward(
+        self,
+        gt_indices: torch.Tensor,
+        cond_seq: torch.Tensor,
+        has_object: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """One-step teacher-forced denoising for joint training.
+        gt_indices: [B, L, num_codebooks] from tokenizer
+        cond_seq: [B, L_cond, obs_cond_dim] from condition encoder
+        has_object: [B] bool
+        Returns dict with soft_z_q, logits, target indices, timestep.
+        """
+        B, L = gt_indices.shape[:2]
+        device = gt_indices.device
+        t = torch.randint(0, self.timesteps, (B,), device=device, dtype=torch.long)
+        x_t = self.q_sample(gt_indices.detach(), t)
+        logits = self.denoiser(x_t, cond_seq, t)
+        soft_z_q = self.soft_embed_from_logits(logits)
+        soft_z_q = soft_z_q * has_object.to(dtype=soft_z_q.dtype).view(B, 1, 1)
+        return {
+            "soft_z_q": soft_z_q,
+            "logits": logits,
+            "target": gt_indices,
+            "t": t,
+        }
+
+    def tokenize_from_resolved(
+        self,
+        obj_points: torch.Tensor,
+        human_pose6d: torch.Tensor,
+        human_trans: torch.Tensor,
+        obj_rot_mats: Optional[torch.Tensor] = None,
+        obj_trans_world: Optional[torch.Tensor] = None,
+        obj_scale: Optional[torch.Tensor] = None,
+        differentiable: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        if differentiable:
+            # Direct call without no_grad — allows gradient flow through VQ
+            return self.tokenizer.tokenize_from_resolved(
+                obj_points, human_pose6d, human_trans,
+                obj_rot_mats=obj_rot_mats,
+                obj_trans_world=obj_trans_world,
+                obj_scale=obj_scale,
+            )
         return self._run_tokenizer_eval(
             self.tokenizer.tokenize_from_resolved,
             obj_points,
             human_pose6d,
             human_trans,
+            obj_rot_mats=obj_rot_mats,
+            obj_trans_world=obj_trans_world,
+            obj_scale=obj_scale,
         )
 
     def _resolve_human_state_from_gt(self, gt_targets: Dict, batch_size: int, seq_len: int, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -484,7 +541,39 @@ class ObsTokenDiffusionModule(nn.Module):
         has_object = self._prepare_has_object(data_dict.get("has_object"), batch_size, device)
         obj_points = self.tokenizer._prepare_obj_points(data_dict.get("obj_points_canonical"), batch_size, device, dtype)
 
-        tokenized = self.tokenize_from_resolved(obj_points, human_pose6d, human_trans)
+        # Extract object transforms for world-space tokenization
+        obj_rot_mats = None
+        obj_trans_world = None
+        obj_scale = None
+        if isinstance(gt_targets, dict):
+            obj_rot_mats = self.tokenizer._resolve_obj_rot_mats(
+                gt_targets.get("obj_rot"), batch_size, seq_len, device, dtype,
+            )
+            obj_trans_raw = gt_targets.get("obj_trans")
+            if isinstance(obj_trans_raw, torch.Tensor):
+                obj_trans_world = obj_trans_raw.to(device=device, dtype=dtype)
+                if obj_trans_world.dim() == 2:
+                    obj_trans_world = obj_trans_world.unsqueeze(0)
+                if obj_trans_world.shape[0] == 1 and batch_size > 1:
+                    obj_trans_world = obj_trans_world.expand(batch_size, -1, -1)
+                if obj_trans_world.shape[:2] != (batch_size, seq_len) or obj_trans_world.shape[-1] != 3:
+                    obj_trans_world = None
+            obj_scale_raw = gt_targets.get("obj_scale")
+            if isinstance(obj_scale_raw, torch.Tensor):
+                obj_scale = obj_scale_raw.to(device=device, dtype=dtype)
+                if obj_scale.dim() == 1:
+                    obj_scale = obj_scale.unsqueeze(0)
+                if obj_scale.shape[0] == 1 and batch_size > 1:
+                    obj_scale = obj_scale.expand(batch_size, -1)
+                if obj_scale.shape[:2] != (batch_size, seq_len):
+                    obj_scale = None
+
+        tokenized = self.tokenize_from_resolved(
+            obj_points, human_pose6d, human_trans,
+            obj_rot_mats=obj_rot_mats,
+            obj_trans_world=obj_trans_world,
+            obj_scale=obj_scale,
+        )
         x0_idx = tokenized["indices"].detach()
         cond_seq = self.build_condition_sequence(human_pose6d, human_trans, obj_imu)
         cond_seq = cond_seq * has_object.to(device=device, dtype=dtype).view(batch_size, 1, 1)
@@ -611,6 +700,46 @@ class InteractionVQModule(InteractionModule):
                 return pose6d, trans
         return feats["human_pose6d"], feats["human_trans"]
 
+    def _resolve_obj_transforms(
+        self,
+        gt_targets: Optional[Dict],
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Extract object rotation matrices, translation, and scale from gt_targets."""
+        if not isinstance(gt_targets, dict):
+            return None, None, None
+        tokenizer = self.obs_token_diffusion.tokenizer
+
+        obj_rot_mats = tokenizer._resolve_obj_rot_mats(
+            gt_targets.get("obj_rot"), batch_size, seq_len, device, dtype,
+        )
+        obj_trans_world = None
+        obj_trans_raw = gt_targets.get("obj_trans")
+        if isinstance(obj_trans_raw, torch.Tensor):
+            obj_trans_world = obj_trans_raw.to(device=device, dtype=dtype)
+            if obj_trans_world.dim() == 2:
+                obj_trans_world = obj_trans_world.unsqueeze(0)
+            if obj_trans_world.shape[0] == 1 and batch_size > 1:
+                obj_trans_world = obj_trans_world.expand(batch_size, -1, -1)
+            if obj_trans_world.shape[:2] != (batch_size, seq_len) or obj_trans_world.shape[-1] != 3:
+                obj_trans_world = None
+
+        obj_scale = None
+        obj_scale_raw = gt_targets.get("obj_scale")
+        if isinstance(obj_scale_raw, torch.Tensor):
+            obj_scale = obj_scale_raw.to(device=device, dtype=dtype)
+            if obj_scale.dim() == 1:
+                obj_scale = obj_scale.unsqueeze(0)
+            if obj_scale.shape[0] == 1 and batch_size > 1:
+                obj_scale = obj_scale.expand(batch_size, -1)
+            if obj_scale.shape[:2] != (batch_size, seq_len):
+                obj_scale = None
+
+        return obj_rot_mats, obj_trans_world, obj_scale
+
     def _build_object_condition(
         self,
         data_dict: Dict,
@@ -619,6 +748,7 @@ class InteractionVQModule(InteractionModule):
         context: Dict,
         *,
         training: bool,
+        joint_training: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         batch_size = int(context["batch_size"])
         seq_len = int(context["seq_len"])
@@ -645,6 +775,11 @@ class InteractionVQModule(InteractionModule):
         direct_indices = torch.zeros(batch_size, latent_len, tokenizer.num_codebooks, device=device, dtype=torch.long)
         obs_indices = torch.zeros_like(direct_indices)
 
+        # Resolve object transforms for world-space tokenization
+        obj_rot_mats, obj_trans_world, obj_scale = self._resolve_obj_transforms(
+            gt_targets, batch_size, seq_len, device, dtype,
+        )
+
         if training:
             mode = self._select_condition_mode(batch_size, device)
             mode = torch.where(sample_has_object, mode, torch.full_like(mode, 2))
@@ -659,26 +794,72 @@ class InteractionVQModule(InteractionModule):
             need_direct = False
             need_obs = bool(sample_has_object.any().item())
 
-        if need_direct:
+        # For joint training, store auxiliary outputs for combined loss
+        joint_vq_aux = {}
+        joint_obs_aux = {}
+
+        if joint_training and training:
+            # --- Joint training path: differentiable throughout ---
+            # Tokenize with gradients (straight-through VQ)
             direct_tokenized = self.obs_token_diffusion.tokenize_from_resolved(
-                obj_points,
-                human_pose_for_vq,
-                human_trans_for_vq,
+                obj_points, human_pose_for_vq, human_trans_for_vq,
+                obj_rot_mats=obj_rot_mats,
+                obj_trans_world=obj_trans_world,
+                obj_scale=obj_scale,
+                differentiable=True,
             )
             direct_indices = direct_tokenized["indices"]
-            direct_cond = direct_tokenized["z_q_detached"].to(device=device, dtype=dtype)
-            cond[mode == 0] = direct_cond[mode == 0]
+            z_q_st = direct_tokenized["z_q"]  # straight-through, HAS gradients
+            z_q_detached = direct_tokenized["z_q_detached"]
+            joint_vq_aux = {
+                "codebook_loss": direct_tokenized["codebook_loss"],
+                "commit_loss": direct_tokenized["commit_loss"],
+                "perplexity": direct_tokenized["perplexity"],
+            }
 
-        if need_obs:
-            obs_indices = self.obs_token_diffusion.sample_from_resolved(
-                human_pose_for_vq,
-                human_trans_for_vq,
-                feats["obj_imu"],
-                has_object=sample_has_object,
-                steps=None,
-            )
-            obs_cond = tokenizer.lookup_codes(obs_indices).to(device=device, dtype=dtype)
-            cond[mode == 1] = obs_cond[mode == 1]
+            if need_direct:
+                cond[mode == 0] = z_q_st.to(dtype=dtype)[mode == 0]
+
+            if need_obs:
+                # Teacher-forced obs path: differentiable soft embeddings
+                obs_cond_seq = self.obs_token_diffusion.build_condition_sequence(
+                    human_pose_for_vq, human_trans_for_vq, feats["obj_imu"],
+                )
+                obs_cond_seq = obs_cond_seq * sample_has_object.to(dtype=dtype).view(batch_size, 1, 1)
+                tf_result = self.obs_token_diffusion.teacher_forced_forward(
+                    direct_indices, obs_cond_seq, sample_has_object,
+                )
+                cond[mode == 1] = tf_result["soft_z_q"].to(dtype=dtype)[mode == 1]
+                obs_indices = direct_indices  # GT indices for reference
+                joint_obs_aux = {
+                    "logits": tf_result["logits"],
+                    "target": tf_result["target"],
+                    "t": tf_result["t"],
+                    "sample_has_object": sample_has_object,
+                }
+        else:
+            # --- Original non-joint path ---
+            if need_direct:
+                direct_tokenized = self.obs_token_diffusion.tokenize_from_resolved(
+                    obj_points, human_pose_for_vq, human_trans_for_vq,
+                    obj_rot_mats=obj_rot_mats,
+                    obj_trans_world=obj_trans_world,
+                    obj_scale=obj_scale,
+                )
+                direct_indices = direct_tokenized["indices"]
+                direct_cond = direct_tokenized["z_q_detached"].to(device=device, dtype=dtype)
+                cond[mode == 0] = direct_cond[mode == 0]
+
+            if need_obs:
+                obs_indices = self.obs_token_diffusion.sample_from_resolved(
+                    human_pose_for_vq,
+                    human_trans_for_vq,
+                    feats["obj_imu"],
+                    has_object=sample_has_object,
+                    steps=None,
+                )
+                obs_cond = tokenizer.lookup_codes(obs_indices).to(device=device, dtype=dtype)
+                cond[mode == 1] = obs_cond[mode == 1]
 
         cond[mode == 2] = null_cond[mode == 2]
         cond_info = {
@@ -688,6 +869,8 @@ class InteractionVQModule(InteractionModule):
             "direct_indices": direct_indices,
             "obs_indices": obs_indices,
             "latent_len": torch.tensor(latent_len, device=device, dtype=torch.long),
+            "joint_vq_aux": joint_vq_aux,
+            "joint_obs_aux": joint_obs_aux,
         }
         return cond, cond_info
 
@@ -766,7 +949,7 @@ class InteractionVQModule(InteractionModule):
             history = torch.cat([history, current.unsqueeze(1)], dim=1)
         return history
 
-    def forward(self, data_dict: Dict, hp_out: Optional[Dict] = None, gt_targets: Optional[Dict] = None):
+    def forward(self, data_dict: Dict, hp_out: Optional[Dict] = None, gt_targets: Optional[Dict] = None, joint_training: bool = False):
         if gt_targets is None:
             raise ValueError("InteractionVQModule forward requires gt_targets for training")
 
@@ -786,6 +969,7 @@ class InteractionVQModule(InteractionModule):
             feats,
             context,
             training=bool(self.training),
+            joint_training=joint_training,
         )
 
         x0_pred, aux = self.dit(

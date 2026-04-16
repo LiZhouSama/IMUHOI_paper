@@ -1005,7 +1005,7 @@ class InteractiveViewer(Viewer):
 
 def main():
     parser = argparse.ArgumentParser(description='Interactive IMUHOI Visualization Tool')
-    parser.add_argument('--config', type=str, default='configs/IMUHOI_train.yaml', help='Path to config file')
+    parser.add_argument('--config', type=str, default='configs/IMUHOI_train_vq.yaml', help='Path to config file')
     parser.add_argument('--smpl_model_path', type=str, default=None, help='Path to SMPL model file')
     parser.add_argument('--test_data_dir', type=str, default='process/processed_split_data_OMOMO_bps/test', help='Test data directory or a single .pt sequence file')
     parser.add_argument('--obj_geo_root', type=str, default='datasets/OMOMO/captured_objects', help='Root directory of object geometry files')

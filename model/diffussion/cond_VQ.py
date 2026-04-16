@@ -8,7 +8,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pytorch3d.transforms import axis_angle_to_matrix, matrix_to_rotation_6d
+from pytorch3d.transforms import axis_angle_to_matrix, matrix_to_rotation_6d, rotation_6d_to_matrix
 
 
 class _SequenceEncoder(nn.Module):
@@ -223,6 +223,54 @@ class CondVQModule(nn.Module):
             points = torch.zeros(batch_size, self.obj_points_count, 3, device=device, dtype=dtype)
         return points
 
+    @staticmethod
+    def _resolve_obj_rot_mats(
+        obj_rot,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        """Convert obj_rot (6D or 3x3) to rotation matrices [B, T, 3, 3]."""
+        if not isinstance(obj_rot, torch.Tensor):
+            return None
+        obj_rot = obj_rot.to(device=device, dtype=dtype)
+        if obj_rot.dim() == 2:
+            obj_rot = obj_rot.unsqueeze(0)
+        if obj_rot.shape[0] == 1 and batch_size > 1:
+            obj_rot = obj_rot.expand(batch_size, -1, *obj_rot.shape[2:])
+
+        if obj_rot.dim() == 3 and obj_rot.shape[-1] == 6:
+            # 6D rotation → 3x3 matrix
+            flat = obj_rot.reshape(-1, 6)
+            mats = rotation_6d_to_matrix(flat)
+            return mats.reshape(batch_size, seq_len, 3, 3)
+        if obj_rot.dim() == 4 and obj_rot.shape[-2:] == (3, 3):
+            if obj_rot.shape[:2] == (batch_size, seq_len):
+                return obj_rot
+        return None
+
+    def _transform_points_to_world(
+        self,
+        canonical_points: torch.Tensor,
+        obj_rot_mats: torch.Tensor,
+        obj_trans: torch.Tensor,
+        obj_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """Transform canonical points to world frame per frame.
+        canonical_points: [B, N, 3]
+        obj_rot_mats: [B, T, 3, 3]
+        obj_trans: [B, T, 3]
+        obj_scale: [B, T]
+        Returns: [B, T, N, 3]
+        """
+        B, T = obj_rot_mats.shape[:2]
+        N = canonical_points.shape[1]
+        pts = canonical_points.unsqueeze(1).expand(B, T, N, 3)
+        rotated = torch.einsum('btij,btnj->btni', obj_rot_mats, pts)
+        scaled = rotated * obj_scale.unsqueeze(-1).unsqueeze(-1)
+        return scaled + obj_trans.unsqueeze(2)
+
     def _resolve_pose6d_from_gt(
         self,
         gt_targets: Dict,
@@ -306,7 +354,15 @@ class CondVQModule(nn.Module):
             up = torch.cat([up, pad], dim=1)
         return up[:, :seq_len]
 
-    def encode_to_latent(self, obj_points: torch.Tensor, pose6d: torch.Tensor, trans: torch.Tensor) -> torch.Tensor:
+    def encode_to_latent(
+        self,
+        obj_points: torch.Tensor,
+        pose6d: torch.Tensor,
+        trans: torch.Tensor,
+        obj_rot_mats: Optional[torch.Tensor] = None,
+        obj_trans_world: Optional[torch.Tensor] = None,
+        obj_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if pose6d.dim() != 4 or pose6d.shape[-1] != 6:
             raise ValueError(f"pose6d must be [B,T,J,6], got {tuple(pose6d.shape)}")
         if trans.dim() != 3 or trans.shape[-1] != 3:
@@ -319,8 +375,24 @@ class CondVQModule(nn.Module):
         self._decode_seq_len = int(seq_len)
         self._decode_num_points = int(obj_points.shape[1])
 
-        point_feat = self.point_encoder(obj_points).amax(dim=1)
-        point_feat = point_feat.unsqueeze(1).expand(batch_size, seq_len, self.hidden_dim)
+        if (
+            isinstance(obj_rot_mats, torch.Tensor)
+            and isinstance(obj_trans_world, torch.Tensor)
+            and isinstance(obj_scale, torch.Tensor)
+        ):
+            # World-space path: per-frame point clouds [B, T, N, 3]
+            world_points = self._transform_points_to_world(
+                obj_points,
+                obj_rot_mats.to(device=device, dtype=dtype),
+                obj_trans_world.to(device=device, dtype=dtype),
+                obj_scale.to(device=device, dtype=dtype),
+            )
+            # point_encoder is pointwise MLP on last dim, works on [B, T, N, 3]
+            point_feat = self.point_encoder(world_points).amax(dim=2)  # [B, T, hidden]
+        else:
+            # Fallback: canonical points (same for all frames)
+            point_feat = self.point_encoder(obj_points).amax(dim=1)  # [B, hidden]
+            point_feat = point_feat.unsqueeze(1).expand(batch_size, seq_len, self.hidden_dim)
 
         pose_flat = pose6d.reshape(batch_size, seq_len, -1)
         frame_feat = self.frame_fuse(torch.cat([pose_flat, trans, point_feat], dim=-1))
@@ -387,6 +459,39 @@ class CondVQModule(nn.Module):
         else:
             has_object = torch.ones(batch_size, device=device, dtype=torch.bool)
 
+        # Extract object transforms for world-space encoding
+        obj_rot_mats = self._resolve_obj_rot_mats(
+            gt_targets.get("obj_rot"), batch_size, seq_len, device, dtype,
+        )
+        obj_trans_world = None
+        obj_trans_raw = gt_targets.get("obj_trans")
+        if isinstance(obj_trans_raw, torch.Tensor):
+            obj_trans_world = obj_trans_raw.to(device=device, dtype=dtype)
+            if obj_trans_world.dim() == 2:
+                obj_trans_world = obj_trans_world.unsqueeze(0)
+            if obj_trans_world.shape[0] == 1 and batch_size > 1:
+                obj_trans_world = obj_trans_world.expand(batch_size, -1, -1)
+            if obj_trans_world.shape[:2] != (batch_size, seq_len) or obj_trans_world.shape[-1] != 3:
+                obj_trans_world = None
+
+        obj_scale = None
+        obj_scale_raw = gt_targets.get("obj_scale")
+        if isinstance(obj_scale_raw, torch.Tensor):
+            obj_scale = obj_scale_raw.to(device=device, dtype=dtype)
+            if obj_scale.dim() == 1:
+                obj_scale = obj_scale.unsqueeze(0)
+            if obj_scale.shape[0] == 1 and batch_size > 1:
+                obj_scale = obj_scale.expand(batch_size, -1)
+            if obj_scale.shape[:2] != (batch_size, seq_len):
+                obj_scale = None
+
+        # Compute world-frame point cloud at mid-frame for reconstruction target
+        obj_points_world_mid = obj_points  # fallback to canonical
+        if obj_rot_mats is not None and obj_trans_world is not None and obj_scale is not None:
+            mid = seq_len // 2
+            world_pts = self._transform_points_to_world(obj_points, obj_rot_mats, obj_trans_world, obj_scale)
+            obj_points_world_mid = world_pts[:, mid]  # [B, N, 3]
+
         self._decode_seq_len = int(seq_len)
         self._decode_num_points = int(obj_points.shape[1])
         return {
@@ -394,6 +499,10 @@ class CondVQModule(nn.Module):
             "trans": trans,
             "obj_points": obj_points,
             "has_object": has_object,
+            "obj_rot_mats": obj_rot_mats,
+            "obj_trans_world": obj_trans_world,
+            "obj_scale": obj_scale,
+            "obj_points_world_mid": obj_points_world_mid,
         }
 
     def tokenize_from_resolved(
@@ -401,8 +510,16 @@ class CondVQModule(nn.Module):
         obj_points: torch.Tensor,
         pose6d: torch.Tensor,
         trans: torch.Tensor,
+        obj_rot_mats: Optional[torch.Tensor] = None,
+        obj_trans_world: Optional[torch.Tensor] = None,
+        obj_scale: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        z_e = self.encode_to_latent(obj_points, pose6d, trans)
+        z_e = self.encode_to_latent(
+            obj_points, pose6d, trans,
+            obj_rot_mats=obj_rot_mats,
+            obj_trans_world=obj_trans_world,
+            obj_scale=obj_scale,
+        )
         quant = self.quantize(z_e)
         return {
             "z_e": z_e,
@@ -415,6 +532,9 @@ class CondVQModule(nn.Module):
             targets["obj_points"],
             targets["pose6d"],
             targets["trans"],
+            obj_rot_mats=targets.get("obj_rot_mats"),
+            obj_trans_world=targets.get("obj_trans_world"),
+            obj_scale=targets.get("obj_scale"),
         )
         recon = self.decode(tokenized["z_q"])
         return {

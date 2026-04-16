@@ -1,5 +1,5 @@
 """
-InteractionVQ standalone training script for stage-2 obs diffusion and stage-3 main DiT.
+InteractionVQ training script for stage-2 obs diffusion, stage-3 main DiT, and joint training.
 """
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import os
 import sys
 
 import torch
+from torch import optim
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
@@ -32,7 +33,7 @@ def get_args():
         "--stage",
         type=str,
         default=None,
-        choices=["obs_diffusion", "main_dit"],
+        choices=["obs_diffusion", "main_dit", "joint"],
         help="interaction_vq training stage",
     )
     return parser.parse_args()
@@ -72,7 +73,8 @@ class InteractionVQTrainer(BaseTrainer):
                 sampler=sampler,
                 eta=eta,
             )
-        return self.model(data_dict, gt_targets=batch)
+        joint = self.stage == "joint"
+        return self.model(data_dict, gt_targets=batch, joint_training=joint)
 
 
 def _load_stage_dependencies(cfg, model, stage: str, device: torch.device):
@@ -85,6 +87,24 @@ def _load_stage_dependencies(cfg, model, stage: str, device: torch.device):
         model.freeze_tokenizer()
         return
 
+    if stage == "joint":
+        # Joint training: load all pretrained weights but do NOT freeze
+        cond_vq_path = pretrained.get("cond_vq")
+        if cond_vq_path:
+            load_checkpoint(model.obs_token_diffusion.tokenizer, cond_vq_path, device, strict=False)
+            print(f"Loaded CondVQ tokenizer from: {cond_vq_path}")
+        obs_path = pretrained.get("interaction_vq_obs")
+        if obs_path:
+            load_checkpoint(model.obs_token_diffusion, obs_path, device, strict=False)
+            print(f"Loaded obs token diffusion from: {obs_path}")
+        main_path = pretrained.get("interaction_vq")
+        if main_path:
+            load_checkpoint(model, main_path, device, strict=False)
+            print(f"Loaded InteractionVQ from: {main_path}")
+        # All parameters remain trainable
+        return
+
+    # stage == "main_dit"
     cond_vq_path = pretrained.get("cond_vq")
     if cond_vq_path:
         load_checkpoint(model.obs_token_diffusion.tokenizer, cond_vq_path, device, strict=False)
@@ -97,6 +117,49 @@ def _load_stage_dependencies(cfg, model, stage: str, device: torch.device):
     model.obs_token_diffusion.freeze_all()
 
 
+def _build_joint_optimizer(model, cfg):
+    """Build optimizer with per-module learning rate groups for joint training."""
+    joint_cfg = getattr(cfg, "joint_training", {})
+    if not isinstance(joint_cfg, dict):
+        joint_cfg = {}
+    vq_lr_factor = float(joint_cfg.get("vq_lr_factor", 0.1))
+    obs_lr_factor = float(joint_cfg.get("obs_lr_factor", 0.5))
+
+    base_lr = cfg.lr
+    if cfg.use_multi_gpu:
+        base_lr = base_lr * len(cfg.gpus)
+
+    # Collect parameter id sets for grouping
+    vq_param_ids = set(id(p) for p in model.obs_token_diffusion.tokenizer.parameters())
+    obs_all_param_ids = set(id(p) for p in model.obs_token_diffusion.parameters())
+    obs_only_param_ids = obs_all_param_ids - vq_param_ids
+
+    vq_params = [p for p in model.obs_token_diffusion.tokenizer.parameters() if p.requires_grad]
+    obs_params = [p for p in model.obs_token_diffusion.parameters()
+                  if p.requires_grad and id(p) in obs_only_param_ids]
+    dit_params = [p for p in model.parameters()
+                  if p.requires_grad and id(p) not in obs_all_param_ids]
+
+    param_groups = [
+        {"params": vq_params, "lr": base_lr * vq_lr_factor},
+        {"params": obs_params, "lr": base_lr * obs_lr_factor},
+        {"params": dit_params, "lr": base_lr},
+    ]
+
+    print(f"Joint optimizer param groups:")
+    print(f"  VQ encoder: {sum(p.numel() for p in vq_params)} params, lr={base_lr * vq_lr_factor:.6f}")
+    print(f"  Obs denoiser: {sum(p.numel() for p in obs_params)} params, lr={base_lr * obs_lr_factor:.6f}")
+    print(f"  Main DiT: {sum(p.numel() for p in dit_params)} params, lr={base_lr:.6f}")
+
+    optimizer = optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
+    scheduler = optim.lr_scheduler.MultiStepLR(
+        optimizer,
+        milestones=cfg.milestones,
+        gamma=cfg.gamma,
+    )
+    return optimizer, scheduler
+
+
 def main():
     args = get_args()
     cfg = merge_config(args)
@@ -106,8 +169,12 @@ def main():
     setup_seed(cfg.seed)
     cfg = setup_device(cfg)
 
-    save_name = "interaction_vq_obs" if stage == "obs_diffusion" else "interaction_vq"
-    save_dir = create_save_dir(cfg, save_name)
+    save_names = {
+        "obs_diffusion": "interaction_vq_obs",
+        "main_dit": "interaction_vq",
+        "joint": "interaction_vq_joint",
+    }
+    save_dir = create_save_dir(cfg, save_names.get(stage, "interaction_vq"))
 
     print("=" * 50)
     print(f"InteractionVQ training: stage={stage}")
@@ -130,12 +197,19 @@ def main():
     _load_stage_dependencies(cfg, model, stage, device)
 
     print(f"model params: {sum(p.numel() for p in model.parameters())}")
+    print(f"trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
     loss_fn = InteractionVQLoss(
         stage=stage,
         weights=getattr(cfg, "loss_weights", {}),
         test_metric_weights=getattr(cfg, "test_metric_weights", {}),
     )
     trainer = InteractionVQTrainer(cfg, model, loss_fn, train_loader, test_loader, stage=stage)
+
+    # Override optimizer for joint training with per-module LR groups
+    if stage == "joint":
+        raw_model = trainer._unwrap_model(trainer.model)
+        trainer.optimizer, trainer.scheduler = _build_joint_optimizer(raw_model, cfg)
+
     trainer.train()
 
     if not cfg.debug:

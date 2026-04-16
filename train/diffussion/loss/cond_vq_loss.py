@@ -44,7 +44,7 @@ class CondVQLoss:
         targets = pred_dict.get("targets", {}) if isinstance(pred_dict, dict) else {}
         pose_target = targets.get("pose6d")
         trans_target = targets.get("trans")
-        points_target = targets.get("obj_points")
+        points_target = targets.get("obj_points_world_mid", targets.get("obj_points"))
         pose_pred = pred_dict.get("recon_pose6d") if isinstance(pred_dict, dict) else None
         trans_pred = pred_dict.get("recon_trans") if isinstance(pred_dict, dict) else None
         points_pred = pred_dict.get("recon_obj_points") if isinstance(pred_dict, dict) else None
@@ -93,7 +93,7 @@ class CondVQLoss:
         targets = pred_dict.get("targets", {}) if isinstance(pred_dict, dict) else {}
         pose_target = targets.get("pose6d")
         trans_target = targets.get("trans")
-        points_target = targets.get("obj_points")
+        points_target = targets.get("obj_points_world_mid", targets.get("obj_points"))
         pose_pred = pred_dict.get("recon_pose6d") if isinstance(pred_dict, dict) else None
         trans_pred = pred_dict.get("recon_trans") if isinstance(pred_dict, dict) else None
         points_pred = pred_dict.get("recon_obj_points") if isinstance(pred_dict, dict) else None

@@ -44,7 +44,7 @@ eval_eta: 0.0
 
 # ============ Optimization ============
 epoch: 300
-batch_size: 200
+batch_size: 80
 lr: 0.0002
 weight_decay: 0.00001
 milestones: [100, 200, 300, 400]
@@ -135,6 +135,11 @@ loss_weights:
   Loss_vel_obj: 1.5
   Loss_jitter_obj: 10000
 
+  # Joint stage: auxiliary losses (VQ + obs token matching)
+  Loss_codebook_joint: 0.1
+  Loss_commit_joint: 0.05
+  Loss_code_ce_joint: 0.1
+
 # ============ Validation Metrics ============
 test_metric_weights:
   # Stage 1
@@ -155,13 +160,20 @@ test:
 
 # ============ Optional Stage Defaults ============
 interaction_vq:
-  stage: "obs_diffusion"  # obs_diffusion | main_dit
+  stage: "obs_diffusion"  # obs_diffusion | main_dit | joint
+
+# ============ Joint Training ============
+# Per-module LR multipliers for joint (Stage 2 + Stage 3) training.
+# VQ encoder uses lower LR to avoid catastrophic forgetting of pretrained weights.
+joint_training:
+  vq_lr_factor: 0.1       # LR multiplier for VQ encoder
+  obs_lr_factor: 0.5      # LR multiplier for obs denoiser
 
 # ============ Pretrained Modules ============
 # human_pose can stay fixed because this config does not change its architecture.
 # The VQ checkpoints below should be updated after you retrain each stage.
 pretrained_modules:
   human_pose: "outputs/IMUHOI_DiT/human_pose_04011146/best.pt"
-  cond_vq: "outputs/IMUHOI_DiT/cond_vq_04112155/best.pt"
-  interaction_vq_obs: "outputs/IMUHOI_DiT/interaction_vq_obs_04141716/best.pt"
-  interaction_vq: "outputs/IMUHOI_DiT/interaction_vq_04141957/best.pt"
+  # cond_vq: "outputs/IMUHOI_DiT/cond_vq_04151916/best.pt"
+  # interaction_vq_obs: "outputs/IMUHOI_DiT/interaction_vq_obs_04152018/best.pt"
+  interaction_vq: "outputs/IMUHOI_DiT/interaction_vq_joint_04160448/best.pt"
