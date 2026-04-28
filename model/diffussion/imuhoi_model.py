@@ -180,6 +180,48 @@ class IMUHOIModel(nn.Module):
                 out[key] = value
         return out
 
+    def _override_hp_trans_with_gt(self, hp_out: Dict, gt_targets: Optional[Dict]) -> Dict:
+        """Keep predicted pose, but rebuild global human positions with GT root translation."""
+        if not isinstance(hp_out, dict) or not isinstance(gt_targets, dict):
+            return hp_out
+        trans_gt = gt_targets.get("trans")
+        joints_local = hp_out.get("pred_joints_local")
+        if not isinstance(trans_gt, torch.Tensor) or not isinstance(joints_local, torch.Tensor):
+            return hp_out
+
+        batch_size, seq_len = joints_local.shape[:2]
+        trans_gt = trans_gt.to(device=joints_local.device, dtype=joints_local.dtype)
+        if trans_gt.dim() == 2:
+            trans_gt = trans_gt.unsqueeze(0)
+        if trans_gt.shape[0] == 1 and batch_size > 1:
+            trans_gt = trans_gt.expand(batch_size, -1, -1)
+        if trans_gt.shape[0] != batch_size or trans_gt.shape[1] != seq_len or trans_gt.shape[-1] != 3:
+            return hp_out
+
+        out = dict(hp_out)
+        out["root_trans_pred"] = trans_gt
+        pred_joints_global = joints_local + trans_gt.unsqueeze(2)
+        out["pred_joints_global"] = pred_joints_global
+        out["pred_hand_glb_pos"] = torch.stack(
+            [
+                pred_joints_global[:, :, self.human_pose_module.hand_joint_indices[0]],
+                pred_joints_global[:, :, self.human_pose_module.hand_joint_indices[1]],
+            ],
+            dim=2,
+        )
+        if hasattr(self.human_pose_module, "_compute_root_velocity_from_trans"):
+            root_vel = self.human_pose_module._compute_root_velocity_from_trans(trans_gt)
+            out["root_vel_pred"] = root_vel
+            root_rot = hp_out.get("R_pred_rotmat")
+            if isinstance(root_rot, torch.Tensor) and root_rot.dim() >= 5:
+                root_rot0 = root_rot[:, :, 0].to(device=root_vel.device, dtype=root_vel.dtype)
+                out["root_vel_local_pred"] = torch.matmul(
+                    root_rot0.transpose(-1, -2),
+                    root_vel.unsqueeze(-1),
+                ).squeeze(-1)
+        out["human_trans_source"] = "gt"
+        return out
+
     def _build_hp_input(self, data_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         hp_input = {
             "human_imu": data_dict["human_imu"],
@@ -285,6 +327,7 @@ class IMUHOIModel(nn.Module):
         eta: float | None = None,
         interaction_use_human_pred: Optional[bool] = None,
         interaction_human_source: Optional[str] = None,
+        interaction_human_trans_source: Optional[str] = None,
         **_,
     ) -> Dict[str, torch.Tensor]:
         if force_inference or (not self.training):
@@ -298,6 +341,7 @@ class IMUHOIModel(nn.Module):
                 eta=eta,
                 interaction_use_human_pred=interaction_use_human_pred,
                 interaction_human_source=interaction_human_source,
+                interaction_human_trans_source=interaction_human_trans_source,
             )
 
         if gt_targets is None:
@@ -317,6 +361,11 @@ class IMUHOIModel(nn.Module):
         run_interaction = bool(use_object_data) and self._has_any_object(data_dict.get("has_object"))
         if run_interaction:
             interaction_hp_out = hp_out if use_human_pred_for_interaction else None
+            if (
+                interaction_hp_out is not None
+                and str(interaction_human_trans_source or "").strip().lower() == "gt"
+            ):
+                interaction_hp_out = self._override_hp_trans_with_gt(interaction_hp_out, gt_targets)
             if detach_hp:
                 interaction_hp_out = self._detach_tensor_dict(interaction_hp_out)
             if (interaction_hp_out is None) and (gt_targets is None):
@@ -335,6 +384,9 @@ class IMUHOIModel(nn.Module):
 
         results["has_object"] = data_dict.get("has_object")
         results["interaction_human_source"] = "pred" if use_human_pred_for_interaction else "gt"
+        results["interaction_human_trans_source"] = (
+            "gt" if str(interaction_human_trans_source or "").strip().lower() == "gt" else "pred"
+        )
         return results
 
     @torch.no_grad()
@@ -349,6 +401,7 @@ class IMUHOIModel(nn.Module):
         eta: float | None = None,
         interaction_use_human_pred: Optional[bool] = None,
         interaction_human_source: Optional[str] = None,
+        interaction_human_trans_source: Optional[str] = None,
         **_,
     ) -> Dict[str, torch.Tensor]:
         use_human_pred_for_interaction = self._resolve_use_human_pred(
@@ -373,6 +426,11 @@ class IMUHOIModel(nn.Module):
         run_interaction = bool(use_object_data) and self._has_any_object(data_dict.get("has_object"))
         if run_interaction:
             interaction_hp_out = hp_out if use_human_pred_for_interaction else None
+            if (
+                interaction_hp_out is not None
+                and str(interaction_human_trans_source or "").strip().lower() == "gt"
+            ):
+                interaction_hp_out = self._override_hp_trans_with_gt(interaction_hp_out, gt_targets)
             interaction_out = self.interaction_module.inference(
                 data_dict,
                 hp_out=interaction_hp_out,
@@ -393,6 +451,9 @@ class IMUHOIModel(nn.Module):
 
         results["has_object"] = data_dict.get("has_object")
         results["interaction_human_source"] = "pred" if use_human_pred_for_interaction else "gt"
+        results["interaction_human_trans_source"] = (
+            "gt" if str(interaction_human_trans_source or "").strip().lower() == "gt" else "pred"
+        )
         return results
 
 

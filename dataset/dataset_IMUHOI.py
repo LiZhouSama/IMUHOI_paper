@@ -248,14 +248,6 @@ class IMUDataset(Dataset):
         else:
             print(f"过滤条件：序列长度 >= {self.window_size + 1}，手部接触帧数(左右手任一) >= {self.min_obj_contact_frames}")
 
-        # 检查BPS文件夹 - 对于多个数据目录，检查第一个目录的BPS文件夹
-        self.bps_dir = os.path.join(os.path.dirname(self.data_dirs[0]), "bps_features")
-        self.use_bps = os.path.exists(self.bps_dir)
-        if self.use_bps:
-            print(f"使用BPS特征从 {self.bps_dir}")
-        else:
-            print("未找到BPS特征文件夹")
-
         # 调试模式下只使用一小部分序列
         if debug and len(self.sequence_info) > 100:
             # 只缩减 sequence_info 列表

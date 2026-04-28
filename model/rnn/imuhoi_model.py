@@ -254,6 +254,29 @@ class IMUHOIModel(nn.Module):
         results["has_object"] = has_object
         return results
 
+    def inference(
+        self,
+        data_dict: Dict[str, torch.Tensor],
+        gt_targets: Optional[Dict[str, torch.Tensor]] = None,
+        use_object_data: bool = True,
+        compute_fk: bool = False,
+        interaction_use_human_pred: bool = True,
+        **_,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Evaluation-compatible inference entrypoint.
+
+        The RNN pipeline is deterministic and does not need diffusion sampling or
+        GT target conditioning.  Keep the signature aligned with the DiT
+        pipeline so shared eval/visualization code can call either backend.
+        """
+        _ = gt_targets, interaction_use_human_pred
+        return self.forward(
+            data_dict,
+            use_object_data=use_object_data,
+            compute_fk=compute_fk,
+        )
+
 
 def load_model(
     config,

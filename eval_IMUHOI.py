@@ -7,6 +7,7 @@ import sys
 import argparse
 import copy
 import time
+import types
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -15,10 +16,23 @@ import torch
 from torch.utils.data import DataLoader
 from easydict import EasyDict as edict
 from sklearn.metrics import f1_score
-import pytorch3d.transforms as t3d
 
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+try:
+    import pytorch3d.transforms as t3d
+except Exception:
+    from utils import rotation_conversions as _rot
+
+    pytorch3d_mod = types.ModuleType("pytorch3d")
+    t3d = types.ModuleType("pytorch3d.transforms")
+    t3d.rotation_6d_to_matrix = _rot.rotation_6d_to_matrix
+    t3d.matrix_to_rotation_6d = _rot.matrix_to_rotation_6d
+    t3d.matrix_to_axis_angle = _rot.matrix_to_axis_angle
+    pytorch3d_mod.transforms = t3d
+    sys.modules["pytorch3d"] = pytorch3d_mod
+    sys.modules["pytorch3d.transforms"] = t3d
 
 from dataset.dataset_IMUHOI import IMUDataset
 from model import IMUHOIModel, load_model
@@ -29,6 +43,7 @@ from utils.utils import (
 )
 from configs import (
     FRAME_RATE,
+    _IGNORED_INDICES,
     _REDUCED_POSE_NAMES,
     _SENSOR_ROT_INDICES,
 )
@@ -145,6 +160,8 @@ def _get_human_pose_module(model):
     module = getattr(core, "human_pose_module", None)
     if module is not None:
         return module
+    if core.__class__.__name__.lower() == "humanposemodule":
+        return core
     wrapped = getattr(core, "module", None)
     if wrapped is not None:
         return getattr(wrapped, "human_pose_module", None)
@@ -160,6 +177,8 @@ def _infer_model_kind(model):
         return "pipeline"
     if "interactionmodule" in name:
         return "interaction"
+    if "humanposemodule" in name:
+        return "human_pose"
     if hasattr(core, "human_pose_module") and hasattr(core, "interaction_module"):
         return "pipeline"
     if hasattr(core, "mesh_encoder") and hasattr(core, "object_codebook"):
@@ -178,6 +197,13 @@ def _filter_pipeline_module_paths(module_paths):
     return out if out else None
 
 
+def _filter_human_pose_module_paths(module_paths):
+    if not isinstance(module_paths, dict):
+        return None
+    human_pose_path = module_paths.get("human_pose")
+    return {"human_pose": human_pose_path} if human_pose_path else None
+
+
 def _global_to_local_rotmat(global_rotmats, parents):
     if global_rotmats.dim() != 4 or global_rotmats.shape[-2:] != (3, 3):
         raise ValueError(f"Expected [T, J, 3, 3], got {tuple(global_rotmats.shape)}")
@@ -191,6 +217,11 @@ def _global_to_local_rotmat(global_rotmats, parents):
         parent_idx = max(0, min(parent_idx, num_joints - 1))
         parent_rot = global_rotmats[:, parent_idx]
         local_rotmats[:, i] = torch.matmul(parent_rot.transpose(-1, -2), global_rotmats[:, i])
+
+    valid_ignored = [idx for idx in _IGNORED_INDICES if idx < num_joints]
+    if valid_ignored:
+        eye = torch.eye(3, device=global_rotmats.device, dtype=global_rotmats.dtype).view(1, 1, 3, 3)
+        local_rotmats[:, valid_ignored] = eye.expand(seq_len, len(valid_ignored), 3, 3)
 
     return local_rotmats
 
@@ -261,12 +292,21 @@ def evaluate_model(
             compute_fk = bool(compare_three and want_object_predictions)
 
             def _run_model_inference(use_object_data, compute_fk_flag):
+                def _call_forward():
+                    return model(
+                        data_dict,
+                        use_object_data=use_object_data,
+                        compute_fk=compute_fk_flag,
+                    )
+
                 if model_kind == "mix":
                     return model.inference(
                         data_dict,
                         gt_targets=batch_device,
                     )
                 if model_kind == "pipeline":
+                    if not hasattr(model, "inference"):
+                        return _call_forward()
                     return model.inference(
                         data_dict,
                         gt_targets=batch_device,
@@ -282,7 +322,16 @@ def evaluate_model(
                         hp_out=None,
                         gt_targets=batch_device,
                     )
+                if model_kind == "human_pose":
+                    if hasattr(model, "inference"):
+                        try:
+                            return model.inference(data_dict, gt_targets=batch_device)
+                        except TypeError:
+                            return model.inference(data_dict)
+                    return model(data_dict)
                 # Unknown model type: try broad signature, then simplified.
+                if not hasattr(model, "inference"):
+                    return _call_forward()
                 try:
                     return model.inference(
                         data_dict,
@@ -646,7 +695,7 @@ def evaluate_model(
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate IMUHOI Model")
-    parser.add_argument("--config", type=str, default="configs/IMUHOI_train.yaml", help="配置文件路径")
+    parser.add_argument("--config", type=str, default="configs/IMUHOI_train_mamba.yaml", help="配置文件路径")
     parser.add_argument("--dataset", type=str, default=None, help="数据集名称")
     parser.add_argument("--smpl_model_path", type=str, default="datasets/smpl_models/smplh/male/model.npz", help="SMPL模型路径")
     parser.add_argument("--test_data_dir", type=str, default=None, help="测试数据目录")
@@ -654,7 +703,7 @@ def main():
     parser.add_argument("--no_trans", action="store_true", help="使用noTrans模式")
     parser.add_argument("--no_eval_objects", action="store_true", help="跳过物体相关指标")
     parser.add_argument("--compare_3", action="store_true", help="比较FK/IMU方法")
-    parser.add_argument("--model_arch", type=str, choices=["rnn", "dit"], default=None, help="选择模型架构")
+    parser.add_argument("--model_arch", type=str, choices=["rnn", "dit", "mamba"], default=None, help="选择模型架构")
     parser.add_argument(
         "--interaction_human_source",
         type=str,
@@ -696,8 +745,11 @@ def main():
         if modules_override:
             _apply_module_overrides(config, modules_override)
             module_paths = dict(config.pretrained_modules) if getattr(config, "pretrained_modules", None) else module_paths
-        if str(getattr(config, "model_arch", "rnn")).lower() == "dit":
+        model_arch = str(getattr(config, "model_arch", "rnn")).lower()
+        if model_arch == "dit":
             module_paths = _filter_pipeline_module_paths(module_paths)
+        elif model_arch == "mamba":
+            module_paths = _filter_human_pose_module_paths(module_paths)
         
         if args.smpl_model_path:
             config.body_model_path = args.smpl_model_path
@@ -710,6 +762,11 @@ def main():
             continue
         
         model = load_model(config, device, no_trans=args.no_trans, module_paths=module_paths)
+        model_kind = _infer_model_kind(model)
+        evaluate_objects = not args.no_eval_objects
+        if model_kind == "human_pose" and evaluate_objects:
+            print("[Eval] model_arch=mamba 当前只实现人体姿态，自动跳过物体相关指标。")
+            evaluate_objects = False
         
         data_dir_default = dataset_cfg.get("data_dir")
         if data_dir_default is None and not args.test_data_dir:
@@ -734,7 +791,8 @@ def main():
             data_dir=str(data_path),
             window_size=test_window,
             debug=config.get("debug", False),
-            full_sequence=False,
+            simulate_imu_noise=True,
+            full_sequence=True,
         )
         
         if len(test_dataset) == 0:
@@ -760,7 +818,7 @@ def main():
             config,
             device,
             no_trans=args.no_trans,
-            evaluate_objects=not args.no_eval_objects,
+            evaluate_objects=evaluate_objects,
             compare_three=args.compare_3,
             interaction_human_source=args.interaction_human_source,
         )
@@ -783,7 +841,7 @@ def main():
             print(f"Hand Vel Error Avg (m/s):       {_fmt('hand_vel_err_avg')}")
         print(f"Jitter (mm/frame^2):            {_fmt('jitter')}")
         
-        if not args.no_eval_objects:
+        if evaluate_objects:
             print("\n--- Object Translation Errors ---")
             print(f"Fusion (cm):                    {_fmt('obj_trans_err_fusion')}")
             print(f"FK (cm):                        {_fmt('obj_trans_err_fk')}")

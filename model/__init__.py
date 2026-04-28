@@ -6,10 +6,7 @@ from __future__ import annotations
 import os
 from typing import Any, Optional
 
-from . import diffussion as _dit
-from . import rnn as _rnn
-
-ARCH_CHOICES = ("rnn", "dit")
+ARCH_CHOICES = ("rnn", "dit", "mamba")
 _ARCH_ENV = os.environ.get("IMUHOI_MODEL_ARCH", "").lower()
 
 
@@ -25,24 +22,36 @@ def _resolve_arch(cfg: Optional[Any]) -> str:
     return arch
 
 
+def _arch_module(arch: str):
+    if arch == "dit":
+        from . import diffussion as module
+    elif arch == "mamba":
+        from . import mamba as module
+    else:
+        from . import rnn as module
+    return module
+
+
 def HumanPoseModule(cfg, *args, **kwargs):
     arch = _resolve_arch(cfg)
-    if arch == "dit":
-        return _dit.HumanPoseModule(cfg, *args, **kwargs)
-    return _rnn.HumanPoseModule(cfg, *args, **kwargs)
+    return _arch_module(arch).HumanPoseModule(cfg, *args, **kwargs)
 
 
 def InteractionModule(cfg, *args, **kwargs):
     arch = _resolve_arch(cfg)
     if arch == "dit":
-        return _dit.InteractionModule(cfg, *args, **kwargs)
+        return _arch_module(arch).InteractionModule(cfg, *args, **kwargs)
+    if arch == "mamba":
+        raise RuntimeError("InteractionModule is not implemented for model_arch='mamba' yet.")
     raise RuntimeError("InteractionModule is only available for model_arch='dit'.")
 
 
 def IMUHOIMixModule(cfg, *args, **kwargs):
     arch = _resolve_arch(cfg)
     if arch == "dit":
-        return _dit.IMUHOIMixModule(cfg, *args, **kwargs)
+        return _arch_module(arch).IMUHOIMixModule(cfg, *args, **kwargs)
+    if arch == "mamba":
+        raise RuntimeError("IMUHOIMixModule is not implemented for model_arch='mamba' yet.")
     raise RuntimeError("IMUHOIMixModule is only available for model_arch='dit'.")
 
 
@@ -52,7 +61,9 @@ def VelocityContactModule(cfg, *args, **kwargs):
         raise RuntimeError(
             "DiT path removed standalone VelocityContactModule. Use InteractionModule or IMUHOIModel instead."
         )
-    return _rnn.VelocityContactModule(cfg, *args, **kwargs)
+    if arch == "mamba":
+        raise RuntimeError("VelocityContactModule is not implemented for model_arch='mamba' yet.")
+    return _arch_module(arch).VelocityContactModule(cfg, *args, **kwargs)
 
 
 def ObjectTransModule(cfg, *args, **kwargs):
@@ -61,14 +72,18 @@ def ObjectTransModule(cfg, *args, **kwargs):
         raise RuntimeError(
             "DiT path removed standalone ObjectTransModule. Use InteractionModule or IMUHOIModel instead."
         )
-    return _rnn.ObjectTransModule(cfg, *args, **kwargs)
+    if arch == "mamba":
+        raise RuntimeError("ObjectTransModule is not implemented for model_arch='mamba' yet.")
+    return _arch_module(arch).ObjectTransModule(cfg, *args, **kwargs)
 
 
 def IMUHOIModel(cfg, *args, **kwargs):
     arch = _resolve_arch(cfg)
     if arch == "dit":
-        return _dit.IMUHOIModel(cfg, *args, **kwargs)
-    return _rnn.IMUHOIModel(cfg, *args, **kwargs)
+        return _arch_module(arch).IMUHOIModel(cfg, *args, **kwargs)
+    if arch == "mamba":
+        raise RuntimeError("IMUHOIModel is not implemented for model_arch='mamba' yet.")
+    return _arch_module(arch).IMUHOIModel(cfg, *args, **kwargs)
 
 
 def load_model(
@@ -78,9 +93,7 @@ def load_model(
     module_paths: Optional[dict] = None,
 ):
     arch = _resolve_arch(config)
-    if arch == "dit":
-        return _dit.load_model(config, device, no_trans=no_trans, module_paths=module_paths)
-    return _rnn.load_model(config, device, no_trans=no_trans, module_paths=module_paths)
+    return _arch_module(arch).load_model(config, device, no_trans=no_trans, module_paths=module_paths)
 
 
 __all__ = [

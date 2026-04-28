@@ -64,6 +64,7 @@ class _MeshPriorEncoder(nn.Module):
         self,
         *,
         point_dim: int,
+        aux_dim: int,
         d_model: int,
         out_dim: int,
         temporal_model: str = "gru",
@@ -78,6 +79,18 @@ class _MeshPriorEncoder(nn.Module):
             nn.Linear(d_model, d_model),
             nn.GELU(),
         )
+        self.aux_dim = int(max(aux_dim, 0))
+        if self.aux_dim > 0:
+            self.aux_mlp = nn.Sequential(
+                nn.Linear(self.aux_dim, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+            )
+            self.frame_fuse = nn.Linear(d_model * 2, d_model)
+        else:
+            self.aux_mlp = None
+            self.frame_fuse = None
         self.frame_norm = nn.LayerNorm(d_model)
 
         self.temporal_model = str(temporal_model).lower()
@@ -108,9 +121,18 @@ class _MeshPriorEncoder(nn.Module):
             raise ValueError(f"Unsupported mesh temporal_model: {temporal_model}")
         self.out_proj = nn.Linear(d_model, out_dim)
 
-    def forward(self, point_seq: torch.Tensor) -> torch.Tensor:
-        # point_seq: [B,T,N,3]
+    def forward(self, point_seq: torch.Tensor, aux_seq: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # point_seq: [B,T,N,3], aux_seq: [B,T,C_aux]
         frame_tokens = self.point_mlp(point_seq).amax(dim=2)
+        if self.aux_mlp is not None:
+            if aux_seq is None:
+                raise ValueError("aux_seq must be provided when aux_dim > 0")
+            if aux_seq.dim() != 3 or aux_seq.shape[:2] != frame_tokens.shape[:2]:
+                raise ValueError(
+                    f"aux_seq shape mismatch, got {aux_seq.shape}, expected [B={frame_tokens.shape[0]},T={frame_tokens.shape[1]},C]"
+                )
+            aux_tokens = self.aux_mlp(aux_seq)
+            frame_tokens = self.frame_fuse(torch.cat([frame_tokens, aux_tokens], dim=-1))
         frame_tokens = self.frame_norm(frame_tokens)
 
         if self.temporal_model == "gru":
@@ -135,6 +157,7 @@ class InteractionModule(nn.Module):
         self.num_human_imus = int(getattr(cfg, "num_human_imus", len(_SENSOR_NAMES)))
         self.imu_dim = int(getattr(cfg, "imu_dim", 9))
         self.obj_imu_dim = int(getattr(cfg, "obj_imu_dim", self.imu_dim))
+        self.obj_imu_feat_dim = max(self.obj_imu_dim, 9)
         self.fps = float(getattr(cfg, "frame_rate", FRAME_RATE))
 
         self.hand_joint_indices = (20, 21)
@@ -229,6 +252,8 @@ class InteractionModule(nn.Module):
         self.object_geo_root = str(getattr(cfg, "object_geo_root", "datasets/OMOMO/captured_objects"))
         self.mesh_downsample_points = int(max(1, getattr(cfg, "mesh_downsample_points", 256)))
         self.vq_commit_beta = float(getattr(cfg, "vq_commit_beta", 0.25))
+        self.mesh_cond_dim = self.human_rot_dim + self.hands_dim
+        self.obs_cond_dim = self.human_rot_dim + self.obj_imu_feat_dim + self.hands_dim
 
         prior_hidden = int(getattr(cfg, "prior_encoder_hidden_dim", 256))
         prior_heads = int(getattr(cfg, "prior_encoder_heads", 8))
@@ -250,6 +275,7 @@ class InteractionModule(nn.Module):
 
         self.mesh_encoder = _MeshPriorEncoder(
             point_dim=3,
+            aux_dim=self.mesh_cond_dim,
             d_model=prior_hidden,
             out_dim=self.code_dim,
             temporal_model=mesh_temporal_model,
@@ -258,7 +284,7 @@ class InteractionModule(nn.Module):
             temporal_dropout=mesh_temporal_dropout,
         )
         self.obs_encoder = _SequenceTransformerEncoder(
-            in_dim=self.rot_dim + self.acc_dim + self.hands_dim,
+            in_dim=self.obs_cond_dim,
             d_model=prior_hidden,
             nhead=prior_heads,
             num_layers=prior_layers,
@@ -364,24 +390,25 @@ class InteractionModule(nn.Module):
         return mask
 
     def _prepare_obj_imu(self, obj_imu, *, batch_size: int, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        target_dim = self.obj_imu_feat_dim
         if not isinstance(obj_imu, torch.Tensor):
-            return torch.zeros(batch_size, seq_len, 9, device=device, dtype=dtype)
+            return torch.zeros(batch_size, seq_len, target_dim, device=device, dtype=dtype)
 
         out = obj_imu.to(device=device, dtype=dtype)
         if out.dim() == 4:
             out = out.reshape(batch_size, seq_len, -1)
         if out.dim() != 3:
-            return torch.zeros(batch_size, seq_len, 9, device=device, dtype=dtype)
+            return torch.zeros(batch_size, seq_len, target_dim, device=device, dtype=dtype)
         if out.shape[0] == 1 and batch_size > 1:
             out = out.expand(batch_size, -1, -1)
         if out.shape[0] != batch_size or out.shape[1] != seq_len:
-            return torch.zeros(batch_size, seq_len, 9, device=device, dtype=dtype)
+            return torch.zeros(batch_size, seq_len, target_dim, device=device, dtype=dtype)
 
-        if out.shape[-1] < 9:
-            pad = torch.zeros(batch_size, seq_len, 9 - out.shape[-1], device=device, dtype=dtype)
+        if out.shape[-1] < target_dim:
+            pad = torch.zeros(batch_size, seq_len, target_dim - out.shape[-1], device=device, dtype=dtype)
             out = torch.cat([out, pad], dim=-1)
-        elif out.shape[-1] > 9:
-            out = out[..., :9]
+        elif out.shape[-1] > target_dim:
+            out = out[..., :target_dim]
 
         return out
 
@@ -553,7 +580,8 @@ class InteractionModule(nn.Module):
             dtype=dtype,
         )
         obj_rot6d = obj_imu[..., 3:9]
-        rot_human_obj = torch.cat([human_rot6d.reshape(batch_size, seq_len, -1), obj_rot6d], dim=-1)
+        human_pose = human_rot6d.reshape(batch_size, seq_len, -1)
+        rot_human_obj = torch.cat([human_pose, obj_rot6d], dim=-1)
 
         human_acc = human_imu[..., :3].reshape(batch_size, seq_len, -1)
         obj_acc = obj_imu[..., :3]
@@ -656,6 +684,8 @@ class InteractionModule(nn.Module):
             delta_p_obj[:, 1:] = obj_trans[:, 1:] - obj_trans[:, :-1]
 
         return {
+            "human_pose": human_pose,
+            "obj_imu": obj_imu,
             "rot_human_obj": rot_human_obj,
             "acc_human_obj": acc_human_obj,
             "hands": hands,
@@ -766,8 +796,8 @@ class InteractionModule(nn.Module):
     def _encode_observation_prior(self, feats: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         obs_seq = torch.cat(
             [
-                feats["rot_human_obj"],
-                feats["acc_human_obj"],
+                feats["human_pose"],
+                feats["obj_imu"],
                 feats["hands_flat"],
             ],
             dim=-1,
@@ -785,6 +815,7 @@ class InteractionModule(nn.Module):
         self,
         data_dict: Dict,
         gt_targets: Optional[Dict],
+        feats: Dict[str, torch.Tensor],
         *,
         batch_size: int,
         seq_len: int,
@@ -881,6 +912,7 @@ class InteractionModule(nn.Module):
         load_object_geometry = None
 
         valid_points = []
+        valid_aux = []
         valid_batch_idx = []
 
         for b in range(batch_size):
@@ -943,6 +975,7 @@ class InteractionModule(nn.Module):
             points = self._downsample_points(points)
 
             valid_points.append(points)
+            valid_aux.append(torch.cat([feats["human_pose"][b], feats["hands_flat"][b]], dim=-1))
             valid_batch_idx.append(b)
 
         if len(valid_batch_idx) == 0:
@@ -956,7 +989,8 @@ class InteractionModule(nn.Module):
             }
 
         point_tensor = torch.stack(valid_points, dim=0)
-        z_e_valid = self.mesh_encoder(point_tensor)
+        aux_tensor = torch.stack(valid_aux, dim=0)
+        z_e_valid = self.mesh_encoder(point_tensor, aux_tensor)
         z_q_valid, code_idx_valid, _, logits_valid = self._quantize_to_codebook(z_e_valid)
 
         # Under autocast, mesh branch may run in bf16/fp16 while accumulators stay fp32.
@@ -1023,6 +1057,7 @@ class InteractionModule(nn.Module):
             mesh_prior = self._encode_mesh_prior(
                 data_dict,
                 gt_targets,
+                feats,
                 batch_size=batch_size,
                 seq_len=seq_len,
                 device=device,

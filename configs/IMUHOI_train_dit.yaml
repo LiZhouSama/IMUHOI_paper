@@ -140,6 +140,6 @@ test:
 # 取消注释以使用预训练权重
 pretrained_modules:
   human_pose: "outputs/IMUHOI_DiT/human_pose_04011146/best.pt"
-  interaction: "outputs/IMUHOI_DiT/interaction_03312312/best.pt"
+  interaction: "outputs/IMUHOI_DiT/interaction_04222310/best.pt"
 
   # imuhoi_mix: "outputs/IMUHOI_DiT/imuhoi_mix_03241600/best.pt"

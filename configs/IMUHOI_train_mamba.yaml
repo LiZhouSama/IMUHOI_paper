@@ -1,38 +1,39 @@
-# IMUHOI RNN training config
-# 使用 --no_trans 切换是否预测根节点位移
+# IMUHOI Mamba human-pose training config
+# 当前 Mamba 分支只实现 Stage 1 HumanPoseModule
 
 # ============ 基本配置 ============
-save_dir: "outputs/IMUHOI_RNN"
+save_dir: "outputs/IMUHOI_Mamba"
 body_model_path: datasets/smpl_models/smplh/male/model.npz
 use_tensorboard: true
 use_multi_gpu: true
 device: "cuda:0"
 gpus: [0]
-model_arch: "rnn"
+model_arch: "mamba"
 
-# ============ RNN 模型超参数 ============
-human_pose_hidden: 200
-human_pose_layers: 2
-human_pose_dropout: 0.2
-
-velocity_hidden_dim: 128
-velocity_num_layers: 2
-velocity_dropout: 0.2
-boundary_group_hidden: 64
-boundary_hidden_dim: 128
-
-hidden_dim_multiplier: 1
-gating_prior_beta: 5.0
-gating_temperature: 5.0
-gating_smoothing_enabled: false
-gating_smoothing_alpha: 0.6
-gating_max_change: 0.25
-vel_static_threshold: 0.3
-vel_min_hand_speed: 0.02
+# ============ Mamba 模型超参数 ============
+mamba:
+  hidden_dim: 256
+  part_hidden_dim: 256
+  fast_layers: 3
+  slow_layers: 3
+  fast_kernel: 3
+  slow_kernel: 9
+  slow_dilation: 2
+  slow_ma_window: 5
+  memory_heads: 4
+  memory_size: 8
+  dropout: 0.1
+  use_delta_features: false
+  contact_fusion_enabled: true
+  contact_fusion_min_prob: 0.5
+  contact_fusion_full_prob: 0.9
+  contact_fusion_max_speed: 5.0
+  prevent_floor_penetration: true
+  floor_height: 0.0
 
 # ============ 训练超参数 ============
 epoch: 300
-batch_size: 120
+batch_size: 80
 lr: 0.0002
 weight_decay: 0.00001
 milestones: [100, 200]
@@ -43,7 +44,6 @@ num_workers: 12
 # ============ 特征维度 ============
 num_human_imus: 6
 imu_dim: 9
-obj_imu_dim: 9
 num_joints: 24
 
 # ============ 噪声配置 ============
@@ -74,45 +74,23 @@ datasets:
 
 # ============ 损失权重 ============
 loss_weights:
-  # Stage 1: HumanPoseModule
   vel_root: 1.0
   pose_reduced: 10.0
   root_vel_local: 1.0
   root_vel: 1.0
   root_trans: 1.0
   hand_pos: 1.0
+  fk_joint: 1.0
   contact: 1.0
-
-  # Stage 2: VelocityContactModule
-  obj_vel: 1.0
-  hand_vel: 1.0
-  obj_move: 1.0
-  hand_contact_cond: 1.0
-  interaction_boundary: 0.1
-  interaction_order: 1.0
-  boundary_focal_alpha: 0.25
-  boundary_focal_gamma: 2.0
-
-  # Stage 3: ObjectTransModule
-  obj_trans: 1.0
-  lhand_obj_direction: 0.1
-  rhand_obj_direction: 0.1
-  lhand_lb: 0.1
-  rhand_lb: 0.1
-  hoi_error_l: 0.2
-  hoi_error_r: 0.2
-  obj_vel_cons: 0.1
-  obj_acc_cons: 0.01
+  smooth: 0.5
 
 # ============ 窗口配置 ============
 train:
-  window: 60
+  window: 120
 
 test:
-  window: 60
+  window: 120
 
 # ============ 预训练模块路径（可选）============
 pretrained_modules:
-  human_pose: "outputs/IMUHOI_rnn/joint_train_01112057/best_human_pose.pt"
-  velocity_contact: "outputs/IMUHOI_rnn/joint_train_01112057/best_velocity_contact.pt"
-  object_trans: "outputs/IMUHOI_rnn/joint_train_01112057/best_object_trans.pt"
+  human_pose: "outputs/IMUHOI_Mamba/human_pose_mamba_04272154/best.pt"

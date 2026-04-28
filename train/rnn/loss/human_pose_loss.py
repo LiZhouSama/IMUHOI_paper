@@ -12,7 +12,15 @@ class HumanPoseLoss:
     """人体姿态预测的损失计算"""
     
     # 训练阶段使用的损失键
-    LOSS_KEYS = {'vel_root', 'pose_reduced', 'root_vel_local', 'root_vel', 'root_trans', 'hand_pos'}
+    LOSS_KEYS = {
+        'vel_root',
+        'pose_reduced',
+        'root_vel_local',
+        'root_vel',
+        'root_trans',
+        'hand_pos',
+        'contact',
+    }
     
     # 测试阶段用于模型选择的损失键 (可自定义子集)
     TEST_LOSS_KEYS = {'pose_reduced', 'root_trans'}
@@ -106,6 +114,22 @@ class HumanPoseLoss:
                 position_global_gt[:, :, 21, :],
             ], dim=2)
             losses['hand_pos'] = F.mse_loss(pred_dict['pred_hand_glb_pos'], hand_pos_gt)
+
+        if 'contact_pred' in pred_dict:
+            lfoot_contact_gt = batch.get('lfoot_contact')
+            rfoot_contact_gt = batch.get('rfoot_contact')
+            if isinstance(lfoot_contact_gt, torch.Tensor) and isinstance(rfoot_contact_gt, torch.Tensor):
+                lfoot_contact_gt = lfoot_contact_gt.to(device=device, dtype=dtype)
+                rfoot_contact_gt = rfoot_contact_gt.to(device=device, dtype=dtype)
+                if lfoot_contact_gt.dim() == 1:
+                    lfoot_contact_gt = lfoot_contact_gt.unsqueeze(0).expand(bs, -1)
+                if rfoot_contact_gt.dim() == 1:
+                    rfoot_contact_gt = rfoot_contact_gt.unsqueeze(0).expand(bs, -1)
+                if lfoot_contact_gt.shape[:2] == (bs, seq) and rfoot_contact_gt.shape[:2] == (bs, seq):
+                    contact_target = torch.stack([lfoot_contact_gt, rfoot_contact_gt], dim=-1).clamp(0.0, 1.0)
+                    contact_pred = pred_dict['contact_pred'].to(device=device, dtype=dtype)
+                    if contact_pred.shape == contact_target.shape:
+                        losses['contact'] = F.binary_cross_entropy_with_logits(contact_pred, contact_target)
         
         # 加权求和
         total_loss = zero.clone()
