@@ -204,6 +204,15 @@ def _filter_human_pose_module_paths(module_paths):
     return {"human_pose": human_pose_path} if human_pose_path else None
 
 
+def _apply_cli_module_overrides(module_paths, args):
+    out = dict(module_paths) if isinstance(module_paths, dict) else {}
+    if getattr(args, "hp_ckpt", None):
+        out["human_pose"] = args.hp_ckpt
+    if getattr(args, "interaction_ckpt", None):
+        out["interaction"] = args.interaction_ckpt
+    return out if out else None
+
+
 def _global_to_local_rotmat(global_rotmats, parents):
     if global_rotmats.dim() != 4 or global_rotmats.shape[-2:] != (3, 3):
         raise ValueError(f"Expected [T, J, 3, 3], got {tuple(global_rotmats.shape)}")
@@ -704,6 +713,8 @@ def main():
     parser.add_argument("--no_eval_objects", action="store_true", help="跳过物体相关指标")
     parser.add_argument("--compare_3", action="store_true", help="比较FK/IMU方法")
     parser.add_argument("--model_arch", type=str, choices=["rnn", "dit", "mamba"], default=None, help="选择模型架构")
+    parser.add_argument("--hp_ckpt", type=str, default=None, help="覆盖 HumanPose checkpoint")
+    parser.add_argument("--interaction_ckpt", type=str, default=None, help="覆盖 Interaction/Object checkpoint")
     parser.add_argument(
         "--interaction_human_source",
         type=str,
@@ -745,11 +756,10 @@ def main():
         if modules_override:
             _apply_module_overrides(config, modules_override)
             module_paths = dict(config.pretrained_modules) if getattr(config, "pretrained_modules", None) else module_paths
+        module_paths = _apply_cli_module_overrides(module_paths, args)
         model_arch = str(getattr(config, "model_arch", "rnn")).lower()
-        if model_arch == "dit":
+        if model_arch in {"dit", "mamba"}:
             module_paths = _filter_pipeline_module_paths(module_paths)
-        elif model_arch == "mamba":
-            module_paths = _filter_human_pose_module_paths(module_paths)
         
         if args.smpl_model_path:
             config.body_model_path = args.smpl_model_path
@@ -765,7 +775,7 @@ def main():
         model_kind = _infer_model_kind(model)
         evaluate_objects = not args.no_eval_objects
         if model_kind == "human_pose" and evaluate_objects:
-            print("[Eval] model_arch=mamba 当前只实现人体姿态，自动跳过物体相关指标。")
+            print("[Eval] 当前加载的是 human-only 模型；如需评估物体，请提供 pretrained_modules.interaction 或 --interaction_ckpt。")
             evaluate_objects = False
         
         data_dir_default = dataset_cfg.get("data_dir")

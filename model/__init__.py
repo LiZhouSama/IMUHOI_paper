@@ -42,7 +42,7 @@ def InteractionModule(cfg, *args, **kwargs):
     if arch == "dit":
         return _arch_module(arch).InteractionModule(cfg, *args, **kwargs)
     if arch == "mamba":
-        raise RuntimeError("InteractionModule is not implemented for model_arch='mamba' yet.")
+        return _arch_module(arch).InteractionModule(cfg, *args, **kwargs)
     raise RuntimeError("InteractionModule is only available for model_arch='dit'.")
 
 
@@ -82,7 +82,7 @@ def IMUHOIModel(cfg, *args, **kwargs):
     if arch == "dit":
         return _arch_module(arch).IMUHOIModel(cfg, *args, **kwargs)
     if arch == "mamba":
-        raise RuntimeError("IMUHOIModel is not implemented for model_arch='mamba' yet.")
+        return _arch_module(arch).IMUHOIModel(cfg, *args, **kwargs)
     return _arch_module(arch).IMUHOIModel(cfg, *args, **kwargs)
 
 

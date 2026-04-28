@@ -1,5 +1,5 @@
-# IMUHOI Mamba human-pose training config
-# 当前 Mamba 分支只实现 Stage 1 HumanPoseModule
+# IMUHOI Mamba training config
+# Stage 1: HumanPoseModule, Stage 2: InteractionModule
 
 # ============ 基本配置 ============
 save_dir: "outputs/IMUHOI_Mamba"
@@ -25,11 +25,40 @@ mamba:
   dropout: 0.1
   use_delta_features: false
   contact_fusion_enabled: true
-  contact_fusion_min_prob: 0.5
-  contact_fusion_full_prob: 0.9
-  contact_fusion_max_speed: 5.0
+  contact_fusion_min_prob: 0.6
+  contact_fusion_full_prob: 0.95
+  contact_fusion_max_speed: 2.0
   prevent_floor_penetration: true
   floor_height: 0.0
+  interaction:
+    # 评估/可视化时设为 true 可强制加载 Mamba 全 pipeline；
+    # 更常用的方式是在 pretrained_modules.interaction 或命令行传入 interaction checkpoint。
+    enabled: false
+    use_refined_outputs: true
+    hidden_dim: 256
+    fast_layers: 3
+    slow_layers: 3
+    fast_kernel: 3
+    slow_kernel: 9
+    slow_dilation: 2
+    slow_ma_window: 5
+    dropout: 0.1
+    object_code_dim: 128
+    num_object_codes: 128
+    prior_hidden_dim: 256
+    prior_layers: 2
+    prior_dropout: 0.1
+    mesh_downsample_points: 256
+    cond_mode_probs: [0.4, 0.4, 0.2]  # mesh/obs/null
+    vq_commit_beta: 0.25
+    refine_gt_epochs: 50
+    gating_prior_beta: 5.0
+    gating_temperature: 5.0
+    gating_smoothing_enabled: false
+    gating_smoothing_alpha: 0.6
+    gating_max_change: 0.25
+    vel_static_threshold: 0.3
+    vel_min_hand_speed: 0.02
 
 # ============ 训练超参数 ============
 epoch: 300
@@ -45,6 +74,8 @@ num_workers: 12
 num_human_imus: 6
 imu_dim: 9
 num_joints: 24
+mesh_downsample_points: 256
+object_geo_root: "datasets/OMOMO/captured_objects"
 
 # ============ 噪声配置 ============
 imu_noise_std: 0.3
@@ -74,15 +105,43 @@ datasets:
 
 # ============ 损失权重 ============
 loss_weights:
+  # Stage 1: HumanPose
   vel_root: 1.0
   pose_reduced: 10.0
   root_vel_local: 1.0
   root_vel: 1.0
-  root_trans: 1.0
+  root_trans: 0.5
   hand_pos: 1.0
   fk_joint: 1.0
   contact: 1.0
   smooth: 0.5
+  pose_acc: 0.2
+  root_acc: 1.0
+  joint_acc: 0.2
+  contact_smooth: 0.1
+
+  # Stage 2: Interaction
+  hand_vel: 1.0
+  obj_vel: 1.0
+  obj_move: 1.0
+  hand_contact: 1.0
+  foot_contact: 1.0
+  obj_trans: 1.0
+  lhand_obj_direction: 1.0
+  rhand_obj_direction: 1.0
+  lhand_lb: 1.0
+  rhand_lb: 1.0
+  obj_vel_cons: 0.5
+  obj_acc_cons: 0.2
+  refine_pose: 5.0
+  refine_root_trans: 0.5
+  refine_hand_pos: 2.0
+  refine_fk_joint: 1.0
+  align: 1.0
+  commit: 0.1
+  code_cls: 0.5
+  obj_smooth: 0.3
+  refine_smooth: 0.3
 
 # ============ 窗口配置 ============
 train:
@@ -94,3 +153,4 @@ test:
 # ============ 预训练模块路径（可选）============
 pretrained_modules:
   human_pose: "outputs/IMUHOI_Mamba/human_pose_mamba_04272154/best.pt"
+  interaction: null

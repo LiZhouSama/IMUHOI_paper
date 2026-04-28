@@ -21,6 +21,10 @@ class HumanPoseLoss:
         "fk_joint",
         "contact",
         "smooth",
+        "pose_acc",
+        "root_acc",
+        "joint_acc",
+        "contact_smooth",
     )
     TEST_LOSS_KEYS = ("pose_reduced", "root_trans", "fk_joint", "hand_pos")
 
@@ -34,6 +38,10 @@ class HumanPoseLoss:
         "fk_joint": ("fk_joint", "fk"),
         "contact": ("contact", "foot_contact", "contact_logits"),
         "smooth": ("smooth", "vel_smooth"),
+        "pose_acc": ("pose_acc", "pose_accel", "pose_acceleration"),
+        "root_acc": ("root_acc", "root_accel", "root_acceleration"),
+        "joint_acc": ("joint_acc", "joint_accel", "joint_acceleration", "jitter"),
+        "contact_smooth": ("contact_smooth", "contact_vel_smooth"),
     }
 
     _DEFAULT_WEIGHTS = {
@@ -46,6 +54,10 @@ class HumanPoseLoss:
         "fk_joint": 1.0,
         "contact": 1.0,
         "smooth": 0.5,
+        "pose_acc": 0.0,
+        "root_acc": 0.0,
+        "joint_acc": 0.0,
+        "contact_smooth": 0.0,
     }
 
     def __init__(self, weights=None, no_trans: bool = False):
@@ -60,6 +72,10 @@ class HumanPoseLoss:
             if alias in self.weights:
                 return float(self.weights[alias])
         return self._DEFAULT_WEIGHTS[key]
+
+    @staticmethod
+    def _second_diff(x: torch.Tensor) -> torch.Tensor:
+        return x[:, 2:] - 2.0 * x[:, 1:-1] + x[:, :-2]
 
     @staticmethod
     def _expand_bt(value, batch_size: int, seq_len: int, trailing_shape, device, dtype):
@@ -138,6 +154,8 @@ class HumanPoseLoss:
 
             if seq_len > 1:
                 losses["smooth"] = F.mse_loss(p_pred[:, 1:] - p_pred[:, :-1], pose_gt_6d[:, 1:] - pose_gt_6d[:, :-1])
+            if seq_len > 2:
+                losses["pose_acc"] = F.mse_loss(self._second_diff(p_pred), self._second_diff(pose_gt_6d))
 
         if not self.no_trans:
             if isinstance(pred_dict.get("root_vel_local_pred"), torch.Tensor):
@@ -155,6 +173,8 @@ class HumanPoseLoss:
                         root_trans_pred[:, 1:] - root_trans_pred[:, :-1],
                         trans_gt[:, 1:] - trans_gt[:, :-1],
                     )
+                if seq_len > 2:
+                    losses["root_acc"] = F.mse_loss(self._second_diff(root_trans_pred), self._second_diff(trans_gt))
 
         position_global_gt = self._expand_bt(batch.get("position_global"), batch_size, seq_len, None, device, dtype)
         if position_global_gt is None and isinstance(batch.get("position_global"), torch.Tensor):
@@ -184,6 +204,11 @@ class HumanPoseLoss:
             nj = min(pred_joints.shape[2], position_global_gt.shape[2])
             if nj > 0:
                 losses["fk_joint"] = F.mse_loss(pred_joints[:, :, :nj], position_global_gt[:, :, :nj])
+                if seq_len > 2:
+                    losses["joint_acc"] = F.mse_loss(
+                        self._second_diff(pred_joints[:, :, :nj]),
+                        self._second_diff(position_global_gt[:, :, :nj]),
+                    )
 
         contact_pred = pred_dict.get("contact_pred", pred_dict.get("b_pred"))
         lfoot = self._expand_bt(batch.get("lfoot_contact"), batch_size, seq_len, (), device, dtype)
@@ -194,12 +219,18 @@ class HumanPoseLoss:
                 contact_pred.to(device=device, dtype=dtype),
                 contact_target,
             )
+            if seq_len > 1:
+                contact_prob = torch.sigmoid(contact_pred.to(device=device, dtype=dtype))
+                losses["contact_smooth"] = F.mse_loss(
+                    contact_prob[:, 1:] - contact_prob[:, :-1],
+                    contact_target[:, 1:] - contact_target[:, :-1],
+                )
 
         total_loss = zero.clone()
         weighted_losses = {}
         for key in self.LOSS_KEYS:
             weight = self._weight(key)
-            if self.no_trans and key in {"root_vel_local", "root_vel", "root_trans"}:
+            if self.no_trans and key in {"root_vel_local", "root_vel", "root_trans", "root_acc"}:
                 weight = 0.0
             weighted = losses[key] * weight
             weighted_losses[key] = weighted

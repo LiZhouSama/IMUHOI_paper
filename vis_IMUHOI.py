@@ -147,13 +147,22 @@ def _global_to_local_rotmat(global_rotmats, parents):
 
 def _run_model_prediction(model, model_input, batch_device, compute_fk_flag, model_arch):
     model_kind = _infer_model_kind(model)
-    if model_kind == "human_pose" or model_arch == "mamba":
+    if model_kind == "human_pose":
         if hasattr(model, "inference"):
             try:
                 return model.inference(model_input, gt_targets=batch_device)
             except TypeError:
                 return model.inference(model_input)
         return model(model_input)
+    if model_kind == "pipeline":
+        if hasattr(model, "inference"):
+            return model.inference(
+                model_input,
+                gt_targets=batch_device,
+                use_object_data=True,
+                compute_fk=compute_fk_flag,
+            )
+        return model(model_input, use_object_data=True, compute_fk=compute_fk_flag)
     if model_arch == "dit":
         return model.inference(
             model_input,
@@ -897,6 +906,8 @@ def main():
     parser = argparse.ArgumentParser(description='Interactive IMUHOI Visualization Tool')
     parser.add_argument('--config', type=str, default='configs/IMUHOI_train_mamba.yaml', help='Path to config file')
     parser.add_argument('--model_arch', type=str, choices=['rnn', 'dit', 'mamba'], default=None, help='Override model architecture in config')
+    parser.add_argument('--hp_ckpt', type=str, default=None, help='Override HumanPose checkpoint')
+    parser.add_argument('--interaction_ckpt', type=str, default=None, help='Override Interaction/Object checkpoint')
     parser.add_argument('--smpl_model_path', type=str, default=None, help='Path to SMPL model file')
     parser.add_argument('--test_data_dir', type=str, default='process/processed_split_data_OMOMO_bps/test', help='Test data directory or a single .pt sequence file')
     parser.add_argument('--obj_geo_root', type=str, default='datasets/OMOMO/captured_objects', help='Root directory of object geometry files')
@@ -925,10 +936,17 @@ def main():
     module_paths = None
     if hasattr(config, "pretrained_modules") and config.pretrained_modules:
         module_paths = dict(config.pretrained_modules)
+    if args.hp_ckpt:
+        module_paths = dict(module_paths) if isinstance(module_paths, dict) else {}
+        module_paths["human_pose"] = args.hp_ckpt
+    if args.interaction_ckpt:
+        module_paths = dict(module_paths) if isinstance(module_paths, dict) else {}
+        module_paths["interaction"] = args.interaction_ckpt
     model_arch = str(getattr(config, "model_arch", "rnn")).lower()
-    if model_arch == "mamba" and isinstance(module_paths, dict):
-        human_pose_path = module_paths.get("human_pose")
-        module_paths = {"human_pose": human_pose_path} if human_pose_path else None
+    if model_arch in {"dit", "mamba"} and isinstance(module_paths, dict):
+        allowed = {"human_pose", "interaction", "velocity_contact", "object_trans"}
+        module_paths = {key: value for key, value in module_paths.items() if key in allowed and value}
+        module_paths = module_paths or None
     
     if args.smpl_model_path:
         config.body_model_path = args.smpl_model_path
@@ -941,7 +959,7 @@ def main():
 
     model = load_model(config, device, no_trans=args.no_trans, module_paths=module_paths)
     if _infer_model_kind(model) == "human_pose" and not args.no_objects:
-        print("[Vis] model_arch=mamba 当前只实现人体姿态，将不会渲染预测物体。")
+        print("[Vis] 当前加载的是 human-only 模型；如需渲染预测物体，请提供 pretrained_modules.interaction 或 --interaction_ckpt。")
 
     test_data_input = args.test_data_dir
     if not test_data_input or not os.path.exists(test_data_input):

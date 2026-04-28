@@ -49,6 +49,7 @@ def get_base_args():
     parser.add_argument("--epochs", type=int, default=None, help="训练轮数")
     parser.add_argument("--lr", type=float, default=None, help="学习率（优先于配置文件）")
     parser.add_argument("--pretrained_ckpt", type=str, default=None, help="预训练权重路径")
+    parser.add_argument("--resume_dir", type=str, default=None, help="从已有训练输出目录恢复训练")
     parser.add_argument("--debug", action="store_true", help="调试模式")
     parser.add_argument("--no_trans", action="store_true", help="禁用根节点位移预测")
     parser.add_argument("--model_arch", type=str, choices=["rnn", "dit", "mamba"], default="mamba", help="选择模型架构")
@@ -69,6 +70,7 @@ def merge_config(args):
     if args.lr is not None:
         cfg.lr = args.lr
     cfg.pretrained_ckpt = args.pretrained_ckpt or getattr(cfg, "pretrained_ckpt", None)
+    cfg.resume_dir = args.resume_dir or getattr(cfg, "resume_dir", None)
     cfg.debug = args.debug
     cfg.no_trans = args.no_trans
     cfg.cfg_file = args.cfg
@@ -114,6 +116,14 @@ def setup_device(cfg):
 
 
 def create_save_dir(cfg, module_name):
+    resume_dir = getattr(cfg, "resume_dir", None)
+    if resume_dir:
+        resume_dir = os.path.normpath(resume_dir)
+        if not os.path.isdir(resume_dir):
+            raise FileNotFoundError(f"resume_dir does not exist or is not a directory: {resume_dir}")
+        cfg.save_dir = resume_dir
+        return resume_dir
+
     time_stamp = datetime.now().strftime("%m%d%H%M")
     suffix = "_noTrans" if cfg.no_trans else ""
     run_name = f"{module_name}{suffix}_{time_stamp}"
@@ -209,32 +219,101 @@ def flatten_lstm_parameters(module):
             flatten_lstm_parameters(child)
 
 
-def save_checkpoint(model, optimizer, epoch, save_path, loss, additional_info=None):
+def _capture_rng_state():
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state):
+    if not isinstance(state, dict):
+        return
+    try:
+        if state.get("python") is not None:
+            random.setstate(state["python"])
+        if state.get("numpy") is not None:
+            np.random.set_state(state["numpy"])
+        if state.get("torch") is not None:
+            torch.set_rng_state(state["torch"])
+        if torch.cuda.is_available() and state.get("cuda") is not None:
+            torch.cuda.set_rng_state_all(state["cuda"])
+    except Exception as exc:
+        print(f"警告：恢复随机数状态失败: {exc}")
+
+
+def _select_state_dict(checkpoint, use_ema=True):
+    if not isinstance(checkpoint, dict):
+        return checkpoint
+    if use_ema and checkpoint.get("ema_state_dict") is not None:
+        return checkpoint["ema_state_dict"]
+    return checkpoint.get("module_state_dict", checkpoint.get("model_state_dict", checkpoint))
+
+
+def _load_model_from_checkpoint(model, checkpoint, strict=True, use_ema=True):
+    state_dict = _select_state_dict(checkpoint, use_ema=use_ema)
+    model.load_state_dict(state_dict, strict=strict)
+
+
+def _torch_load_checkpoint(checkpoint_path, map_location):
+    try:
+        return torch.load(checkpoint_path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(checkpoint_path, map_location=map_location)
+
+
+def save_checkpoint(
+    model,
+    optimizer,
+    epoch,
+    save_path,
+    loss,
+    additional_info=None,
+    scheduler=None,
+    scaler=None,
+):
     model_state_dict = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
     checkpoint_data = {
         "epoch": epoch,
         "model_state_dict": model_state_dict,
         "module_state_dict": model_state_dict,
         "optimizer_state_dict": optimizer.state_dict() if optimizer else None,
+        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+        "scaler_state_dict": scaler.state_dict() if scaler else None,
+        "rng_state": _capture_rng_state(),
         "loss": loss,
     }
     if additional_info:
         checkpoint_data.update(additional_info)
-    torch.save(checkpoint_data, save_path)
+    tmp_path = f"{save_path}.tmp"
+    torch.save(checkpoint_data, tmp_path)
+    os.replace(tmp_path, save_path)
     print(f"保存检查点: {save_path}")
 
 
 def load_checkpoint(model, checkpoint_path, device, strict=True, use_ema=True):
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    state_dict = checkpoint
-    if isinstance(checkpoint, dict):
-        if use_ema and checkpoint.get("ema_state_dict") is not None:
-            state_dict = checkpoint["ema_state_dict"]
-        else:
-            state_dict = checkpoint.get("module_state_dict", checkpoint.get("model_state_dict", checkpoint))
-    model.load_state_dict(state_dict, strict=strict)
+    checkpoint = _torch_load_checkpoint(checkpoint_path, map_location=device)
+    _load_model_from_checkpoint(model, checkpoint, strict=strict, use_ema=use_ema)
     print(f"加载检查点: {checkpoint_path}")
     return checkpoint.get("epoch", 0) if isinstance(checkpoint, dict) else 0
+
+
+def resolve_resume_checkpoint(resume_dir):
+    if not resume_dir:
+        return None
+    candidates = [
+        os.path.join(resume_dir, "last.pt"),
+        os.path.join(resume_dir, "final.pt"),
+        os.path.join(resume_dir, "best.pt"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(f"resume_dir contains no last.pt, final.pt, or best.pt: {resume_dir}")
 
 
 def _ensure_bt(tensor, shape, device, dtype):
@@ -298,6 +377,62 @@ def build_model_input_dict(batch, cfg, device, add_noise=True):
         obj_imu = obj_imu.to(device=device, dtype=dtype)
     else:
         obj_imu = torch.zeros(batch_size, seq_len, int(getattr(cfg, "obj_imu_dim", 9)), device=device, dtype=dtype)
+    obj_noise_std = float(getattr(cfg, "obj_imu_noise_std", 0.1))
+    if add_noise and obj_noise_std > 0.0 and not skip_noise:
+        obj_imu = obj_imu + torch.randn_like(obj_imu) * obj_noise_std
+
+    obj_vel = _ensure_bt(batch.get("obj_vel"), (batch_size, seq_len, 3), device, dtype)
+    obj_trans = _ensure_bt(batch.get("obj_trans"), (batch_size, seq_len, 3), device, dtype)
+
+    lhand_contact = batch.get("lhand_contact")
+    rhand_contact = batch.get("rhand_contact")
+    obj_contact = batch.get("obj_contact")
+    if isinstance(lhand_contact, torch.Tensor):
+        lhand_first = lhand_contact.to(device=device, dtype=dtype)
+        if lhand_first.dim() == 1:
+            lhand_first = lhand_first.unsqueeze(0)
+        lhand_first = lhand_first[:, 0]
+    else:
+        lhand_first = torch.zeros(batch_size, device=device, dtype=dtype)
+    if isinstance(rhand_contact, torch.Tensor):
+        rhand_first = rhand_contact.to(device=device, dtype=dtype)
+        if rhand_first.dim() == 1:
+            rhand_first = rhand_first.unsqueeze(0)
+        rhand_first = rhand_first[:, 0]
+    else:
+        rhand_first = torch.zeros(batch_size, device=device, dtype=dtype)
+    if isinstance(obj_contact, torch.Tensor):
+        obj_first = obj_contact.to(device=device, dtype=dtype)
+        if obj_first.dim() == 1:
+            obj_first = obj_first.unsqueeze(0)
+        obj_first = obj_first[:, 0]
+    else:
+        obj_first = torch.zeros(batch_size, device=device, dtype=dtype)
+
+    has_object_raw = batch.get("has_object")
+    if isinstance(has_object_raw, torch.Tensor):
+        has_object = has_object_raw.to(device=device, dtype=torch.bool)
+        if has_object.dim() == 0:
+            has_object = has_object.view(1)
+        if has_object.shape[0] == 1 and batch_size > 1:
+            has_object = has_object.expand(batch_size)
+    elif isinstance(has_object_raw, (bool, int)):
+        has_object = torch.full((batch_size,), bool(has_object_raw), dtype=torch.bool, device=device)
+    else:
+        has_object = torch.ones(batch_size, dtype=torch.bool, device=device)
+
+    obj_points_count = int(getattr(cfg, "mesh_downsample_points", 256))
+    obj_points_canonical_raw = batch.get("obj_points_canonical")
+    if isinstance(obj_points_canonical_raw, torch.Tensor):
+        obj_points_canonical = obj_points_canonical_raw.to(device=device, dtype=dtype)
+        if obj_points_canonical.dim() == 2:
+            obj_points_canonical = obj_points_canonical.unsqueeze(0)
+        if obj_points_canonical.shape[0] == 1 and batch_size > 1:
+            obj_points_canonical = obj_points_canonical.expand(batch_size, -1, -1)
+        if obj_points_canonical.dim() != 3 or obj_points_canonical.shape[0] != batch_size or obj_points_canonical.shape[-1] != 3:
+            obj_points_canonical = torch.zeros(batch_size, obj_points_count, 3, device=device, dtype=dtype)
+    else:
+        obj_points_canonical = torch.zeros(batch_size, obj_points_count, 3, device=device, dtype=dtype)
 
     return {
         "human_imu": human_imu,
@@ -307,10 +442,15 @@ def build_model_input_dict(batch, cfg, device, add_noise=True):
         "trans_init": trans[:, 0],
         "trans_gt": trans,
         "hand_vel_glb_init": sensor_vel_glb[:, 0, -2:],
-        "obj_trans_init": torch.zeros(batch_size, 3, device=device, dtype=dtype),
-        "obj_vel_init": torch.zeros(batch_size, 3, device=device, dtype=dtype),
-        "contact_init": torch.zeros(batch_size, 3, device=device, dtype=dtype),
-        "has_object": torch.ones(batch_size, dtype=torch.bool, device=device),
+        "obj_trans_init": obj_trans[:, 0],
+        "obj_vel_init": obj_vel[:, 0],
+        "contact_init": torch.stack((lhand_first, rhand_first, obj_first), dim=-1),
+        "has_object": has_object,
+        "obj_name": batch.get("obj_name"),
+        "obj_points_canonical": obj_points_canonical,
+        "seq_file": batch.get("seq_file"),
+        "window_start": batch.get("window_start"),
+        "window_end": batch.get("window_end"),
     }
 
 
@@ -334,9 +474,19 @@ class BaseTrainer:
         self.train_loader = train_loader
         self.test_loader = test_loader
         self.device = torch.device(cfg.device)
+        self.resume_path = resolve_resume_checkpoint(getattr(cfg, "resume_dir", None))
+        self.resume_checkpoint = None
+        self.start_epoch = 0
+        self.best_loss = float("inf")
+        self.n_iter = 0
 
         pretrained_ckpt = getattr(cfg, "pretrained_ckpt", None)
-        if pretrained_ckpt:
+        if self.resume_path:
+            print(f"Resume checkpoint: {self.resume_path}")
+            self.resume_checkpoint = _torch_load_checkpoint(self.resume_path, map_location=self.device)
+            _load_model_from_checkpoint(self.model, self.resume_checkpoint, strict=False, use_ema=False)
+            print(f"恢复模型权重: {self.resume_path}")
+        elif pretrained_ckpt:
             if os.path.exists(pretrained_ckpt):
                 try:
                     load_checkpoint(self.model, pretrained_ckpt, self.device, strict=False)
@@ -344,6 +494,8 @@ class BaseTrainer:
                     print(f"警告：加载预训练权重失败 {pretrained_ckpt}: {exc}")
             else:
                 print(f"警告：预训练权重文件不存在: {pretrained_ckpt}")
+        if self.resume_path and pretrained_ckpt:
+            print("检测到 --resume_dir，忽略 --pretrained_ckpt；resume 会恢复断点权重。")
 
         if getattr(cfg, "use_multi_gpu", False):
             print(f"Wrapping model with DataParallel for GPUs: {cfg.gpus}")
@@ -352,6 +504,8 @@ class BaseTrainer:
         flatten_lstm_parameters(self.model)
         self.optimizer, self.scheduler = build_optimizer_and_scheduler(self.model, cfg)
         self.scaler = GradScaler(enabled=self.device.type == "cuda")
+        if self.resume_checkpoint is not None:
+            self._restore_training_state(self.resume_checkpoint)
 
         self.writer = None
         if getattr(cfg, "use_tensorboard", False) and not cfg.debug:
@@ -362,8 +516,51 @@ class BaseTrainer:
                 self.writer = SummaryWriter(log_dir=log_dir)
                 print(f"TensorBoard logs: {log_dir}")
 
-        self.best_loss = float("inf")
-        self.n_iter = 0
+    def _restore_training_state(self, checkpoint):
+        if not isinstance(checkpoint, dict):
+            raise ValueError(f"Resume checkpoint must be a dict: {self.resume_path}")
+
+        optimizer_state = checkpoint.get("optimizer_state_dict")
+        if optimizer_state is not None:
+            self.optimizer.load_state_dict(optimizer_state)
+        else:
+            print("警告：resume checkpoint 缺少 optimizer_state_dict，将只恢复权重。")
+
+        scheduler_state = checkpoint.get("scheduler_state_dict")
+        if scheduler_state is not None:
+            self.scheduler.load_state_dict(scheduler_state)
+        else:
+            print("警告：resume checkpoint 缺少 scheduler_state_dict，学习率调度器将从当前配置重新开始。")
+
+        scaler_state = checkpoint.get("scaler_state_dict")
+        if scaler_state is not None:
+            self.scaler.load_state_dict(scaler_state)
+
+        completed_epoch = int(checkpoint.get("epoch", -1))
+        self.start_epoch = completed_epoch + 1
+        self.n_iter = int(checkpoint.get("n_iter", self.start_epoch * max(len(self.train_loader), 1)))
+        self.best_loss = self._resolve_resume_best_loss(checkpoint)
+        _restore_rng_state(checkpoint.get("rng_state"))
+        print(
+            f"恢复训练状态: completed_epoch={completed_epoch}, "
+            f"next_epoch={self.start_epoch}, n_iter={self.n_iter}, best_loss={self.best_loss:.6f}"
+        )
+
+    def _resolve_resume_best_loss(self, checkpoint):
+        if isinstance(checkpoint.get("best_loss"), (int, float)):
+            return float(checkpoint["best_loss"])
+        if os.path.basename(self.resume_path or "") == "best.pt" and isinstance(checkpoint.get("loss"), (int, float)):
+            return float(checkpoint["loss"])
+
+        best_path = os.path.join(self.cfg.save_dir, "best.pt")
+        if os.path.isfile(best_path):
+            try:
+                best_checkpoint = _torch_load_checkpoint(best_path, map_location="cpu")
+                if isinstance(best_checkpoint, dict) and isinstance(best_checkpoint.get("loss"), (int, float)):
+                    return float(best_checkpoint["loss"])
+            except Exception as exc:
+                print(f"警告：读取 best.pt 的 best_loss 失败: {exc}")
+        return float("inf")
 
     def model_forward(self, data_dict, batch=None):
         return self.model(data_dict)
@@ -435,8 +632,14 @@ class BaseTrainer:
     def train(self):
         max_epoch = self.cfg.epoch
         last_train_loss = 0.0
-        for epoch in range(max_epoch):
-            last_train_loss, _ = self.train_epoch(epoch)
+        if self.start_epoch >= max_epoch:
+            print(f"Resume checkpoint already reached epoch {self.start_epoch - 1}; target epochs={max_epoch}.")
+            if self.writer is not None:
+                self.writer.close()
+            return self.model
+
+        for epoch in range(self.start_epoch, max_epoch):
+            last_train_loss, train_components = self.train_epoch(epoch)
             print(f"\rEpoch {epoch}, Train Loss: {last_train_loss:.4f}", end="")
 
             if epoch % 10 == 0 and self.test_loader is not None:
@@ -452,7 +655,13 @@ class BaseTrainer:
                             epoch,
                             save_path,
                             test_loss,
-                            {"test_components": test_components},
+                            {
+                                "test_components": test_components,
+                                "best_loss": self.best_loss,
+                                "n_iter": self.n_iter,
+                            },
+                            scheduler=self.scheduler,
+                            scaler=self.scaler,
                         )
                         print(f"新的最佳测试损失: {self.best_loss:.4f}")
                     if self.writer is not None:
@@ -463,9 +672,33 @@ class BaseTrainer:
                 print()
 
             self.scheduler.step()
+            last_path = os.path.join(self.cfg.save_dir, "last.pt")
+            save_checkpoint(
+                self.model,
+                self.optimizer,
+                epoch,
+                last_path,
+                last_train_loss,
+                {
+                    "train_components": train_components,
+                    "best_loss": self.best_loss,
+                    "n_iter": self.n_iter,
+                },
+                scheduler=self.scheduler,
+                scaler=self.scaler,
+            )
 
         final_path = os.path.join(self.cfg.save_dir, "final.pt")
-        save_checkpoint(self.model, self.optimizer, max_epoch - 1, final_path, last_train_loss)
+        save_checkpoint(
+            self.model,
+            self.optimizer,
+            max_epoch - 1,
+            final_path,
+            last_train_loss,
+            {"best_loss": self.best_loss, "n_iter": self.n_iter},
+            scheduler=self.scheduler,
+            scaler=self.scaler,
+        )
         if self.writer is not None:
             self.writer.close()
         return self.model
