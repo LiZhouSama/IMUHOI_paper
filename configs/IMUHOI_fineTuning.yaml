@@ -60,7 +60,7 @@ REDUCED_POSE_NAMES: ['LeftHip', 'RightHip', 'Spine1', 'Spine2', 'Spine3', 'Neck'
                      'LeftCollar', 'RightCollar', 'LeftShoulder', 'RightShoulder']
 
 # ============ 训练超参数 ============
-epoch: 300
+epochs: 300
 batch_size: 60
 lr: 0.0002
 weight_decay: 0.0001

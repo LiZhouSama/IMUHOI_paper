@@ -15,7 +15,7 @@ from utils.human_pose import (
     load_body_model,
     reduced_root_pose_to_full_global,
 )
-from utils.rotation_conversions import matrix_to_rotation_6d, rotation_6d_to_matrix
+from utils.rotation_conversions import matrix_to_axis_angle, matrix_to_rotation_6d, rotation_6d_to_matrix
 
 from .base import CausalMovingAverage, CrossScaleFusion, InputStem, MambaBlock, RMSNorm, TemporalMambaEncoder
 
@@ -80,6 +80,42 @@ class _GRUPriorEncoder(nn.Module):
         h = self.in_proj(x)
         _, h_n = self.gru(h)
         return self.out_proj(h_n[-1])
+
+
+class _InitConditionedLSTMHead(nn.Module):
+    """RNNWithInit-style temporal head with an input-conditioned initial LSTM state."""
+
+    def __init__(self, in_dim: int, out_dim: int, hidden_dim: int, init_dim: int, layers: int, dropout: float):
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.layers = max(int(layers), 1)
+        self.in_proj = nn.Linear(in_dim, self.hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.rnn = nn.LSTM(
+            input_size=self.hidden_dim,
+            hidden_size=self.hidden_dim,
+            num_layers=self.layers,
+            batch_first=True,
+            dropout=float(dropout) if self.layers > 1 else 0.0,
+        )
+        self.init_net = nn.Sequential(
+            nn.Linear(init_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim * self.layers),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim * self.layers, 2 * self.layers * self.hidden_dim),
+        )
+        self.out_proj = nn.Linear(self.hidden_dim, out_dim)
+
+    def forward(self, inputs: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        x, x_init = inputs
+        batch_size = x.shape[0]
+        init = self.init_net(x_init).view(batch_size, 2, self.layers, self.hidden_dim)
+        h0 = init[:, 0].permute(1, 0, 2).contiguous()
+        c0 = init[:, 1].permute(1, 0, 2).contiguous()
+        h = self.dropout(F.relu(self.in_proj(x)))
+        out, _ = self.rnn(h, (h0, c0))
+        return self.out_proj(out)
 
 
 class _MeshPriorEncoder(nn.Module):
@@ -169,8 +205,11 @@ class InteractionModule(nn.Module):
         self.vel_min_hand_speed = float(_cfg_lookup(cfg, "vel_min_hand_speed", 0.02))
         self.refine_gt_epochs = int(_cfg_lookup(cfg, "refine_gt_epochs", 50))
         self.current_epoch = 0
+        self.left_hand_sensor = _SENSOR_NAMES.index("LeftForeArm")
+        self.right_hand_sensor = _SENSOR_NAMES.index("RightForeArm")
 
-        input_dim = self.num_human_imus * self.imu_dim + self.obj_imu_dim + self.num_joints * 6 + 6 + 3 + 3
+        init_feat_dim = 6 + 3 + 3  # hand velocity init, object velocity init, contact init
+        input_dim = self.num_human_imus * self.imu_dim + self.obj_imu_dim + self.num_joints * 6 + 6 + 3 + 3 + init_feat_dim
         self.stem = InputStem(input_dim, hidden_dim, dropout=dropout, conv_kernel=3)
         self.fast_encoder = TemporalMambaEncoder(hidden_dim, fast_layers, conv_kernel=fast_kernel, dropout=dropout, dilation=1)
         self.slow_filter = CausalMovingAverage(slow_ma_window)
@@ -200,10 +239,14 @@ class InteractionModule(nn.Module):
         self.hand_contact_head = nn.Linear(hidden_dim, 2)
         self.obj_move_head = nn.Linear(hidden_dim, 1)
 
-        fk_input_dim = hidden_dim + 6 + 3 + 1 + self.obj_imu_dim
-        self.lhand_fk_head = _make_mlp(fk_input_dim, hidden_dim, 4, dropout)
-        self.rhand_fk_head = _make_mlp(fk_input_dim, hidden_dim, 4, dropout)
-        self.gating_head = nn.Sequential(nn.Linear(hidden_dim, 64), nn.SiLU(), nn.Dropout(dropout), nn.Linear(64, 3))
+        fk_input_dim = 6 + 3 + 1 + self.obj_imu_dim + self.imu_dim + 3 + 3
+        fk_hidden = int(_cfg_lookup(cfg, "fk_hidden_dim", max(hidden_dim // 2, 128)))
+        fk_layers = int(_cfg_lookup(cfg, "fk_layers", 2))
+        gating_hidden = int(_cfg_lookup(cfg, "gating_hidden_dim", max(hidden_dim // 4, 64)))
+        gating_layers = int(_cfg_lookup(cfg, "gating_layers", 1))
+        self.lhand_fk_head = _InitConditionedLSTMHead(fk_input_dim, 4, fk_hidden, 4, fk_layers, dropout)
+        self.rhand_fk_head = _InitConditionedLSTMHead(fk_input_dim, 4, fk_hidden, 4, fk_layers, dropout)
+        self.gating_head = _InitConditionedLSTMHead(9, 3, gating_hidden, 3, gating_layers, dropout)
 
         refine_input_dim = hidden_dim + 3 + 6 + 2 + 3
         self.refine_proj = nn.Sequential(nn.Linear(refine_input_dim, hidden_dim), nn.SiLU(), nn.Dropout(dropout))
@@ -246,6 +289,41 @@ class InteractionModule(nn.Module):
         if out.shape[0] != batch_size or out.shape[1] != seq_len:
             return torch.full(shape, float(default), device=device, dtype=dtype)
         if trailing_shape != () and tuple(out.shape[2:]) != tuple(trailing_shape):
+            return torch.full(shape, float(default), device=device, dtype=dtype)
+        return out
+
+    @staticmethod
+    def _to_b_vector(value, batch_size: int, dim: int, device, dtype, default: float = 0.0) -> torch.Tensor:
+        shape = (batch_size, dim)
+        if not isinstance(value, torch.Tensor):
+            return torch.full(shape, float(default), device=device, dtype=dtype)
+        out = value.to(device=device, dtype=dtype)
+        if out.dim() == 1:
+            out = out.unsqueeze(0)
+        if out.shape[0] == 1 and batch_size > 1:
+            out = out.expand(batch_size, -1)
+        if out.dim() != 2 or out.shape[0] != batch_size:
+            return torch.full(shape, float(default), device=device, dtype=dtype)
+        if out.shape[-1] < dim:
+            pad = torch.full((batch_size, dim - out.shape[-1]), float(default), device=device, dtype=dtype)
+            out = torch.cat((out, pad), dim=-1)
+        elif out.shape[-1] > dim:
+            out = out[..., :dim]
+        return out
+
+    @staticmethod
+    def _to_b_hand_velocity(value, batch_size: int, device, dtype, default: float = 0.0) -> torch.Tensor:
+        shape = (batch_size, 2, 3)
+        if not isinstance(value, torch.Tensor):
+            return torch.full(shape, float(default), device=device, dtype=dtype)
+        out = value.to(device=device, dtype=dtype)
+        if out.dim() == 2 and out.shape == (2, 3):
+            out = out.unsqueeze(0)
+        elif out.dim() == 2 and out.shape[-1] == 6:
+            out = out.reshape(out.shape[0], 2, 3)
+        if out.dim() == 3 and out.shape[0] == 1 and batch_size > 1:
+            out = out.expand(batch_size, -1, -1)
+        if out.dim() != 3 or out.shape[0] != batch_size or out.shape[1:] != (2, 3):
             return torch.full(shape, float(default), device=device, dtype=dtype)
         return out
 
@@ -297,6 +375,11 @@ class InteractionModule(nn.Module):
         elif out.shape[-1] > self.obj_imu_dim:
             out = out[..., : self.obj_imu_dim]
         return out
+
+    def _select_human_imu(self, human_imu: torch.Tensor, sensor_idx: int) -> torch.Tensor:
+        if sensor_idx < human_imu.shape[2]:
+            return human_imu[:, :, sensor_idx, :]
+        return human_imu.new_zeros(human_imu.shape[0], human_imu.shape[1], self.imu_dim)
 
     def _resolve_full_human_pose(self, hp_out: Optional[Dict], gt_targets: Optional[Dict], batch_size, seq_len, device, dtype):
         pose = hp_out.get("pred_full_pose_6d") if isinstance(hp_out, dict) else None
@@ -430,6 +513,13 @@ class InteractionModule(nn.Module):
         else:
             obj_trans_init = torch.zeros(batch_size, 3, device=device, dtype=dtype)
 
+        hand_vel_init = self._to_b_hand_velocity(data_dict.get("hand_vel_glb_init"), batch_size, device, dtype)
+        obj_vel_init = self._to_b_vector(data_dict.get("obj_vel_init"), batch_size, 3, device, dtype)
+        contact_init = self._to_b_vector(data_dict.get("contact_init"), batch_size, 3, device, dtype)
+        hand_vel_init_seq = hand_vel_init.reshape(batch_size, 1, -1).expand(-1, seq_len, -1)
+        obj_vel_init_seq = obj_vel_init.unsqueeze(1).expand(-1, seq_len, -1)
+        contact_init_seq = contact_init.unsqueeze(1).expand(-1, seq_len, -1)
+
         has_object_mask = self._prepare_has_object_mask(data_dict.get("has_object"), batch_size, seq_len, device)
         input_feat = torch.cat(
             (
@@ -439,6 +529,9 @@ class InteractionModule(nn.Module):
                 hand_pos.reshape(batch_size, seq_len, -1),
                 root_vel,
                 root_trans,
+                hand_vel_init_seq,
+                obj_vel_init_seq,
+                contact_init_seq,
             ),
             dim=-1,
         )
@@ -453,6 +546,9 @@ class InteractionModule(nn.Module):
             "root_trans": root_trans,
             "trans_init": trans_init,
             "obj_trans_init": obj_trans_init,
+            "hand_vel_init": hand_vel_init,
+            "obj_vel_init": obj_vel_init,
+            "contact_init": contact_init,
             "has_object_mask": has_object_mask,
         }
 
@@ -672,6 +768,23 @@ class InteractionModule(nn.Module):
             "contact_prob_pred": hand_prob,
         }
 
+    @staticmethod
+    def _build_fk_inputs(obj_rot6d, hand_pos, hand_contact, obj_imu, hand_imu, obj_vel, obj_rot_delta):
+        return torch.cat((obj_rot6d, hand_pos, hand_contact, obj_imu, hand_imu, obj_vel, obj_rot_delta), dim=-1)
+
+    @staticmethod
+    def _build_gating_inputs(contact_prob, obj_vel, obj_imu_acc):
+        return torch.cat((contact_prob, obj_vel, obj_imu_acc), dim=-1)
+
+    def _rot6d_delta(self, rot6d: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len = rot6d.shape[:2]
+        if seq_len < 2:
+            return rot6d.new_zeros(batch_size, seq_len, 3)
+        rotm = rotation_6d_to_matrix(rot6d.reshape(-1, 6)).reshape(batch_size, seq_len, 3, 3)
+        rel = torch.matmul(rotm[:, 1:].transpose(-1, -2), rotm[:, :-1])
+        delta = matrix_to_axis_angle(rel.reshape(-1, 3, 3)).reshape(batch_size, seq_len - 1, 3)
+        return F.pad(delta, (0, 0, 1, 0))
+
     def _compute_hand_velocity(self, hand_pos: torch.Tensor) -> torch.Tensor:
         vel = torch.zeros_like(hand_pos)
         if hand_pos.shape[1] > 1:
@@ -733,18 +846,27 @@ class InteractionModule(nn.Module):
         rhand_pos = hand_pos[:, :, 1]
         obj_imu = feats["obj_imu"]
         obj_rot6d = obj_imu[..., 3:9]
+        obj_rot_delta = self._rot6d_delta(obj_rot6d)
         obj_rotm = rotation_6d_to_matrix(obj_rot6d.reshape(-1, 6)).reshape(batch_size, seq_len, 3, 3)
+        obj_trans_init = feats["obj_trans_init"]
+        l_oe0, l_lb0 = self._compute_init_dir_len(lhand_pos[:, 0], obj_rotm[:, 0], obj_trans_init)
+        r_oe0, r_lb0 = self._compute_init_dir_len(rhand_pos[:, 0], obj_rotm[:, 0], obj_trans_init)
+        l_init_vec = torch.cat((l_oe0, l_lb0.unsqueeze(-1)), dim=-1)
+        r_init_vec = torch.cat((r_oe0, r_lb0.unsqueeze(-1)), dim=-1)
 
         contact_prob = contact_out["pred_hand_contact_prob"]
         p_left = contact_prob[..., 0:1]
         p_right = contact_prob[..., 1:2]
         p_move = contact_prob[..., 2:3]
         obj_vel = contact_out["pred_obj_vel"]
+        human_imu = feats["human_imu"]
+        lhand_imu = self._select_human_imu(human_imu, self.left_hand_sensor)
+        rhand_imu = self._select_human_imu(human_imu, self.right_hand_sensor)
 
-        l_fk_in = torch.cat((ctx, obj_rot6d, lhand_pos, p_left, obj_imu), dim=-1)
-        r_fk_in = torch.cat((ctx, obj_rot6d, rhand_pos, p_right, obj_imu), dim=-1)
-        l_fk = self.lhand_fk_head(l_fk_in)
-        r_fk = self.rhand_fk_head(r_fk_in)
+        l_fk_in = self._build_fk_inputs(obj_rot6d, lhand_pos, p_left, obj_imu, lhand_imu, obj_vel, obj_rot_delta)
+        r_fk_in = self._build_fk_inputs(obj_rot6d, rhand_pos, p_right, obj_imu, rhand_imu, obj_vel, obj_rot_delta)
+        l_fk = self.lhand_fk_head((l_fk_in, l_init_vec))
+        r_fk = self.rhand_fk_head((r_fk_in, r_init_vec))
         l_dir = self._unit_vector(l_fk[..., :3])
         r_dir = self._unit_vector(r_fk[..., :3])
         l_len = self._positive(l_fk[..., 3])
@@ -760,14 +882,14 @@ class InteractionModule(nn.Module):
         rhand_vel = self._compute_hand_velocity(rhand_pos)
         obj_vel_corrected = self._correct_obj_velocity(obj_vel, lhand_vel, rhand_vel, p_left, p_right, p_move)
 
-        gate_logits = self.gating_head(ctx)
+        gating_input = self._build_gating_inputs(contact_prob, obj_vel, obj_imu[..., :3])
+        gate_logits = self.gating_head((gating_input, feats["contact_init"]))
         prior_imu = 1.0 - p_move.squeeze(-1)
         prior = torch.stack((p_left.squeeze(-1), p_right.squeeze(-1), prior_imu), dim=-1)
         gate_logits = gate_logits + self.gating_prior_beta * torch.log(prior + 1e-6)
         weights_raw = F.softmax(gate_logits / max(self.gating_temperature, 1e-6), dim=-1)
         weights = self._smooth_gating_weights(weights_raw)
 
-        obj_trans_init = feats["obj_trans_init"]
         fused_pos = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
         dt = 1.0 / self.fps
         for t in range(seq_len):
@@ -800,8 +922,6 @@ class InteractionModule(nn.Module):
         l_len = l_len * mask.squeeze(-1)
         r_len = r_len * mask.squeeze(-1)
 
-        l_oe0, l_lb0 = self._compute_init_dir_len(lhand_pos[:, 0], obj_rotm[:, 0], obj_trans_init)
-        r_oe0, r_lb0 = self._compute_init_dir_len(rhand_pos[:, 0], obj_rotm[:, 0], obj_trans_init)
         sample_mask = feats["has_object_mask"].any(dim=1).to(device=device, dtype=dtype)
         l_oe0 = l_oe0 * sample_mask.unsqueeze(-1)
         r_oe0 = r_oe0 * sample_mask.unsqueeze(-1)

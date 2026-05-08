@@ -61,11 +61,11 @@ mamba:
     vel_min_hand_speed: 0.02
 
 # ============ 训练超参数 ============
-epoch: 300
+epochs: 500
 batch_size: 80
 lr: 0.0002
 weight_decay: 0.00001
-milestones: [100, 200]
+milestones: [100, 200, 300, 350, 400, 450, 500]
 gamma: 0.2
 seed: 42
 num_workers: 12
@@ -153,4 +153,4 @@ test:
 # ============ 预训练模块路径（可选）============
 pretrained_modules:
   human_pose: "outputs/IMUHOI_Mamba/human_pose_mamba_04272154/best.pt"
-  interaction: null
+  interaction: "outputs/IMUHOI_Mamba/interaction_mamba_04291803/best.pt"

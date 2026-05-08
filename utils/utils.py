@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 from easydict import EasyDict as edict
-from pytorch3d.transforms import matrix_to_rotation_6d
+from utils.rotation_conversions import matrix_to_rotation_6d
 
 from configs import (
     _SENSOR_POS_INDICES,

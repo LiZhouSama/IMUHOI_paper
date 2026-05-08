@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 from typing import Any, Optional
 
-ARCH_CHOICES = ("rnn", "dit", "mamba")
+ARCH_CHOICES = ("rnn", "dit", "mamba", "mamba_simple")
 _ARCH_ENV = os.environ.get("IMUHOI_MODEL_ARCH", "").lower()
 
 
@@ -27,6 +27,8 @@ def _arch_module(arch: str):
         from . import diffussion as module
     elif arch == "mamba":
         from . import mamba as module
+    elif arch == "mamba_simple":
+        from . import mamba_simple as module
     else:
         from . import rnn as module
     return module
@@ -43,6 +45,8 @@ def InteractionModule(cfg, *args, **kwargs):
         return _arch_module(arch).InteractionModule(cfg, *args, **kwargs)
     if arch == "mamba":
         return _arch_module(arch).InteractionModule(cfg, *args, **kwargs)
+    if arch == "mamba_simple":
+        raise RuntimeError("InteractionModule is not used by model_arch='mamba_simple'; use IMUHOIModel instead.")
     raise RuntimeError("InteractionModule is only available for model_arch='dit'.")
 
 
@@ -52,6 +56,8 @@ def IMUHOIMixModule(cfg, *args, **kwargs):
         return _arch_module(arch).IMUHOIMixModule(cfg, *args, **kwargs)
     if arch == "mamba":
         raise RuntimeError("IMUHOIMixModule is not implemented for model_arch='mamba' yet.")
+    if arch == "mamba_simple":
+        raise RuntimeError("IMUHOIMixModule is not implemented for model_arch='mamba_simple'.")
     raise RuntimeError("IMUHOIMixModule is only available for model_arch='dit'.")
 
 
@@ -63,6 +69,8 @@ def VelocityContactModule(cfg, *args, **kwargs):
         )
     if arch == "mamba":
         raise RuntimeError("VelocityContactModule is not implemented for model_arch='mamba' yet.")
+    if arch == "mamba_simple":
+        return _arch_module(arch).VelocityContactModule(cfg, *args, **kwargs)
     return _arch_module(arch).VelocityContactModule(cfg, *args, **kwargs)
 
 
@@ -74,6 +82,8 @@ def ObjectTransModule(cfg, *args, **kwargs):
         )
     if arch == "mamba":
         raise RuntimeError("ObjectTransModule is not implemented for model_arch='mamba' yet.")
+    if arch == "mamba_simple":
+        return _arch_module(arch).ObjectTransModule(cfg, *args, **kwargs)
     return _arch_module(arch).ObjectTransModule(cfg, *args, **kwargs)
 
 

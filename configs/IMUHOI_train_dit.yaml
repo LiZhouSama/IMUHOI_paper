@@ -38,7 +38,7 @@ eval_sampler: "ddim"
 eval_eta: 0.0
 
 # ============ 训练超参数 ============
-epoch: 500
+epochs: 500
 batch_size: 80
 lr: 0.0002
 weight_decay: 0.00001

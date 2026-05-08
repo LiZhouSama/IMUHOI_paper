@@ -77,7 +77,7 @@ def main():
     print(f"Unified: IMUHOIMixModule training ({mode_str})")
     print(f"device: {cfg.device}")
     print(f"batch size: {cfg.batch_size}")
-    print(f"epochs: {cfg.epoch}")
+    print(f"epochs: {cfg.epochs}")
     print(f"noTrans: {cfg.no_trans}")
     print(f"save dir: {save_dir}")
     print("=" * 50)

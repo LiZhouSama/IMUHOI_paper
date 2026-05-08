@@ -59,7 +59,7 @@ def get_default_dataset_config(no_trans: bool = False):
     
     return {
         # "processed_seg_data_BEHAVE": {
-        #     "data_dir": PROCESS_ROOT / "processed_seg_data_BEHAVE" / "test",
+        #     "data_dir": PROCESS_ROOT / "processed_split_data_BEHAVE" / "test",
         #     "modules": {
         #         "velocity_contact": output_path / "behave" / "modules" / "velocity_contact_best.pt",
         #         "human_pose": output_path / "behave" / "modules" / "human_pose_best.pt",
@@ -704,7 +704,7 @@ def evaluate_model(
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate IMUHOI Model")
-    parser.add_argument("--config", type=str, default="configs/IMUHOI_train_mamba.yaml", help="配置文件路径")
+    parser.add_argument("--config", type=str, default="configs/IMUHOI_train_mamba_simple.yaml", help="配置文件路径")
     parser.add_argument("--dataset", type=str, default=None, help="数据集名称")
     parser.add_argument("--smpl_model_path", type=str, default="datasets/smpl_models/smplh/male/model.npz", help="SMPL模型路径")
     parser.add_argument("--test_data_dir", type=str, default=None, help="测试数据目录")

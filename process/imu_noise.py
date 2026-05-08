@@ -2,7 +2,7 @@ import math
 from typing import Dict, Optional, Tuple
 
 import torch
-import pytorch3d.transforms as transforms
+from utils.rotation_conversions import axis_angle_to_matrix, matrix_to_rotation_6d, rotation_6d_to_matrix
 
 
 # Default noise profile approximating a mid-tier Noitom IMU (consumer-grade MEMS).
@@ -73,7 +73,7 @@ def _apply_acc_noise(acc: torch.Tensor, cfg: Dict[str, float], fps: float) -> to
 
     if cfg.get("acc_misalignment_std", 0.0) > 0:
         misalign = torch.randn(num_sensors, 3, device=device, dtype=dtype) * cfg["acc_misalignment_std"]
-        misalign_R = transforms.axis_angle_to_matrix(misalign).to(dtype=dtype)
+        misalign_R = axis_angle_to_matrix(misalign).to(dtype=dtype)
         acc_flat = acc_base.reshape(seq_len * num_sensors, 3)
         misalign_R_expanded = misalign_R.unsqueeze(0).repeat(seq_len, 1, 1, 1).reshape(seq_len * num_sensors, 3, 3)
         acc_base = torch.bmm(misalign_R_expanded, acc_flat.unsqueeze(-1)).reshape(seq_len, num_sensors, 3)
@@ -97,7 +97,7 @@ def _apply_rot_noise(rot6d: torch.Tensor, cfg: Dict[str, float], fps: float) -> 
     dt = 1.0 / float(fps)
     sqrt_dt = math.sqrt(dt)
 
-    rot_mat = transforms.rotation_6d_to_matrix(rot6d.reshape(-1, 6)).reshape(seq_len, num_sensors, 3, 3)
+    rot_mat = rotation_6d_to_matrix(rot6d.reshape(-1, 6)).reshape(seq_len, num_sensors, 3, 3)
 
     bias0 = torch.randn(num_sensors, 3, device=device, dtype=dtype) * cfg["ori_bias_std"]
     bias_walk = torch.randn(seq_len, num_sensors, 3, device=device, dtype=dtype) * cfg["ori_rw_std"] * sqrt_dt
@@ -113,14 +113,14 @@ def _apply_rot_noise(rot6d: torch.Tensor, cfg: Dict[str, float], fps: float) -> 
     misalign_std = cfg.get("ori_misalignment_std", 0.0)
     if misalign_std > 0:
         misalign = torch.randn(num_sensors, 3, device=device, dtype=dtype) * misalign_std
-        misalign_R = transforms.axis_angle_to_matrix(misalign).to(dtype=dtype)
+        misalign_R = axis_angle_to_matrix(misalign).to(dtype=dtype)
         misalign_R_expanded = misalign_R.unsqueeze(0).expand(seq_len, -1, -1, -1)
     else:
         misalign_R_expanded = torch.eye(3, device=device, dtype=dtype).view(1, 1, 3, 3).expand(seq_len, num_sensors, 3, 3)
 
-    noise_R = transforms.axis_angle_to_matrix(aa_total.reshape(-1, 3)).reshape(seq_len, num_sensors, 3, 3)
+    noise_R = axis_angle_to_matrix(aa_total.reshape(-1, 3)).reshape(seq_len, num_sensors, 3, 3)
     rot_noisy = torch.matmul(rot_mat, torch.matmul(misalign_R_expanded, noise_R))
-    rot6d_noisy = transforms.matrix_to_rotation_6d(rot_noisy.reshape(-1, 3, 3)).reshape(seq_len, num_sensors, 6)
+    rot6d_noisy = matrix_to_rotation_6d(rot_noisy.reshape(-1, 3, 3)).reshape(seq_len, num_sensors, 6)
     return rot6d_noisy
 
 

@@ -904,7 +904,7 @@ class InteractiveViewer(Viewer):
 
 def main():
     parser = argparse.ArgumentParser(description='Interactive IMUHOI Visualization Tool')
-    parser.add_argument('--config', type=str, default='configs/IMUHOI_train_mamba.yaml', help='Path to config file')
+    parser.add_argument('--config', type=str, default='configs/IMUHOI_train_mamba_simple.yaml', help='Path to config file')
     parser.add_argument('--model_arch', type=str, choices=['rnn', 'dit', 'mamba'], default=None, help='Override model architecture in config')
     parser.add_argument('--hp_ckpt', type=str, default=None, help='Override HumanPose checkpoint')
     parser.add_argument('--interaction_ckpt', type=str, default=None, help='Override Interaction/Object checkpoint')

@@ -66,7 +66,7 @@ def merge_config(args):
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
     if args.epochs is not None:
-        cfg.epoch = args.epochs
+        cfg.epochs = args.epochs
     if args.lr is not None:
         cfg.lr = args.lr
     cfg.pretrained_ckpt = args.pretrained_ckpt or getattr(cfg, "pretrained_ckpt", None)
@@ -630,7 +630,7 @@ class BaseTrainer:
         return test_loss, loss_components
 
     def train(self):
-        max_epoch = self.cfg.epoch
+        max_epoch = self.cfg.epochs
         last_train_loss = 0.0
         if self.start_epoch >= max_epoch:
             print(f"Resume checkpoint already reached epoch {self.start_epoch - 1}; target epochs={max_epoch}.")

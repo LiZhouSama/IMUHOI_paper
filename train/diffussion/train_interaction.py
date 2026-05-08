@@ -71,7 +71,7 @@ def main():
     print("Stage 2: InteractionModule training")
     print(f"device: {cfg.device}")
     print(f"batch size: {cfg.batch_size}")
-    print(f"epochs: {cfg.epoch}")
+    print(f"epochs: {cfg.epochs}")
     print(f"save dir: {save_dir}")
     print("=" * 50)
 

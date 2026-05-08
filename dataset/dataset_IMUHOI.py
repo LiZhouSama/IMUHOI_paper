@@ -6,8 +6,8 @@ import torch
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-import pytorch3d.transforms as transforms
 import random # Import random for shuffling sequence info in debug mode
+from utils.rotation_conversions import matrix_to_axis_angle, matrix_to_rotation_6d, rotation_6d_to_matrix
 
 from configs import (
     FRAME_RATE, _SENSOR_POS_INDICES, _SENSOR_ROT_INDICES, _VEL_SELECTION_INDICES,
@@ -33,7 +33,7 @@ def _build_human_imu_root(position_global: torch.Tensor,
     root_imu_ori = rot[:, 0]
     imu_acc_norm = torch.cat((acc[:, :1], acc[:, 1:] - acc[:, :1]), dim=1).bmm(root_imu_ori)
     imu_ori_norm = torch.cat((rot[:, :1], rot[:, :1].transpose(2, 3).matmul(rot[:, 1:])), dim=1)
-    imu_ori_norm_6d = transforms.matrix_to_rotation_6d(imu_ori_norm)
+    imu_ori_norm_6d = matrix_to_rotation_6d(imu_ori_norm)
     imu = torch.cat((imu_acc_norm, imu_ori_norm_6d), dim=-1)
     return imu  # [T, 6, 9]
 
@@ -57,7 +57,7 @@ def _compute_joint_velocity_root(rotation_global: torch.Tensor,
 def _build_object_imu(obj_rot: torch.Tensor, obj_pos: torch.Tensor, fps: float) -> torch.Tensor:
     """计算物体的 IMU 特征（姿态 + 加速度）。"""
     if obj_rot.shape[-1] != 6:
-        ori_obj_6d = transforms.matrix_to_rotation_6d(obj_rot.reshape(-1, 3, 3))
+        ori_obj_6d = matrix_to_rotation_6d(obj_rot.reshape(-1, 3, 3))
     else:
         ori_obj_6d = obj_rot
     vel_obj = _central_diff(obj_pos, 1.0 / fps)
@@ -118,7 +118,7 @@ def compute_obj_direction_supervision(position_global, obj_trans, obj_rot,
     seq_len = obj_trans.shape[0]
     
     # 将6D旋转表示转换为旋转矩阵
-    obj_rot_mat = transforms.rotation_6d_to_matrix(obj_rot)  # [seq, 3, 3]
+    obj_rot_mat = rotation_6d_to_matrix(obj_rot)  # [seq, 3, 3]
     
     # 初始化结果
     result = {
@@ -403,7 +403,7 @@ class IMUDataset(Dataset):
             # 获取实际的序列长度（考虑full_sequence模式）
             actual_seq_len = end_idx - start_idx
             
-            pose = transforms.matrix_to_axis_angle(transforms.rotation_6d_to_matrix(
+            pose = matrix_to_axis_angle(rotation_6d_to_matrix(
                 seq_data["rotation_local_full_gt_list"].reshape(seq_len, -1, 6)[start_idx:end_idx])).reshape(actual_seq_len, -1) # [seq, 66]
             position_global_full = seq_data["position_global_full_gt_world"][start_idx:end_idx]  # [seq, J, 3]
             rotation_global_full = seq_data["rotation_global"][start_idx:end_idx]  # [seq, J, 3, 3]
@@ -462,7 +462,7 @@ class IMUDataset(Dataset):
             imu_dim = human_imu.shape[-1]
             obj_trans = torch.zeros(actual_seq_len, 3, device=device, dtype=dtype)
             obj_rot = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(actual_seq_len, 1, 1)
-            obj_rot_6d = transforms.matrix_to_rotation_6d(obj_rot.reshape(-1, 3, 3)).reshape(actual_seq_len, 6)
+            obj_rot_6d = matrix_to_rotation_6d(obj_rot.reshape(-1, 3, 3)).reshape(actual_seq_len, 6)
             obj_scale = torch.ones(actual_seq_len, device=device, dtype=dtype)
             obj_imu = torch.zeros(actual_seq_len, imu_dim, device=device, dtype=dtype)
             obj_vel = torch.zeros(actual_seq_len, 3, device=device, dtype=dtype)
@@ -472,7 +472,7 @@ class IMUDataset(Dataset):
                 obj_name = seq_data.get("obj_name", "unknown_object")
                 obj_trans = seq_data["obj_trans"][start_idx:end_idx].squeeze(-1).to(device=device, dtype=dtype)
                 obj_rot = seq_data["obj_rot"][start_idx:end_idx].to(device=device, dtype=dtype)
-                obj_rot_6d = transforms.matrix_to_rotation_6d(obj_rot.reshape(-1, 3, 3)).reshape(actual_seq_len, 6)
+                obj_rot_6d = matrix_to_rotation_6d(obj_rot.reshape(-1, 3, 3)).reshape(actual_seq_len, 6)
                 obj_scale = seq_data["obj_scale"][start_idx:end_idx].to(device=device, dtype=dtype)
                 if obj_imu_real is not None:
                     obj_imu = obj_imu_real
@@ -508,7 +508,7 @@ class IMUDataset(Dataset):
                         obj_points_canonical = points
             else:
                 # 无物体时保持占位但不使用接触信息
-                obj_rot_6d = transforms.matrix_to_rotation_6d(obj_rot.reshape(-1, 3, 3)).reshape(actual_seq_len, 6)
+                obj_rot_6d = matrix_to_rotation_6d(obj_rot.reshape(-1, 3, 3)).reshape(actual_seq_len, 6)
 
             # --- 提前初始化所有接触窗口变量 ---
             lfoot_contact_window = seq_data.get("lfoot_contact", torch.zeros(seq_len, dtype=torch.float))[start_idx:end_idx]

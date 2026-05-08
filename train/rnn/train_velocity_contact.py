@@ -9,7 +9,8 @@ import torch
 from tqdm import tqdm
 
 # add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, PROJECT_ROOT)
 
 from model import VelocityContactModule, HumanPoseModule
 from train.rnn.loss.velocity_contact_loss import VelocityContactLoss
@@ -125,7 +126,7 @@ def main():
     print("Stage 2: VelocityContactModule training")
     print(f"Device: {cfg.device}")
     print(f"Batch size: {cfg.batch_size}")
-    print(f"Epochs: {cfg.epoch}")
+    print(f"Epochs: {cfg.epochs}")
     print(f"Learning rate: {cfg.lr}")
     if getattr(cfg, "pretrained_ckpt", None):
         print(f"Pretrained: {cfg.pretrained_ckpt}")

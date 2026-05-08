@@ -10,7 +10,10 @@ from datetime import datetime
 import torch
 from torch import optim
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard.writer import SummaryWriter
+try:
+    from torch.utils.tensorboard.writer import SummaryWriter
+except Exception:
+    SummaryWriter = None
 from torch.cuda.amp.grad_scaler import GradScaler
 from tqdm import tqdm
 
@@ -53,7 +56,7 @@ def get_base_args():
     parser.add_argument('--pretrained_ckpt', type=str, default=None, help='预训练权重路径')
     parser.add_argument('--debug', action='store_true', help='调试模式')
     parser.add_argument('--no_trans', action='store_true', help='禁用根节点位移预测')
-    parser.add_argument('--model_arch', type=str, choices=['rnn', 'dit'], default=None, help='选择模型架构(rnn/dit)')
+    parser.add_argument('--model_arch', type=str, choices=['rnn', 'dit', 'mamba_simple'], default=None, help='选择模型架构(rnn/dit/mamba_simple)')
     return parser
 
 
@@ -70,7 +73,7 @@ def merge_config(args):
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
     if args.epochs is not None:
-        cfg.epoch = args.epochs
+        cfg.epochs = args.epochs
     if args.lr is not None:
         cfg.lr = args.lr
     cfg.pretrained_ckpt = args.pretrained_ckpt or getattr(cfg, 'pretrained_ckpt', None)
@@ -111,7 +114,7 @@ def create_dataloaders(cfg, project_root=None):
         train_loader, test_loader
     """
     if project_root is None:
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     
     # 获取要使用的数据集列表
     train_datasets = getattr(cfg, 'train_datasets', None)
@@ -242,10 +245,12 @@ class BaseTrainer:
         
         # TensorBoard
         self.writer = None
-        if cfg.use_tensorboard and not cfg.debug:
+        if cfg.use_tensorboard and not cfg.debug and SummaryWriter is not None:
             log_dir = os.path.join(cfg.save_dir, 'tensorboard_logs')
             self.writer = SummaryWriter(log_dir=log_dir)
             print(f'TensorBoard logs: {log_dir}')
+        elif cfg.use_tensorboard and not cfg.debug:
+            print('TensorBoard is unavailable; continue without SummaryWriter.')
         
         self.best_loss = float('inf')
         self.n_iter = 0
@@ -339,7 +344,7 @@ class BaseTrainer:
     
     def train(self):
         """完整训练循环"""
-        max_epoch = self.cfg.epoch
+        max_epoch = self.cfg.epochs
         
         for epoch in range(max_epoch):
             train_loss, train_components = self.train_epoch(epoch)

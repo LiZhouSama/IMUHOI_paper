@@ -16,7 +16,8 @@ import torch
 from tqdm import tqdm
 
 # 添加项目根目录到路径
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, PROJECT_ROOT)
 
 from model import VelocityContactModule, HumanPoseModule, ObjectTransModule
 from train.rnn.loss import VelocityContactLoss, HumanPoseLoss, ObjectTransLoss
@@ -310,7 +311,7 @@ class Stage3JointTrainer:
     
     def train(self):
         """完整训练循环"""
-        max_epoch = self.cfg.epoch
+        max_epoch = self.cfg.epochs
         
         for epoch in range(max_epoch):
             train_loss, train_components = self.train_epoch(epoch)
@@ -399,7 +400,7 @@ def main():
     print(f"{mode_str}: ObjectTransModule训练 ({trans_str}模式)")
     print(f"设备: {cfg.device}")
     print(f"批次大小: {cfg.batch_size}")
-    print(f"训练轮数: {cfg.epoch}")
+    print(f"训练轮数: {cfg.epochs}")
     print(f"noTrans模式: {cfg.no_trans}")
     print(f"保存目录: {save_dir}")
     print("=" * 50)

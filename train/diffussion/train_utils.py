@@ -77,7 +77,7 @@ def merge_config(args):
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
     if args.epochs is not None:
-        cfg.epoch = args.epochs
+        cfg.epochs = args.epochs
     if args.lr is not None:
         cfg.lr = args.lr
     cfg.pretrained_ckpt = args.pretrained_ckpt or getattr(cfg, "pretrained_ckpt", None)
@@ -497,7 +497,7 @@ class BaseTrainer:
 
     def train(self):
         """完整训练循环"""
-        max_epoch = self.cfg.epoch
+        max_epoch = self.cfg.epochs
 
         for epoch in range(max_epoch):
             train_loss, train_components = self.train_epoch(epoch)

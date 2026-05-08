@@ -3,7 +3,7 @@ HumanPoseModule的损失函数
 """
 import torch
 import torch.nn.functional as F
-from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_rotation_6d
+from utils.rotation_conversions import rotation_6d_to_matrix, matrix_to_rotation_6d
 
 from configs import _SENSOR_VEL_NAMES, _REDUCED_POSE_NAMES
 

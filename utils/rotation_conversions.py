@@ -60,3 +60,40 @@ def matrix_to_axis_angle(matrix: torch.Tensor) -> torch.Tensor:
         aa[small] = 0.0
     return aa.reshape(*orig_shape, 3)
 
+
+def axis_angle_to_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
+    """Convert axis-angle vectors to rotation matrices."""
+    if axis_angle.shape[-1] != 3:
+        raise ValueError(f"axis-angle input must end with 3 dims, got {axis_angle.shape}")
+
+    orig_shape = axis_angle.shape[:-1]
+    aa = axis_angle.reshape(-1, 3)
+    angle = torch.linalg.norm(aa, dim=-1, keepdim=True)
+    axis = aa / angle.clamp_min(1e-8)
+
+    x, y, z = axis.unbind(dim=-1)
+    zeros = torch.zeros_like(x)
+    k = torch.stack(
+        (
+            zeros,
+            -z,
+            y,
+            z,
+            zeros,
+            -x,
+            -y,
+            x,
+            zeros,
+        ),
+        dim=-1,
+    ).reshape(-1, 3, 3)
+
+    eye = torch.eye(3, device=axis_angle.device, dtype=axis_angle.dtype).expand(aa.shape[0], 3, 3)
+    sin = torch.sin(angle).view(-1, 1, 1)
+    cos = torch.cos(angle).view(-1, 1, 1)
+    rot = eye + sin * k + (1.0 - cos) * torch.matmul(k, k)
+
+    small = angle.squeeze(-1) < 1e-8
+    if bool(small.any()):
+        rot[small] = eye[small]
+    return rot.reshape(*orig_shape, 3, 3)
