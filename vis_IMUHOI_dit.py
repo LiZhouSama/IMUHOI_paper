@@ -1142,7 +1142,7 @@ def main():
             window_size=test_window_size,
             debug=dataset_debug,
             full_sequence=True,
-            simulate_imu_noise=True,
+            simulate_imu_noise=False,
             sequence_paths=[target_pt],
         )
         if len(test_dataset.sequence_info) != 1:

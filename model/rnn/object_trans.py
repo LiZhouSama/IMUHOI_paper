@@ -7,8 +7,275 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_axis_angle
 
-from .base import RNNWithInit
-from configs import FRAME_RATE, _SENSOR_NAMES
+from .base import RNN, RNNWithInit
+from configs import FRAME_RATE, _REDUCED_POSE_NAMES, _SENSOR_NAMES
+
+
+def _make_mlp(in_dim: int, hidden_dim: int, out_dim: int, dropout: float) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Linear(in_dim, hidden_dim),
+        nn.GELU(),
+        nn.Dropout(dropout),
+        nn.Linear(hidden_dim, out_dim),
+        nn.GELU(),
+    )
+
+
+def _gather_neighbors(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    # x: [B,N,C], idx: [B,N,K]
+    batch_size, num_points, channels = x.shape
+    k = idx.shape[-1]
+    x_expand = x.unsqueeze(1).expand(batch_size, num_points, num_points, channels)
+    idx_expand = idx.unsqueeze(-1).expand(batch_size, num_points, k, channels)
+    return torch.gather(x_expand, dim=2, index=idx_expand)
+
+
+def _knn_indices(x: torch.Tensor, k: int) -> torch.Tensor:
+    k = min(max(int(k), 1), int(x.shape[1]))
+    with torch.no_grad():
+        dist = torch.cdist(x.float(), x.float())
+        return dist.topk(k=k, dim=-1, largest=False).indices
+
+
+class _EdgeConvBlock(nn.Module):
+    """Small dependency-free EdgeConv block used by the RNN mesh prior."""
+
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(in_dim * 2, out_dim),
+            nn.GELU(),
+            nn.Linear(out_dim, out_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor, knn_source: torch.Tensor, k: int) -> torch.Tensor:
+        idx = _knn_indices(knn_source.detach(), k)
+        neigh = _gather_neighbors(x, idx)
+        center = x.unsqueeze(2).expand_as(neigh)
+        edge = torch.cat((center, neigh - center), dim=-1)
+        return self.edge_mlp(edge).amax(dim=2)
+
+
+class _DGCNNLiteEncoder(nn.Module):
+    """DGCNN-lite point encoder with chunked kNN to keep memory bounded."""
+
+    def __init__(self, hidden_dim: int, k: int, chunk_size: int = 64):
+        super().__init__()
+        mid_dim = max(hidden_dim // 2, 32)
+        self.k = int(max(k, 1))
+        self.chunk_size = int(max(chunk_size, 1))
+        self.edge1 = _EdgeConvBlock(3, mid_dim)
+        self.edge2 = _EdgeConvBlock(mid_dim, hidden_dim)
+        self.out_proj = nn.Linear(mid_dim + hidden_dim, hidden_dim)
+        self.out_norm = nn.LayerNorm(hidden_dim)
+
+    def _forward_chunk(self, points: torch.Tensor) -> torch.Tensor:
+        f1 = self.edge1(points, points, self.k)
+        f2 = self.edge2(f1, f1, self.k)
+        return self.out_norm(self.out_proj(torch.cat((f1, f2), dim=-1)))
+
+    def forward(self, points: torch.Tensor) -> torch.Tensor:
+        # points: [B,T,N,3] -> [B,T,N,H]
+        batch_size, seq_len, num_points, _ = points.shape
+        flat = points.reshape(batch_size * seq_len, num_points, 3)
+        chunks = []
+        for start in range(0, flat.shape[0], self.chunk_size):
+            chunks.append(self._forward_chunk(flat[start:start + self.chunk_size]))
+        return torch.cat(chunks, dim=0).reshape(batch_size, seq_len, num_points, -1)
+
+
+class _ObsEncoder(nn.Module):
+    """Observation prior encoder: IMU + human context -> per-frame interaction code."""
+
+    def __init__(
+        self,
+        *,
+        obj_imu_dim: int,
+        pose_dim: int,
+        hidden_dim: int,
+        code_dim: int,
+        layers: int,
+        dropout: float,
+    ):
+        super().__init__()
+        self.in_dim = obj_imu_dim + pose_dim + 3 + 6
+        self.in_proj = nn.Sequential(
+            nn.Linear(self.in_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout),
+        )
+        layers = max(int(layers), 1)
+        self.temporal = nn.GRU(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=layers,
+            batch_first=True,
+            dropout=float(dropout) if layers > 1 else 0.0,
+        )
+        self.out_proj = nn.Linear(hidden_dim, code_dim)
+
+    def forward(
+        self,
+        obj_imu: torch.Tensor,
+        human_pose: torch.Tensor,
+        root_trans: torch.Tensor,
+        hand_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        x = torch.cat(
+            (
+                obj_imu,
+                human_pose,
+                root_trans,
+                hand_positions.reshape(hand_positions.shape[0], hand_positions.shape[1], -1),
+            ),
+            dim=-1,
+        )
+        h = self.in_proj(x)
+        h, _ = self.temporal(h)
+        return self.out_proj(h)
+
+
+class _MeshPriorEncoder(nn.Module):
+    """Privileged mesh teacher: local object geometry + human context -> per-frame code."""
+
+    def __init__(
+        self,
+        *,
+        pose_dim: int,
+        hidden_dim: int,
+        code_dim: int,
+        layers: int,
+        dropout: float,
+        k: int,
+        chunk_size: int,
+    ):
+        super().__init__()
+        self.pose_dim = int(pose_dim)
+        self.point_encoder = _DGCNNLiteEncoder(hidden_dim=hidden_dim, k=k, chunk_size=chunk_size)
+        self.human_mlp = _make_mlp(self.pose_dim + 3 + 6, hidden_dim, hidden_dim, dropout)
+        heads = 8
+        while hidden_dim % heads != 0 and heads > 1:
+            heads //= 2
+        self.cross_attn = nn.MultiheadAttention(hidden_dim, num_heads=heads, dropout=dropout, batch_first=True)
+        self.frame_fuse = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout),
+        )
+        layers = max(int(layers), 1)
+        self.temporal = nn.GRU(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=layers,
+            batch_first=True,
+            dropout=float(dropout) if layers > 1 else 0.0,
+        )
+        self.out_proj = nn.Linear(hidden_dim, code_dim)
+
+    @staticmethod
+    def _expand_bt(value, batch_size, seq_len, trailing_shape, device, dtype, default=0.0):
+        shape = (batch_size, seq_len, *trailing_shape)
+        if not isinstance(value, torch.Tensor):
+            return torch.full(shape, float(default), device=device, dtype=dtype), False
+        out = value.to(device=device, dtype=dtype)
+        if out.dim() == len(shape) - 1:
+            out = out.unsqueeze(0)
+        if out.shape[0] == 1 and batch_size > 1:
+            out = out.expand(batch_size, *out.shape[1:])
+        if out.dim() != len(shape) or out.shape[:2] != (batch_size, seq_len):
+            return torch.full(shape, float(default), device=device, dtype=dtype), False
+        if tuple(out.shape[2:]) != tuple(trailing_shape):
+            return torch.full(shape, float(default), device=device, dtype=dtype), False
+        return out, True
+
+    @staticmethod
+    def _resolve_rot_mats(value, batch_size, seq_len, device, dtype):
+        if not isinstance(value, torch.Tensor):
+            return None
+        rot = value.to(device=device, dtype=dtype)
+        if rot.dim() == 2 and rot.shape[-1] == 6:
+            rot = rot.unsqueeze(0)
+        if rot.dim() == 3 and rot.shape[-1] == 6:
+            if rot.shape[0] == 1 and batch_size > 1:
+                rot = rot.expand(batch_size, -1, -1)
+            if rot.shape[:2] == (batch_size, seq_len):
+                return rotation_6d_to_matrix(rot.reshape(-1, 6)).reshape(batch_size, seq_len, 3, 3)
+        if rot.dim() == 3 and rot.shape[-2:] == (3, 3):
+            rot = rot.unsqueeze(0)
+        if rot.dim() == 4 and rot.shape[-2:] == (3, 3):
+            if rot.shape[0] == 1 and batch_size > 1:
+                rot = rot.expand(batch_size, -1, -1, -1)
+            if rot.shape[:2] == (batch_size, seq_len):
+                return rot
+        return None
+
+    @staticmethod
+    def _prepare_points(value, batch_size, device, dtype):
+        if not isinstance(value, torch.Tensor):
+            return None
+        points = value.to(device=device, dtype=dtype)
+        if points.dim() == 2:
+            points = points.unsqueeze(0)
+        if points.shape[0] == 1 and batch_size > 1:
+            points = points.expand(batch_size, -1, -1)
+        if points.dim() != 3 or points.shape[0] != batch_size or points.shape[-1] != 3:
+            return None
+        return points
+
+    def forward(
+        self,
+        *,
+        obj_points_canonical,
+        obj_rot_gt,
+        obj_trans_gt,
+        obj_scale_gt,
+        hand_positions: torch.Tensor,
+        human_pose: torch.Tensor,
+        root_trans: torch.Tensor,
+        sample_has_object: torch.Tensor,
+    ):
+        batch_size, seq_len = hand_positions.shape[:2]
+        device = hand_positions.device
+        dtype = hand_positions.dtype
+        zero_code = torch.zeros(batch_size, seq_len, self.out_proj.out_features, device=device, dtype=dtype)
+        valid_mask = torch.zeros(batch_size, device=device, dtype=torch.bool)
+
+        points = self._prepare_points(obj_points_canonical, batch_size, device, dtype)
+        obj_rot_mats = self._resolve_rot_mats(obj_rot_gt, batch_size, seq_len, device, dtype)
+        obj_trans, trans_ok = self._expand_bt(obj_trans_gt, batch_size, seq_len, (3,), device, dtype, default=0.0)
+        obj_scale, _ = self._expand_bt(obj_scale_gt, batch_size, seq_len, (), device, dtype, default=1.0)
+        if points is None or obj_rot_mats is None or not trans_ok:
+            return zero_code, valid_mask
+
+        nonzero_points = points.abs().sum(dim=(1, 2)) > 1e-8
+        valid_mask = sample_has_object.to(device=device, dtype=torch.bool) & nonzero_points
+        if not valid_mask.any():
+            return zero_code, valid_mask
+
+        points_seq = points[:, None] * obj_scale[:, :1].view(batch_size, 1, 1, 1)
+        obj_rt = obj_rot_mats.transpose(-1, -2)
+        hand_local = torch.matmul(
+            obj_rt.unsqueeze(2),
+            (hand_positions - obj_trans.unsqueeze(2)).unsqueeze(-1),
+        ).squeeze(-1)
+        root_local = torch.matmul(obj_rt, (root_trans - obj_trans).unsqueeze(-1)).squeeze(-1)
+
+        point_tokens = self.point_encoder(points_seq).expand(-1, seq_len, -1, -1)
+        human_token = self.human_mlp(torch.cat((human_pose, root_local, hand_local.reshape(batch_size, seq_len, -1)), dim=-1))
+
+        bt = batch_size * seq_len
+        query = human_token.reshape(bt, 1, -1)
+        key_value = point_tokens.reshape(bt, point_tokens.shape[2], point_tokens.shape[3])
+        attn_token, _ = self.cross_attn(query, key_value, key_value, need_weights=False)
+        attn_token = attn_token.reshape(batch_size, seq_len, -1)
+        obj_token = point_tokens.amax(dim=2)
+        fused = self.frame_fuse(torch.cat((human_token, attn_token, obj_token), dim=-1))
+        temporal, _ = self.temporal(fused)
+        code = self.out_proj(temporal)
+        return code * valid_mask.to(dtype=dtype).view(batch_size, 1, 1), valid_mask
 
 
 class ObjectTransModule(nn.Module):
@@ -18,7 +285,8 @@ class ObjectTransModule(nn.Module):
     """
     def __init__(self, cfg):
         super().__init__()
-        self.imu_dim = getattr(cfg, "imu_dim", 9)
+        self.imu_dim = int(getattr(cfg, "imu_dim", 9))
+        self.obj_imu_dim = int(max(getattr(cfg, "obj_imu_dim", self.imu_dim), 9))
         self.num_human_imus = getattr(cfg, "num_human_imus", len(_SENSOR_NAMES))
         hidden_dim_multiplier = getattr(cfg, "hidden_dim_multiplier", 1)
 
@@ -32,9 +300,42 @@ class ObjectTransModule(nn.Module):
         # 速度校正参数
         self.vel_static_threshold = getattr(cfg, "vel_static_threshold", 0.3)
         self.vel_min_hand_speed = getattr(cfg, "vel_min_hand_speed", 0.02)
+        self.refine_pose_dim = len(_REDUCED_POSE_NAMES) * 6
 
-        n_fk_branch_input = 34
-        n_gating_input = 9
+        self.interaction_code_dim = int(getattr(cfg, "interaction_code_dim", getattr(cfg, "object_code_dim", 128)))
+        prior_hidden_dim = int(getattr(cfg, "prior_encoder_hidden_dim", 256))
+        prior_layers = int(getattr(cfg, "prior_encoder_layers", 2))
+        prior_dropout = float(getattr(cfg, "prior_encoder_dropout", 0.1))
+        dgcnn_k = int(getattr(cfg, "dgcnn_k", 16))
+        dgcnn_chunk_size = int(getattr(cfg, "dgcnn_chunk_size", 64))
+        mode_probs_cfg = getattr(cfg, "cond_mode_probs", [0.4, 0.4, 0.2])
+        if not isinstance(mode_probs_cfg, (list, tuple)) or len(mode_probs_cfg) != 3:
+            mode_probs_cfg = [0.4, 0.4, 0.2]
+        cond_mode_probs = torch.tensor(mode_probs_cfg, dtype=torch.float32)
+        if float(cond_mode_probs.sum().item()) <= 0.0:
+            cond_mode_probs = torch.tensor([0.4, 0.4, 0.2], dtype=torch.float32)
+        self.register_buffer("cond_mode_probs", cond_mode_probs / cond_mode_probs.sum().clamp_min(1e-8), persistent=False)
+
+        self.mesh_prior_encoder = _MeshPriorEncoder(
+            pose_dim=self.refine_pose_dim,
+            hidden_dim=prior_hidden_dim,
+            code_dim=self.interaction_code_dim,
+            layers=prior_layers,
+            dropout=prior_dropout,
+            k=dgcnn_k,
+            chunk_size=dgcnn_chunk_size,
+        )
+        self.obs_encoder = _ObsEncoder(
+            obj_imu_dim=self.obj_imu_dim,
+            pose_dim=self.refine_pose_dim,
+            hidden_dim=prior_hidden_dim,
+            code_dim=self.interaction_code_dim,
+            layers=prior_layers,
+            dropout=prior_dropout,
+        )
+
+        n_fk_branch_input = 6 + 3 + 1 + self.obj_imu_dim + self.imu_dim + 3 + 3 + self.interaction_code_dim
+        n_gating_input = 9 + self.interaction_code_dim
 
         # 左手FK预测头
         self.lhand_fk_head = RNNWithInit(
@@ -68,6 +369,18 @@ class ObjectTransModule(nn.Module):
             bidirectional=False,
             dropout=0.2,
         )
+
+        n_refine_input = self.refine_pose_dim + 21
+        self.refine_head = RNN(
+            n_input=n_refine_input,
+            n_output=self.refine_pose_dim + 3,
+            n_hidden=128 * hidden_dim_multiplier,
+            n_rnn_layer=2,
+            bidirectional=False,
+            dropout=0.2,
+        )
+        nn.init.zeros_(self.refine_head.linear2.weight)
+        nn.init.zeros_(self.refine_head.linear2.bias)
 
     @staticmethod
     def _unit_vector(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -123,11 +436,150 @@ class ObjectTransModule(nn.Module):
 
         return smoothed_weights
 
-    def _build_fk_inputs(self, obj_rot6d, hand_pos, hand_contact_scalar, obj_imu9, hand_imu9, obj_vel3, obj_rot_delta3):
-        return torch.cat([obj_rot6d, hand_pos, hand_contact_scalar, obj_imu9, hand_imu9, obj_vel3, obj_rot_delta3], dim=2)
+    def _build_fk_inputs(self, obj_rot6d, hand_pos, hand_contact_scalar, obj_imu9, hand_imu9, obj_vel3, obj_rot_delta3, interaction_code):
+        return torch.cat(
+            [obj_rot6d, hand_pos, hand_contact_scalar, obj_imu9, hand_imu9, obj_vel3, obj_rot_delta3, interaction_code],
+            dim=2,
+        )
 
-    def _build_gating_inputs(self, contact_prob3, obj_vel3, obj_imu_acc3):
-        return torch.cat([contact_prob3, obj_vel3, obj_imu_acc3], dim=2)
+    def _build_gating_inputs(self, contact_prob3, obj_vel3, obj_imu_acc3, interaction_code):
+        return torch.cat([contact_prob3, obj_vel3, obj_imu_acc3, interaction_code], dim=2)
+
+    @staticmethod
+    def _pad_or_trim_last_dim(x: torch.Tensor, out_dim: int) -> torch.Tensor:
+        if x.shape[-1] == out_dim:
+            return x
+        if x.shape[-1] > out_dim:
+            return x[..., :out_dim]
+        pad_shape = (*x.shape[:-1], out_dim - x.shape[-1])
+        return torch.cat((x, torch.zeros(pad_shape, device=x.device, dtype=x.dtype)), dim=-1)
+
+    def _prepare_obj_imu(self, obj_imu: torch.Tensor, batch_size: int, seq_len: int, device, dtype) -> torch.Tensor:
+        if not isinstance(obj_imu, torch.Tensor):
+            return torch.zeros(batch_size, seq_len, self.obj_imu_dim, device=device, dtype=dtype)
+        out = obj_imu.to(device=device, dtype=dtype)
+        if out.dim() == 4:
+            out = out.reshape(batch_size, seq_len, -1)
+        if out.dim() == 2:
+            out = out.unsqueeze(0)
+        if out.shape[0] == 1 and batch_size > 1:
+            out = out.expand(batch_size, -1, -1)
+        if out.dim() != 3 or out.shape[:2] != (batch_size, seq_len):
+            return torch.zeros(batch_size, seq_len, self.obj_imu_dim, device=device, dtype=dtype)
+        return self._pad_or_trim_last_dim(out, self.obj_imu_dim)
+
+    def _prepare_human_imu(self, human_imu: torch.Tensor, batch_size: int, seq_len: int, device, dtype) -> torch.Tensor:
+        if not isinstance(human_imu, torch.Tensor):
+            return torch.zeros(batch_size, seq_len, self.num_human_imus, self.imu_dim, device=device, dtype=dtype)
+        out = human_imu.to(device=device, dtype=dtype)
+        if out.dim() == 3 and out.shape[-1] == self.num_human_imus * self.imu_dim:
+            out = out.view(batch_size, seq_len, self.num_human_imus, self.imu_dim)
+        if out.dim() != 4 or out.shape[:2] != (batch_size, seq_len):
+            return torch.zeros(batch_size, seq_len, self.num_human_imus, self.imu_dim, device=device, dtype=dtype)
+        if out.shape[2] != self.num_human_imus or out.shape[3] != self.imu_dim:
+            flat = out.reshape(batch_size, seq_len, -1)
+            flat = self._pad_or_trim_last_dim(flat, self.num_human_imus * self.imu_dim)
+            out = flat.view(batch_size, seq_len, self.num_human_imus, self.imu_dim)
+        return out
+
+    def _prepare_pose_feature(self, human_pose_input, batch_size, seq_len, device, dtype):
+        pose = self._prepare_refine_pose(human_pose_input, batch_size, seq_len, device, dtype)
+        if pose is None:
+            return torch.zeros(batch_size, seq_len, self.refine_pose_dim, device=device, dtype=dtype)
+        return pose
+
+    @staticmethod
+    def _prepare_root_feature(root_trans_input, batch_size, seq_len, device, dtype):
+        if not isinstance(root_trans_input, torch.Tensor):
+            return torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
+        root = root_trans_input.to(device=device, dtype=dtype)
+        if root.dim() == 2:
+            root = root.unsqueeze(1).expand(batch_size, seq_len, 3)
+        if root.dim() == 3 and root.shape[:2] == (batch_size, seq_len) and root.shape[-1] == 3:
+            return root
+        return torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
+
+    @staticmethod
+    def _sample_has_object(has_object_mask, batch_size, seq_len, device) -> torch.Tensor:
+        if has_object_mask is None:
+            return torch.ones(batch_size, device=device, dtype=torch.bool)
+        if isinstance(has_object_mask, torch.Tensor):
+            mask = has_object_mask.to(device=device, dtype=torch.bool)
+        elif isinstance(has_object_mask, (bool, int)):
+            return torch.full((batch_size,), bool(has_object_mask), device=device, dtype=torch.bool)
+        else:
+            mask = torch.as_tensor(has_object_mask, device=device, dtype=torch.bool)
+        if mask.dim() == 0:
+            mask = mask.view(1)
+        if mask.shape[0] == 1 and batch_size > 1:
+            mask = mask.expand(batch_size, *mask.shape[1:])
+        if mask.dim() == 1:
+            return mask[:batch_size]
+        if mask.shape[0] != batch_size:
+            return mask.reshape(-1)[:1].expand(batch_size)
+        return mask.reshape(batch_size, -1).any(dim=1)
+
+    def _select_condition_mode(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        return torch.multinomial(self.cond_mode_probs.to(device=device), batch_size, replacement=True)
+
+    def _build_interaction_condition(
+        self,
+        *,
+        hand_positions,
+        obj_imu,
+        human_pose_input,
+        root_trans_input,
+        has_object_mask,
+        obj_points_canonical,
+        obj_rot_gt,
+        obj_trans_gt,
+        obj_scale_gt,
+    ):
+        batch_size, seq_len = hand_positions.shape[:2]
+        device = hand_positions.device
+        dtype = hand_positions.dtype
+        human_pose = self._prepare_pose_feature(human_pose_input, batch_size, seq_len, device, dtype)
+        root_trans = self._prepare_root_feature(root_trans_input, batch_size, seq_len, device, dtype)
+        sample_has_object = self._sample_has_object(has_object_mask, batch_size, seq_len, device)
+
+        obs_code = self.obs_encoder(obj_imu, human_pose, root_trans, hand_positions)
+        mesh_code = torch.zeros_like(obs_code)
+        mesh_valid_mask = torch.zeros(batch_size, device=device, dtype=torch.bool)
+        if self.training:
+            mesh_code, mesh_valid_mask = self.mesh_prior_encoder(
+                obj_points_canonical=obj_points_canonical,
+                obj_rot_gt=obj_rot_gt,
+                obj_trans_gt=obj_trans_gt,
+                obj_scale_gt=obj_scale_gt,
+                hand_positions=hand_positions,
+                human_pose=human_pose,
+                root_trans=root_trans,
+                sample_has_object=sample_has_object,
+            )
+
+        null_code = torch.zeros_like(obs_code)
+        if self.training:
+            mode = self._select_condition_mode(batch_size, device)
+            mode = torch.where((mode == 0) & (~mesh_valid_mask), torch.ones_like(mode), mode)
+            mode = torch.where(sample_has_object, mode, torch.full_like(mode, 2))
+            interaction_code = obs_code.clone()
+            interaction_code = torch.where(mode.view(batch_size, 1, 1) == 0, mesh_code, interaction_code)
+            interaction_code = torch.where(mode.view(batch_size, 1, 1) == 2, null_code, interaction_code)
+        else:
+            mode = torch.where(
+                sample_has_object,
+                torch.ones(batch_size, device=device, dtype=torch.long),
+                torch.full((batch_size,), 2, device=device, dtype=torch.long),
+            )
+            interaction_code = torch.where(sample_has_object.view(batch_size, 1, 1), obs_code, null_code)
+
+        return interaction_code, {
+            "mesh_code": mesh_code,
+            "obs_code": obs_code,
+            "mode": mode,
+            "mesh_valid_mask": mesh_valid_mask,
+            "sample_has_object": sample_has_object,
+        }
 
     def _rot6d_delta(self, rot6d: torch.Tensor) -> torch.Tensor:
         B, T, _ = rot6d.shape
@@ -198,6 +650,80 @@ class ObjectTransModule(nn.Module):
         oe0 = torch.bmm(obj_Rt, unit_world.unsqueeze(-1)).squeeze(-1)
         return oe0, lb0
 
+    def _prepare_refine_pose(self, human_pose_input, batch_size, seq_len, device, dtype):
+        if not isinstance(human_pose_input, torch.Tensor):
+            return None
+        pose = human_pose_input.to(device=device, dtype=dtype)
+        if pose.dim() == 4:
+            pose = pose.reshape(batch_size, seq_len, -1)
+        if pose.dim() == 3 and pose.shape[:2] == (batch_size, seq_len) and pose.shape[-1] == self.refine_pose_dim:
+            return pose
+        return None
+
+    def _prepare_refine_root(self, root_trans_input, batch_size, seq_len, device, dtype):
+        if not isinstance(root_trans_input, torch.Tensor):
+            return None
+        root = root_trans_input.to(device=device, dtype=dtype)
+        if root.dim() == 2:
+            root = root.unsqueeze(1).expand(batch_size, seq_len, 3)
+        if root.dim() == 3 and root.shape[:2] == (batch_size, seq_len) and root.shape[-1] == 3:
+            return root
+        return None
+
+    def _compute_human_refinement(
+        self,
+        human_pose_input,
+        root_trans_input,
+        fused_pos,
+        obj_vel_corrected,
+        weights,
+        pred_hand_contact_prob,
+        lhand_position,
+        rhand_position,
+        has_object_mask,
+        enable_refine,
+    ):
+        if not enable_refine:
+            return {}
+        batch_size, seq_len = fused_pos.shape[:2]
+        device = fused_pos.device
+        dtype = fused_pos.dtype
+        base_pose = self._prepare_refine_pose(human_pose_input, batch_size, seq_len, device, dtype)
+        base_root = self._prepare_refine_root(root_trans_input, batch_size, seq_len, device, dtype)
+        if base_pose is None or base_root is None:
+            return {}
+
+        refine_input = torch.cat(
+            (
+                fused_pos,
+                obj_vel_corrected,
+                weights,
+                pred_hand_contact_prob,
+                lhand_position,
+                rhand_position,
+                base_root,
+                base_pose,
+            ),
+            dim=-1,
+        )
+        residual = self.refine_head(refine_input)
+        pose_delta = residual[:, :, : self.refine_pose_dim]
+        root_trans_delta = residual[:, :, self.refine_pose_dim :]
+        if has_object_mask is not None:
+            mask = has_object_mask
+            if mask.dim() > 1:
+                mask = mask.view(batch_size)
+            mask = mask.to(device=device, dtype=dtype).view(batch_size, 1, 1)
+            pose_delta = pose_delta * mask
+            root_trans_delta = root_trans_delta * mask
+
+        return {
+            "pose_delta": pose_delta,
+            "root_trans_delta": root_trans_delta,
+            "refined_pose": base_pose + pose_delta,
+            "refined_root_trans": base_root + root_trans_delta,
+        }
+
     def forward(
         self,
         hand_positions: torch.Tensor,
@@ -208,6 +734,13 @@ class ObjectTransModule(nn.Module):
         obj_vel_input: torch.Tensor = None,
         contact_init: torch.Tensor = None,
         has_object_mask: torch.Tensor = None,
+        human_pose_input: torch.Tensor = None,
+        root_trans_input: torch.Tensor = None,
+        obj_points_canonical: torch.Tensor = None,
+        obj_rot_gt: torch.Tensor = None,
+        obj_trans_gt: torch.Tensor = None,
+        obj_scale_gt: torch.Tensor = None,
+        enable_refine: bool = True,
     ):
         """
         前向传播
@@ -221,6 +754,11 @@ class ObjectTransModule(nn.Module):
             obj_vel_input: [B, T, 3] 物体速度 (来自VelocityContactModule)
             contact_init: [B, 3] 初始接触状态
             has_object_mask: [B] 是否有物体
+            human_pose_input: [B, T, num_reduced*6] 人体姿态基线，用于残差微调
+            root_trans_input: [B, T, 3] 根节点位移基线，用于残差微调
+            obj_points_canonical: [B, N, 3] 训练期物体canonical点云
+            obj_rot_gt/obj_trans_gt/obj_scale_gt: 训练期mesh teacher使用的GT物体姿态
+            enable_refine: 是否输出人体姿态/root trans微调结果
         
         Returns:
             dict: 包含预测的物体位置和相关信息
@@ -241,16 +779,8 @@ class ObjectTransModule(nn.Module):
         rhand_position = hand_positions[:, :, 1, :]
 
         # 处理输入
-        if obj_imu is None:
-            obj_imu = torch.zeros(bs, seq_len, self.imu_dim, device=device, dtype=dtype)
-        else:
-            if obj_imu.dim() == 4:
-                obj_imu = obj_imu.reshape(bs, seq_len, -1)
-
-        if human_imu is None:
-            human_imu = torch.zeros(bs, seq_len, self.num_human_imus * self.imu_dim, device=device, dtype=dtype)
-        if human_imu.dim() == 3 and human_imu.shape[-1] == self.num_human_imus * self.imu_dim:
-            human_imu = human_imu.view(bs, seq_len, self.num_human_imus, self.imu_dim)
+        obj_imu = self._prepare_obj_imu(obj_imu, bs, seq_len, device, dtype)
+        human_imu = self._prepare_human_imu(human_imu, bs, seq_len, device, dtype)
 
         obj_rot = obj_imu[:, :, 3:9]
         obj_rot_delta = self._rot6d_delta(obj_rot)
@@ -274,9 +804,21 @@ class ObjectTransModule(nn.Module):
         rhand_vel = self._compute_hand_velocity(rhand_position)
         obj_vel_corrected = self._correct_obj_velocity(obj_vel_input, lhand_vel, rhand_vel, pL, pR, p_move)
 
+        interaction_code, interaction_prior_aux = self._build_interaction_condition(
+            hand_positions=hand_positions,
+            obj_imu=obj_imu,
+            human_pose_input=human_pose_input,
+            root_trans_input=root_trans_input,
+            has_object_mask=has_object_mask,
+            obj_points_canonical=obj_points_canonical,
+            obj_rot_gt=obj_rot_gt,
+            obj_trans_gt=obj_trans_gt,
+            obj_scale_gt=obj_scale_gt,
+        )
+
         # 构建FK输入
-        fk_l_input = self._build_fk_inputs(obj_rot, lhand_position, pL, obj_imu, lhand_imu9, obj_vel_input, obj_rot_delta)
-        fk_r_input = self._build_fk_inputs(obj_rot, rhand_position, pR, obj_imu, rhand_imu9, obj_vel_input, obj_rot_delta)
+        fk_l_input = self._build_fk_inputs(obj_rot, lhand_position, pL, obj_imu, lhand_imu9, obj_vel_input, obj_rot_delta, interaction_code)
+        fk_r_input = self._build_fk_inputs(obj_rot, rhand_position, pR, obj_imu, rhand_imu9, obj_vel_input, obj_rot_delta, interaction_code)
 
         # 计算初始方向和长度
         obj_pos_0 = obj_trans_init
@@ -317,7 +859,7 @@ class ObjectTransModule(nn.Module):
         r_pos_fk = rhand_position + r_dir_world * r_len.unsqueeze(-1)
 
         # Gating预测
-        gating_input = self._build_gating_inputs(pred_hand_contact_prob, obj_vel_input, obj_imu_acc)
+        gating_input = self._build_gating_inputs(pred_hand_contact_prob, obj_vel_input, obj_imu_acc, interaction_code)
         gate_logits = self.gating_head((gating_input, contact_init_vec))
         prior_im = 1.0 - p_move.squeeze(-1)
         prior = torch.stack([pL.squeeze(-1), pR.squeeze(-1), prior_im], dim=-1)
@@ -369,7 +911,7 @@ class ObjectTransModule(nn.Module):
             l_lb0 = l_lb0.squeeze(-1)
             r_lb0 = r_lb0.squeeze(-1)
 
-        return {
+        results = {
             "pred_obj_trans": fused_pos,
             "gating_weights": weights,
             "gating_weights_raw": weights_raw,
@@ -388,7 +930,24 @@ class ObjectTransModule(nn.Module):
             "init_lhand_lb": l_lb0,
             "init_rhand_lb": r_lb0,
             "gating_smoothing_applied": (not self.training) and self.gating_smoothing_enabled,
+            "interaction_code": interaction_code,
+            "interaction_prior_aux": interaction_prior_aux,
         }
+        results.update(
+            self._compute_human_refinement(
+                human_pose_input,
+                root_trans_input,
+                fused_pos,
+                obj_vel_corrected,
+                weights,
+                pred_hand_contact_prob,
+                lhand_position,
+                rhand_position,
+                has_object_mask,
+                enable_refine,
+            )
+        )
+        return results
 
     @staticmethod
     def empty_output(batch_size: int, seq_len: int, device: torch.device):

@@ -3,6 +3,8 @@ ObjectTransModule的损失函数
 """
 import torch
 import torch.nn.functional as F
+from utils.rotation_conversions import matrix_to_rotation_6d
+from configs import _REDUCED_POSE_NAMES
 
 
 def _masked_mse(pred, target, mask, zero):
@@ -39,6 +41,9 @@ class ObjectTransLoss:
         'hoi_error_r',
         'obj_vel_cons',
         'obj_acc_cons',
+        'refine_pose',
+        'refine_root_trans',
+        'interaction_code_align',
     }
     
     # 测试阶段用于模型选择的损失键
@@ -49,6 +54,8 @@ class ObjectTransLoss:
         'rhand_lb',
         'hoi_error_l',
         'hoi_error_r',
+        'refine_pose',
+        'refine_root_trans',
     }
     
     def __init__(self, weights=None):
@@ -88,6 +95,32 @@ class ObjectTransLoss:
             obj_trans_gt = obj_trans_gt.to(device)
         else:
             obj_trans_gt = torch.zeros(bs, seq, 3, device=device, dtype=dtype)
+
+        trans_gt = batch.get('trans')
+        if isinstance(trans_gt, torch.Tensor):
+            trans_gt = trans_gt.to(device=device, dtype=dtype)
+            if trans_gt.dim() == 2:
+                trans_gt = trans_gt.unsqueeze(0).expand(bs, -1, -1)
+            if trans_gt.shape[:2] != (bs, seq):
+                trans_gt = torch.zeros(bs, seq, 3, device=device, dtype=dtype)
+        else:
+            trans_gt = torch.zeros(bs, seq, 3, device=device, dtype=dtype)
+
+        ori_root_reduced_gt = batch.get('ori_root_reduced')
+        pose_gt_6d = None
+        if isinstance(ori_root_reduced_gt, torch.Tensor):
+            ori_root_reduced_gt = ori_root_reduced_gt.to(device=device, dtype=dtype)
+            if ori_root_reduced_gt.dim() == 4:
+                ori_root_reduced_gt = ori_root_reduced_gt.unsqueeze(0)
+            if ori_root_reduced_gt.shape[0] == 1 and bs > 1:
+                ori_root_reduced_gt = ori_root_reduced_gt.expand(bs, -1, -1, -1, -1)
+            if (
+                ori_root_reduced_gt.shape[:3] == (bs, seq, len(_REDUCED_POSE_NAMES))
+                and ori_root_reduced_gt.shape[-2:] == (3, 3)
+            ):
+                pose_gt_6d = matrix_to_rotation_6d(
+                    ori_root_reduced_gt.reshape(-1, 3, 3)
+                ).reshape(bs, seq, len(_REDUCED_POSE_NAMES) * 6)
         
         position_global_gt = batch.get('position_global')
         if isinstance(position_global_gt, torch.Tensor):
@@ -156,6 +189,18 @@ class ObjectTransLoss:
         
         if 'pred_obj_acc_from_posdiff' in pred_dict and obj_imu_gt is not None:
             losses['obj_acc_cons'] = _masked_mse(pred_dict['pred_obj_acc_from_posdiff'], obj_imu_gt[:, :, :3], obj_mask, zero)
+
+        if pose_gt_6d is not None and 'refined_pose' in pred_dict:
+            refined_pose = pred_dict['refined_pose']
+            if refined_pose.dim() == 4:
+                refined_pose = refined_pose.reshape(bs, seq, -1)
+            if refined_pose.shape == pose_gt_6d.shape:
+                losses['refine_pose'] = _masked_mse(refined_pose, pose_gt_6d, obj_mask, zero)
+
+        if 'refined_root_trans' in pred_dict:
+            refined_root_trans = pred_dict['refined_root_trans']
+            if refined_root_trans.shape == trans_gt.shape:
+                losses['refine_root_trans'] = _masked_mse(refined_root_trans, trans_gt, obj_mask, zero)
         
         if position_global_gt is not None:
             lhand_pos_gt = position_global_gt[:, :, 20, :]
@@ -191,6 +236,33 @@ class ObjectTransLoss:
                     vec_pred_r = pred_dict['pred_rhand_obj_direction'] * pred_dict['pred_rhand_lb'].unsqueeze(-1)
                     diff_r = torch.norm(vec_pred_r - vec_gt_r, dim=-1)
                     losses['hoi_error_r'] = _masked_mean(diff_r, mask_r, zero)
+
+        prior_aux = pred_dict.get('interaction_prior_aux') if isinstance(pred_dict, dict) else None
+        if isinstance(prior_aux, dict):
+            obs_code = prior_aux.get('obs_code')
+            mesh_code = prior_aux.get('mesh_code')
+            mesh_valid_mask = prior_aux.get('mesh_valid_mask')
+            sample_has_object = prior_aux.get('sample_has_object')
+            if (
+                isinstance(obs_code, torch.Tensor)
+                and isinstance(mesh_code, torch.Tensor)
+                and obs_code.shape == mesh_code.shape
+                and obs_code.dim() == 3
+                and obs_code.shape[:2] == (bs, seq)
+            ):
+                if isinstance(mesh_valid_mask, torch.Tensor):
+                    valid = mesh_valid_mask.to(device=device, dtype=torch.bool)
+                else:
+                    valid = torch.zeros(bs, device=device, dtype=torch.bool)
+                if isinstance(sample_has_object, torch.Tensor):
+                    valid = valid & sample_has_object.to(device=device, dtype=torch.bool)
+                else:
+                    valid = valid & obj_mask.any(dim=1)
+                if valid.any():
+                    losses['interaction_code_align'] = F.mse_loss(
+                        obs_code.to(device=device, dtype=dtype)[valid],
+                        mesh_code.to(device=device, dtype=dtype).detach()[valid],
+                    )
         
         # 加权求和
         total_loss = zero.clone()
@@ -218,4 +290,3 @@ class ObjectTransLoss:
     def get_loss_keys(cls):
         """返回损失键列表"""
         return list(cls.LOSS_KEYS)
-

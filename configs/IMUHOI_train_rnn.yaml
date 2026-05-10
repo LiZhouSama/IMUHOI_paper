@@ -2,7 +2,7 @@
 # 使用 --no_trans 切换是否预测根节点位移
 
 # ============ 基本配置 ============
-save_dir: "outputs/IMUHOI_RNN"
+save_dir: "outputs/IMUHOI_RNN_2"
 body_model_path: datasets/smpl_models/smplh/male/model.npz
 use_tensorboard: true
 use_multi_gpu: true
@@ -29,13 +29,22 @@ gating_smoothing_alpha: 0.6
 gating_max_change: 0.25
 vel_static_threshold: 0.3
 vel_min_hand_speed: 0.02
+interaction_code_dim: 128
+prior_encoder_hidden_dim: 256
+prior_encoder_layers: 2
+prior_encoder_dropout: 0.1
+mesh_downsample_points: 256
+dgcnn_k: 16
+cond_mode_probs: [0.4, 0.4, 0.2]  # mesh/obs/null
 
 # ============ 训练超参数 ============
-epochs: 300
+epochs: 500
+input_mix_start_epoch: 0
+input_mix_end_epoch: 100
 batch_size: 120
-lr: 0.0002
-weight_decay: 0.00001
-milestones: [100, 200]
+lr: 0.002
+weight_decay: 0.0001
+milestones: [100, 200, 300, 350, 400, 450, 500]
 gamma: 0.2
 seed: 42
 num_workers: 12
@@ -103,16 +112,17 @@ loss_weights:
   hoi_error_r: 0.2
   obj_vel_cons: 0.1
   obj_acc_cons: 0.01
+  interaction_code_align: 1.0
 
 # ============ 窗口配置 ============
 train:
-  window: 60
+  window: 120
 
 test:
-  window: 60
+  window: 120
 
 # ============ 预训练模块路径（可选）============
 pretrained_modules:
   human_pose: "outputs/IMUHOI_rnn/human_pose_12302142/best.pt"
-  velocity_contact: "outputs/IMUHOI_rnn/joint_train_01112057/best_velocity_contact.pt"
+  velocity_contact: "outputs/IMUHOI_RNN_2/velocity_contact_05102216/best.pt"
   object_trans: "outputs/IMUHOI_rnn/joint_train_01112057/best_object_trans.pt"

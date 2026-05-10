@@ -164,7 +164,7 @@ def create_dataloaders(cfg, project_root=None):
         raise ValueError("训练数据路径不存在")
 
     print(f"训练数据路径: {train_paths}")
-    train_dataset = IMUDataset(data_dir=train_paths, window_size=cfg.train.window, debug=cfg.debug)
+    train_dataset = IMUDataset(data_dir=train_paths, window_size=cfg.train.window, debug=cfg.debug, simulate_imu_noise=False)
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg.batch_size,

@@ -5,8 +5,8 @@ ObjectTransModule训练脚本 (Stage 3) + 联合训练
 用法:
     # 仅训练Stage3 (Object Trans)
     python train_object_trans.py --cfg config.yaml --vc_ckpt path/to/vc.pt --hp_ckpt path/to/hp.pt
-    
-    # 联合训练所有模块
+
+    # 联合微调ObjectTrans + VelocityContact
     python train_object_trans.py --cfg config.yaml --vc_ckpt path/to/vc.pt --hp_ckpt path/to/hp.pt --joint_train
 """
 import os
@@ -20,7 +20,14 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 sys.path.insert(0, PROJECT_ROOT)
 
 from model import VelocityContactModule, HumanPoseModule, ObjectTransModule
-from train.rnn.loss import VelocityContactLoss, HumanPoseLoss, ObjectTransLoss
+from train.rnn.loss import VelocityContactLoss, ObjectTransLoss
+from train.rnn.scheduled_inputs import (
+    build_gt_human_pose_outputs,
+    build_gt_velocity_contact_outputs,
+    prediction_mix_probability,
+    sample_mix_dict,
+    sample_mix_tensor,
+)
 from train.rnn.train_utils import (
     get_base_args,
     merge_config,
@@ -34,7 +41,10 @@ from train.rnn.train_utils import (
     load_checkpoint,
 )
 from torch.cuda.amp.grad_scaler import GradScaler
-from torch.utils.tensorboard.writer import SummaryWriter
+try:
+    from torch.utils.tensorboard.writer import SummaryWriter
+except Exception:
+    SummaryWriter = None
 
 
 def get_args():
@@ -50,7 +60,7 @@ def get_args():
     parser.add_argument('--ot_ckpt', type=str, default=None,
                         help='ObjectTransModule预训练权重路径（联合微调起点）')
     parser.add_argument('--joint_train', action='store_true', 
-                        help='是否进行联合训练（微调所有模块）')
+                        help='是否进行联合训练（先微调ObjectTrans，到预设epoch后联合微调VelocityContact）')
     
     return parser.parse_args()
 
@@ -89,19 +99,19 @@ class Stage3JointTrainer:
         self.train_loader = train_loader
         self.test_loader = test_loader
         
-        # 设置训练/冻结状态
+        self.joint_vc_unfreeze_epoch = int(getattr(cfg, "joint_vc_unfreeze_epoch", 100))
+        self.vc_unfrozen = False
+
+        # 设置训练/冻结状态：HP始终冻结；VC只在joint阶段达到阈值后解冻
+        print("Stage3模式：冻结HumanPose，训练ObjectTrans")
+        for param in self.hp_model.parameters():
+            param.requires_grad = False
+        for param in self.vc_model.parameters():
+            param.requires_grad = False
+        for param in self.ot_model.parameters():
+            param.requires_grad = True
         if joint_train:
-            # 联合微调：VC 仍然冻结，仅微调 HP + OT
-            print("联合训练模式：冻结VelocityContact，微调HumanPose + ObjectTrans")
-            for param in self.vc_model.parameters():
-                param.requires_grad = False
-        else:
-            # Stage3：冻结VC和HP，只训练OT
-            print("Stage3模式：冻结VelocityContact和HumanPose，只训练ObjectTrans")
-            for param in self.vc_model.parameters():
-                param.requires_grad = False
-            for param in self.hp_model.parameters():
-                param.requires_grad = False
+            print(f"联合训练模式：epoch {self.joint_vc_unfreeze_epoch} 后微调VelocityContact + ObjectTrans")
         
         # 多GPU包装
         if cfg.use_multi_gpu:
@@ -114,76 +124,166 @@ class Stage3JointTrainer:
         flatten_lstm_parameters(self.hp_model)
         flatten_lstm_parameters(self.ot_model)
         
-        # 收集可训练参数
-        trainable_params = []
-        if joint_train:
-            trainable_params.extend(self.hp_model.parameters())
-        trainable_params.extend(self.ot_model.parameters())
-        trainable_params = [p for p in trainable_params if p.requires_grad]
-        
         # 优化器
-        lr = cfg.lr
+        base_lr = cfg.lr
         if joint_train:
-            lr_factor = getattr(cfg, "joint_lr_factor", 0.1)
-            lr = lr * lr_factor
+            base_lr = base_lr * float(getattr(cfg, "joint_ot_lr_factor", 0.1))
         if cfg.use_multi_gpu:
-            lr = lr * len(cfg.gpus)
-        
-        self.optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=cfg.weight_decay)
+            base_lr = base_lr * len(cfg.gpus)
+
+        param_groups = [
+            {
+                "params": [p for p in self.ot_model.parameters() if p.requires_grad],
+                "lr": base_lr,
+                "name": "object_trans",
+            }
+        ]
+        if joint_train:
+            vc_lr = base_lr * float(getattr(cfg, "joint_vc_lr_ratio", 0.1))
+            param_groups.append(
+                {
+                    "params": list(self.vc_model.parameters()),
+                    "lr": vc_lr,
+                    "name": "velocity_contact",
+                }
+            )
+
+        self.optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
         self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
             self.optimizer, milestones=cfg.milestones, gamma=cfg.gamma
         )
         self.scaler = GradScaler()
-        
-        print(f"可训练参数数量: {sum(p.numel() for p in trainable_params)}")
+
+        ot_trainable = sum(p.numel() for p in self.ot_model.parameters() if p.requires_grad)
+        vc_params = sum(p.numel() for p in self.vc_model.parameters())
+        print(f"ObjectTrans可训练参数数量: {ot_trainable}, lr={base_lr}")
+        if joint_train:
+            print(f"VelocityContact将在epoch {self.joint_vc_unfreeze_epoch}解冻，参数数量: {vc_params}, lr={vc_lr}")
         
         # 损失函数
         loss_weights = getattr(cfg, 'loss_weights', {})
-        self.vc_loss_fn = None  # VC冻结，不参与训练
-        self.hp_loss_fn = HumanPoseLoss(weights=loss_weights, no_trans=cfg.no_trans) if joint_train else None
+        self.vc_loss_fn = VelocityContactLoss(weights=loss_weights) if joint_train else None
         self.ot_loss_fn = ObjectTransLoss(weights=loss_weights)
         
         # TensorBoard
         self.writer = None
-        if cfg.use_tensorboard and not cfg.debug:
+        if cfg.use_tensorboard and not cfg.debug and SummaryWriter is not None:
             log_dir = os.path.join(cfg.save_dir, 'tensorboard_logs')
             self.writer = SummaryWriter(log_dir=log_dir)
+        elif cfg.use_tensorboard and not cfg.debug:
+            print('TensorBoard is unavailable; continue without SummaryWriter.')
         
         self.best_loss = float('inf')
         self.n_iter = 0
-    
-    
 
-    def forward_all(self, data_dict):
+    def _set_vc_trainable(self, trainable: bool):
+        for param in self.vc_model.parameters():
+            param.requires_grad = trainable
+        self.vc_unfrozen = trainable
+
+    def _update_joint_state(self, epoch: int):
+        should_unfreeze = self.joint_train and epoch >= self.joint_vc_unfreeze_epoch
+        if should_unfreeze and not self.vc_unfrozen:
+            self._set_vc_trainable(True)
+            flatten_lstm_parameters(self.vc_model)
+            print(f"\n解冻VelocityContact进行联合微调 (epoch {epoch})")
+        elif (not should_unfreeze) and self.vc_unfrozen:
+            self._set_vc_trainable(False)
+
+    def forward_all(self, data_dict, batch=None, epoch: int = 0, training: bool = True):
         """完整的前向传播"""
-        if self.joint_train:
-            self.hp_model.train()
-            self.vc_model.eval()
+        self.hp_model.eval()
+        if self.vc_unfrozen and training:
+            self.vc_model.train()
         else:
-            self.hp_model.eval()
             self.vc_model.eval()
-
-        with torch.set_grad_enabled(self.joint_train):
-            hp_out = self.hp_model(data_dict)
-
-        if self.joint_train:
-            hp_for_vc = hp_out
-        else:
-            hp_for_vc = {k: (v.detach() if isinstance(v, torch.Tensor) else v) for k, v in hp_out.items()}
 
         with torch.no_grad():
+            hp_out = self.hp_model(data_dict)
+
+        gt_hp = None
+        if training and batch is not None:
+            pred_prob = prediction_mix_probability(epoch, self.cfg)
+            gt_hp = build_gt_human_pose_outputs(batch, self.device, dtype=hp_out['pred_hand_glb_pos'].dtype)
+            hp_for_vc = sample_mix_dict(
+                gt_hp,
+                hp_out,
+                (
+                    "p_pred",
+                    "pred_full_pose_6d",
+                    "pred_joints_local",
+                    "pred_joints_global",
+                    "pred_hand_glb_pos",
+                    "root_vel_pred",
+                    "root_trans_pred",
+                ),
+                pred_prob,
+            )
+        else:
+            hp_for_vc = hp_out
+
+        vc_grad_enabled = self.vc_unfrozen and training
+        with torch.set_grad_enabled(vc_grad_enabled):
             vc_out = self.vc_model(data_dict, hp_out=hp_for_vc)
 
-        hp_for_ot = hp_out if self.joint_train else hp_for_vc
+        if training and batch is not None:
+            pred_prob = prediction_mix_probability(epoch, self.cfg)
+            if gt_hp is None:
+                gt_hp = build_gt_human_pose_outputs(batch, self.device, dtype=hp_out['pred_hand_glb_pos'].dtype)
+            gt_vc = build_gt_velocity_contact_outputs(batch, self.device, dtype=vc_out['pred_obj_vel'].dtype)
+            hand_positions, ot_mask = sample_mix_tensor(
+                gt_hp['pred_hand_glb_pos'],
+                hp_out['pred_hand_glb_pos'],
+                pred_prob,
+                return_mask=True,
+            )
+            contact_prob = sample_mix_tensor(
+                gt_vc['pred_hand_contact_prob'],
+                vc_out['pred_hand_contact_prob'],
+                pred_prob,
+                mask=ot_mask,
+            )
+            obj_vel_input = sample_mix_tensor(
+                gt_vc['pred_obj_vel'],
+                vc_out['pred_obj_vel'],
+                pred_prob,
+                mask=ot_mask,
+            )
+            human_pose_input = sample_mix_tensor(
+                gt_hp['p_pred'],
+                hp_out['p_pred'],
+                pred_prob,
+                mask=ot_mask,
+            )
+            root_trans_input = sample_mix_tensor(
+                gt_hp['root_trans_pred'],
+                hp_out['root_trans_pred'],
+                pred_prob,
+                mask=ot_mask,
+            )
+        else:
+            hand_positions = hp_out['pred_hand_glb_pos']
+            contact_prob = vc_out['pred_hand_contact_prob']
+            obj_vel_input = vc_out['pred_obj_vel']
+            human_pose_input = hp_out.get('p_pred')
+            root_trans_input = hp_out.get('root_trans_pred')
+
         ot_out = self.ot_model(
-            hp_for_ot['pred_hand_glb_pos'],
-            vc_out['pred_hand_contact_prob'],
+            hand_positions,
+            contact_prob,
             data_dict['obj_trans_init'],
             obj_imu=data_dict['obj_imu'],
             human_imu=data_dict['human_imu'],
-            obj_vel_input=vc_out['pred_obj_vel'],
+            obj_vel_input=obj_vel_input,
             contact_init=data_dict['contact_init'],
             has_object_mask=data_dict['has_object'],
+            human_pose_input=human_pose_input,
+            root_trans_input=root_trans_input,
+            obj_points_canonical=data_dict.get('obj_points_canonical'),
+            obj_rot_gt=data_dict.get('obj_rot_gt'),
+            obj_trans_gt=data_dict.get('obj_trans_gt'),
+            obj_scale_gt=data_dict.get('obj_scale_gt'),
+            enable_refine=getattr(self.cfg, "enable_ot_refine", True),
         )
 
         results = {}
@@ -195,8 +295,9 @@ class Stage3JointTrainer:
 
     def train_epoch(self, epoch):
             """训练一个epoch"""
-            self.vc_model.eval()
-            self.hp_model.train() if self.joint_train else self.hp_model.eval()
+            self._update_joint_state(epoch)
+            self.vc_model.train() if self.vc_unfrozen else self.vc_model.eval()
+            self.hp_model.eval()
             self.ot_model.train()
             
             total_loss = 0
@@ -209,24 +310,24 @@ class Stage3JointTrainer:
                 
                 self.optimizer.zero_grad()
                 
-                results, vc_out, hp_out, ot_out = self.forward_all(data_dict)
+                results, vc_out, hp_out, ot_out = self.forward_all(data_dict, batch=batch, epoch=epoch, training=True)
                 
                 # 计算损失
                 losses = {}
-                hp_losses = {}
                 ot_losses = {}
-                
-                if self.joint_train and self.hp_loss_fn:
-                    hp_loss, hp_losses, _ = self.hp_loss_fn(hp_out, batch, self.device)
-                    losses.update({f'hp_{k}': v for k, v in hp_losses.items()})
+                vc_losses = {}
+
+                if self.joint_train and self.vc_unfrozen and self.vc_loss_fn:
+                    vc_loss, vc_losses, _ = self.vc_loss_fn(vc_out, batch, self.device)
+                    losses.update({f'vc_{k}': v for k, v in vc_losses.items()})
                 else:
-                    hp_loss = torch.tensor(0.0, device=self.device)
-                
+                    vc_loss = torch.tensor(0.0, device=self.device)
+
                 ot_loss, ot_losses, _ = self.ot_loss_fn(ot_out, batch, self.device)
                 losses.update({f'ot_{k}': v for k, v in ot_losses.items()})
-                
+
                 # 总损失
-                batch_loss = hp_loss + ot_loss
+                batch_loss = vc_loss + ot_loss
                 
                 self.scaler.scale(batch_loss).backward()
                 self.scaler.step(self.optimizer)
@@ -239,22 +340,22 @@ class Stage3JointTrainer:
                 
                 # 更新进度条
                 postfix = {'loss': batch_loss.item(), 'ot': ot_loss.item()}
-                if self.joint_train:
-                    postfix['hp'] = hp_loss.item()
+                if self.joint_train and self.vc_unfrozen:
+                    postfix['vc'] = vc_loss.item()
                 train_iter.set_postfix(postfix)
                 
                 if self.writer is not None:
                     self.writer.add_scalar('train/total_loss', batch_loss.item(), self.n_iter)
                     self.writer.add_scalar('train/ot_loss', ot_loss.item(), self.n_iter)
-                    if self.joint_train:
-                        self.writer.add_scalar('train/hp_loss', hp_loss.item(), self.n_iter)
+                    if self.joint_train and self.vc_unfrozen:
+                        self.writer.add_scalar('train/vc_loss', vc_loss.item(), self.n_iter)
                     for key, value in ot_losses.items():
                         if isinstance(value, torch.Tensor):
                             self.writer.add_scalar(f'train/ot/{key}', value.item(), self.n_iter)
-                    if self.joint_train:
-                        for key, value in hp_losses.items():
+                    if self.joint_train and self.vc_unfrozen:
+                        for key, value in vc_losses.items():
                             if isinstance(value, torch.Tensor):
-                                self.writer.add_scalar(f'train/hp/{key}', value.item(), self.n_iter)
+                                self.writer.add_scalar(f'train/vc/{key}', value.item(), self.n_iter)
                 
                 self.n_iter += 1
             
@@ -281,27 +382,24 @@ class Stage3JointTrainer:
             
             for batch in test_iter:
                 data_dict = build_model_input_dict(batch, self.cfg, self.device, add_noise=False)
-                results, vc_out, hp_out, ot_out = self.forward_all(data_dict)
-                
+                results, vc_out, hp_out, ot_out = self.forward_all(data_dict, batch=batch, epoch=epoch, training=False)
+
                 # 计算测试损失
-                hp_loss = torch.tensor(0.0, device=self.device)
-                hp_losses = {}
-                if self.joint_train and self.hp_loss_fn:
-                    if hasattr(self.hp_loss_fn, "compute_test_loss"):
-                        hp_loss, hp_losses = self.hp_loss_fn.compute_test_loss(hp_out, batch, self.device)
-                    else:
-                        hp_loss, hp_losses, _ = self.hp_loss_fn(hp_out, batch, self.device)
+                vc_loss = torch.tensor(0.0, device=self.device)
+                vc_losses = {}
+                if self.joint_train and self.vc_unfrozen and self.vc_loss_fn:
+                    vc_loss, vc_losses, _ = self.vc_loss_fn(vc_out, batch, self.device)
 
                 ot_loss, ot_losses = self.ot_loss_fn.compute_test_loss(ot_out, batch, self.device)
 
-                combined_loss = ot_loss + hp_loss
+                combined_loss = ot_loss + vc_loss
                 total_loss += combined_loss.item()
                 for key, value in ot_losses.items():
                     if isinstance(value, torch.Tensor):
                         loss_components[key] = loss_components.get(key, 0) + value.item()
-                for key, value in hp_losses.items():
+                for key, value in vc_losses.items():
                     if isinstance(value, torch.Tensor):
-                        loss_components[f"hp_{key}"] = loss_components.get(f"hp_{key}", 0) + value.item()
+                        loss_components[f"vc_{key}"] = loss_components.get(f"vc_{key}", 0) + value.item()
         
         total_loss /= len(self.test_loader)
         for key in loss_components:
@@ -334,8 +432,8 @@ class Stage3JointTrainer:
                         for key, value in test_components.items():
                             if key in ObjectTransLoss.TEST_LOSS_KEYS:
                                 self.writer.add_scalar(f'test/ot/{key}', value, self.n_iter)
-                            elif key.startswith('hp_'):
-                                self.writer.add_scalar(f'test/hp/{key[3:]}', value, self.n_iter)
+                            elif key.startswith('vc_'):
+                                self.writer.add_scalar(f'test/vc/{key[3:]}', value, self.n_iter)
                             else:
                                 self.writer.add_scalar(f'test/{key}', value, self.n_iter)
             else:
@@ -361,7 +459,7 @@ class Stage3JointTrainer:
         }, ot_path)
         
         if self.joint_train:
-            # 联合训练时保存所有模块
+            # 联合训练时只保存OT和VC，HP始终冻结不输出
             vc_path = os.path.join(self.cfg.save_dir, f'{prefix}_velocity_contact.pt')
             vc_state = self.vc_model.module.state_dict() if isinstance(self.vc_model, torch.nn.DataParallel) else self.vc_model.state_dict()
             torch.save({
@@ -369,16 +467,7 @@ class Stage3JointTrainer:
                 'module_state_dict': vc_state,
                 'loss': loss,
             }, vc_path)
-            
-            hp_path = os.path.join(self.cfg.save_dir, f'{prefix}_human_pose.pt')
-            hp_state = self.hp_model.module.state_dict() if isinstance(self.hp_model, torch.nn.DataParallel) else self.hp_model.state_dict()
-            torch.save({
-                'epoch': epoch,
-                'module_state_dict': hp_state,
-                'loss': loss,
-                'no_trans': self.cfg.no_trans,
-            }, hp_path)
-        
+
         print(f'保存模型: {prefix}')
 
 
@@ -447,7 +536,7 @@ def main():
     ot_model = ObjectTransModule(cfg)
     if args.joint_train:
         if ot_ckpt and os.path.exists(ot_ckpt):
-            load_checkpoint(ot_model, ot_ckpt, device)
+            load_checkpoint(ot_model, ot_ckpt, device, strict=False)
             print(f"联合微调起点加载ObjectTrans权重: {ot_ckpt}")
         else:
             raise ValueError("联合微调需要已训练的ObjectTrans权重，请先进行单独Stage3训练或指定 --ot_ckpt")
@@ -476,6 +565,7 @@ def main():
             cfg_dict = dict(cfg)
             cfg_dict['vc_ckpt'] = vc_ckpt
             cfg_dict['hp_ckpt'] = hp_ckpt
+            cfg_dict['ot_ckpt'] = ot_ckpt
             cfg_dict['joint_train'] = args.joint_train
             yaml.dump(cfg_dict, f)
 

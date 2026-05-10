@@ -48,7 +48,7 @@ __all__ = [
 def get_base_args():
     """获取基础命令行参数"""
     parser = argparse.ArgumentParser(description='IMUHOI模块化训练')
-    parser.add_argument('--cfg', type=str, default='configs/IMUHOI_train.yaml', help='配置文件路径')
+    parser.add_argument('--cfg', type=str, default='configs/IMUHOI_train_rnn.yaml', help='配置文件路径')
     parser.add_argument('--seed', type=int, default=10, help='随机种子')
     parser.add_argument('--batch_size', type=int, default=None, help='批量大小')
     parser.add_argument('--epochs', type=int, default=None, help='训练轮数')
@@ -152,7 +152,8 @@ def create_dataloaders(cfg, project_root=None):
     train_dataset = IMUDataset(
         data_dir=train_paths,
         window_size=cfg.train.window,
-        debug=cfg.debug
+        debug=cfg.debug,
+        obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
     )
     
     train_loader = DataLoader(
@@ -171,7 +172,8 @@ def create_dataloaders(cfg, project_root=None):
         test_dataset = IMUDataset(
             data_dir=test_paths,
             window_size=cfg.test.window,
-            debug=cfg.debug
+            debug=cfg.debug,
+            obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
         )
         if len(test_dataset) > 0:
             test_loader = DataLoader(

@@ -6,7 +6,7 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
-from pytorch3d.transforms import rotation_6d_to_matrix
+from pytorch3d.transforms import matrix_to_rotation_6d, rotation_6d_to_matrix
 
 from .velocity_contact import VelocityContactModule
 from .human_pose import HumanPoseModule
@@ -160,17 +160,101 @@ class IMUHOIModel(nn.Module):
             if path and os.path.exists(path):
                 module = getattr(self, f"{name}_module", None)
                 if module is not None:
-                    load_checkpoint(module, path, self.device, strict=strict)
+                    module_strict = False if name == "object_trans" else strict
+                    load_checkpoint(module, path, self.device, strict=module_strict)
                     print(f"Loaded {name} from {path}")
             else:
                 if path:
                     print(f"Warning: {name} checkpoint not found at {path}")
+
+    def _promote_refined_human_outputs(
+        self,
+        results: Dict[str, torch.Tensor],
+        ot_out: Dict[str, torch.Tensor],
+        data_dict: Dict[str, torch.Tensor],
+    ) -> None:
+        refined_pose = ot_out.get("refined_pose")
+        refined_root = ot_out.get("refined_root_trans")
+        if not isinstance(refined_pose, torch.Tensor) or not isinstance(refined_root, torch.Tensor):
+            return
+
+        for key in (
+            "p_pred",
+            "root_trans_pred",
+            "root_vel_pred",
+            "root_vel_local_pred",
+            "pred_joints_local",
+            "pred_joints_global",
+            "pred_hand_glb_pos",
+            "pred_full_pose_rotmat",
+            "pred_full_pose_6d",
+        ):
+            if key in results and f"stage1_{key}" not in results:
+                results[f"stage1_{key}"] = results[key]
+
+        results["p_pred"] = refined_pose
+        results["root_trans_pred"] = refined_root
+
+        hp_module = self.human_pose_module
+        human_imu = data_dict["human_imu"]
+        batch_size, seq_len = human_imu.shape[:2]
+        device = refined_pose.device
+        dtype = refined_pose.dtype
+
+        root_vel = None
+        if hasattr(hp_module, "_compute_root_velocity_from_trans"):
+            root_vel = hp_module._compute_root_velocity_from_trans(refined_root)
+            if isinstance(root_vel, torch.Tensor):
+                results["root_vel_pred"] = root_vel
+
+        try:
+            orientation_6d = human_imu[..., -6:].to(device=device, dtype=dtype)
+            orientation_mat = rotation_6d_to_matrix(orientation_6d.reshape(-1, 6)).reshape(
+                batch_size, seq_len, human_imu.shape[2], 3, 3
+            )
+            if root_vel is not None:
+                root_rot = orientation_mat[:, :, 0]
+                results["root_vel_local_pred"] = torch.matmul(
+                    root_rot.transpose(-1, -2),
+                    root_vel.unsqueeze(-1),
+                ).squeeze(-1)
+
+            if getattr(hp_module, "body_model", None) is not None and getattr(hp_module, "body_model_device", None) != device:
+                hp_module.body_model = hp_module.body_model.to(device)
+                hp_module.body_model_device = device
+
+            joints_local = None
+            if hasattr(hp_module, "_compute_fk_joints_batched"):
+                joints_local = hp_module._compute_fk_joints_batched(refined_pose, orientation_mat.clone())
+            if isinstance(joints_local, torch.Tensor):
+                results["pred_joints_local"] = joints_local
+                joints_global = joints_local + refined_root.unsqueeze(2)
+                results["pred_joints_global"] = joints_global
+                if joints_global.shape[2] > 21:
+                    results["pred_hand_glb_pos"] = torch.stack(
+                        (joints_global[:, :, 20], joints_global[:, :, 21]),
+                        dim=2,
+                    )
+
+            if hasattr(hp_module, "_reduced_glb_6d_to_full_glb_mat"):
+                bt = batch_size * seq_len
+                reduced = refined_pose.reshape(bt, -1, 6)
+                orientation_flat = orientation_mat[:, :, :6].reshape(bt, 6, 3, 3)
+                full_flat = hp_module._reduced_glb_6d_to_full_glb_mat(reduced, orientation_flat)
+                full_rotmats = full_flat.reshape(batch_size, seq_len, 24, 3, 3)
+                results["pred_full_pose_rotmat"] = full_rotmats
+                results["pred_full_pose_6d"] = matrix_to_rotation_6d(full_flat.reshape(-1, 3, 3)).reshape(
+                    batch_size, seq_len, 24, 6
+                )
+        except Exception as exc:
+            print(f"Warning: failed to recompute refined human outputs: {exc}")
     
     def forward(
         self,
         data_dict: Dict[str, torch.Tensor],
         use_object_data: bool = True,
         compute_fk: bool = False,
+        refine_human: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         前向传播
@@ -189,6 +273,7 @@ class IMUHOIModel(nn.Module):
                 - has_object: [B] 是否有物体
             use_object_data: 是否使用物体数据进行Stage 3
             compute_fk: 是否计算FK方式的物体位置
+            refine_human: 是否使用ObjectTrans输出的人体姿态/root trans微调结果
         
         Returns:
             结果字典，包含各阶段的预测输出
@@ -236,8 +321,17 @@ class IMUHOIModel(nn.Module):
                 obj_vel_input=vc_out["pred_obj_vel"],
                 contact_init=data_dict.get("contact_init"),
                 has_object_mask=has_object,
+                human_pose_input=hp_out.get("p_pred"),
+                root_trans_input=hp_out.get("root_trans_pred"),
+                obj_points_canonical=data_dict.get("obj_points_canonical"),
+                obj_rot_gt=data_dict.get("obj_rot_gt"),
+                obj_trans_gt=data_dict.get("obj_trans_gt"),
+                obj_scale_gt=data_dict.get("obj_scale_gt"),
+                enable_refine=refine_human,
             )
             results.update(ot_out)
+            if refine_human:
+                self._promote_refined_human_outputs(results, ot_out, data_dict)
             
             # 如果需要计算FK方式的物体位置（用于比较）
             if compute_fk:
@@ -246,7 +340,7 @@ class IMUHOIModel(nn.Module):
                 obj_rotm = rotation_6d_to_matrix(obj_rot6d.reshape(-1, 6)).reshape(batch_size, seq_len, 3, 3)
                 results["pred_obj_trans_fk"] = self._fk_obj_trans_baseline_hard(
                     vc_out["pred_hand_contact_prob"],
-                    hp_out["pred_hand_glb_pos"],
+                    results.get("pred_hand_glb_pos", hp_out["pred_hand_glb_pos"]),
                     obj_rotm,
                     data_dict["obj_trans_init"],
                 )
@@ -261,6 +355,7 @@ class IMUHOIModel(nn.Module):
         use_object_data: bool = True,
         compute_fk: bool = False,
         interaction_use_human_pred: bool = True,
+        refine_human: bool = True,
         **_,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -275,6 +370,7 @@ class IMUHOIModel(nn.Module):
             data_dict,
             use_object_data=use_object_data,
             compute_fk=compute_fk,
+            refine_human=refine_human,
         )
 
 

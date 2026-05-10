@@ -904,7 +904,7 @@ class InteractiveViewer(Viewer):
 
 def main():
     parser = argparse.ArgumentParser(description='Interactive IMUHOI Visualization Tool')
-    parser.add_argument('--config', type=str, default='configs/IMUHOI_train_mamba_simple.yaml', help='Path to config file')
+    parser.add_argument('--config', type=str, default='configs/IMUHOI_train_rnn.yaml', help='Path to config file')
     parser.add_argument('--model_arch', type=str, choices=['rnn', 'dit', 'mamba'], default=None, help='Override model architecture in config')
     parser.add_argument('--hp_ckpt', type=str, default=None, help='Override HumanPose checkpoint')
     parser.add_argument('--interaction_ckpt', type=str, default=None, help='Override Interaction/Object checkpoint')
@@ -977,7 +977,7 @@ def main():
             window_size=test_window_size,
             debug=dataset_debug,
             full_sequence=True,
-            simulate_imu_noise=True
+            simulate_imu_noise=False
         )
     elif os.path.isfile(test_data_input) and test_data_input.lower().endswith(".pt"):
         target_pt = os.path.normcase(os.path.normpath(os.path.abspath(test_data_input)))
@@ -990,7 +990,7 @@ def main():
             debug=dataset_debug,
             full_sequence=True,
             sequence_paths=[target_pt],
-            simulate_imu_noise=True
+            simulate_imu_noise=False
         )
         if len(test_dataset.sequence_info) != 1:
             try:

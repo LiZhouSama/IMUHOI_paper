@@ -26,6 +26,11 @@ from train.rnn.train_utils import (
     BaseTrainer,
     load_checkpoint,
 )
+from train.rnn.scheduled_inputs import (
+    build_gt_human_pose_outputs,
+    prediction_mix_probability,
+    sample_mix_dict,
+)
 
 
 def get_args():
@@ -46,6 +51,7 @@ class VelocityContactTrainer(BaseTrainer):
     def __init__(self, cfg, model, loss_fn, train_loader, test_loader=None, hp_model=None):
         super().__init__(cfg, model, loss_fn, train_loader, test_loader)
         self.hp_model = hp_model
+        self.current_epoch = 0
         if self.hp_model is not None:
             self.hp_model.eval()
             for p in self.hp_model.parameters():
@@ -55,16 +61,46 @@ class VelocityContactTrainer(BaseTrainer):
         self,
         data_dict,
         batch=None,
+        epoch=None,
+        training=None,
     ):
-        """Use frozen HP to produce hp_out, then forward VC."""
-        hp_out = None
+        """Use frozen HP/GT scheduled hp_out, then forward VC."""
+        training = self.model.training if training is None else bool(training)
+        epoch = self.current_epoch if epoch is None else int(epoch)
+        pred_hp_out = None
         if self.hp_model is not None:
             with torch.no_grad():
-                hp_out = self.hp_model(data_dict)
+                pred_hp_out = self.hp_model(data_dict)
+
+        hp_out = pred_hp_out
+        if batch is not None:
+            gt_hp_out = build_gt_human_pose_outputs(
+                batch,
+                self.device,
+                dtype=data_dict['human_imu'].dtype,
+            )
+            if pred_hp_out is None:
+                hp_out = gt_hp_out
+            elif training:
+                hp_out = sample_mix_dict(
+                    gt_hp_out,
+                    pred_hp_out,
+                    (
+                        "p_pred",
+                        "pred_full_pose_6d",
+                        "pred_joints_local",
+                        "pred_joints_global",
+                        "pred_hand_glb_pos",
+                        "root_vel_pred",
+                        "root_trans_pred",
+                    ),
+                    prediction_mix_probability(epoch, self.cfg),
+                )
         return self.model(data_dict, hp_out=hp_out)
 
     def train_epoch(self, epoch):
         """Override to add gradient clipping for stability."""
+        self.current_epoch = epoch
         self.model.train()
         total_loss = 0
         loss_components = {}
@@ -75,7 +111,7 @@ class VelocityContactTrainer(BaseTrainer):
             data_dict = build_model_input_dict(batch, self.cfg, self.device, add_noise=True)
 
             self.optimizer.zero_grad()
-            pred_dict = self.model_forward(data_dict, batch=batch)
+            pred_dict = self.model_forward(data_dict, batch=batch, epoch=epoch, training=True)
 
             total_loss_tensor, losses, weighted_losses = self.loss_fn(pred_dict, batch, self.device)
 

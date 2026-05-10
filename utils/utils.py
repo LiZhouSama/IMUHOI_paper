@@ -246,9 +246,9 @@ def build_model_input_dict(batch, cfg, device, add_noise=True):
             return value
         return None
     
-    def _ensure_bt(tensor, default_shape, fill_dtype):
+    def _ensure_bt(tensor, default_shape, fill_dtype, fill_value=0.0):
         if tensor is None:
-            return torch.zeros(*default_shape, device=device, dtype=fill_dtype)
+            return torch.full(default_shape, fill_value, device=device, dtype=fill_dtype)
         tensor = tensor.to(device=device)
         if tensor.dim() == len(default_shape) - 1:
             tensor = tensor.unsqueeze(0)
@@ -263,6 +263,31 @@ def build_model_input_dict(batch, cfg, device, add_noise=True):
     obj_vel = _ensure_bt(_get_tensor('obj_vel'), (bs, seq, 3), dtype)
     trans = _ensure_bt(_get_tensor('trans'), (bs, seq, 3), dtype)
     obj_trans = _ensure_bt(_get_tensor('obj_trans'), (bs, seq, 3), dtype)
+    obj_scale = _ensure_bt(_get_tensor('obj_scale'), (bs, seq), dtype, fill_value=1.0)
+    obj_rot_val = _get_tensor('obj_rot')
+    if isinstance(obj_rot_val, torch.Tensor):
+        obj_rot_gt = obj_rot_val.to(device=device, dtype=dtype)
+        if obj_rot_gt.dim() in {2, 3} and obj_rot_gt.shape[-1] == 6:
+            if obj_rot_gt.dim() == 2:
+                obj_rot_gt = obj_rot_gt.unsqueeze(0)
+            if obj_rot_gt.shape[0] == 1 and bs > 1:
+                obj_rot_gt = obj_rot_gt.expand(bs, -1, -1)
+            if obj_rot_gt.shape[:2] != (bs, seq):
+                obj_rot_gt = None
+        elif obj_rot_gt.dim() in {3, 4} and obj_rot_gt.shape[-2:] == (3, 3):
+            if obj_rot_gt.dim() == 3:
+                obj_rot_gt = obj_rot_gt.unsqueeze(0)
+            if obj_rot_gt.shape[0] == 1 and bs > 1:
+                obj_rot_gt = obj_rot_gt.expand(bs, -1, -1, -1)
+            if obj_rot_gt.shape[:2] != (bs, seq):
+                obj_rot_gt = None
+        else:
+            obj_rot_gt = None
+    else:
+        obj_rot_gt = None
+    if obj_rot_gt is None:
+        eye = torch.eye(3, device=device, dtype=dtype).view(1, 1, 3, 3).expand(bs, seq, 3, 3)
+        obj_rot_gt = matrix_to_rotation_6d(eye.reshape(-1, 3, 3)).reshape(bs, seq, 6)
     
     v_init = sensor_vel_root[:, 0]
     hand_indices = [len(_SENSOR_POS_INDICES) - 2, len(_SENSOR_POS_INDICES) - 1]
@@ -341,6 +366,9 @@ def build_model_input_dict(batch, cfg, device, add_noise=True):
         'trans_init': trans_init,
         'trans_gt': trans,
         'obj_trans_init': obj_trans_init,
+        'obj_trans_gt': obj_trans,
+        'obj_rot_gt': obj_rot_gt,
+        'obj_scale_gt': obj_scale,
         'obj_vel_init': obj_vel_init,
         'hand_vel_glb_init': hand_vel_glb_init,
         'contact_init': contact_init,

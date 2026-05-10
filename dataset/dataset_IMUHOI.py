@@ -176,10 +176,10 @@ class IMUDataset(Dataset):
         data_dir,
         window_size=60,
         debug=False,
-        min_obj_contact_frames=10,
+        min_obj_contact_frames=20,
         full_sequence=False,
         imu_noise_cfg=None,
-        simulate_imu_noise=True,
+        simulate_imu_noise=False,
         sequence_paths=None,
         obj_points_sample_count=256,
     ):
