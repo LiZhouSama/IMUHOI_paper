@@ -86,7 +86,9 @@ class VelocityContactModule(nn.Module):
             dropout=dropout,
         )
         # Hand contact conditioned on object moving
+        self.legacy_hand_contact_input_dim = contact_input_dim
         hand_contact_input_dim = 2 * (3 + 3) + 3 + self.obj_imu_dim + boundary_hidden  # vel+acc per hand + root vel + obj imu + boundary features
+        self.hand_contact_input_mode = "current"
         self.hand_contact_net = RNNWithInit(
             n_input=hand_contact_input_dim,
             n_output=2,  # left/right conditional prob
@@ -96,10 +98,33 @@ class VelocityContactModule(nn.Module):
             bidirectional=False,
             dropout=dropout,
         )
-        self.hand_contact_input_norm = nn.LayerNorm(hand_contact_input_dim)
 
         self.left_hand_sensor = _SENSOR_NAMES.index("LeftForeArm")
         self.right_hand_sensor = _SENSOR_NAMES.index("RightForeArm")
+
+    def enable_legacy_hand_contact_input(self, input_dim: int = None):
+        """Use the pre-boundary 27D hand-contact input expected by older VC checkpoints."""
+        input_dim = int(input_dim or self.legacy_hand_contact_input_dim)
+        current_dim = int(self.hand_contact_net.linear1.in_features)
+        self.hand_contact_input_mode = "legacy"
+        if current_dim == input_dim:
+            return self
+
+        hidden_dim = int(self.hand_contact_net.n_hidden)
+        num_layers = int(self.hand_contact_net.n_rnn_layer)
+        dropout = float(getattr(self.hand_contact_net.dropout, "p", 0.0))
+        device = self.hand_contact_net.linear1.weight.device
+        dtype = self.hand_contact_net.linear1.weight.dtype
+        self.hand_contact_net = RNNWithInit(
+            n_input=input_dim,
+            n_output=2,
+            n_hidden=hidden_dim,
+            n_init=3,
+            n_rnn_layer=num_layers,
+            bidirectional=False,
+            dropout=dropout,
+        ).to(device=device, dtype=dtype)
+        return self
 
     def _denormalize_imu(self, human_imu: torch.Tensor):
         """Convert IMU data back to world frame."""
@@ -269,16 +294,24 @@ class VelocityContactModule(nn.Module):
         boundary_logits, boundary_prob, boundary_out = self._encode_body_groups(pose_streams)
 
         # Hand contact using HPE-derived velocity/acc plus boundary hidden states
-        hand_dyn_feat = torch.cat(
-            (
-                pose_streams["hand_vel"].reshape(batch_size, seq_len, -1),
-                pose_streams["hand_acc"].reshape(batch_size, seq_len, -1),
-            ),
-            dim=-1,
-        )
-        root_vel_feat = pose_streams["root_vel"]
-        hand_contact_input = torch.cat((hand_dyn_feat, root_vel_feat, obj_imu, boundary_out), dim=-1)
-        hand_contact_input = self.hand_contact_input_norm(hand_contact_input)
+        if getattr(self, "hand_contact_input_mode", "current") == "legacy":
+            hand_contact_input = contact_input_imu
+        else:
+            hand_dyn_feat = torch.cat(
+                (
+                    pose_streams["hand_vel"].reshape(batch_size, seq_len, -1),
+                    pose_streams["hand_acc"].reshape(batch_size, seq_len, -1),
+                ),
+                dim=-1,
+            )
+            root_vel_feat = pose_streams["root_vel"]
+            hand_contact_input = torch.cat((hand_dyn_feat, root_vel_feat, obj_imu, boundary_out), dim=-1)
+        expected_contact_dim = int(self.hand_contact_net.linear1.in_features)
+        if hand_contact_input.shape[-1] != expected_contact_dim:
+            raise ValueError(
+                f"hand_contact_input dim {hand_contact_input.shape[-1]} does not match "
+                f"hand_contact_net input dim {expected_contact_dim}"
+            )
 
         hand_contact_logits = self.hand_contact_net((hand_contact_input, contact_init_vec))
         hand_contact_prob_cond = torch.sigmoid(hand_contact_logits)

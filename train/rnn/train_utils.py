@@ -154,6 +154,7 @@ def create_dataloaders(cfg, project_root=None):
         window_size=cfg.train.window,
         debug=cfg.debug,
         obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
+        simulate_imu_noise=True,
     )
     
     train_loader = DataLoader(
@@ -174,6 +175,7 @@ def create_dataloaders(cfg, project_root=None):
             window_size=cfg.test.window,
             debug=cfg.debug,
             obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
+            simulate_imu_noise=False,
         )
         if len(test_dataset) > 0:
             test_loader = DataLoader(
@@ -330,11 +332,13 @@ class BaseTrainer:
                 
                 if hasattr(self.loss_fn, 'compute_test_loss'):
                     total_loss, losses = self.loss_fn.compute_test_loss(pred_dict, batch, self.device)
+                    component_losses = losses
                 else:
-                    total_loss, losses, _ = self.loss_fn(pred_dict, batch, self.device)
+                    total_loss, losses, weighted_losses = self.loss_fn(pred_dict, batch, self.device)
+                    component_losses = weighted_losses
                 
                 test_loss += total_loss.item()
-                for key, value in losses.items():
+                for key, value in component_losses.items():
                     if isinstance(value, torch.Tensor):
                         loss_components[key] = loss_components.get(key, 0) + value.item()
         

@@ -35,16 +35,19 @@ prior_encoder_layers: 2
 prior_encoder_dropout: 0.1
 mesh_downsample_points: 256
 dgcnn_k: 16
-cond_mode_probs: [0.4, 0.4, 0.2]  # mesh/obs/null
+cond_mode_probs: [0.0, 1.0, 0.0]  # mesh/obs/null, obs-only warmup
+enable_ot_refine: true
 
 # ============ 训练超参数 ============
 epochs: 500
 input_mix_start_epoch: 0
-input_mix_end_epoch: 100
-batch_size: 120
+input_mix_end_epoch: 0  # 0 means use predicted HP/VC inputs from epoch 0
+joint_vc_unfreeze_epoch: 0
+batch_size: 60
 lr: 0.002
 weight_decay: 0.0001
-milestones: [100, 200, 300, 350, 400, 450, 500]
+# milestones: [100, 200, 300, 350, 400, 450, 500]
+milestones: [10,20,30,40,50,60,70,80,90,100]  #joint_train
 gamma: 0.2
 seed: 42
 num_workers: 12
@@ -58,6 +61,10 @@ num_joints: 24
 # ============ 噪声配置 ============
 imu_noise_std: 0.3
 obj_imu_noise_std: 0.3
+
+# ============ 评估超参数 ============
+hand_contact_threshold: 0.15
+object_contact_threshold: 0.5
 
 # ============ 要使用的数据集 ============
 train_datasets: ["omomo"]  # 可选: behave, imhd, omomo, amass
@@ -97,22 +104,27 @@ loss_weights:
   hand_vel: 1.0
   obj_move: 1.0
   hand_contact_cond: 1.0
+  hand_contact_pos_weight: 0.7
+  hand_contact_neg_weight: 4.0
+  hand_contact_hard_neg_weight: 8.0
   interaction_boundary: 0.1
   interaction_order: 1.0
   boundary_focal_alpha: 0.25
   boundary_focal_gamma: 2.0
 
   # Stage 3: ObjectTransModule
-  obj_trans: 1.0
-  lhand_obj_direction: 0.1
-  rhand_obj_direction: 0.1
-  lhand_lb: 0.1
-  rhand_lb: 0.1
-  hoi_error_l: 0.2
-  hoi_error_r: 0.2
-  obj_vel_cons: 0.1
-  obj_acc_cons: 0.01
-  interaction_code_align: 1.0
+  obj_trans: 10
+  lhand_obj_direction: 1
+  rhand_obj_direction: 1
+  lhand_lb: 10
+  rhand_lb: 10
+  hoi_error_l: 1
+  hoi_error_r: 1
+  obj_vel_cons: 0.01
+  obj_acc_cons: 0.00001
+  interaction_code_align: 0.1
+  refine_pose: 100
+  refine_root_trans: 10
 
 # ============ 窗口配置 ============
 train:
@@ -124,5 +136,9 @@ test:
 # ============ 预训练模块路径（可选）============
 pretrained_modules:
   human_pose: "outputs/IMUHOI_rnn/human_pose_12302142/best.pt"
-  velocity_contact: "outputs/IMUHOI_RNN_2/velocity_contact_05102216/best.pt"
-  object_trans: "outputs/IMUHOI_rnn/joint_train_01112057/best_object_trans.pt"
+  velocity_contact: "outputs/IMUHOI_RNN_2/joint_train_05141105/best_velocity_contact.pt"
+  object_trans: "outputs/IMUHOI_RNN_2/joint_train_05141105/best_object_trans.pt"
+
+  # human_pose: "outputs/IMUHOI_rnn/joint_train_01112057/best_human_pose.pt"
+  # velocity_contact: "outputs/IMUHOI_rnn/joint_train_01112057/best_velocity_contact.pt"
+  # object_trans: "outputs/IMUHOI_rnn/joint_train_01112057/best_object_trans.pt"

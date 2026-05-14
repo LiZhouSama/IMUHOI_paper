@@ -41,6 +41,10 @@ class VelocityContactLoss:
         neg_term = -(1 - alpha) * pred ** gamma * (1 - target) * torch.log(1 - pred)
         loss = pos_term + neg_term
         if mask is not None:
+            mask = mask.to(device=loss.device, dtype=loss.dtype)
+            while mask.dim() < loss.dim():
+                mask = mask.unsqueeze(-1)
+            mask = mask.expand_as(loss)
             loss = loss * mask
             denom = mask.sum().clamp_min(eps)
             return loss.sum() / denom
@@ -134,8 +138,27 @@ class VelocityContactLoss:
                 hand_logits_cond, hand_contact_gt_2.float(), reduction='none'
             )
             mask = obj_contact_gt.float()
+            pos_weight = float(self.weights.get('hand_contact_pos_weight', 1.0))
+            neg_weight = float(self.weights.get('hand_contact_neg_weight', 1.0))
+            hard_neg_weight = float(self.weights.get('hand_contact_hard_neg_weight', neg_weight))
+            elem_weight = torch.where(
+                hand_contact_gt_2 > 0.5,
+                torch.full_like(hand_contact_gt_2, pos_weight),
+                torch.full_like(hand_contact_gt_2, neg_weight),
+            )
+            hard_neg_mask = (
+                obj_contact_gt
+                & (~lhand_contact_gt)
+                & (~rhand_contact_gt)
+            ).unsqueeze(-1)
+            elem_weight = torch.where(
+                hard_neg_mask & (hand_contact_gt_2 <= 0.5),
+                torch.full_like(elem_weight, hard_neg_weight),
+                elem_weight,
+            )
+            valid_weight = elem_weight * mask.unsqueeze(-1)
             losses['hand_contact_cond'] = (
-                (cond_loss * mask.unsqueeze(-1)).sum() / mask.sum().clamp_min(1e-6)
+                (cond_loss * valid_weight).sum() / valid_weight.sum().clamp_min(1e-6)
                 if mask.sum() > 0
                 else zero.clone()
             )
@@ -146,8 +169,27 @@ class VelocityContactLoss:
             )
             cond_loss = F.binary_cross_entropy(hand_contact_prob, hand_contact_gt_2.float(), reduction='none')
             mask = obj_contact_gt.float()
+            pos_weight = float(self.weights.get('hand_contact_pos_weight', 1.0))
+            neg_weight = float(self.weights.get('hand_contact_neg_weight', 1.0))
+            hard_neg_weight = float(self.weights.get('hand_contact_hard_neg_weight', neg_weight))
+            elem_weight = torch.where(
+                hand_contact_gt_2 > 0.5,
+                torch.full_like(hand_contact_gt_2, pos_weight),
+                torch.full_like(hand_contact_gt_2, neg_weight),
+            )
+            hard_neg_mask = (
+                obj_contact_gt
+                & (~lhand_contact_gt)
+                & (~rhand_contact_gt)
+            ).unsqueeze(-1)
+            elem_weight = torch.where(
+                hard_neg_mask & (hand_contact_gt_2 <= 0.5),
+                torch.full_like(elem_weight, hard_neg_weight),
+                elem_weight,
+            )
+            valid_weight = elem_weight * mask.unsqueeze(-1)
             losses['hand_contact_cond'] = (
-                (cond_loss * mask.unsqueeze(-1)).sum() / mask.sum().clamp_min(1e-6)
+                (cond_loss * valid_weight).sum() / valid_weight.sum().clamp_min(1e-6)
                 if mask.sum() > 0
                 else zero.clone()
             )

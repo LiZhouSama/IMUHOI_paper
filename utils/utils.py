@@ -65,6 +65,36 @@ def setup_device(cfg):
 
 # ============ 模型加载 ============
 
+def _find_state_tensor_by_suffix(state_dict, suffix):
+    for key, value in state_dict.items():
+        clean_key = key[7:] if key.startswith('module.') else key
+        if clean_key == suffix and isinstance(value, torch.Tensor):
+            return value
+    return None
+
+
+def _maybe_adapt_legacy_velocity_contact(model, state_dict):
+    target = model.module if hasattr(model, 'module') else model
+    if not hasattr(target, 'enable_legacy_hand_contact_input'):
+        return False
+    ckpt_weight = _find_state_tensor_by_suffix(state_dict, 'hand_contact_net.linear1.weight')
+    if ckpt_weight is None or ckpt_weight.dim() != 2:
+        return False
+    model_weight = target.state_dict().get('hand_contact_net.linear1.weight')
+    if model_weight is None or model_weight.dim() != 2:
+        return False
+    ckpt_input_dim = int(ckpt_weight.shape[1])
+    model_input_dim = int(model_weight.shape[1])
+    if ckpt_input_dim == model_input_dim:
+        return False
+    target.enable_legacy_hand_contact_input(ckpt_input_dim)
+    print(
+        "检测到旧版VelocityContact hand_contact_net输入维度 "
+        f"{ckpt_input_dim}，已切换legacy contact输入路径。"
+    )
+    return True
+
+
 def load_smpl_model(smpl_path: str, device: torch.device):
     """加载SMPL模型"""
     from human_body_prior.body_model.body_model import BodyModel
@@ -85,6 +115,10 @@ def load_checkpoint(model, checkpoint_path, device, strict=True, use_ema=True):
             state_dict = checkpoint['ema_state_dict']
         else:
             state_dict = checkpoint.get('module_state_dict', checkpoint.get('model_state_dict', checkpoint))
+    adapted_legacy = isinstance(state_dict, dict) and _maybe_adapt_legacy_velocity_contact(model, state_dict)
+    if strict and adapted_legacy:
+        print("检测到旧版VelocityContact结构漂移，自动使用兼容加载。")
+        strict = False
     if strict:
         model.load_state_dict(state_dict, strict=True)
     else:

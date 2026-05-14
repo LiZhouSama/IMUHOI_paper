@@ -48,6 +48,7 @@ class ObjectTransLoss:
     
     # 测试阶段用于模型选择的损失键
     TEST_LOSS_KEYS = {
+        'obj_trans',
         'lhand_obj_direction',
         'rhand_obj_direction',
         'lhand_lb',
@@ -276,10 +277,10 @@ class ObjectTransLoss:
     
     def compute_test_loss(self, pred_dict, batch, device):
         """计算测试损失（用于模型选择）"""
-        total_loss, losses, _ = self.compute_loss(pred_dict, batch, device)
+        total_loss, losses, weighted_losses = self.compute_loss(pred_dict, batch, device)
         
         # 只选择测试损失键
-        test_losses = {k: v for k, v in losses.items() if k in self.TEST_LOSS_KEYS}
+        test_losses = {k: v for k, v in weighted_losses.items() if k in self.TEST_LOSS_KEYS}
         
         # 重新计算测试总损失
         test_total = sum(test_losses.values())

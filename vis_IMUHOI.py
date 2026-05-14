@@ -145,7 +145,7 @@ def _global_to_local_rotmat(global_rotmats, parents):
     return local_rotmats
 
 
-def _run_model_prediction(model, model_input, batch_device, compute_fk_flag, model_arch):
+def _run_model_prediction(model, model_input, batch_device, compute_fk_flag, model_arch, ot_refine=False):
     model_kind = _infer_model_kind(model)
     if model_kind == "human_pose":
         if hasattr(model, "inference"):
@@ -161,16 +161,18 @@ def _run_model_prediction(model, model_input, batch_device, compute_fk_flag, mod
                 gt_targets=batch_device,
                 use_object_data=True,
                 compute_fk=compute_fk_flag,
+                refine_human=ot_refine,
             )
-        return model(model_input, use_object_data=True, compute_fk=compute_fk_flag)
+        return model(model_input, use_object_data=True, compute_fk=compute_fk_flag, refine_human=ot_refine)
     if model_arch == "dit":
         return model.inference(
             model_input,
             gt_targets=batch_device,
             use_object_data=True,
             compute_fk=compute_fk_flag,
+            refine_human=ot_refine,
         )
-    return model(model_input, use_object_data=True, compute_fk=compute_fk_flag)
+    return model(model_input, use_object_data=True, compute_fk=compute_fk_flag, refine_human=ot_refine)
 
 
 def compute_virtual_bone_info(wrist_pos, obj_trans, obj_rot_mat):
@@ -326,7 +328,7 @@ def _add_overlay_meshes(viewer, verts_seq, faces_np, frame_ids, base_name, base_
 def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root, 
                          show_objects=True, vis_gt_only=False, show_foot_contact=False, 
                          show_obj_traj=False, show_hand_traj=False, use_fk=False, compare_3=False, 
-                         pred_offset_np=None, no_trans=False, overlay_frames=None):
+                         pred_offset_np=None, no_trans=False, overlay_frames=None, ot_refine=False):
     """Visualize one batch sequence."""
     try:
         nodes_to_remove = [
@@ -460,7 +462,14 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                 model_input = build_model_input_dict(batch_device, config, device, add_noise=False)
                 compute_fk_flag = bool(use_fk or compare_3)
                 model_arch = str(getattr(config, "model_arch", "rnn")).lower()
-                pred_dict = _run_model_prediction(model, model_input, batch_device, compute_fk_flag, model_arch)
+                pred_dict = _run_model_prediction(
+                    model,
+                    model_input,
+                    batch_device,
+                    compute_fk_flag,
+                    model_arch,
+                    ot_refine=ot_refine,
+                )
             except Exception as exc:
                 print(f"Model inference failed: {exc}")
                 pred_dict = None
@@ -811,7 +820,7 @@ class InteractiveViewer(Viewer):
     def __init__(self, data_list, model, smpl_model, config, device, obj_geo_root, 
                  show_objects=True, vis_gt_only=False, show_foot_contact=False,
                  show_obj_traj=False, show_hand_traj=False, use_fk=False, compare_3=False, 
-                 pred_offset=None, no_trans=False, overlay_frames=None, **kwargs):
+                 pred_offset=None, no_trans=False, overlay_frames=None, ot_refine=False, **kwargs):
         super().__init__(**kwargs)
         self.data_list = data_list
         self.current_index = 0
@@ -830,6 +839,7 @@ class InteractiveViewer(Viewer):
         self.pred_offset = pred_offset
         self.no_trans = no_trans
         self.overlay_frames = overlay_frames
+        self.ot_refine = ot_refine
         self.virtual_bone_info = {'has_data': False}
         
         self.visualize_current_sequence()
@@ -865,6 +875,7 @@ class InteractiveViewer(Viewer):
                     self.obj_geo_root, self.show_objects, self.vis_gt_only,
                     self.show_foot_contact, self.show_obj_traj, self.show_hand_traj,
                     self.use_fk, self.compare_3, self.pred_offset, self.no_trans, self.overlay_frames,
+                    self.ot_refine,
                 )
                 title_base = f"Sequence: {seq_file_name}" if seq_file_name else f"Sequence Index: {self.current_index}/{len(self.data_list)-1}"
                 self.title = f"{title_base}{mode_str} (q/e:闁?, Ctrl+q/e:闁?0, Alt+q/e:闁?0)"
@@ -919,10 +930,24 @@ def main():
     parser.add_argument('--show_hand_traj', action='store_true', help='Show hand contact trajectory')
     parser.add_argument('--use_fk', action='store_true', help='Enable FK branch')
     parser.add_argument('--compare_3', action='store_true', help='Compare three object branches')
-    parser.add_argument('--limit_sequences', type=int, default=None, help='Limit number of loaded sequences')
+    parser.add_argument('--limit_sequences', type=int, default=500, help='Limit number of loaded sequences')
     parser.add_argument('--pred_offset', type=float, nargs=3, default=[0.0, 0.0, 0.0], help='Prediction translation offset')
     parser.add_argument('--overlay_frames', type=int, nargs='+', default=None, help='Overlay selected 0-based frames in one scene')
     parser.add_argument('--no_trans', action='store_true', help='Enable noTrans mode')
+    refine_group = parser.add_mutually_exclusive_group()
+    refine_group.add_argument(
+        '--enable_ot_refine',
+        dest='ot_refine',
+        action='store_true',
+        default=None,
+        help='Allow ObjectTrans refine to override human pose/root trans',
+    )
+    refine_group.add_argument(
+        '--disable_ot_refine',
+        dest='ot_refine',
+        action='store_false',
+        help='Disable ObjectTrans human refine and keep HumanPose output',
+    )
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -933,6 +958,13 @@ def main():
     config = load_config(args.config)
     if args.model_arch is not None:
         config.model_arch = args.model_arch
+    ot_refine = (
+        bool(args.ot_refine)
+        if args.ot_refine is not None
+        else bool(getattr(config, 'enable_ot_refine', False))
+    )
+    config.enable_ot_refine = ot_refine
+    print(f"OT human refine: {'enabled' if ot_refine else 'disabled'}")
     module_paths = None
     if hasattr(config, "pretrained_modules") and config.pretrained_modules:
         module_paths = dict(config.pretrained_modules)
@@ -1075,6 +1107,7 @@ def main():
         pred_offset=pred_offset_np,
         no_trans=args.no_trans,
         overlay_frames=args.overlay_frames,
+        ot_refine=ot_refine,
         window_size=(1920, 1080)
     )
     

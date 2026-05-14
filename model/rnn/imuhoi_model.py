@@ -248,13 +248,18 @@ class IMUHOIModel(nn.Module):
                 )
         except Exception as exc:
             print(f"Warning: failed to recompute refined human outputs: {exc}")
+
+    def _resolve_refine_human(self, refine_human: Optional[bool]) -> bool:
+        if refine_human is None:
+            return bool(getattr(self.cfg, "enable_ot_refine", False))
+        return bool(refine_human)
     
     def forward(
         self,
         data_dict: Dict[str, torch.Tensor],
         use_object_data: bool = True,
         compute_fk: bool = False,
-        refine_human: bool = True,
+        refine_human: Optional[bool] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         前向传播
@@ -278,6 +283,7 @@ class IMUHOIModel(nn.Module):
         Returns:
             结果字典，包含各阶段的预测输出
         """
+        refine_human = self._resolve_refine_human(refine_human)
         human_imu = data_dict["human_imu"]
         batch_size, seq_len = human_imu.shape[:2]
         
@@ -355,7 +361,7 @@ class IMUHOIModel(nn.Module):
         use_object_data: bool = True,
         compute_fk: bool = False,
         interaction_use_human_pred: bool = True,
-        refine_human: bool = True,
+        refine_human: Optional[bool] = None,
         **_,
     ) -> Dict[str, torch.Tensor]:
         """

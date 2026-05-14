@@ -176,7 +176,7 @@ class IMUDataset(Dataset):
         data_dir,
         window_size=60,
         debug=False,
-        min_obj_contact_frames=20,
+        min_obj_contact_frames=0,
         full_sequence=False,
         imu_noise_cfg=None,
         simulate_imu_noise=False,

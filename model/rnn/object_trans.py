@@ -138,7 +138,7 @@ class _ObsEncoder(nn.Module):
 
 
 class _MeshPriorEncoder(nn.Module):
-    """Privileged mesh teacher: local object geometry + human context -> per-frame code."""
+    """Privileged mesh teacher: canonical object geometry + human context -> per-frame code."""
 
     def __init__(
         self,
@@ -192,27 +192,6 @@ class _MeshPriorEncoder(nn.Module):
         return out, True
 
     @staticmethod
-    def _resolve_rot_mats(value, batch_size, seq_len, device, dtype):
-        if not isinstance(value, torch.Tensor):
-            return None
-        rot = value.to(device=device, dtype=dtype)
-        if rot.dim() == 2 and rot.shape[-1] == 6:
-            rot = rot.unsqueeze(0)
-        if rot.dim() == 3 and rot.shape[-1] == 6:
-            if rot.shape[0] == 1 and batch_size > 1:
-                rot = rot.expand(batch_size, -1, -1)
-            if rot.shape[:2] == (batch_size, seq_len):
-                return rotation_6d_to_matrix(rot.reshape(-1, 6)).reshape(batch_size, seq_len, 3, 3)
-        if rot.dim() == 3 and rot.shape[-2:] == (3, 3):
-            rot = rot.unsqueeze(0)
-        if rot.dim() == 4 and rot.shape[-2:] == (3, 3):
-            if rot.shape[0] == 1 and batch_size > 1:
-                rot = rot.expand(batch_size, -1, -1, -1)
-            if rot.shape[:2] == (batch_size, seq_len):
-                return rot
-        return None
-
-    @staticmethod
     def _prepare_points(value, batch_size, device, dtype):
         if not isinstance(value, torch.Tensor):
             return None
@@ -243,11 +222,11 @@ class _MeshPriorEncoder(nn.Module):
         zero_code = torch.zeros(batch_size, seq_len, self.out_proj.out_features, device=device, dtype=dtype)
         valid_mask = torch.zeros(batch_size, device=device, dtype=torch.bool)
 
+        # GT object rotation/translation are intentionally ignored here. The
+        # teacher should not expose pose information that the obs encoder lacks.
         points = self._prepare_points(obj_points_canonical, batch_size, device, dtype)
-        obj_rot_mats = self._resolve_rot_mats(obj_rot_gt, batch_size, seq_len, device, dtype)
-        obj_trans, trans_ok = self._expand_bt(obj_trans_gt, batch_size, seq_len, (3,), device, dtype, default=0.0)
         obj_scale, _ = self._expand_bt(obj_scale_gt, batch_size, seq_len, (), device, dtype, default=1.0)
-        if points is None or obj_rot_mats is None or not trans_ok:
+        if points is None:
             return zero_code, valid_mask
 
         nonzero_points = points.abs().sum(dim=(1, 2)) > 1e-8
@@ -256,15 +235,10 @@ class _MeshPriorEncoder(nn.Module):
             return zero_code, valid_mask
 
         points_seq = points[:, None] * obj_scale[:, :1].view(batch_size, 1, 1, 1)
-        obj_rt = obj_rot_mats.transpose(-1, -2)
-        hand_local = torch.matmul(
-            obj_rt.unsqueeze(2),
-            (hand_positions - obj_trans.unsqueeze(2)).unsqueeze(-1),
-        ).squeeze(-1)
-        root_local = torch.matmul(obj_rt, (root_trans - obj_trans).unsqueeze(-1)).squeeze(-1)
-
         point_tokens = self.point_encoder(points_seq).expand(-1, seq_len, -1, -1)
-        human_token = self.human_mlp(torch.cat((human_pose, root_local, hand_local.reshape(batch_size, seq_len, -1)), dim=-1))
+        human_token = self.human_mlp(
+            torch.cat((human_pose, root_trans, hand_positions.reshape(batch_size, seq_len, -1)), dim=-1)
+        )
 
         bt = batch_size * seq_len
         query = human_token.reshape(bt, 1, -1)
@@ -757,7 +731,8 @@ class ObjectTransModule(nn.Module):
             human_pose_input: [B, T, num_reduced*6] 人体姿态基线，用于残差微调
             root_trans_input: [B, T, 3] 根节点位移基线，用于残差微调
             obj_points_canonical: [B, N, 3] 训练期物体canonical点云
-            obj_rot_gt/obj_trans_gt/obj_scale_gt: 训练期mesh teacher使用的GT物体姿态
+            obj_scale_gt: 训练期mesh teacher可选scale
+            obj_rot_gt/obj_trans_gt: 兼容旧调用，MeshPrior不再使用GT物体姿态
             enable_refine: 是否输出人体姿态/root trans微调结果
         
         Returns:

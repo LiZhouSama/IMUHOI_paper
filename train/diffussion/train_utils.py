@@ -160,7 +160,7 @@ def create_dataloaders(cfg, project_root=None):
         data_dir=train_paths,
         window_size=cfg.train.window,
         debug=cfg.debug,
-        simulate_imu_noise=False,
+        simulate_imu_noise=True,
         full_sequence=bool(train_full_sequence),
         obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
     )

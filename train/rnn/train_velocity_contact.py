@@ -33,6 +33,23 @@ from train.rnn.scheduled_inputs import (
 )
 
 
+def _cfg_get(container, key, default=None):
+    if isinstance(container, dict):
+        return container.get(key, default)
+    return getattr(container, key, default)
+
+
+def _resolve_hp_ckpt(cfg, cli_hp_ckpt=None):
+    """Prefer explicit CLI, then cfg.hp_ckpt, then pretrained_modules.human_pose."""
+    if cli_hp_ckpt:
+        return cli_hp_ckpt
+    cfg_hp_ckpt = getattr(cfg, "hp_ckpt", None)
+    if cfg_hp_ckpt:
+        return cfg_hp_ckpt
+    pretrained_modules = getattr(cfg, "pretrained_modules", None)
+    return _cfg_get(pretrained_modules, "human_pose")
+
+
 def get_args():
     parser = get_base_args()
     parser.description = 'VelocityContactModule training (Stage 2)'
@@ -152,7 +169,7 @@ class VelocityContactTrainer(BaseTrainer):
 def main():
     args = get_args()
     cfg = merge_config(args)
-    cfg.hp_ckpt = getattr(args, "hp_ckpt", None)
+    cfg.hp_ckpt = _resolve_hp_ckpt(cfg, getattr(args, "hp_ckpt", None))
 
     setup_seed(cfg.seed)
     cfg = setup_device(cfg)
@@ -166,6 +183,8 @@ def main():
     print(f"Learning rate: {cfg.lr}")
     if getattr(cfg, "pretrained_ckpt", None):
         print(f"Pretrained: {cfg.pretrained_ckpt}")
+    if getattr(cfg, "hp_ckpt", None):
+        print(f"HumanPose checkpoint: {cfg.hp_ckpt}")
     print(f"Save dir: {save_dir}")
     print("=" * 50)
 
@@ -190,10 +209,10 @@ def main():
                 load_checkpoint(hp_model, cfg.hp_ckpt, device, strict=False)
                 print(f"Loaded HumanPose checkpoint: {cfg.hp_ckpt}")
             else:
-                print(f"Warning: HumanPose checkpoint not found at {cfg.hp_ckpt}, hp_out will be zeros.")
+                print(f"Warning: HumanPose checkpoint not found at {cfg.hp_ckpt}, fallback to GT hp_out.")
             hp_model = hp_model.to(device)
         except Exception as exc:
-            print(f"Warning: failed to init/load HumanPose; hp_out will be zeros. {exc}")
+            print(f"Warning: failed to init/load HumanPose; fallback to GT hp_out. {exc}")
             hp_model = None
 
     # loss

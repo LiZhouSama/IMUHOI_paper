@@ -32,10 +32,14 @@ except Exception:
     sys.modules["pytorch3d.transforms"] = transforms_mod
 
 from configs import _REDUCED_POSE_NAMES
+from model.rnn.imuhoi_model import IMUHOIModel
 from model.rnn.object_trans import ObjectTransModule
+from model.rnn.velocity_contact import VelocityContactModule
 from train.rnn.loss.object_trans_loss import ObjectTransLoss
+from train.rnn.loss.velocity_contact_loss import VelocityContactLoss
 from train.rnn.scheduled_inputs import prediction_mix_probability, sample_mix_tensor
-from train.rnn.train_object_trans import Stage3JointTrainer
+from train.rnn.train_object_trans import Stage3JointTrainer, _resolve_pretrained_ckpt
+from train.rnn.train_velocity_contact import _resolve_hp_ckpt
 from utils.utils import build_model_input_dict
 
 
@@ -104,6 +108,20 @@ def test_object_trans_refinement_outputs_identity_at_init():
     )
     assert "refined_pose" not in disabled
     assert "refined_root_trans" not in disabled
+
+
+def test_imuhoi_model_refine_human_defaults_to_config_flag():
+    model = object.__new__(IMUHOIModel)
+    model.cfg = SimpleNamespace(enable_ot_refine=False)
+    assert model._resolve_refine_human(None) is False
+    assert model._resolve_refine_human(True) is True
+
+    model.cfg = SimpleNamespace(enable_ot_refine=True)
+    assert model._resolve_refine_human(None) is True
+    assert model._resolve_refine_human(False) is False
+
+    model.cfg = SimpleNamespace()
+    assert model._resolve_refine_human(None) is False
 
 
 def test_object_trans_loss_includes_refinement_terms():
@@ -196,6 +214,30 @@ def test_object_trans_interaction_prior_mesh_train_outputs_frame_codes():
     assert bool((aux["mesh_valid_mask"] == 1).all())
     assert bool((aux["mode"] == 0).all())
     assert out["pred_obj_trans"].shape == (2, 3, 3)
+
+
+def test_object_trans_mesh_prior_does_not_require_gt_object_pose():
+    torch.manual_seed(127)
+    model = ObjectTransModule(_small_prior_cfg(cond_mode_probs=[1.0, 0.0, 0.0])).train()
+    data = _object_trans_prior_inputs()
+
+    out = model(
+        data["hand_pos"],
+        data["contact"],
+        data["obj_trans_init"],
+        obj_imu=data["obj_imu"],
+        human_imu=data["human_imu"],
+        obj_vel_input=data["obj_vel"],
+        has_object_mask=data["has_object"],
+        human_pose_input=data["pose"],
+        root_trans_input=data["root"],
+        obj_points_canonical=data["obj_points"],
+        obj_scale_gt=data["obj_scale"],
+    )
+
+    aux = out["interaction_prior_aux"]
+    assert bool((aux["mesh_valid_mask"] == 1).all())
+    assert bool((aux["mode"] == 0).all())
 
 
 def test_object_trans_interaction_prior_eval_uses_obs_without_mesh_gt():
@@ -297,6 +339,98 @@ def test_object_trans_loss_interaction_code_align_term():
     assert losses_no_aux["interaction_code_align"].item() == 0
 
 
+def test_object_trans_test_loss_records_obj_trans():
+    batch_size, seq_len = 2, 3
+    batch = {
+        "human_imu": torch.zeros(batch_size, seq_len, 6, 9),
+        "has_object": torch.ones(batch_size, dtype=torch.bool),
+        "obj_trans": torch.ones(batch_size, seq_len, 3),
+    }
+    pred = {"pred_obj_trans": torch.zeros(batch_size, seq_len, 3)}
+
+    loss_fn = ObjectTransLoss()
+    total, test_losses = loss_fn.compute_test_loss(pred, batch, torch.device("cpu"))
+
+    assert "obj_trans" in test_losses
+    assert test_losses["obj_trans"].item() > 0
+    assert total.item() >= test_losses["obj_trans"].item()
+
+
+def test_velocity_contact_legacy_hand_contact_input_mode_forward():
+    cfg = SimpleNamespace(
+        num_human_imus=6,
+        imu_dim=9,
+        obj_imu_dim=9,
+        velocity_hidden_dim=16,
+        velocity_num_layers=1,
+        velocity_dropout=0.0,
+        boundary_group_hidden=8,
+        boundary_hidden_dim=8,
+    )
+    model = VelocityContactModule(cfg)
+    model.enable_legacy_hand_contact_input(27)
+
+    batch_size, seq_len = 2, 4
+    eye6 = torch.eye(3)[:, :2].reshape(6)
+    data = {
+        "human_imu": torch.zeros(batch_size, seq_len, 6, 9),
+        "obj_imu": torch.zeros(batch_size, seq_len, 9),
+        "hand_vel_glb_init": torch.zeros(batch_size, 2, 3),
+        "obj_vel_init": torch.zeros(batch_size, 3),
+        "contact_init": torch.zeros(batch_size, 3),
+    }
+    data["human_imu"][..., 3:9] = eye6
+    data["obj_imu"][..., 3:9] = eye6
+
+    out = model(data)
+    assert model.hand_contact_input_mode == "legacy"
+    assert model.hand_contact_net.linear1.in_features == 27
+    assert out["pred_hand_contact_prob"].shape == (batch_size, seq_len, 3)
+    assert out["pred_obj_vel"].shape == (batch_size, seq_len, 3)
+
+
+def test_velocity_contact_hp_ckpt_resolves_from_config_pretrained_modules():
+    cfg = SimpleNamespace(
+        hp_ckpt=None,
+        pretrained_modules=SimpleNamespace(human_pose="outputs/IMUHOI_rnn/human_pose_12302142/best.pt"),
+    )
+
+    assert _resolve_hp_ckpt(cfg) == "outputs/IMUHOI_rnn/human_pose_12302142/best.pt"
+    assert _resolve_hp_ckpt(cfg, "custom_hp.pt") == "custom_hp.pt"
+
+
+def test_object_trans_checkpoint_resolution_prefers_config_before_auto():
+    cfg = SimpleNamespace(
+        hp_ckpt=None,
+        pretrained_modules=SimpleNamespace(
+            human_pose="cfg_hp.pt",
+            velocity_contact="cfg_vc.pt",
+            object_trans="cfg_ot.pt",
+        ),
+    )
+
+    assert _resolve_pretrained_ckpt(cfg, None, "human_pose", "hp_ckpt") == (
+        "cfg_hp.pt",
+        "config.pretrained_modules.human_pose",
+    )
+    assert _resolve_pretrained_ckpt(cfg, "cli_vc.pt", "velocity_contact", "vc_ckpt") == (
+        "cli_vc.pt",
+        "cli",
+    )
+    assert _resolve_pretrained_ckpt(SimpleNamespace(), None, "human_pose", "hp_ckpt") == (None, None)
+
+
+def test_velocity_contact_focal_binary_mask_denominator_expands_to_loss_shape():
+    pred = torch.full((2, 3, 2), 0.5)
+    target = torch.zeros_like(pred)
+    sample_mask = torch.tensor([[[1.0]], [[0.0]]])
+
+    loss = VelocityContactLoss._focal_binary(pred, target, mask=sample_mask)
+    expected = -(1 - 0.25) * (0.5 ** 2) * torch.log(torch.tensor(0.5))
+
+    assert torch.allclose(loss, expected, atol=1e-6)
+
+
 def test_build_model_input_dict_passes_object_prior_fields():
     cfg = SimpleNamespace(
         num_human_imus=6,
@@ -361,4 +495,36 @@ def test_stage3_joint_unfreezes_vc_only_after_boundary():
 
     trainer._update_joint_state(2)
     assert all(not p.requires_grad for p in trainer.hp_model.parameters())
+    assert all(p.requires_grad for p in trainer.vc_model.parameters())
+
+
+def test_stage3_joint_unfreezes_vc_immediately_by_default():
+    class TinyModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = nn.Linear(2, 2)
+
+    cfg = SimpleNamespace(
+        device="cpu",
+        use_multi_gpu=False,
+        lr=1e-3,
+        weight_decay=0.0,
+        milestones=[],
+        gamma=0.1,
+        use_tensorboard=False,
+        debug=True,
+        no_trans=False,
+        loss_weights={},
+    )
+    trainer = Stage3JointTrainer(
+        cfg,
+        vc_model=TinyModule(),
+        hp_model=TinyModule(),
+        ot_model=TinyModule(),
+        train_loader=[],
+        test_loader=None,
+        joint_train=True,
+    )
+
+    trainer._update_joint_state(0)
     assert all(p.requires_grad for p in trainer.vc_model.parameters())
