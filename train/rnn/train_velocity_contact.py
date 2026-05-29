@@ -25,6 +25,7 @@ from train.rnn.train_utils import (
     build_model_input_dict,
     BaseTrainer,
     load_checkpoint,
+    call_model_inference,
 )
 from train.rnn.scheduled_inputs import (
     build_gt_human_pose_outputs,
@@ -87,7 +88,7 @@ class VelocityContactTrainer(BaseTrainer):
         pred_hp_out = None
         if self.hp_model is not None:
             with torch.no_grad():
-                pred_hp_out = self.hp_model(data_dict)
+                pred_hp_out = call_model_inference(self.hp_model, data_dict, inference_mode="offline")
 
         hp_out = pred_hp_out
         if batch is not None:
@@ -113,7 +114,7 @@ class VelocityContactTrainer(BaseTrainer):
                     ),
                     prediction_mix_probability(epoch, self.cfg),
                 )
-        return self.model(data_dict, hp_out=hp_out)
+        return call_model_inference(self.model, data_dict, hp_out=hp_out, inference_mode="offline")
 
     def train_epoch(self, epoch):
         """Override to add gradient clipping for stability."""

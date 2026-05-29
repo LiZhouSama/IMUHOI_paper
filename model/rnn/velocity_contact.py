@@ -6,6 +6,16 @@ import torch.nn as nn
 from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_rotation_6d
 
 from .base import RNNWithInit
+from .online import (
+    append_stream_data,
+    concat_time_dicts,
+    infer_batch_seq,
+    normalize_inference_mode,
+    resolve_online_window,
+    slice_time_dict,
+    take_latest_frame,
+    update_data_inits_from_history,
+)
 from configs import FRAME_RATE, _SENSOR_NAMES
 from utils.utils import _central_diff, _smooth_acceleration
 
@@ -19,6 +29,7 @@ class VelocityContactModule(nn.Module):
 
     def __init__(self, cfg):
         super().__init__()
+        self.cfg = cfg
         self.num_human_imus = getattr(cfg, "num_human_imus", len(_SENSOR_NAMES))
         self.imu_dim = getattr(cfg, "imu_dim", 9)
         self.obj_imu_dim = getattr(cfg, "obj_imu_dim", self.imu_dim)
@@ -334,6 +345,63 @@ class VelocityContactModule(nn.Module):
             "pred_interaction_boundary_logits": boundary_logits,
             "pred_interaction_boundary_prob": boundary_prob,
         }
+
+    def _slice_hp_out(self, hp_out, start: int, end: int, batch_size: int, seq_len: int):
+        if not isinstance(hp_out, dict):
+            return hp_out
+        return slice_time_dict(hp_out, start, end, batch_size, seq_len)
+
+    def _inference_online_sequence(self, data_dict: dict, hp_out: dict = None, online_window: int = 120):
+        batch_size, seq_len = infer_batch_seq(data_dict)
+        if seq_len <= online_window:
+            return self.forward(data_dict, hp_out=hp_out)
+
+        warmup_len = int(online_window)
+        warmup_data = slice_time_dict(data_dict, 0, warmup_len, batch_size, seq_len)
+        warmup_hp = self._slice_hp_out(hp_out, 0, warmup_len, batch_size, seq_len)
+        history = self.forward(warmup_data, hp_out=warmup_hp)
+
+        for end in range(warmup_len + 1, seq_len + 1):
+            start = end - warmup_len
+            window_data = slice_time_dict(data_dict, start, end, batch_size, seq_len)
+            window_data = update_data_inits_from_history(window_data, history, index=start - 1)
+            window_hp = self._slice_hp_out(hp_out, start, end, batch_size, seq_len)
+            window_out = self.forward(window_data, hp_out=window_hp)
+            latest = take_latest_frame(window_out, batch_size, end - start)
+            history = concat_time_dicts([history, latest])
+
+        return history
+
+    def inference(
+        self,
+        data_dict: dict,
+        hp_out: dict = None,
+        inference_mode: str = "offline",
+        online_window: int = None,
+        online_state: dict = None,
+        return_online_state: bool = False,
+        **_,
+    ):
+        mode = normalize_inference_mode(inference_mode)
+        if mode == "offline":
+            output = self.forward(data_dict, hp_out=hp_out)
+            if return_online_state:
+                return output, online_state or {}
+            return output
+
+        window = resolve_online_window(self.cfg, online_window)
+        run_data, previous_len = append_stream_data(
+            online_state.get("data_dict") if isinstance(online_state, dict) else None,
+            data_dict,
+        )
+        output = self._inference_online_sequence(run_data, hp_out=hp_out, online_window=window)
+        state = {"data_dict": run_data, "hp_out": hp_out, "outputs": output}
+        if return_online_state:
+            if previous_len > 0:
+                batch_size, seq_len = infer_batch_seq(run_data)
+                output = slice_time_dict(output, previous_len, seq_len, batch_size, seq_len)
+            return output, state
+        return output
 
     @staticmethod
     def empty_output(batch_size: int, seq_len: int, device: torch.device):

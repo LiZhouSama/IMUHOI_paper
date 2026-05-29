@@ -23,6 +23,7 @@ from train.rnn.train_utils import (
     create_save_dir,
     create_dataloaders,
     BaseTrainer,
+    call_model_inference,
 )
 
 
@@ -46,7 +47,7 @@ class HumanPoseTrainer(BaseTrainer):
         batch=None,
     ):
         """模型前向传播（统一由HumanPoseModule内部根据no_trans处理）"""
-        return self.model(data_dict)
+        return call_model_inference(self.model, data_dict, inference_mode="offline")
 
 
 def main():

@@ -145,18 +145,35 @@ def _global_to_local_rotmat(global_rotmats, parents):
     return local_rotmats
 
 
-def _run_model_prediction(model, model_input, batch_device, compute_fk_flag, model_arch, ot_refine=False):
+def _run_model_prediction(
+    model,
+    model_input,
+    batch_device,
+    compute_fk_flag,
+    model_arch,
+    ot_refine=False,
+    inference_mode="online",
+    online_window=None,
+):
     model_kind = _infer_model_kind(model)
+
+    def _call_inference(*args, **kwargs):
+        kwargs.setdefault("inference_mode", inference_mode)
+        kwargs.setdefault("online_window", online_window)
+        try:
+            return model.inference(*args, **kwargs)
+        except TypeError:
+            kwargs.pop("inference_mode", None)
+            kwargs.pop("online_window", None)
+            return model.inference(*args, **kwargs)
+
     if model_kind == "human_pose":
         if hasattr(model, "inference"):
-            try:
-                return model.inference(model_input, gt_targets=batch_device)
-            except TypeError:
-                return model.inference(model_input)
+            return _call_inference(model_input, gt_targets=batch_device)
         return model(model_input)
     if model_kind == "pipeline":
         if hasattr(model, "inference"):
-            return model.inference(
+            return _call_inference(
                 model_input,
                 gt_targets=batch_device,
                 use_object_data=True,
@@ -165,7 +182,7 @@ def _run_model_prediction(model, model_input, batch_device, compute_fk_flag, mod
             )
         return model(model_input, use_object_data=True, compute_fk=compute_fk_flag, refine_human=ot_refine)
     if model_arch == "dit":
-        return model.inference(
+        return _call_inference(
             model_input,
             gt_targets=batch_device,
             use_object_data=True,
@@ -328,7 +345,8 @@ def _add_overlay_meshes(viewer, verts_seq, faces_np, frame_ids, base_name, base_
 def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root, 
                          show_objects=True, vis_gt_only=False, show_foot_contact=False, 
                          show_obj_traj=False, show_hand_traj=False, use_fk=False, compare_3=False, 
-                         pred_offset_np=None, no_trans=False, overlay_frames=None, ot_refine=False):
+                         pred_offset_np=None, no_trans=False, overlay_frames=None, ot_refine=False,
+                         inference_mode="online", online_window=None):
     """Visualize one batch sequence."""
     try:
         nodes_to_remove = [
@@ -469,6 +487,8 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                     compute_fk_flag,
                     model_arch,
                     ot_refine=ot_refine,
+                    inference_mode=inference_mode,
+                    online_window=online_window,
                 )
             except Exception as exc:
                 print(f"Model inference failed: {exc}")
@@ -820,7 +840,8 @@ class InteractiveViewer(Viewer):
     def __init__(self, data_list, model, smpl_model, config, device, obj_geo_root, 
                  show_objects=True, vis_gt_only=False, show_foot_contact=False,
                  show_obj_traj=False, show_hand_traj=False, use_fk=False, compare_3=False, 
-                 pred_offset=None, no_trans=False, overlay_frames=None, ot_refine=False, **kwargs):
+                 pred_offset=None, no_trans=False, overlay_frames=None, ot_refine=False,
+                 inference_mode="online", online_window=None, **kwargs):
         super().__init__(**kwargs)
         self.data_list = data_list
         self.current_index = 0
@@ -840,6 +861,8 @@ class InteractiveViewer(Viewer):
         self.no_trans = no_trans
         self.overlay_frames = overlay_frames
         self.ot_refine = ot_refine
+        self.inference_mode = inference_mode
+        self.online_window = online_window
         self.virtual_bone_info = {'has_data': False}
         
         self.visualize_current_sequence()
@@ -875,7 +898,7 @@ class InteractiveViewer(Viewer):
                     self.obj_geo_root, self.show_objects, self.vis_gt_only,
                     self.show_foot_contact, self.show_obj_traj, self.show_hand_traj,
                     self.use_fk, self.compare_3, self.pred_offset, self.no_trans, self.overlay_frames,
-                    self.ot_refine,
+                    self.ot_refine, self.inference_mode, self.online_window,
                 )
                 title_base = f"Sequence: {seq_file_name}" if seq_file_name else f"Sequence Index: {self.current_index}/{len(self.data_list)-1}"
                 self.title = f"{title_base}{mode_str} (q/e:闁?, Ctrl+q/e:闁?0, Alt+q/e:闁?0)"
@@ -934,6 +957,8 @@ def main():
     parser.add_argument('--pred_offset', type=float, nargs=3, default=[0.0, 0.0, 0.0], help='Prediction translation offset')
     parser.add_argument('--overlay_frames', type=int, nargs='+', default=None, help='Overlay selected 0-based frames in one scene')
     parser.add_argument('--no_trans', action='store_true', help='Enable noTrans mode')
+    parser.add_argument('--inference_mode', '--inference-mode', choices=['online', 'offline'], default='online', help='RNN inference mode')
+    parser.add_argument('--online_window', '--online-window', type=int, default=None, help='RNN online sliding window size')
     refine_group = parser.add_mutually_exclusive_group()
     refine_group.add_argument(
         '--enable_ot_refine',
@@ -953,6 +978,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     print(f"Mode: {'noTrans' if args.no_trans else 'Normal'}")
+    print(f"Inference mode: {args.inference_mode} | online_window: {args.online_window or 'config/default'}")
 
     print(f"Loading config from: {args.config}")
     config = load_config(args.config)
@@ -1108,6 +1134,8 @@ def main():
         no_trans=args.no_trans,
         overlay_frames=args.overlay_frames,
         ot_refine=ot_refine,
+        inference_mode=args.inference_mode,
+        online_window=args.online_window,
         window_size=(1920, 1080)
     )
     

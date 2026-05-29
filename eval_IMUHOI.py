@@ -74,14 +74,22 @@ def get_default_dataset_config(no_trans: bool = False):
         #         "object_trans": output_path / "imhd" / "modules" / "object_trans_best.pt",
         #     },
         # },
-        "processed_split_data_OMOMO": {
-            "data_dir": PROCESS_ROOT / "processed_split_data_OMOMO_bps" / "test",
+        # "processed_split_data_OMOMO": {
+        #     "data_dir": PROCESS_ROOT / "processed_split_data_OMOMO_bps" / "test",
             # 默认不覆盖checkpoint路径，优先使用 config.pretrained_modules。
             # 如需按数据集指定权重，可添加 modules 字段，例如：
             # "modules": {
             #     "human_pose": ".../human_pose/best.pt",
             #     "interaction": ".../interaction/best.pt",
             # }
+        # },
+        "processed_split_data_HODOME": {
+            "data_dir": PROCESS_ROOT / "processed_split_data_HODOME",
+            # "modules": {
+            #     "velocity_contact": output_path / "behave" / "modules" / "velocity_contact_best.pt",
+            #     "human_pose": output_path / "behave" / "modules" / "human_pose_best.pt",
+            #     "object_trans": output_path / "behave" / "modules" / "object_trans_best.pt",
+            # },
         },
     }
 
@@ -269,6 +277,8 @@ def evaluate_model(
     ot_refine: bool = False,
     hand_contact_threshold: float = 0.5,
     object_contact_threshold: float = 0.5,
+    inference_mode: str = "online",
+    online_window: Optional[int] = None,
 ):
     """评估模型"""
     metrics = {
@@ -343,15 +353,24 @@ def evaluate_model(
                         refine_human=ot_refine,
                     )
 
+                def _call_inference(*args, **kwargs):
+                    if "inference_mode" not in kwargs:
+                        kwargs["inference_mode"] = inference_mode
+                    if "online_window" not in kwargs:
+                        kwargs["online_window"] = online_window
+                    try:
+                        return model.inference(*args, **kwargs)
+                    except TypeError:
+                        kwargs.pop("inference_mode", None)
+                        kwargs.pop("online_window", None)
+                        return model.inference(*args, **kwargs)
+
                 if model_kind == "mix":
-                    return model.inference(
-                        data_dict,
-                        gt_targets=batch_device,
-                    )
+                    return _call_inference(data_dict, gt_targets=batch_device)
                 if model_kind == "pipeline":
                     if not hasattr(model, "inference"):
                         return _call_forward()
-                    return model.inference(
+                    return _call_inference(
                         data_dict,
                         gt_targets=batch_device,
                         use_object_data=use_object_data,
@@ -362,23 +381,16 @@ def evaluate_model(
                 if model_kind == "interaction":
                     if interaction_use_human_pred:
                         print("Warning: interaction-only model has no human branch; fallback to GT human context.")
-                    return model.inference(
-                        data_dict,
-                        hp_out=None,
-                        gt_targets=batch_device,
-                    )
+                    return _call_inference(data_dict, hp_out=None, gt_targets=batch_device)
                 if model_kind == "human_pose":
                     if hasattr(model, "inference"):
-                        try:
-                            return model.inference(data_dict, gt_targets=batch_device)
-                        except TypeError:
-                            return model.inference(data_dict)
+                        return _call_inference(data_dict, gt_targets=batch_device)
                     return model(data_dict)
                 # Unknown model type: try broad signature, then simplified.
                 if not hasattr(model, "inference"):
                     return _call_forward()
                 try:
-                    return model.inference(
+                    return _call_inference(
                         data_dict,
                         gt_targets=batch_device,
                         use_object_data=use_object_data,
@@ -387,10 +399,7 @@ def evaluate_model(
                         refine_human=ot_refine,
                     )
                 except TypeError:
-                    return model.inference(
-                        data_dict,
-                        gt_targets=batch_device,
-                    )
+                    return _call_inference(data_dict, gt_targets=batch_device)
 
             try:
                 pred_dict = _run_model_inference(
@@ -802,6 +811,8 @@ def main():
     parser.add_argument("--object_trans_ckpt", type=str, default=None, help="覆盖 ObjectTrans checkpoint")
     parser.add_argument("--hand_contact_threshold", type=float, default=None, help="左右手接触评估阈值")
     parser.add_argument("--object_contact_threshold", type=float, default=None, help="物体接触评估阈值")
+    parser.add_argument("--inference_mode", "--inference-mode", choices=["online", "offline"], default="online", help="RNN inference mode")
+    parser.add_argument("--online_window", "--online-window", type=int, default=None, help="RNN online sliding window size")
     parser.add_argument(
         "--interaction_human_source",
         type=str,
@@ -829,6 +840,7 @@ def main():
     print(f"Using device: {device}")
     print(f"Mode: {'noTrans' if args.no_trans else 'Normal'}")
     print(f"Interaction human source: {args.interaction_human_source}")
+    print(f"Inference mode: {args.inference_mode} | online_window: {args.online_window or 'config/default'}")
 
     default_config = get_default_dataset_config(args.no_trans)
 
@@ -934,6 +946,7 @@ def main():
             window_size=test_window,
             debug=config.get("debug", False),
             simulate_imu_noise=True,
+            min_obj_contact_frames=0,
             full_sequence=True,
         )
 
@@ -969,6 +982,8 @@ def main():
             ot_refine=ot_refine,
             hand_contact_threshold=hand_contact_threshold,
             object_contact_threshold=object_contact_threshold,
+            inference_mode=args.inference_mode,
+            online_window=args.online_window,
         )
 
         eval_duration = time.time() - eval_start_time

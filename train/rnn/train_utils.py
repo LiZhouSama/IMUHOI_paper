@@ -213,6 +213,20 @@ def build_optimizer_and_scheduler(model, cfg):
     return optimizer, scheduler
 
 
+def call_model_inference(model, *args, inference_mode: str = "offline", **kwargs):
+    """Call the standardized inference API without changing offline training semantics."""
+    mode = str(inference_mode or "offline").lower()
+    if mode == "offline" and isinstance(model, torch.nn.DataParallel):
+        return model(*args, **kwargs)
+
+    target = model.module if isinstance(model, torch.nn.DataParallel) else model
+    if hasattr(target, "inference"):
+        return target.inference(*args, inference_mode=mode, **kwargs)
+    if mode != "offline":
+        raise RuntimeError(f"Model {type(target).__name__} does not support online inference.")
+    return model(*args, **kwargs)
+
+
 class BaseTrainer:
     """基础训练器"""
     
@@ -265,7 +279,7 @@ class BaseTrainer:
         batch=None,
     ):
         """默认的前向封装，可被子类重写"""
-        return self.model(data_dict)
+        return call_model_inference(self.model, data_dict, inference_mode="offline")
     
     def train_epoch(self, epoch):
         """训练一个epoch"""

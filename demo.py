@@ -87,6 +87,8 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Enable FK branch outputs inside the object module (adds slight runtime overhead).",
     )
+    parser.add_argument("--inference-mode", "--inference_mode", choices=["online", "offline"], default="online", help="RNN inference mode.")
+    parser.add_argument("--online-window", "--online_window", type=int, default=None, help="RNN online sliding window size.")
     parser.add_argument(
         "--save-pred",
         default=None,
@@ -204,19 +206,31 @@ def run_inference(
     data_dict: Dict[str, torch.Tensor],
     use_object_data: bool,
     compute_fk: bool,
+    inference_mode: str = "online",
+    online_window: int = None,
 ) -> Dict[str, torch.Tensor]:
 
     with torch.no_grad():
-        if cfg.model_arch == 'dit':
-            outputs = model.inference(
-                data_dict,
-                gt_targets=data_dict,
-                use_object_data=use_object_data,
-                compute_fk=compute_fk,
-            )
+        if hasattr(model, "inference"):
+            try:
+                outputs = model.inference(
+                    data_dict,
+                    gt_targets=data_dict,
+                    use_object_data=use_object_data,
+                    compute_fk=compute_fk,
+                    inference_mode=inference_mode,
+                    online_window=online_window,
+                )
+            except TypeError:
+                outputs = model.inference(
+                    data_dict,
+                    gt_targets=data_dict,
+                    use_object_data=use_object_data,
+                    compute_fk=compute_fk,
+                )
         else:
             outputs = model(data_dict, use_object_data=use_object_data, compute_fk=compute_fk)
-    print("[demo] Model forward pass complete.")
+    print(f"[demo] Model inference complete ({inference_mode}).")
     return outputs
 
 
@@ -658,6 +672,7 @@ def main():
     cfg = load_config(args.config, device)
     if args.model_arch is not None:
         cfg.model_arch = args.model_arch
+    print(f"[demo] Inference mode: {args.inference_mode} | online_window: {args.online_window or 'config/default'}")
     model = build_model(cfg, args, device)
     smpl_model = load_body_model(args.body_model, device)
     data_dict = load_data_dict(args.data_dict, device)
@@ -668,6 +683,8 @@ def main():
         data_dict,
         use_object_data=data_dict.get("use_object_data", True),
         compute_fk=args.compute_fk,
+        inference_mode=args.inference_mode,
+        online_window=args.online_window,
     )
     foot_contact_watch = outputs.get("contact_pred").detach().cpu().numpy()
 

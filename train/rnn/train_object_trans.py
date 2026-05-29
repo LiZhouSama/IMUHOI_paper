@@ -39,6 +39,7 @@ from train.rnn.train_utils import (
     flatten_lstm_parameters,
     save_checkpoint,
     load_checkpoint,
+    call_model_inference,
 )
 from torch.cuda.amp.grad_scaler import GradScaler
 try:
@@ -226,7 +227,7 @@ class Stage3JointTrainer:
             self.vc_model.eval()
 
         with torch.no_grad():
-            hp_out = self.hp_model(data_dict)
+            hp_out = call_model_inference(self.hp_model, data_dict, inference_mode="offline")
 
         gt_hp = None
         if training and batch is not None:
@@ -251,7 +252,7 @@ class Stage3JointTrainer:
 
         vc_grad_enabled = self.vc_unfrozen and training
         with torch.set_grad_enabled(vc_grad_enabled):
-            vc_out = self.vc_model(data_dict, hp_out=hp_for_vc)
+            vc_out = call_model_inference(self.vc_model, data_dict, hp_out=hp_for_vc, inference_mode="offline")
 
         if training and batch is not None:
             pred_prob = prediction_mix_probability(epoch, self.cfg)
@@ -295,7 +296,8 @@ class Stage3JointTrainer:
             human_pose_input = hp_out.get('p_pred')
             root_trans_input = hp_out.get('root_trans_pred')
 
-        ot_out = self.ot_model(
+        ot_out = call_model_inference(
+            self.ot_model,
             hand_positions,
             contact_prob,
             data_dict['obj_trans_init'],
@@ -311,6 +313,7 @@ class Stage3JointTrainer:
             obj_trans_gt=data_dict.get('obj_trans_gt'),
             obj_scale_gt=data_dict.get('obj_scale_gt'),
             enable_refine=getattr(self.cfg, "enable_ot_refine", False),
+            inference_mode="offline",
         )
 
         results = {}

@@ -8,6 +8,17 @@ import torch.nn.functional as F
 from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_axis_angle
 
 from .base import RNN, RNNWithInit
+from .online import (
+    append_stream_data,
+    concat_time_dicts,
+    infer_batch_seq,
+    normalize_inference_mode,
+    resolve_online_window,
+    select_time_context,
+    slice_time_dict,
+    slice_time_value,
+    take_latest_frame,
+)
 from configs import FRAME_RATE, _REDUCED_POSE_NAMES, _SENSOR_NAMES
 
 
@@ -259,6 +270,7 @@ class ObjectTransModule(nn.Module):
     """
     def __init__(self, cfg):
         super().__init__()
+        self.cfg = cfg
         self.imu_dim = int(getattr(cfg, "imu_dim", 9))
         self.obj_imu_dim = int(max(getattr(cfg, "obj_imu_dim", self.imu_dim), 9))
         self.num_human_imus = getattr(cfg, "num_human_imus", len(_SENSOR_NAMES))
@@ -715,6 +727,7 @@ class ObjectTransModule(nn.Module):
         obj_trans_gt: torch.Tensor = None,
         obj_scale_gt: torch.Tensor = None,
         enable_refine: bool = True,
+        known_obj_trans_prefix: torch.Tensor = None,
     ):
         """
         前向传播
@@ -842,10 +855,20 @@ class ObjectTransModule(nn.Module):
         weights_raw = F.softmax(gate_logits / self.gating_temperature, dim=-1)
         weights = self._smooth_gating_weights(weights_raw)
 
-        # 融合位置（使用校正后的速度）
+        # 融合位置（使用校正后的速度）。online模式下，窗口prefix来自已知历史结果，
+        # 只预测窗口内尚未知的尾部帧。
         fused_pos = torch.zeros(bs, seq_len, 3, device=device, dtype=dtype)
+        prefix_len = 0
+        if isinstance(known_obj_trans_prefix, torch.Tensor):
+            prefix = known_obj_trans_prefix.to(device=device, dtype=dtype)
+            if prefix.dim() == 2:
+                prefix = prefix.unsqueeze(1)
+            if prefix.dim() == 3 and prefix.shape[0] == bs and prefix.shape[-1] == 3:
+                prefix_len = min(int(prefix.shape[1]), seq_len)
+                if prefix_len > 0:
+                    fused_pos[:, :prefix_len, :] = prefix[:, :prefix_len, :]
         dt = 1.0 / FRAME_RATE
-        for t in range(seq_len):
+        for t in range(prefix_len, seq_len):
             prev_pos = fused_pos[:, t - 1, :] if t > 0 else obj_trans_init
             pos_imu_integrated = prev_pos + obj_vel_corrected[:, t, :] * dt
             fused_pos[:, t, :] = (
@@ -923,6 +946,123 @@ class ObjectTransModule(nn.Module):
             )
         )
         return results
+
+    @staticmethod
+    def _slice_optional_time(value, start: int, end: int, batch_size: int, seq_len: int):
+        return slice_time_value(value, start, end, batch_size, seq_len)
+
+    def _inference_online_sequence(
+        self,
+        hand_positions: torch.Tensor,
+        pred_hand_contact_prob: torch.Tensor,
+        obj_trans_init: torch.Tensor,
+        online_window: int,
+        **kwargs,
+    ):
+        if hand_positions.dim() == 3:
+            batch_size, seq_len, _ = hand_positions.shape
+        elif hand_positions.dim() == 4:
+            batch_size, seq_len = hand_positions.shape[:2]
+        else:
+            raise ValueError(f"Unexpected hand_positions shape {hand_positions.shape}")
+
+        if seq_len <= online_window:
+            return self.forward(
+                hand_positions,
+                pred_hand_contact_prob,
+                obj_trans_init,
+                **kwargs,
+            )
+
+        def _slice_kwargs(start: int, end: int):
+            return {
+                key: self._slice_optional_time(value, start, end, batch_size, seq_len)
+                for key, value in kwargs.items()
+                if key != "known_obj_trans_prefix"
+            }
+
+        warmup_len = int(online_window)
+        warmup_out = self.forward(
+            hand_positions[:, :warmup_len],
+            pred_hand_contact_prob[:, :warmup_len],
+            obj_trans_init,
+            **_slice_kwargs(0, warmup_len),
+        )
+        history = warmup_out
+
+        for end in range(warmup_len + 1, seq_len + 1):
+            start = end - warmup_len
+            prefix = select_time_context(history, start, end - 1).get("pred_obj_trans")
+            if isinstance(prefix, torch.Tensor) and prefix.shape[1] > 0:
+                step_obj_trans_init = prefix[:, 0]
+            else:
+                step_obj_trans_init = obj_trans_init
+            window_out = self.forward(
+                hand_positions[:, start:end],
+                pred_hand_contact_prob[:, start:end],
+                step_obj_trans_init,
+                known_obj_trans_prefix=prefix,
+                **_slice_kwargs(start, end),
+            )
+            latest = take_latest_frame(window_out, batch_size, end - start)
+            history = concat_time_dicts([history, latest])
+
+        return history
+
+    def inference(
+        self,
+        hand_positions: torch.Tensor,
+        pred_hand_contact_prob: torch.Tensor,
+        obj_trans_init: torch.Tensor,
+        inference_mode: str = "offline",
+        online_window: int = None,
+        online_state: dict = None,
+        return_online_state: bool = False,
+        **kwargs,
+    ):
+        mode = normalize_inference_mode(inference_mode)
+        if mode == "offline":
+            output = self.forward(
+                hand_positions,
+                pred_hand_contact_prob,
+                obj_trans_init,
+                **kwargs,
+            )
+            if return_online_state:
+                return output, online_state or {}
+            return output
+
+        window = resolve_online_window(self.cfg, online_window)
+        stream_dict = {
+            "hand_positions": hand_positions,
+            "pred_hand_contact_prob": pred_hand_contact_prob,
+            **{key: value for key, value in kwargs.items() if key != "known_obj_trans_prefix"},
+        }
+        if isinstance(online_state, dict) and isinstance(online_state.get("data_dict"), dict):
+            run_data, previous_len = append_stream_data(online_state["data_dict"], stream_dict, sequence_key="hand_positions")
+            hand_positions = run_data["hand_positions"]
+            pred_hand_contact_prob = run_data["pred_hand_contact_prob"]
+            for key in stream_dict.keys():
+                if key not in {"hand_positions", "pred_hand_contact_prob"}:
+                    kwargs[key] = run_data.get(key)
+        else:
+            previous_len = 0
+            run_data = stream_dict
+
+        output = self._inference_online_sequence(
+            hand_positions,
+            pred_hand_contact_prob,
+            obj_trans_init,
+            window,
+            **kwargs,
+        )
+        state = {"data_dict": run_data, "outputs": output}
+        if return_online_state:
+            if previous_len > 0:
+                batch_size, seq_len = infer_batch_seq(run_data, key="hand_positions")
+                output = slice_time_dict(output, previous_len, seq_len, batch_size, seq_len)
+            return output, state
+        return output
 
     @staticmethod
     def empty_output(batch_size: int, seq_len: int, device: torch.device):

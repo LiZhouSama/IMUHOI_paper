@@ -31,8 +31,8 @@ from scipy.spatial.transform import Rotation, Slerp
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 BADMINTON_ROOT_DEFAULT = Path("/mnt/d/a_WORK/Projects/PhD/tasks/badminton")
-DEFAULT_NOITOM_CSV = BADMINTON_ROOT_DEFAULT / "noitom_badmin/output_noitom_csv/take006_chr02.csv"
-DEFAULT_SYNC_CSV = BADMINTON_ROOT_DEFAULT / "output/20260428_001800/sync.csv"
+DEFAULT_NOITOM_CSV = BADMINTON_ROOT_DEFAULT / "noitom_badmin/output_noitom_csv/take002_chr02.csv"
+DEFAULT_SYNC_CSV = BADMINTON_ROOT_DEFAULT / "output/20260427_234926/sync.csv"
 DEFAULT_RACKET_OBJ = BADMINTON_ROOT_DEFAULT / "obj/badminton_racket/Racket.obj"
 DEFAULT_BODY_MODEL = Path("/mnt/d/a_WORK/Projects/PhD/datasets/smpl_models/smplh/neutral/model.npz")
 
@@ -152,7 +152,16 @@ def parse_args() -> argparse.Namespace:
         "--object-gravity-calib-frames",
         type=int,
         default=60,
-        help="Number of initial sync IMU frames used to estimate the object gravity vector in g.",
+        help="Number of initial sync IMU frames considered for object gravity estimation.",
+    )
+    parser.add_argument("--object-gravity-norm-min-g", type=float, default=0.5)
+    parser.add_argument("--object-gravity-norm-max-g", type=float, default=1.5)
+    parser.add_argument("--object-gravity-min-valid-frames", type=int, default=10)
+    parser.add_argument(
+        "--object-acc-outlier-g",
+        type=float,
+        default=50.0,
+        help="Repair sync object acceleration samples whose raw norm exceeds this g threshold; <=0 disables repair.",
     )
     parser.add_argument(
         "--object-gravity-vector-g",
@@ -187,6 +196,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-object-data", dest="use_object_data", action="store_false")
     parser.add_argument("--interaction-human-source", choices=["pred", "gt"], default="pred")
     parser.add_argument("--interaction-human-trans-source", choices=["pred", "gt"], default="pred")
+    parser.add_argument("--inference-mode", "--inference_mode", choices=["online", "offline"], default="online")
+    parser.add_argument("--online-window", "--online_window", type=int, default=None)
     parser.add_argument("--sample-steps", type=int, default=None)
     parser.add_argument("--sampler", default=None)
     parser.add_argument("--eta", type=float, default=None)
@@ -413,19 +424,84 @@ def _interp_columns(values: np.ndarray, src_time: np.ndarray, dst_time: np.ndarr
     return out
 
 
-def remove_object_gravity_from_sync(sync_seq: SyncDemoSequence, args: argparse.Namespace) -> np.ndarray:
+def repair_object_acc_outliers(sync_seq: SyncDemoSequence, args: argparse.Namespace) -> int:
+    threshold = float(args.object_acc_outlier_g)
+    if threshold <= 0.0:
+        return 0
+
+    acc = np.asarray(sync_seq.acc_g, dtype=np.float32)
+    mag = np.linalg.norm(acc, axis=1)
+    valid = np.isfinite(acc).all(axis=1) & np.isfinite(mag) & (mag <= threshold)
+    invalid = ~valid
+    if not np.any(invalid):
+        return 0
+    if not np.any(valid):
+        raise ValueError(
+            f"Cannot repair object acceleration: all sync acc samples are invalid or exceed {threshold:g}g."
+        )
+
+    idx = np.arange(acc.shape[0], dtype=np.float64)
+    valid_idx = idx[valid]
+    repaired = acc.copy()
+    for axis_idx in range(3):
+        repaired[invalid, axis_idx] = np.interp(
+            idx[invalid],
+            valid_idx,
+            acc[valid, axis_idx].astype(np.float64),
+            left=float(acc[valid, axis_idx][0]),
+            right=float(acc[valid, axis_idx][-1]),
+        )
+    sync_seq.acc_g = repaired.astype(np.float32, copy=False)
+    return int(np.count_nonzero(invalid))
+
+
+def _robust_gravity_from_samples(samples: np.ndarray, args: argparse.Namespace) -> Tuple[np.ndarray, Dict[str, Any]]:
+    acc = np.asarray(samples, dtype=np.float32)
+    if acc.ndim != 2 or acc.shape[1] != 3:
+        raise ValueError(f"Expected object acc samples [N, 3], got {acc.shape}")
+
+    mag = np.linalg.norm(acc, axis=1)
+    valid = np.isfinite(acc).all(axis=1) & np.isfinite(mag)
+    valid &= mag >= float(args.object_gravity_norm_min_g)
+    valid &= mag <= float(args.object_gravity_norm_max_g)
+    min_valid = max(1, int(args.object_gravity_min_valid_frames))
+    if np.count_nonzero(valid) < min_valid:
+        raise ValueError(
+            "Cannot estimate object gravity robustly: "
+            f"valid_samples={int(np.count_nonzero(valid))}, required={min_valid}, "
+            f"norm_range=[{args.object_gravity_norm_min_g}, {args.object_gravity_norm_max_g}]g"
+        )
+
+    calib = acc[valid]
+    gravity_g = np.median(calib, axis=0).astype(np.float32)
+    info = {
+        "valid_samples": int(calib.shape[0]),
+        "candidate_samples": int(acc.shape[0]),
+        "norm_range": [
+            float(args.object_gravity_norm_min_g),
+            float(args.object_gravity_norm_max_g),
+        ],
+    }
+    return gravity_g, info
+
+
+def remove_object_gravity_from_sync(sync_seq: SyncDemoSequence, args: argparse.Namespace) -> Tuple[np.ndarray, Dict[str, Any]]:
     if args.object_gravity_vector_g is not None:
         gravity_g = np.asarray(args.object_gravity_vector_g, dtype=np.float32)
+        info = {"source": "manual", "valid_samples": 0, "candidate_samples": 0}
     else:
         calib_frames = max(1, int(args.object_gravity_calib_frames))
         calib = sync_seq.acc_g[: min(calib_frames, sync_seq.acc_g.shape[0])]
-        valid = np.isfinite(calib).all(axis=1)
-        if not np.any(valid):
-            raise ValueError("Cannot estimate object gravity: no finite sync accelerometer frames.")
-        gravity_g = calib[valid].mean(axis=0).astype(np.float32)
+        try:
+            gravity_g, info = _robust_gravity_from_samples(calib, args)
+            info["source"] = "initial_window"
+        except ValueError:
+            gravity_g, info = _robust_gravity_from_samples(sync_seq.acc_g, args)
+            info["source"] = "full_sequence"
 
     sync_seq.acc_g = (sync_seq.acc_g - gravity_g[None, :]).astype(np.float32)
-    return gravity_g
+    info["gravity_norm_g"] = float(np.linalg.norm(gravity_g))
+    return gravity_g, info
 
 
 def align_sync_to_noitom_model_frames(
@@ -651,6 +727,20 @@ def build_object_inputs(
     frame_no_model: np.ndarray,
 ) -> Tuple[torch.Tensor, torch.Tensor, np.ndarray, np.ndarray, np.ndarray]:
     sync_seq = read_sync_demo_csv(args.sync_path, fit_module)
+    repaired_count = repair_object_acc_outliers(sync_seq, args)
+    if repaired_count:
+        print(
+            "[demo_badmin] Repaired object acc outliers before gravity removal: "
+            f"count={repaired_count}, threshold={float(args.object_acc_outlier_g):g}g"
+        )
+    if args.remove_object_gravity:
+        gravity_g, gravity_info = remove_object_gravity_from_sync(sync_seq, args)
+        print(
+            "[demo_badmin] Removed object gravity from sync acc: "
+            f"gravity_g={gravity_g}, norm={gravity_info['gravity_norm_g']:.4f}g, "
+            f"source={gravity_info['source']}, "
+            f"valid={gravity_info['valid_samples']}/{gravity_info['candidate_samples']}"
+        )
     rotmats, acc_mps2, pressure, sync_indices = align_sync_to_noitom_model_frames(
         sync_seq=sync_seq,
         frame_no_model=frame_no_model,
@@ -919,6 +1009,8 @@ def run_inference(args: argparse.Namespace, model, data_dict: Dict[str, torch.Te
                     interaction_human_source=args.interaction_human_source,
                     interaction_human_trans_source=args.interaction_human_trans_source,
                     interaction_use_human_pred=args.interaction_human_source == "pred",
+                    inference_mode=args.inference_mode,
+                    online_window=args.online_window,
                 )
             except TypeError:
                 outputs = model.inference(
@@ -929,7 +1021,7 @@ def run_inference(args: argparse.Namespace, model, data_dict: Dict[str, torch.Te
                 )
         else:
             outputs = model(data_dict, use_object_data=args.use_object_data, compute_fk=args.compute_fk)
-    print(f"[demo_badmin] Model inference complete. Output keys: {sorted(outputs.keys())}")
+    print(f"[demo_badmin] Model inference complete ({args.inference_mode}). Output keys: {sorted(outputs.keys())}")
     return outputs
 
 
@@ -1137,6 +1229,7 @@ def main() -> None:
     if args.model_arch is not None:
         cfg.model_arch = args.model_arch
     cfg.body_model_path = str(args.body_model)
+    print(f"[demo_badmin] Inference mode: {args.inference_mode} | online_window: {args.online_window or 'config/default'}")
 
     fit_module = load_fit_module(args.badminton_root)
     betas = load_betas(args.betas_npz, args.num_betas, fit_module)

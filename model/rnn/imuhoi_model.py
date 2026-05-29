@@ -11,6 +11,18 @@ from pytorch3d.transforms import matrix_to_rotation_6d, rotation_6d_to_matrix
 from .velocity_contact import VelocityContactModule
 from .human_pose import HumanPoseModule
 from .object_trans import ObjectTransModule
+from .online import (
+    append_stream_data,
+    concat_time_dicts,
+    infer_batch_seq,
+    merge_latest_context,
+    normalize_inference_mode,
+    resolve_online_window,
+    select_time_context,
+    slice_time_dict,
+    take_latest_frame,
+    update_data_inits_from_history,
+)
 
 
 class IMUHOIModel(nn.Module):
@@ -354,6 +366,134 @@ class IMUHOIModel(nn.Module):
         results["has_object"] = has_object
         return results
 
+    def _build_hp_input_dict(self, data_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        hp_input_dict = {
+            "human_imu": data_dict["human_imu"],
+            "v_init": data_dict["v_init"],
+            "p_init": data_dict["p_init"],
+        }
+        if self.no_trans:
+            hp_input_dict["trans_gt"] = data_dict["trans_gt"]
+        else:
+            hp_input_dict["trans_init"] = data_dict["trans_init"]
+        return hp_input_dict
+
+    def _compute_fk_output(
+        self,
+        results: Dict[str, torch.Tensor],
+        vc_out: Dict[str, torch.Tensor],
+        data_dict: Dict[str, torch.Tensor],
+        obj_trans_init: torch.Tensor,
+    ) -> None:
+        human_imu = data_dict["human_imu"]
+        batch_size, seq_len = human_imu.shape[:2]
+        obj_imu = data_dict["obj_imu"]
+        obj_rot6d = obj_imu[..., 3:9]
+        obj_rotm = rotation_6d_to_matrix(obj_rot6d.reshape(-1, 6)).reshape(batch_size, seq_len, 3, 3)
+        hand_pos = results["pred_hand_glb_pos"]
+        results["pred_obj_trans_fk"] = self._fk_obj_trans_baseline_hard(
+            vc_out["pred_hand_contact_prob"],
+            hand_pos,
+            obj_rotm,
+            obj_trans_init,
+        )
+
+    @staticmethod
+    def _merge_stage_context(prefix: Dict[str, torch.Tensor], latest: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        stage_prefix = {key: prefix[key] for key in latest.keys() if key in prefix}
+        return merge_latest_context(stage_prefix, latest)
+
+    def _inference_online_sequence(
+        self,
+        data_dict: Dict[str, torch.Tensor],
+        use_object_data: bool = True,
+        compute_fk: bool = False,
+        refine_human: Optional[bool] = None,
+        online_window: int = 120,
+    ) -> Dict[str, torch.Tensor]:
+        refine_human = self._resolve_refine_human(refine_human)
+        batch_size, seq_len = infer_batch_seq(data_dict)
+        if seq_len <= online_window:
+            return self.forward(
+                data_dict,
+                use_object_data=use_object_data,
+                compute_fk=compute_fk,
+                refine_human=refine_human,
+            )
+
+        warmup_len = int(online_window)
+        warmup_data = slice_time_dict(data_dict, 0, warmup_len, batch_size, seq_len)
+        history = self.forward(
+            warmup_data,
+            use_object_data=use_object_data,
+            compute_fk=compute_fk,
+            refine_human=refine_human,
+        )
+
+        for end in range(warmup_len + 1, seq_len + 1):
+            start = end - warmup_len
+            window_data = slice_time_dict(data_dict, start, end, batch_size, seq_len)
+            window_data = update_data_inits_from_history(window_data, history, index=start - 1)
+            window_len = end - start
+            prefix = select_time_context(history, start, end - 1)
+
+            hp_out_raw = self.human_pose_module.forward(self._build_hp_input_dict(window_data))
+            hp_latest = take_latest_frame(hp_out_raw, batch_size, window_len)
+            hp_context = self._merge_stage_context(prefix, hp_latest)
+
+            vc_input_dict = {
+                "human_imu": window_data["human_imu"],
+                "obj_imu": window_data["obj_imu"],
+                "hand_vel_glb_init": window_data["hand_vel_glb_init"],
+                "obj_vel_init": window_data["obj_vel_init"],
+                "contact_init": window_data.get("contact_init"),
+                "hp_out": hp_context,
+            }
+            vc_out_raw = self.velocity_contact_module.forward(vc_input_dict, hp_out=hp_context)
+            vc_latest = take_latest_frame(vc_out_raw, batch_size, window_len)
+            vc_context = self._merge_stage_context(prefix, vc_latest)
+
+            results = {}
+            results.update(hp_context)
+            results.update(vc_context)
+
+            has_object = window_data.get("has_object")
+            if use_object_data and (has_object is None or has_object.any()):
+                obj_prefix = prefix.get("pred_obj_trans")
+                if isinstance(obj_prefix, torch.Tensor) and obj_prefix.shape[1] > 0:
+                    ot_obj_trans_init = obj_prefix[:, 0]
+                else:
+                    ot_obj_trans_init = window_data["obj_trans_init"]
+                ot_out = self.object_trans_module.forward(
+                    hp_context["pred_hand_glb_pos"],
+                    vc_context["pred_hand_contact_prob"],
+                    ot_obj_trans_init,
+                    obj_imu=window_data["obj_imu"],
+                    human_imu=window_data["human_imu"],
+                    obj_vel_input=vc_context["pred_obj_vel"],
+                    contact_init=window_data.get("contact_init"),
+                    has_object_mask=has_object,
+                    human_pose_input=hp_context.get("p_pred"),
+                    root_trans_input=hp_context.get("root_trans_pred"),
+                    obj_points_canonical=window_data.get("obj_points_canonical"),
+                    obj_rot_gt=window_data.get("obj_rot_gt"),
+                    obj_trans_gt=window_data.get("obj_trans_gt"),
+                    obj_scale_gt=window_data.get("obj_scale_gt"),
+                    enable_refine=refine_human,
+                    known_obj_trans_prefix=obj_prefix,
+                )
+                results.update(ot_out)
+                if refine_human:
+                    self._promote_refined_human_outputs(results, ot_out, window_data)
+                if compute_fk:
+                    self._compute_fk_output(results, vc_context, window_data, ot_obj_trans_init)
+
+            results["has_object"] = has_object
+            latest = take_latest_frame(results, batch_size, window_len)
+            history = concat_time_dicts([history, latest])
+
+        return history
+
     def inference(
         self,
         data_dict: Dict[str, torch.Tensor],
@@ -362,6 +502,10 @@ class IMUHOIModel(nn.Module):
         compute_fk: bool = False,
         interaction_use_human_pred: bool = True,
         refine_human: Optional[bool] = None,
+        inference_mode: str = "offline",
+        online_window: Optional[int] = None,
+        online_state: Optional[dict] = None,
+        return_online_state: bool = False,
         **_,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -372,12 +516,37 @@ class IMUHOIModel(nn.Module):
         pipeline so shared eval/visualization code can call either backend.
         """
         _ = gt_targets, interaction_use_human_pred
-        return self.forward(
+        mode = normalize_inference_mode(inference_mode)
+        if mode == "offline":
+            output = self.forward(
+                data_dict,
+                use_object_data=use_object_data,
+                compute_fk=compute_fk,
+                refine_human=refine_human,
+            )
+            if return_online_state:
+                return output, online_state or {}
+            return output
+
+        window = resolve_online_window(self.cfg, online_window)
+        run_data, previous_len = append_stream_data(
+            online_state.get("data_dict") if isinstance(online_state, dict) else None,
             data_dict,
+        )
+        output = self._inference_online_sequence(
+            run_data,
             use_object_data=use_object_data,
             compute_fk=compute_fk,
             refine_human=refine_human,
+            online_window=window,
         )
+        state = {"data_dict": run_data, "outputs": output}
+        if return_online_state:
+            if previous_len > 0:
+                batch_size, seq_len = infer_batch_seq(run_data)
+                output = slice_time_dict(output, previous_len, seq_len, batch_size, seq_len)
+            return output, state
+        return output
 
 
 def load_model(

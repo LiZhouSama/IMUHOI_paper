@@ -1,0 +1,77 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Noitom SMPL Retarget Diagnostics</title>
+  <style>
+    body { font-family: sans-serif; margin: 24px; color: #222; }
+    table { border-collapse: collapse; margin: 16px 0; }
+    th, td { border: 1px solid #ccc; padding: 6px 10px; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    code { background: #f4f4f4; padding: 2px 4px; }
+    figure { margin: 18px 0 28px; }
+    figcaption { color: #666; font-size: 13px; margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Noitom SMPL Retarget Diagnostics</h1>
+  <p>
+    Left panel: current direct <code>Bone-Quat</code> retarget.
+    Right panel: arm-only swing/no-twist diagnostic using <code>Joint-Posi</code> bone directions.
+    The right panel is not a final retarget result; it is a visual test for rest-frame/twist mismatch.
+  </p>
+  <h2>Selected Frames</h2>
+  <table>
+    <tr><th>source index</th><th>Frame-No</th><th>left forearm twist deg</th><th>right forearm twist deg</th></tr>
+    <tr><td>0</td><td>0.0</td><td>-41.68</td><td>-16.55</td></tr><tr><td>239</td><td>239.0</td><td>-110.76</td><td>-138.44</td></tr><tr><td>228</td><td>228.0</td><td>-101.71</td><td>-154.06</td></tr><tr><td>120</td><td>120.0</td><td>-30.81</td><td>-14.39</td></tr>
+  </table>
+  <h2>Direction Dot Summary</h2>
+  <pre>{
+  "left_upper_arm": {
+    "mean": 0.9932299852371216,
+    "min": 0.9925475120544434,
+    "max": 0.9946557879447937
+  },
+  "left_forearm": {
+    "mean": 0.999341607093811,
+    "min": 0.9990614652633667,
+    "max": 0.999803364276886
+  },
+  "right_upper_arm": {
+    "mean": 0.9950739741325378,
+    "min": 0.9946640133857727,
+    "max": 0.9954338073730469
+  },
+  "right_forearm": {
+    "mean": 0.9992738962173462,
+    "min": 0.9987862706184387,
+    "max": 0.9995763897895813
+  }
+}</pre>
+  <h2>Images</h2>
+  <figure><img src="frame_00000_front.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00000_front.png</figcaption></figure>
+<figure><img src="frame_00000_left_arm_front.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00000_left_arm_front.png</figcaption></figure>
+<figure><img src="frame_00000_right_arm_front.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00000_right_arm_front.png</figcaption></figure>
+<figure><img src="frame_00000_side.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00000_side.png</figcaption></figure>
+<figure><img src="frame_00000_left_arm_side.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00000_left_arm_side.png</figcaption></figure>
+<figure><img src="frame_00000_right_arm_side.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00000_right_arm_side.png</figcaption></figure>
+<figure><img src="frame_00239_front.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00239_front.png</figcaption></figure>
+<figure><img src="frame_00239_left_arm_front.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00239_left_arm_front.png</figcaption></figure>
+<figure><img src="frame_00239_right_arm_front.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00239_right_arm_front.png</figcaption></figure>
+<figure><img src="frame_00239_side.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00239_side.png</figcaption></figure>
+<figure><img src="frame_00239_left_arm_side.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00239_left_arm_side.png</figcaption></figure>
+<figure><img src="frame_00239_right_arm_side.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00239_right_arm_side.png</figcaption></figure>
+<figure><img src="frame_00228_front.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00228_front.png</figcaption></figure>
+<figure><img src="frame_00228_left_arm_front.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00228_left_arm_front.png</figcaption></figure>
+<figure><img src="frame_00228_right_arm_front.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00228_right_arm_front.png</figcaption></figure>
+<figure><img src="frame_00228_side.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00228_side.png</figcaption></figure>
+<figure><img src="frame_00228_left_arm_side.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00228_left_arm_side.png</figcaption></figure>
+<figure><img src="frame_00228_right_arm_side.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00228_right_arm_side.png</figcaption></figure>
+<figure><img src="frame_00120_front.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00120_front.png</figcaption></figure>
+<figure><img src="frame_00120_left_arm_front.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00120_left_arm_front.png</figcaption></figure>
+<figure><img src="frame_00120_right_arm_front.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00120_right_arm_front.png</figcaption></figure>
+<figure><img src="frame_00120_side.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00120_side.png</figcaption></figure>
+<figure><img src="frame_00120_left_arm_side.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00120_left_arm_side.png</figcaption></figure>
+<figure><img src="frame_00120_right_arm_side.png" style="max-width: 100%; border: 1px solid #ccc;"><figcaption>frame_00120_right_arm_side.png</figcaption></figure>
+</body>
+</html>

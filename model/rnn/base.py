@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .online import normalize_inference_mode
+
 
 class RNN(nn.Module):
     """基础RNN模块，带有输入/输出线性层"""
@@ -31,6 +33,12 @@ class RNN(nn.Module):
         output = self.linear2(output)
         return output
 
+    def inference(self, x, h=None, inference_mode: str = "offline", **_):
+        mode = normalize_inference_mode(inference_mode)
+        if mode == "online":
+            return self.forward(x, h)
+        return self.forward(x, h)
+
 
 class RNNWithInit(RNN):
     """带有初始状态网络的RNN模块"""
@@ -56,6 +64,12 @@ class RNNWithInit(RNN):
         h0 = init[:, 0].permute(1, 0, 2).contiguous()
         c0 = init[:, 1].permute(1, 0, 2).contiguous()
         return super().forward(x, (h0, c0))
+
+    def inference(self, inputs, _=None, inference_mode: str = "offline", **__):
+        mode = normalize_inference_mode(inference_mode)
+        if mode == "online":
+            return self.forward(inputs)
+        return self.forward(inputs)
 
 
 class SubPoser(nn.Module):
@@ -94,3 +108,8 @@ class SubPoser(nn.Module):
         p = self.rnn2((p_input, p_init))
         return v, p
 
+    def inference(self, x, v_init, p_init, inference_mode: str = "offline", **_):
+        mode = normalize_inference_mode(inference_mode)
+        if mode == "online":
+            return self.forward(x, v_init, p_init)
+        return self.forward(x, v_init, p_init)

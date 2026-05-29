@@ -10,6 +10,16 @@ from human_body_prior.body_model.body_model import BodyModel
 from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_axis_angle, matrix_to_rotation_6d
 
 from .base import RNN, RNNWithInit, SubPoser
+from .online import (
+    append_stream_data,
+    concat_time_dicts,
+    infer_batch_seq,
+    normalize_inference_mode,
+    resolve_online_window,
+    slice_time_dict,
+    take_latest_frame,
+    update_data_inits_from_history,
+)
 from configs import (
     FRAME_RATE,
     _SENSOR_NAMES,
@@ -33,6 +43,7 @@ class HumanPoseModule(nn.Module):
     """
     def __init__(self, cfg, device, no_trans=False):
         super().__init__()
+        self.cfg = cfg
         self.device = device
         self.no_trans = no_trans
         self.num_human_imus = getattr(cfg, "num_human_imus", len(_SENSOR_NAMES))
@@ -486,6 +497,55 @@ class HumanPoseModule(nn.Module):
             results["pred_full_pose_6d"] = torch.zeros(batch_size, seq_len, 24, 6, device=device, dtype=human_imu.dtype)
 
         return results
+
+    def _inference_online_sequence(self, data_dict: dict, online_window: int):
+        batch_size, seq_len = infer_batch_seq(data_dict)
+        if seq_len <= online_window:
+            return self.forward(data_dict)
+
+        warmup_len = int(online_window)
+        warmup_data = slice_time_dict(data_dict, 0, warmup_len, batch_size, seq_len)
+        history = self.forward(warmup_data)
+
+        for end in range(warmup_len + 1, seq_len + 1):
+            start = end - warmup_len
+            window_data = slice_time_dict(data_dict, start, end, batch_size, seq_len)
+            window_data = update_data_inits_from_history(window_data, history, index=start - 1)
+            window_out = self.forward(window_data)
+            latest = take_latest_frame(window_out, batch_size, end - start)
+            history = concat_time_dicts([history, latest])
+
+        return history
+
+    def inference(
+        self,
+        data_dict: dict,
+        inference_mode: str = "offline",
+        online_window: int = None,
+        online_state: dict = None,
+        return_online_state: bool = False,
+        **_,
+    ):
+        mode = normalize_inference_mode(inference_mode)
+        if mode == "offline":
+            output = self.forward(data_dict)
+            if return_online_state:
+                return output, online_state or {}
+            return output
+
+        window = resolve_online_window(self.cfg, online_window)
+        run_data, previous_len = append_stream_data(
+            online_state.get("data_dict") if isinstance(online_state, dict) else None,
+            data_dict,
+        )
+        output = self._inference_online_sequence(run_data, window)
+        state = {"data_dict": run_data, "outputs": output}
+        if return_online_state:
+            if previous_len > 0:
+                batch_size, seq_len = infer_batch_seq(run_data)
+                output = slice_time_dict(output, previous_len, seq_len, batch_size, seq_len)
+            return output, state
+        return output
 
     @staticmethod
     def empty_output(batch_size: int, seq_len: int, device: torch.device, no_trans: bool = False):
