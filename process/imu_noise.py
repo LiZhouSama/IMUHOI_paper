@@ -17,12 +17,12 @@ NOITOM_IMU_NOISE_CFG: Dict[str, float] = {
     "acc_clip": 16.0,                     # m/s^2 clipping to emulate sensor range
     "acc_drift_per_s": 0.01,              # m/s^2/sec low-frequency drift
 
-    "ori_bias_std": math.radians(1.0),    # rad, static attitude bias
-    "ori_rw_std": math.radians(0.08),     # rad * sqrt(s) attitude random walk
-    "ori_noise_std": math.radians(0.35),  # rad white noise
-    "ori_misalignment_std": math.radians(0.6),  # rad static misalignment
+    "ori_bias_std": math.radians(0.4),    # rad, static attitude bias
+    "ori_rw_std": math.radians(0.03),     # rad * sqrt(s) attitude random walk
+    "ori_noise_std": math.radians(0.15),  # rad white noise
+    "ori_misalignment_std": math.radians(0.25),  # rad static misalignment
     "ori_spike_prob": 0.001,              # probability of an attitude glitch
-    "ori_spike_std": math.radians(3.0),   # rad attitude glitch magnitude
+    "ori_spike_std": math.radians(1.2),   # rad attitude glitch magnitude
 
     "sample_drop_prob": 0.003,            # probability of dropping/holding a sample
     "sample_hold_prob": 0.004,            # probability of repeating previous sample

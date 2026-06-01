@@ -68,7 +68,6 @@ R_yup = torch.tensor([[1.0, 0.0, 0.0],
 
 OBJ_TRAJ_RADIUS = 0.006
 HAND_TRAJ_RADIUS = 0.004
-HAND_DASH_STRIDE = 2
 
 OBJ_TRAJ_COLORS = {
     "gt": (0.1, 0.8, 0.3, 1),
@@ -78,14 +77,10 @@ OBJ_TRAJ_COLORS = {
 }
 
 HAND_TRAJ_COLORS = {
-    "gt_l_contact": (1.0, 0.0, 0.0, 1),
-    "gt_l_non_contact": (1.0, 0.0, 0.0, 1),
-    "gt_r_contact": (0.0, 0.0, 1.0, 1),
-    "gt_r_non_contact": (0.0, 0.0, 1.0, 1),
-    "pred_l_contact": (1.0, 0.5, 0.0, 1),
-    "pred_l_non_contact": (1.0, 0.5, 0.0, 1),
-    "pred_r_contact": (0.0, 0.6, 1.0, 1),
-    "pred_r_non_contact": (0.0, 0.6, 1.0, 1),
+    "gt_l": (1.0, 0.0, 0.0, 1),
+    "gt_r": (0.0, 0.0, 1.0, 1),
+    "pred_l": (1.0, 0.5, 0.0, 1),
+    "pred_r": (0.0, 0.6, 1.0, 1),
 }
 
 GT_HUMAN_COLOR = (118/255, 147/255, 248/255, 0.9)
@@ -209,51 +204,6 @@ def _to_np_yup(points_torch, device):
     return points_yup.detach().cpu().numpy()
 
 
-def _segments_from_points(points_torch):
-    if points_torch is None or points_torch.dim() != 2 or points_torch.shape[0] < 2:
-        return None
-    return torch.stack([points_torch[:-1], points_torch[1:]], dim=1)
-
-
-def _segments_to_line_points(segments_torch):
-    if segments_torch is None or segments_torch.numel() == 0:
-        return None
-    return segments_torch.reshape(-1, 3)
-
-
-def _split_contact_segments(points_torch, contact_bool, dash_stride=2):
-    if points_torch is None or contact_bool is None:
-        return None, None
-    if points_torch.dim() != 2 or points_torch.shape[0] < 2:
-        return None, None
-
-    contacts = contact_bool
-    if not isinstance(contacts, torch.Tensor):
-        contacts = torch.as_tensor(contacts, device=points_torch.device)
-    else:
-        contacts = contacts.to(points_torch.device)
-    if contacts.dtype != torch.bool:
-        contacts = contacts > 0.5
-
-    valid_len = min(points_torch.shape[0], contacts.shape[0])
-    if valid_len < 2:
-        return None, None
-
-    pts = points_torch[:valid_len]
-    contacts = contacts[:valid_len]
-    segments = _segments_from_points(pts)
-    if segments is None:
-        return None, None
-
-    contact_mask = contacts[:-1] & contacts[1:]
-    contact_segments = segments[contact_mask]
-    non_contact_segments = segments[~contact_mask]
-    if non_contact_segments.numel() > 0 and dash_stride > 1:
-        non_contact_segments = non_contact_segments[::dash_stride]
-
-    return _segments_to_line_points(contact_segments), _segments_to_line_points(non_contact_segments)
-
-
 def _add_line_node_if_nonempty(viewer, points_torch, device, name, color, r_base, mode):
     if points_torch is None:
         return
@@ -277,6 +227,68 @@ def _add_line_node_if_nonempty(viewer, points_torch, device, name, color, r_base
         color=color,
         cast_shadow=False,
         name=name,
+        gui_affine=False,
+        is_selectable=False,
+    )
+    viewer.scene.add(line_node)
+
+
+def _add_prob_traj_nodes(
+    viewer,
+    points_torch,
+    prob_torch,
+    device,
+    name_prefix,
+    base_color,
+    r_base,
+    min_alpha=0.08,
+    max_alpha=0.95,
+):
+    if points_torch is None or prob_torch is None:
+        return
+    if points_torch.dim() != 2 or points_torch.shape[0] < 2:
+        return
+
+    prob = prob_torch
+    if not isinstance(prob, torch.Tensor):
+        prob = torch.as_tensor(prob, device=points_torch.device)
+    else:
+        prob = prob.to(points_torch.device)
+    if prob.dim() > 1:
+        prob = prob.reshape(prob.shape[0], -1)[:, 0]
+    prob = prob.to(dtype=points_torch.dtype).clamp(0.0, 1.0)
+
+    valid_len = min(points_torch.shape[0], prob.shape[0])
+    if valid_len < 2:
+        return
+
+    pts = points_torch[:valid_len]
+    prob = prob[:valid_len]
+    seg_prob = 0.5 * (prob[:-1] + prob[1:])
+    rgb = base_color[:3]
+    alpha_range = float(max_alpha) - float(min_alpha)
+    segments = torch.stack([pts[:-1], pts[1:]], dim=1).reshape(-1, 3)
+    points_np = _to_np_yup(segments, device)
+    if points_np is None:
+        return
+
+    alpha = float(min_alpha) + alpha_range * seg_prob.detach().cpu().numpy()
+    colors = np.stack(
+        (
+            np.full_like(alpha, float(rgb[0]), dtype=np.float32),
+            np.full_like(alpha, float(rgb[1]), dtype=np.float32),
+            np.full_like(alpha, float(rgb[2]), dtype=np.float32),
+            alpha.astype(np.float32),
+        ),
+        axis=1,
+    )
+    line_node = Lines(
+        lines=points_np,
+        mode="lines",
+        r_base=r_base,
+        color=colors,
+        cast_shadow=False,
+        name=name_prefix,
         gui_affine=False,
         is_selectable=False,
     )
@@ -471,8 +483,6 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
         pred_obj_trans_fk_seq = None
         pred_obj_trans_imu_seq = None
         pred_hand_contact_prob_seq = None
-        pred_lhand_contact_seq = None
-        pred_rhand_contact_seq = None
         model_input = None
 
         if not vis_gt_only:
@@ -513,10 +523,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
             pred_hand_contact_prob_all = pred_dict.get("pred_hand_contact_prob")
             if pred_hand_contact_prob_all is not None:
                 pred_hand_contact_prob_seq = pred_hand_contact_prob_all[bs].to(device)
-                if pred_hand_contact_prob_seq.shape[-1] >= 2:
-                    pred_lhand_contact_seq = pred_hand_contact_prob_seq[:, 0] > 0.5
-                    pred_rhand_contact_seq = pred_hand_contact_prob_seq[:, 1] > 0.5
-            
+
             if compare_3 and "pred_obj_vel" in pred_dict and model_input is not None:
                 try:
                     pred_obj_vel_seq = pred_dict["pred_obj_vel"][bs].to(device)
@@ -781,56 +788,46 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
 
             if Jtr_gt_seq is not None:
                 if lhand_contact_seq is not None:
-                    gt_l_contact_lines, gt_l_non_contact_lines = _split_contact_segments(
-                        Jtr_gt_seq[:, lhand_idx], lhand_contact_seq, dash_stride=HAND_DASH_STRIDE
-                    )
-                    _add_line_node_if_nonempty(
-                        viewer, gt_l_contact_lines, device, "GT-LHandTraj-Contact",
-                        HAND_TRAJ_COLORS["gt_l_contact"], HAND_TRAJ_RADIUS, "lines"
-                    )
-                    _add_line_node_if_nonempty(
-                        viewer, gt_l_non_contact_lines, device, "GT-LHandTraj-NonContact",
-                        HAND_TRAJ_COLORS["gt_l_non_contact"], HAND_TRAJ_RADIUS, "lines"
+                    _add_prob_traj_nodes(
+                        viewer,
+                        Jtr_gt_seq[:, lhand_idx],
+                        lhand_contact_seq.float(),
+                        device,
+                        "GT-LHandTraj",
+                        HAND_TRAJ_COLORS["gt_l"],
+                        HAND_TRAJ_RADIUS,
                     )
 
                 if rhand_contact_seq is not None:
-                    gt_r_contact_lines, gt_r_non_contact_lines = _split_contact_segments(
-                        Jtr_gt_seq[:, rhand_idx], rhand_contact_seq, dash_stride=HAND_DASH_STRIDE
-                    )
-                    _add_line_node_if_nonempty(
-                        viewer, gt_r_contact_lines, device, "GT-RHandTraj-Contact",
-                        HAND_TRAJ_COLORS["gt_r_contact"], HAND_TRAJ_RADIUS, "lines"
-                    )
-                    _add_line_node_if_nonempty(
-                        viewer, gt_r_non_contact_lines, device, "GT-RHandTraj-NonContact",
-                        HAND_TRAJ_COLORS["gt_r_non_contact"], HAND_TRAJ_RADIUS, "lines"
+                    _add_prob_traj_nodes(
+                        viewer,
+                        Jtr_gt_seq[:, rhand_idx],
+                        rhand_contact_seq.float(),
+                        device,
+                        "GT-RHandTraj",
+                        HAND_TRAJ_COLORS["gt_r"],
+                        HAND_TRAJ_RADIUS,
                     )
 
             if not vis_gt_only and Jtr_pred_seq is not None:
-                if pred_lhand_contact_seq is not None:
-                    pred_l_contact_lines, pred_l_non_contact_lines = _split_contact_segments(
-                        Jtr_pred_seq[:, lhand_idx] + pred_offset, pred_lhand_contact_seq, dash_stride=HAND_DASH_STRIDE
+                if pred_hand_contact_prob_seq is not None and pred_hand_contact_prob_seq.shape[-1] >= 2:
+                    _add_prob_traj_nodes(
+                        viewer,
+                        Jtr_pred_seq[:, lhand_idx] + pred_offset,
+                        pred_hand_contact_prob_seq[:, 0],
+                        device,
+                        "Pred-LHandTraj",
+                        HAND_TRAJ_COLORS["pred_l"],
+                        HAND_TRAJ_RADIUS,
                     )
-                    _add_line_node_if_nonempty(
-                        viewer, pred_l_contact_lines, device, "Pred-LHandTraj-Contact",
-                        HAND_TRAJ_COLORS["pred_l_contact"], HAND_TRAJ_RADIUS, "lines"
-                    )
-                    _add_line_node_if_nonempty(
-                        viewer, pred_l_non_contact_lines, device, "Pred-LHandTraj-NonContact",
-                        HAND_TRAJ_COLORS["pred_l_non_contact"], HAND_TRAJ_RADIUS, "lines"
-                    )
-
-                if pred_rhand_contact_seq is not None:
-                    pred_r_contact_lines, pred_r_non_contact_lines = _split_contact_segments(
-                        Jtr_pred_seq[:, rhand_idx] + pred_offset, pred_rhand_contact_seq, dash_stride=HAND_DASH_STRIDE
-                    )
-                    _add_line_node_if_nonempty(
-                        viewer, pred_r_contact_lines, device, "Pred-RHandTraj-Contact",
-                        HAND_TRAJ_COLORS["pred_r_contact"], HAND_TRAJ_RADIUS, "lines"
-                    )
-                    _add_line_node_if_nonempty(
-                        viewer, pred_r_non_contact_lines, device, "Pred-RHandTraj-NonContact",
-                        HAND_TRAJ_COLORS["pred_r_non_contact"], HAND_TRAJ_RADIUS, "lines"
+                    _add_prob_traj_nodes(
+                        viewer,
+                        Jtr_pred_seq[:, rhand_idx] + pred_offset,
+                        pred_hand_contact_prob_seq[:, 1],
+                        device,
+                        "Pred-RHandTraj",
+                        HAND_TRAJ_COLORS["pred_r"],
+                        HAND_TRAJ_RADIUS,
                     )
 
         viewer.virtual_bone_info = {'has_data': False}

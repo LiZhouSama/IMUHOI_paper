@@ -172,7 +172,7 @@ class IMUHOIModel(nn.Module):
             if path and os.path.exists(path):
                 module = getattr(self, f"{name}_module", None)
                 if module is not None:
-                    module_strict = False if name == "object_trans" else strict
+                    module_strict = False if name in {"velocity_contact", "object_trans"} else strict
                     load_checkpoint(module, path, self.device, strict=module_strict)
                     print(f"Loaded {name} from {path}")
             else:
@@ -321,6 +321,7 @@ class IMUHOIModel(nn.Module):
             'obj_imu': data_dict["obj_imu"],
             'hand_vel_glb_init': data_dict["hand_vel_glb_init"],
             'obj_vel_init': data_dict["obj_vel_init"],
+            'obj_trans_init': data_dict["obj_trans_init"],
             'contact_init': data_dict.get("contact_init"),
             'hp_out': hp_out,
         }
@@ -446,6 +447,7 @@ class IMUHOIModel(nn.Module):
                 "obj_imu": window_data["obj_imu"],
                 "hand_vel_glb_init": window_data["hand_vel_glb_init"],
                 "obj_vel_init": window_data["obj_vel_init"],
+                "obj_trans_init": window_data["obj_trans_init"],
                 "contact_init": window_data.get("contact_init"),
                 "hp_out": hp_context,
             }

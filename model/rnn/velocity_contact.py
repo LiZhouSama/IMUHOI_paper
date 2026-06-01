@@ -39,6 +39,11 @@ class VelocityContactModule(nn.Module):
         num_layers = getattr(cfg, "velocity_num_layers", 2)
         dropout = getattr(cfg, "velocity_dropout", 0.2)
         self.fps = float(getattr(cfg, "frame_rate", FRAME_RATE))
+        self.use_contact_geom_features = bool(getattr(cfg, "velocity_contact_use_geom_features", True))
+        self.detach_contact_geom_obj_vel = bool(getattr(cfg, "velocity_contact_geom_detach_obj_vel", True))
+        self.adapt_checkpoint_hand_contact_input = bool(
+            getattr(cfg, "velocity_contact_adapt_checkpoint_input", False)
+        )
 
         # Body-part grouped encoders for interaction boundary prediction
         self.body_group_indices = {
@@ -98,8 +103,14 @@ class VelocityContactModule(nn.Module):
         )
         # Hand contact conditioned on object moving
         self.legacy_hand_contact_input_dim = contact_input_dim
-        hand_contact_input_dim = 2 * (3 + 3) + 3 + self.obj_imu_dim + boundary_hidden  # vel+acc per hand + root vel + obj imu + boundary features
-        self.hand_contact_input_mode = "current"
+        self.base_hand_contact_input_dim = 2 * (3 + 3) + 3 + self.obj_imu_dim + boundary_hidden
+        # Per hand: rel_pos(3), distance(1), rel_vel(3), velocity cosine(1).
+        self.contact_geom_dim = 2 * (3 + 1 + 3 + 1)
+        self.geom_hand_contact_input_dim = self.base_hand_contact_input_dim + (
+            self.contact_geom_dim if self.use_contact_geom_features else 0
+        )
+        hand_contact_input_dim = self.geom_hand_contact_input_dim
+        self.hand_contact_input_mode = "geom" if self.use_contact_geom_features else "current"
         self.hand_contact_net = RNNWithInit(
             n_input=hand_contact_input_dim,
             n_output=2,  # left/right conditional prob
@@ -113,11 +124,21 @@ class VelocityContactModule(nn.Module):
         self.left_hand_sensor = _SENSOR_NAMES.index("LeftForeArm")
         self.right_hand_sensor = _SENSOR_NAMES.index("RightForeArm")
 
+    def should_adapt_checkpoint_hand_contact_input(self) -> bool:
+        return bool(self.adapt_checkpoint_hand_contact_input)
+
     def enable_legacy_hand_contact_input(self, input_dim: int = None):
-        """Use the pre-boundary 27D hand-contact input expected by older VC checkpoints."""
+        """Use a checkpoint-compatible hand-contact input path."""
         input_dim = int(input_dim or self.legacy_hand_contact_input_dim)
+        if input_dim == self.legacy_hand_contact_input_dim:
+            self.hand_contact_input_mode = "legacy"
+        elif input_dim == self.base_hand_contact_input_dim:
+            self.hand_contact_input_mode = "current"
+        elif input_dim == self.geom_hand_contact_input_dim:
+            self.hand_contact_input_mode = "geom"
+        else:
+            self.hand_contact_input_mode = "legacy"
         current_dim = int(self.hand_contact_net.linear1.in_features)
-        self.hand_contact_input_mode = "legacy"
         if current_dim == input_dim:
             return self
 
@@ -165,21 +186,56 @@ class VelocityContactModule(nn.Module):
         pose_6d = None
         joint_pos = None
         root_vel = None
+        root_trans = None
         hand_pos = None
         if isinstance(hp_out, dict):
             pose_6d = hp_out.get("pred_full_pose_6d")
             joint_pos = hp_out.get("pred_joints_local")
             root_vel = hp_out.get("root_vel_pred")
+            root_trans = hp_out.get("root_trans_pred")
             hand_pos = hp_out.get("pred_hand_glb_pos")
 
         if pose_6d is None:
             pose_6d = torch.zeros(batch_size, seq_len, 24, 6, device=device, dtype=dtype)
+        else:
+            pose_6d = pose_6d.to(device=device, dtype=dtype)
         if joint_pos is None:
             joint_pos = torch.zeros(batch_size, seq_len, 24, 3, device=device, dtype=dtype)
+        else:
+            joint_pos = joint_pos.to(device=device, dtype=dtype)
         if root_vel is None:
             root_vel = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
+        else:
+            root_vel = root_vel.to(device=device, dtype=dtype)
+            if root_vel.dim() == 2 and root_vel.shape == (batch_size, 3):
+                root_vel = root_vel.unsqueeze(1).expand(batch_size, seq_len, 3)
+            if root_vel.dim() != 3 or root_vel.shape[:2] != (batch_size, seq_len) or root_vel.shape[-1] != 3:
+                root_vel = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
+        if root_trans is None:
+            root_trans = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
+        else:
+            root_trans = root_trans.to(device=device, dtype=dtype)
+            if root_trans.dim() == 2 and root_trans.shape == (batch_size, 3):
+                root_trans = root_trans.unsqueeze(1).expand(batch_size, seq_len, 3)
+            if root_trans.dim() != 3 or root_trans.shape[:2] != (batch_size, seq_len) or root_trans.shape[-1] != 3:
+                root_trans = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
         if hand_pos is None:
-            hand_pos = torch.zeros(batch_size, seq_len, 2, 3, device=device, dtype=dtype)
+            if joint_pos.shape[2] > 21:
+                hand_pos = torch.stack(
+                    (
+                        joint_pos[:, :, 20, :] + root_trans,
+                        joint_pos[:, :, 21, :] + root_trans,
+                    ),
+                    dim=2,
+                )
+            else:
+                hand_pos = torch.zeros(batch_size, seq_len, 2, 3, device=device, dtype=dtype)
+        else:
+            hand_pos = hand_pos.to(device=device, dtype=dtype)
+            if hand_pos.dim() == 3 and hand_pos.shape[:2] == (batch_size, seq_len) and hand_pos.shape[-1] == 6:
+                hand_pos = hand_pos.reshape(batch_size, seq_len, 2, 3)
+            if hand_pos.dim() != 4 or hand_pos.shape[:3] != (batch_size, seq_len, 2) or hand_pos.shape[-1] != 3:
+                hand_pos = torch.zeros(batch_size, seq_len, 2, 3, device=device, dtype=dtype)
 
         dt = 1.0 / self.fps
         joint_vel = _central_diff(joint_pos, dt)
@@ -192,9 +248,51 @@ class VelocityContactModule(nn.Module):
             "joint_vel": joint_vel,
             "joint_acc": joint_acc,
             "root_vel": root_vel,
+            "root_trans": root_trans,
+            "hand_pos": hand_pos,
             "hand_vel": hand_vel,
             "hand_acc": hand_acc,
         }
+
+    def _prepare_init_vector(self, value, batch_size, dim, device, dtype):
+        if isinstance(value, torch.Tensor):
+            out = value.to(device=device, dtype=dtype)
+            if out.dim() == 1:
+                out = out.unsqueeze(0).expand(batch_size, -1)
+            elif out.shape[0] == 1 and batch_size > 1:
+                out = out.expand(batch_size, *out.shape[1:])
+            if out.dim() == 2 and out.shape == (batch_size, dim):
+                return out
+        return torch.zeros(batch_size, dim, device=device, dtype=dtype)
+
+    def _integrate_rough_object_translation(self, obj_vel, obj_trans_init):
+        dt = 1.0 / self.fps
+        disp = torch.cumsum(obj_vel * dt, dim=1)
+        if disp.shape[1] > 0:
+            zero = torch.zeros(disp.shape[0], 1, 3, device=disp.device, dtype=disp.dtype)
+            disp = torch.cat((zero, disp[:, :-1]), dim=1)
+        return obj_trans_init.unsqueeze(1) + disp
+
+    @staticmethod
+    def _cosine_similarity(u, v, eps=1e-6):
+        denom = u.norm(dim=-1, keepdim=True).clamp_min(eps) * v.norm(dim=-1, keepdim=True).clamp_min(eps)
+        return (u * v).sum(dim=-1, keepdim=True) / denom
+
+    def _build_contact_geom_features(self, pose_streams, obj_vel, obj_trans_init):
+        geom_obj_vel = obj_vel.detach() if self.detach_contact_geom_obj_vel else obj_vel
+        obj_trans_rough = self._integrate_rough_object_translation(geom_obj_vel, obj_trans_init)
+        hand_pos = pose_streams["hand_pos"]
+        hand_vel = pose_streams["hand_vel"]
+
+        obj_vel_hands = geom_obj_vel.unsqueeze(2).expand(-1, -1, 2, -1)
+        rel_pos = hand_pos - obj_trans_rough.unsqueeze(2)
+        rel_dist = rel_pos.norm(dim=-1, keepdim=True)
+        rel_vel = hand_vel - obj_vel_hands
+        vel_cos = self._cosine_similarity(hand_vel, obj_vel_hands)
+
+        batch_size, seq_len = obj_vel.shape[:2]
+        geom_feat = torch.cat((rel_pos, rel_dist, rel_vel, vel_cos), dim=-1).reshape(batch_size, seq_len, -1)
+        return geom_feat, obj_trans_rough
 
     def _encode_body_groups(self, pose_streams):
         boundary_features = []
@@ -263,6 +361,7 @@ class VelocityContactModule(nn.Module):
             obj_vel_init_vec = obj_vel_init
         else:
             raise ValueError(f"obj_vel_init must be [B,3] or [3], got {obj_vel_init.shape}")
+        obj_trans_init_vec = self._prepare_init_vector(data_dict.get("obj_trans_init"), batch_size, 3, device, dtype)
 
         # Denormalize IMU
         human_imu_denorm = self._denormalize_imu(human_imu)
@@ -307,6 +406,7 @@ class VelocityContactModule(nn.Module):
         # Hand contact using HPE-derived velocity/acc plus boundary hidden states
         if getattr(self, "hand_contact_input_mode", "current") == "legacy":
             hand_contact_input = contact_input_imu
+            obj_trans_rough = None
         else:
             hand_dyn_feat = torch.cat(
                 (
@@ -316,7 +416,18 @@ class VelocityContactModule(nn.Module):
                 dim=-1,
             )
             root_vel_feat = pose_streams["root_vel"]
-            hand_contact_input = torch.cat((hand_dyn_feat, root_vel_feat, obj_imu, boundary_out), dim=-1)
+            base_contact_input = torch.cat((hand_dyn_feat, root_vel_feat, obj_imu, boundary_out), dim=-1)
+            expected_contact_dim = int(self.hand_contact_net.linear1.in_features)
+            obj_trans_rough = None
+            if expected_contact_dim == self.base_hand_contact_input_dim:
+                hand_contact_input = base_contact_input
+            elif expected_contact_dim == self.geom_hand_contact_input_dim:
+                geom_feat, obj_trans_rough = self._build_contact_geom_features(
+                    pose_streams, obj_vel, obj_trans_init_vec
+                )
+                hand_contact_input = torch.cat((base_contact_input, geom_feat), dim=-1)
+            else:
+                hand_contact_input = base_contact_input
         expected_contact_dim = int(self.hand_contact_net.linear1.in_features)
         if hand_contact_input.shape[-1] != expected_contact_dim:
             raise ValueError(
@@ -334,7 +445,7 @@ class VelocityContactModule(nn.Module):
         contact_logits = torch.cat((hand_contact_logits, obj_move_logits), dim=-1)
         contact_prob = torch.cat((hand_contact_prob, obj_move_prob), dim=-1)
 
-        return {
+        out = {
             "pred_hand_glb_vel": hand_vel,
             "pred_obj_vel": obj_vel,
             "pred_hand_contact_logits": contact_logits,
@@ -345,6 +456,9 @@ class VelocityContactModule(nn.Module):
             "pred_interaction_boundary_logits": boundary_logits,
             "pred_interaction_boundary_prob": boundary_prob,
         }
+        if obj_trans_rough is not None:
+            out["pred_obj_trans_rough"] = obj_trans_rough
+        return out
 
     def _slice_hp_out(self, hp_out, start: int, end: int, batch_size: int, seq_len: int):
         if not isinstance(hp_out, dict):

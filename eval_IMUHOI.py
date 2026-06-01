@@ -16,6 +16,7 @@ import torch
 from torch.utils.data import DataLoader
 from easydict import EasyDict as edict
 from sklearn.metrics import f1_score, fbeta_score, precision_score, recall_score
+from tqdm import tqdm
 
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -74,8 +75,8 @@ def get_default_dataset_config(no_trans: bool = False):
         #         "object_trans": output_path / "imhd" / "modules" / "object_trans_best.pt",
         #     },
         # },
-        # "processed_split_data_OMOMO": {
-        #     "data_dir": PROCESS_ROOT / "processed_split_data_OMOMO_bps" / "test",
+        "processed_split_data_OMOMO": {
+            "data_dir": PROCESS_ROOT / "processed_split_data_OMOMO_bps" / "test",
             # 默认不覆盖checkpoint路径，优先使用 config.pretrained_modules。
             # 如需按数据集指定权重，可添加 modules 字段，例如：
             # "modules": {
@@ -83,8 +84,15 @@ def get_default_dataset_config(no_trans: bool = False):
             #     "interaction": ".../interaction/best.pt",
             # }
         # },
-        "processed_split_data_HODOME": {
-            "data_dir": PROCESS_ROOT / "processed_split_data_HODOME",
+        # "processed_split_data_HODOME": {
+        #     "data_dir": PROCESS_ROOT / "processed_split_data_HODOME" / "test",
+            # "modules": {
+            #     "velocity_contact": output_path / "behave" / "modules" / "velocity_contact_best.pt",
+            #     "human_pose": output_path / "behave" / "modules" / "human_pose_best.pt",
+            #     "object_trans": output_path / "behave" / "modules" / "object_trans_best.pt",
+            # },
+        # "processed_split_data_PAHOI": {
+        #     "data_dir": PROCESS_ROOT / "processed_split_data_PAHOI" / "test",
             # "modules": {
             #     "velocity_contact": output_path / "behave" / "modules" / "velocity_contact_best.pt",
             #     "human_pose": output_path / "behave" / "modules" / "human_pose_best.pt",
@@ -320,8 +328,16 @@ def evaluate_model(
 
     num_eval_joints = 22
 
+    progress_bar = tqdm(
+        data_loader,
+        total=len(data_loader),
+        desc="Evaluating",
+        unit="batch",
+        dynamic_ncols=True,
+    )
+
     with torch.no_grad():
-        for batch_idx, batch in enumerate(data_loader):
+        for batch_idx, batch in enumerate(progress_bar):
             # 移动到设备
             batch_device = {}
             for key, value in batch.items():
@@ -782,9 +798,6 @@ def evaluate_model(
                                 float(pred_rhand_bool[hard_neg_mask].mean())
                             )
 
-            if batch_idx % 50 == 0:
-                print(f"Processed {batch_idx + 1}/{len(data_loader)} batches")
-
     # 计算平均值
     avg_metrics = {}
     for key, values in metrics.items():
@@ -800,7 +813,7 @@ def main():
     parser.add_argument("--dataset", type=str, default=None, help="数据集名称")
     parser.add_argument("--smpl_model_path", type=str, default="datasets/smpl_models/smplh/male/model.npz", help="SMPL模型路径")
     parser.add_argument("--test_data_dir", type=str, default=None, help="测试数据目录")
-    parser.add_argument("--num_workers", type=int, default=0, help="DataLoader workers")
+    parser.add_argument("--num_workers", type=int, default=12, help="DataLoader workers")
     parser.add_argument("--no_trans", action="store_true", help="使用noTrans模式")
     parser.add_argument("--no_eval_objects", action="store_true", help="跳过物体相关指标")
     parser.add_argument("--compare_3", action="store_true", help="比较FK/IMU方法")

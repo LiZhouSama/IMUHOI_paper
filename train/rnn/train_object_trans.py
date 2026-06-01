@@ -565,7 +565,7 @@ def main():
     
     vc_model = VelocityContactModule(cfg)
     if vc_ckpt and os.path.exists(vc_ckpt):
-        load_checkpoint(vc_model, vc_ckpt, device)
+        load_checkpoint(vc_model, vc_ckpt, device, strict=False)
     elif vc_ckpt:
         print(f"警告: VelocityContact权重不存在: {vc_ckpt}")
 

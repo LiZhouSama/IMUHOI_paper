@@ -41,13 +41,13 @@ enable_ot_refine: true
 # ============ 训练超参数 ============
 epochs: 500
 input_mix_start_epoch: 0
-input_mix_end_epoch: 0  # 0 means use predicted HP/VC inputs from epoch 0
+input_mix_end_epoch: 100  # 0 means use predicted HP/VC inputs from epoch 0
 joint_vc_unfreeze_epoch: 0
 batch_size: 60
 lr: 0.002
 weight_decay: 0.0001
-# milestones: [100, 200, 300, 350, 400, 450, 500]
-milestones: [10,20,30,40,50,60,70,80,90,100]  #joint_train
+milestones: [100, 200, 300, 350, 400, 450, 500]
+# milestones: [10,20,30,40,50,60,70,80,90,100]  #joint_train
 gamma: 0.2
 seed: 42
 num_workers: 12
@@ -59,8 +59,8 @@ obj_imu_dim: 9
 num_joints: 24
 
 # ============ 噪声配置 ============
-imu_noise_std: 0.3
-obj_imu_noise_std: 0.3
+imu_noise_std: 0
+obj_imu_noise_std: 0
 
 # ============ 评估超参数 ============
 hand_contact_threshold: 0.15

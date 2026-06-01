@@ -77,6 +77,8 @@ def _maybe_adapt_legacy_velocity_contact(model, state_dict):
     target = model.module if hasattr(model, 'module') else model
     if not hasattr(target, 'enable_legacy_hand_contact_input'):
         return False
+    if hasattr(target, 'should_adapt_checkpoint_hand_contact_input') and not target.should_adapt_checkpoint_hand_contact_input():
+        return False
     ckpt_weight = _find_state_tensor_by_suffix(state_dict, 'hand_contact_net.linear1.weight')
     if ckpt_weight is None or ckpt_weight.dim() != 2:
         return False
