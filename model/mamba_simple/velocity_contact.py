@@ -7,7 +7,6 @@ from utils.rotation_conversions import rotation_6d_to_matrix, matrix_to_rotation
 
 from .base import PartMambaBoundary, RNNWithInit, mamba_kwargs_from_cfg
 from configs import FRAME_RATE, _SENSOR_NAMES
-from utils.utils import _central_diff, _smooth_acceleration
 
 
 class VelocityContactModule(nn.Module):
@@ -141,11 +140,10 @@ class VelocityContactModule(nn.Module):
         if hand_pos is None:
             hand_pos = torch.zeros(batch_size, seq_len, 2, 3, device=device, dtype=dtype)
 
-        dt = 1.0 / self.fps
-        joint_vel = _central_diff(joint_pos, dt)
-        joint_acc = _smooth_acceleration(joint_pos, self.fps, smooth_n=4)
-        hand_vel = _central_diff(hand_pos, dt)
-        hand_acc = _smooth_acceleration(hand_pos, self.fps, smooth_n=4)
+        joint_vel = self._causal_velocity(joint_pos)
+        joint_acc = self._causal_acceleration(joint_pos)
+        hand_vel = self._causal_velocity(hand_pos)
+        hand_acc = self._causal_acceleration(hand_pos)
 
         return {
             "pose_6d": pose_6d,
@@ -155,6 +153,18 @@ class VelocityContactModule(nn.Module):
             "hand_vel": hand_vel,
             "hand_acc": hand_acc,
         }
+
+    def _causal_velocity(self, value: torch.Tensor) -> torch.Tensor:
+        vel = torch.zeros_like(value)
+        if value.size(1) > 1:
+            vel[:, 1:] = (value[:, 1:] - value[:, :-1]) * self.fps
+        return vel
+
+    def _causal_acceleration(self, value: torch.Tensor) -> torch.Tensor:
+        acc = torch.zeros_like(value)
+        if value.size(1) > 2:
+            acc[:, 2:] = (value[:, 2:] - 2.0 * value[:, 1:-1] + value[:, :-2]) * (self.fps ** 2)
+        return acc
 
     def _encode_body_groups(self, pose_streams):
         group_inputs = {}

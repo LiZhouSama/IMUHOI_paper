@@ -19,6 +19,12 @@ class VelocityContactLoss:
         'interaction_order',
     }
 
+    TEST_LOSS_KEYS = {
+        'obj_vel',
+        'obj_move',
+        'hand_contact_cond',
+    }
+
     def __init__(self, weights=None):
         """
         Args:
@@ -250,6 +256,27 @@ class VelocityContactLoss:
 
         return total_loss, losses, weighted_losses
 
+    def compute_test_loss(self, pred_dict, batch, device):
+        """Test loss tracks only downstream-consumed VC outputs.
+
+        Stage3 consumes ``pred_obj_vel`` and ``pred_hand_contact_prob``.  The
+        latter is built from conditional hand-contact logits plus object-move
+        probability, so test loss keeps those contact terms and excludes
+        auxiliary hand-velocity/boundary objectives.
+        """
+        _, _, weighted_losses = self.compute_loss(pred_dict, batch, device)
+        test_losses = {
+            key: value
+            for key, value in weighted_losses.items()
+            if key in self.TEST_LOSS_KEYS
+        }
+        if test_losses:
+            total_loss = sum(test_losses.values())
+        else:
+            human_imu = batch['human_imu'].to(device)
+            total_loss = human_imu.new_tensor(0.0)
+        return total_loss, test_losses
+    
     @classmethod
     def get_loss_keys(cls):
         """Return loss keys."""
