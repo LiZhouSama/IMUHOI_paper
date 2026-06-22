@@ -8,12 +8,12 @@ from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_rotation_6d
 from .base import RNNWithInit
 from .online import (
     append_stream_data,
-    concat_time_dicts,
     infer_batch_seq,
     normalize_inference_mode,
     resolve_online_window,
     slice_time_dict,
     take_latest_frame,
+    TimeDictAccumulator,
     update_data_inits_from_history,
 )
 from configs import FRAME_RATE, _SENSOR_NAMES
@@ -414,6 +414,10 @@ class VelocityContactModule(nn.Module):
         # Boundary prediction from HPE outputs
         pose_streams = self._prepare_pose_streams(hp_out or data_dict.get("hp_out"), device, dtype, batch_size, seq_len)
         boundary_logits, boundary_prob, boundary_out = self._encode_body_groups(pose_streams)
+        if bool(getattr(self.cfg, "ablate_vc_boundary", False)):
+            boundary_logits = torch.zeros_like(boundary_logits)
+            boundary_prob = torch.zeros_like(boundary_prob)
+            boundary_out = torch.zeros_like(boundary_out)
 
         # Hand contact using HPE-derived velocity/acc plus boundary hidden states
         if getattr(self, "hand_contact_input_mode", "current") == "legacy":
@@ -486,6 +490,8 @@ class VelocityContactModule(nn.Module):
         warmup_data = slice_time_dict(data_dict, 0, warmup_len, batch_size, seq_len)
         warmup_hp = self._slice_hp_out(hp_out, 0, warmup_len, batch_size, seq_len)
         history = self.forward(warmup_data, hp_out=warmup_hp)
+        history_acc = TimeDictAccumulator(history, seq_len)
+        history = history_acc.current()
 
         for end in range(warmup_len + 1, seq_len + 1):
             start = end - warmup_len
@@ -494,9 +500,9 @@ class VelocityContactModule(nn.Module):
             window_hp = self._slice_hp_out(hp_out, start, end, batch_size, seq_len)
             window_out = self.forward(window_data, hp_out=window_hp)
             latest = take_latest_frame(window_out, batch_size, end - start)
-            history = concat_time_dicts([history, latest])
+            history = history_acc.append(latest)
 
-        return history
+        return history_acc.current()
 
     def inference(
         self,

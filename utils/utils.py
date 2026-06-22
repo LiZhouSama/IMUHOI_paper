@@ -110,7 +110,10 @@ def load_smpl_model(smpl_path: str, device: torch.device):
 
 def load_checkpoint(model, checkpoint_path, device, strict=True, use_ema=True):
     """加载检查点"""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint
     if isinstance(checkpoint, dict):
         if use_ema and checkpoint.get('ema_state_dict') is not None:

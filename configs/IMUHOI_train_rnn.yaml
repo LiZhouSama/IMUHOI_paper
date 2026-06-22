@@ -136,8 +136,8 @@ test:
 # ============ 预训练模块路径（可选）============
 pretrained_modules:
   human_pose: "outputs/IMUHOI_RNN_2/human_pose_06071743/best.pt"
-  velocity_contact: "outputs/IMUHOI_RNN_2/velocity_contact_06012122/best.pt"
-  object_trans: "outputs/IMUHOI_RNN_2/joint_train_05141342/best_object_trans.pt"
+  velocity_contact: "outputs/IMUHOI_RNN_2/joint_train_06081240/best_velocity_contact.pt"
+  object_trans: "outputs/IMUHOI_RNN_2/joint_train_06081240/best_object_trans.pt"
 
   # human_pose: "outputs/IMUHOI_rnn/joint_train_01112057/best_human_pose.pt"
   # velocity_contact: "outputs/IMUHOI_rnn/joint_train_01112057/best_velocity_contact.pt"

@@ -6,6 +6,8 @@ import os
 import sys
 import argparse
 import copy
+import json
+import random
 import time
 import types
 from pathlib import Path
@@ -60,7 +62,7 @@ def get_default_dataset_config(no_trans: bool = False):
 
     return {
         # "processed_seg_data_BEHAVE": {
-        #     "data_dir": PROCESS_ROOT / "processed_split_data_BEHAVE" / "test",
+        #     "data_dir": PROCESS_ROOT / "processed_split_data_BEHAVE_bps" ,
         #     "modules": {
         #         "velocity_contact": output_path / "behave" / "modules" / "velocity_contact_best.pt",
         #         "human_pose": output_path / "behave" / "modules" / "human_pose_best.pt",
@@ -125,6 +127,24 @@ def _build_dataset_runs(args: argparse.Namespace, default_config: dict):
     for name, cfg in default_config.items():
         runs.append((name, copy.deepcopy(cfg)))
     return runs
+
+
+def _set_eval_seed(seed: Optional[int]) -> Optional[int]:
+    if seed is None:
+        return None
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    return seed
+
+
+def _seed_worker(worker_id: int):
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
 def _apply_module_overrides(config: edict, modules_override: Dict[str, Path]) -> None:
@@ -336,7 +356,7 @@ def evaluate_model(
         dynamic_ncols=True,
     )
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch_idx, batch in enumerate(progress_bar):
             # 移动到设备
             batch_device = {}
@@ -826,6 +846,10 @@ def main():
     parser.add_argument("--object_contact_threshold", type=float, default=None, help="物体接触评估阈值")
     parser.add_argument("--inference_mode", "--inference-mode", choices=["online", "offline"], default="online", help="RNN inference mode")
     parser.add_argument("--online_window", "--online-window", type=int, default=None, help="RNN online sliding window size")
+    parser.add_argument("--ablate_vc_boundary", action="store_true", help="将RNN VC boundary输出置零，用于消融人体pose先验")
+    parser.add_argument("--ablate_ot_obs_encoder", action="store_true", help="将RNN OT obs_encoder输出置零，用于消融物体mesh/人体pose观测先验")
+    parser.add_argument("--output_json", type=str, default=None, help="可选：保存评估结果JSON")
+    parser.add_argument("--seed", type=int, default=None, help="可选：固定评估随机种子，用于可复现实验")
     parser.add_argument(
         "--interaction_human_source",
         type=str,
@@ -854,6 +878,13 @@ def main():
     print(f"Mode: {'noTrans' if args.no_trans else 'Normal'}")
     print(f"Interaction human source: {args.interaction_human_source}")
     print(f"Inference mode: {args.inference_mode} | online_window: {args.online_window or 'config/default'}")
+    print(
+        "Ablations: "
+        f"vc_boundary={'zero' if args.ablate_vc_boundary else 'normal'} | "
+        f"ot_obs_encoder={'zero' if args.ablate_ot_obs_encoder else 'normal'}"
+    )
+    seed = _set_eval_seed(args.seed)
+    print(f"Eval seed: {seed if seed is not None else 'unset'}")
 
     default_config = get_default_dataset_config(args.no_trans)
 
@@ -869,6 +900,8 @@ def main():
         config = load_config(args.config)
         if args.model_arch is not None:
             config.model_arch = args.model_arch
+        config.ablate_vc_boundary = bool(args.ablate_vc_boundary)
+        config.ablate_ot_obs_encoder = bool(args.ablate_ot_obs_encoder)
         ot_refine = (
             bool(args.ot_refine)
             if args.ot_refine is not None
@@ -974,6 +1007,8 @@ def main():
             num_workers=config.get("num_workers", 0),
             pin_memory=True,
             drop_last=False,
+            worker_init_fn=_seed_worker if seed is not None else None,
+            generator=(torch.Generator().manual_seed(seed) if seed is not None else None),
         )
 
         print(f"Dataset size: {len(test_dataset)} | Loader batches: {len(test_loader)}")
@@ -1055,6 +1090,23 @@ def main():
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    if args.output_json:
+        output_path = Path(args.output_json).expanduser()
+        if not output_path.is_absolute():
+            output_path = (Path.cwd() / output_path).resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "config": args.config,
+            "inference_mode": args.inference_mode,
+            "online_window": args.online_window,
+            "ablate_vc_boundary": bool(args.ablate_vc_boundary),
+            "ablate_ot_obs_encoder": bool(args.ablate_ot_obs_encoder),
+            "seed": seed,
+            "results": all_results,
+        }
+        output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"[Eval] Results saved to: {output_path}")
 
 
 if __name__ == "__main__":

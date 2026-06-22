@@ -12,12 +12,12 @@ from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_axis_angle, ma
 from .base import RNN, RNNWithInit, SubPoser
 from .online import (
     append_stream_data,
-    concat_time_dicts,
     infer_batch_seq,
     normalize_inference_mode,
     resolve_online_window,
     slice_time_dict,
     take_latest_frame,
+    TimeDictAccumulator,
     update_data_inits_from_history,
 )
 from configs import (
@@ -506,6 +506,8 @@ class HumanPoseModule(nn.Module):
         warmup_len = int(online_window)
         warmup_data = slice_time_dict(data_dict, 0, warmup_len, batch_size, seq_len)
         history = self.forward(warmup_data)
+        history_acc = TimeDictAccumulator(history, seq_len)
+        history = history_acc.current()
 
         for end in range(warmup_len + 1, seq_len + 1):
             start = end - warmup_len
@@ -513,9 +515,9 @@ class HumanPoseModule(nn.Module):
             window_data = update_data_inits_from_history(window_data, history, index=start - 1)
             window_out = self.forward(window_data)
             latest = take_latest_frame(window_out, batch_size, end - start)
-            history = concat_time_dicts([history, latest])
+            history = history_acc.append(latest)
 
-        return history
+        return history_acc.current()
 
     def inference(
         self,

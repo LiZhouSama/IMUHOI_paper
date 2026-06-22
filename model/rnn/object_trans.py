@@ -10,7 +10,6 @@ from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_axis_angle
 from .base import RNN, RNNWithInit
 from .online import (
     append_stream_data,
-    concat_time_dicts,
     infer_batch_seq,
     normalize_inference_mode,
     resolve_online_window,
@@ -18,6 +17,7 @@ from .online import (
     slice_time_dict,
     slice_time_value,
     take_latest_frame,
+    TimeDictAccumulator,
 )
 from configs import FRAME_RATE, _REDUCED_POSE_NAMES, _SENSOR_NAMES
 
@@ -529,6 +529,8 @@ class ObjectTransModule(nn.Module):
         sample_has_object = self._sample_has_object(has_object_mask, batch_size, seq_len, device)
 
         obs_code = self.obs_encoder(obj_imu, human_pose, root_trans, hand_positions)
+        if bool(getattr(self.cfg, "ablate_ot_obs_encoder", False)):
+            obs_code = torch.zeros_like(obs_code)
         mesh_code = torch.zeros_like(obs_code)
         mesh_valid_mask = torch.zeros(batch_size, device=device, dtype=torch.bool)
         if self.training:
@@ -989,6 +991,8 @@ class ObjectTransModule(nn.Module):
             **_slice_kwargs(0, warmup_len),
         )
         history = warmup_out
+        history_acc = TimeDictAccumulator(history, seq_len)
+        history = history_acc.current()
 
         for end in range(warmup_len + 1, seq_len + 1):
             start = end - warmup_len
@@ -1005,9 +1009,9 @@ class ObjectTransModule(nn.Module):
                 **_slice_kwargs(start, end),
             )
             latest = take_latest_frame(window_out, batch_size, end - start)
-            history = concat_time_dicts([history, latest])
+            history = history_acc.append(latest)
 
-        return history
+        return history_acc.current()
 
     def inference(
         self,

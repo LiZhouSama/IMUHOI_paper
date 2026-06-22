@@ -22,6 +22,7 @@ from train.rnn.train_utils import (
     setup_device,
     create_save_dir,
     create_dataloaders,
+    save_config_snapshot,
     BaseTrainer,
     call_model_inference,
 )
@@ -58,6 +59,7 @@ def main():
     setup_seed(cfg.seed)
     cfg = setup_device(cfg)
     save_dir = create_save_dir(cfg, 'human_pose')
+    save_config_snapshot(cfg)
     
     mode_str = "noTrans" if cfg.no_trans else "普通"
     
@@ -94,13 +96,6 @@ def main():
     model = trainer.train()
     
     print(f"\n训练完成！模型保存到: {save_dir}")
-    
-    # 保存配置
-    if not cfg.debug:
-        import yaml
-        config_path = os.path.join(save_dir, 'config.yaml')
-        with open(config_path, 'w') as f:
-            yaml.dump(dict(cfg), f)
 
 
 if __name__ == "__main__":

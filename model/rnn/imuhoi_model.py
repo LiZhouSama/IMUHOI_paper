@@ -13,7 +13,6 @@ from .human_pose import HumanPoseModule
 from .object_trans import ObjectTransModule
 from .online import (
     append_stream_data,
-    concat_time_dicts,
     infer_batch_seq,
     merge_latest_context,
     normalize_inference_mode,
@@ -21,6 +20,7 @@ from .online import (
     select_time_context,
     slice_time_dict,
     take_latest_frame,
+    TimeDictAccumulator,
     update_data_inits_from_history,
 )
 
@@ -430,6 +430,8 @@ class IMUHOIModel(nn.Module):
             compute_fk=compute_fk,
             refine_human=refine_human,
         )
+        history_acc = TimeDictAccumulator(history, seq_len)
+        history = history_acc.current()
 
         for end in range(warmup_len + 1, seq_len + 1):
             start = end - warmup_len
@@ -492,9 +494,9 @@ class IMUHOIModel(nn.Module):
 
             results["has_object"] = has_object
             latest = take_latest_frame(results, batch_size, window_len)
-            history = concat_time_dicts([history, latest])
+            history = history_acc.append(latest)
 
-        return history
+        return history_acc.current()
 
     def inference(
         self,

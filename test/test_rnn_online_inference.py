@@ -34,6 +34,7 @@ except Exception:
 from configs import _REDUCED_POSE_NAMES
 from model.rnn.imuhoi_model import IMUHOIModel
 from model.rnn.object_trans import ObjectTransModule
+from model.rnn.online import concat_time_dicts, select_time_context
 from train.rnn.train_utils import call_model_inference
 
 
@@ -144,6 +145,28 @@ def test_object_trans_forward_preserves_known_online_prefix():
         )
 
     assert torch.allclose(out["pred_obj_trans"][:, :3], known_prefix)
+
+
+def test_online_concat_keeps_non_temporal_init_vectors_out_of_history_time():
+    history = {
+        "init_lhand_oe_ho": torch.zeros(1, 3),
+        "p_pred": torch.arange(4, dtype=torch.float32).view(1, 4, 1),
+        "pred_obj_trans": torch.zeros(1, 4, 3),
+    }
+    latest = {
+        "init_lhand_oe_ho": torch.ones(1, 3),
+        "p_pred": torch.ones(1, 1, 1),
+        "pred_obj_trans": torch.ones(1, 1, 3),
+    }
+
+    out = concat_time_dicts([history, latest])
+
+    assert out["init_lhand_oe_ho"].shape == (1, 3)
+    assert out["p_pred"].shape == (1, 5, 1)
+
+    context = select_time_context(out, 2, 4)
+    assert context["init_lhand_oe_ho"].shape == (1, 3)
+    assert context["p_pred"].shape == (1, 2, 1)
 
 
 class _FakeHumanPose(nn.Module):
@@ -287,4 +310,3 @@ def test_training_helper_marks_offline_inference():
     out = call_model_inference(model, {}, inference_mode="offline")
     assert out["mode"] == "offline"
     assert model.seen_mode == "offline"
-

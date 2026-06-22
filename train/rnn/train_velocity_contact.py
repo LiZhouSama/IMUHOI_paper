@@ -23,6 +23,7 @@ from train.rnn.train_utils import (
     create_save_dir,
     create_dataloaders,
     build_model_input_dict,
+    save_config_snapshot,
     BaseTrainer,
     load_checkpoint,
     call_model_inference,
@@ -59,6 +60,12 @@ def get_args():
         type=str,
         default=None,
         help='Path to pretrained HumanPoseModule (frozen to provide hp_out).',
+    )
+    parser.add_argument(
+        '--ablate_vc_boundary',
+        action='store_true',
+        default=None,
+        help='Train VelocityContact with boundary logits/prob/hidden states forced to zero.',
     )
     return parser.parse_args()
 
@@ -171,10 +178,17 @@ def main():
     args = get_args()
     cfg = merge_config(args)
     cfg.hp_ckpt = _resolve_hp_ckpt(cfg, getattr(args, "hp_ckpt", None))
+    cfg.ablate_vc_boundary = (
+        bool(args.ablate_vc_boundary)
+        if args.ablate_vc_boundary is not None
+        else bool(getattr(cfg, "ablate_vc_boundary", False))
+    )
 
     setup_seed(cfg.seed)
     cfg = setup_device(cfg)
-    save_dir = create_save_dir(cfg, 'velocity_contact')
+    module_name = 'velocity_contact_vc_boundary_zero' if cfg.ablate_vc_boundary else 'velocity_contact'
+    save_dir = create_save_dir(cfg, module_name)
+    save_config_snapshot(cfg)
 
     print("=" * 50)
     print("Stage 2: VelocityContactModule training")
@@ -186,6 +200,7 @@ def main():
         print(f"Pretrained: {cfg.pretrained_ckpt}")
     if getattr(cfg, "hp_ckpt", None):
         print(f"HumanPose checkpoint: {cfg.hp_ckpt}")
+    print(f"VC boundary ablation: {'enabled' if cfg.ablate_vc_boundary else 'disabled'}")
     print(f"Save dir: {save_dir}")
     print("=" * 50)
 
@@ -227,14 +242,6 @@ def main():
     model = trainer.train()
 
     print(f"\nTraining complete! Models saved to: {save_dir}")
-
-    # save config
-    if not cfg.debug:
-        import yaml
-
-        config_path = os.path.join(save_dir, 'config.yaml')
-        with open(config_path, 'w') as f:
-            yaml.dump(dict(cfg), f)
 
 
 if __name__ == "__main__":

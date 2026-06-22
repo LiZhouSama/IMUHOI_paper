@@ -37,9 +37,15 @@ from train.rnn.train_utils import (
     create_dataloaders,
     build_model_input_dict,
     flatten_lstm_parameters,
-    save_checkpoint,
+    save_config_snapshot,
+    resolve_resume_checkpoint,
+    get_model_state_dict,
+    load_model_state_from_checkpoint,
     load_checkpoint,
     call_model_inference,
+    _capture_rng_state,
+    _restore_rng_state,
+    _torch_load_checkpoint,
 )
 from torch.cuda.amp.grad_scaler import GradScaler
 try:
@@ -62,7 +68,11 @@ def get_args():
                         help='ObjectTransModule预训练权重路径（联合微调起点）')
     parser.add_argument('--joint_train', action='store_true', 
                         help='是否进行联合训练（先微调ObjectTrans，到预设epoch后联合微调VelocityContact）')
-    
+    parser.add_argument('--ablate_vc_boundary', action='store_true', default=None,
+                        help='训练时将VelocityContact boundary输出置零')
+    parser.add_argument('--ablate_ot_obs_encoder', action='store_true', default=None,
+                        help='训练时将ObjectTrans obs_encoder输出置零')
+	    
     return parser.parse_args()
 
 
@@ -120,7 +130,12 @@ class Stage3JointTrainer:
         
         self.train_loader = train_loader
         self.test_loader = test_loader
-        
+        self.resume_path = resolve_resume_checkpoint(getattr(cfg, "resume_dir", None))
+        self.resume_checkpoint = None
+        self.start_epoch = 0
+        self.best_loss = float('inf')
+        self.n_iter = 0
+	        
         self.joint_vc_unfreeze_epoch = int(getattr(cfg, "joint_vc_unfreeze_epoch", 0))
         self.vc_unfrozen = False
 
@@ -137,7 +152,12 @@ class Stage3JointTrainer:
                 print("联合训练模式：立即微调VelocityContact + ObjectTrans")
             else:
                 print(f"联合训练模式：epoch {self.joint_vc_unfreeze_epoch} 后微调VelocityContact + ObjectTrans")
-        
+
+        if self.resume_path:
+            print(f"Resume checkpoint: {self.resume_path}")
+            self.resume_checkpoint = _torch_load_checkpoint(self.resume_path, map_location=self.device)
+            self._restore_model_weights(self.resume_checkpoint)
+	        
         # 多GPU包装
         if cfg.use_multi_gpu:
             print(f'多GPU训练: {cfg.gpus}')
@@ -177,7 +197,9 @@ class Stage3JointTrainer:
         self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
             self.optimizer, milestones=cfg.milestones, gamma=cfg.gamma
         )
-        self.scaler = GradScaler()
+        self.scaler = GradScaler(enabled=self.device.type == "cuda")
+        if self.resume_checkpoint is not None:
+            self._restore_training_state(self.resume_checkpoint)
 
         ot_trainable = sum(p.numel() for p in self.ot_model.parameters() if p.requires_grad)
         vc_params = sum(p.numel() for p in self.vc_model.parameters())
@@ -201,8 +223,81 @@ class Stage3JointTrainer:
         elif cfg.use_tensorboard and not cfg.debug:
             print('TensorBoard is unavailable; continue without SummaryWriter.')
         
-        self.best_loss = float('inf')
-        self.n_iter = 0
+    def _restore_model_weights(self, checkpoint):
+        if not isinstance(checkpoint, dict):
+            raise ValueError(f"Resume checkpoint must be a dict: {self.resume_path}")
+
+        ot_key = "object_trans_state_dict" if checkpoint.get("object_trans_state_dict") is not None else None
+        load_model_state_from_checkpoint(
+            self.ot_model,
+            checkpoint,
+            strict=False,
+            state_key=ot_key,
+            name="ObjectTrans",
+        )
+        print(f"恢复ObjectTrans权重: {self.resume_path}")
+
+        if checkpoint.get("velocity_contact_state_dict") is not None:
+            load_model_state_from_checkpoint(
+                self.vc_model,
+                checkpoint,
+                strict=False,
+                state_key="velocity_contact_state_dict",
+                name="VelocityContact",
+            )
+            print(f"恢复VelocityContact权重: {self.resume_path}")
+
+    def _restore_training_state(self, checkpoint):
+        optimizer_state = checkpoint.get("optimizer_state_dict")
+        if optimizer_state is not None:
+            try:
+                self.optimizer.load_state_dict(optimizer_state)
+            except Exception as exc:
+                print(f"警告：恢复 optimizer_state_dict 失败，将只恢复权重: {exc}")
+        else:
+            print("警告：resume checkpoint 缺少 optimizer_state_dict，将只恢复权重。")
+
+        scheduler_state = checkpoint.get("scheduler_state_dict")
+        if scheduler_state is not None:
+            try:
+                self.scheduler.load_state_dict(scheduler_state)
+            except Exception as exc:
+                print(f"警告：恢复 scheduler_state_dict 失败，学习率调度器将从当前配置重新开始: {exc}")
+        else:
+            print("警告：resume checkpoint 缺少 scheduler_state_dict，学习率调度器将从当前配置重新开始。")
+
+        scaler_state = checkpoint.get("scaler_state_dict")
+        if scaler_state is not None:
+            try:
+                self.scaler.load_state_dict(scaler_state)
+            except Exception as exc:
+                print(f"警告：恢复 scaler_state_dict 失败: {exc}")
+
+        completed_epoch = int(checkpoint.get("epoch", -1))
+        self.start_epoch = completed_epoch + 1
+        self.n_iter = int(checkpoint.get("n_iter", self.start_epoch * max(len(self.train_loader), 1)))
+        self.best_loss = self._resolve_resume_best_loss(checkpoint)
+        _restore_rng_state(checkpoint.get("rng_state"))
+        print(
+            f"恢复训练状态: completed_epoch={completed_epoch}, "
+            f"next_epoch={self.start_epoch}, n_iter={self.n_iter}, best_loss={self.best_loss:.6f}"
+        )
+
+    def _resolve_resume_best_loss(self, checkpoint):
+        if isinstance(checkpoint.get("best_loss"), (int, float)):
+            return float(checkpoint["best_loss"])
+        if os.path.basename(self.resume_path or "") == "best.pt" and isinstance(checkpoint.get("loss"), (int, float)):
+            return float(checkpoint["loss"])
+
+        best_path = os.path.join(self.cfg.save_dir, "best.pt")
+        if os.path.isfile(best_path):
+            try:
+                best_checkpoint = _torch_load_checkpoint(best_path, map_location="cpu")
+                if isinstance(best_checkpoint, dict) and isinstance(best_checkpoint.get("loss"), (int, float)):
+                    return float(best_checkpoint["loss"])
+            except Exception as exc:
+                print(f"警告：读取 best.pt 的 best_loss 失败: {exc}")
+        return float("inf")
 
     def _set_vc_trainable(self, trainable: bool):
         for param in self.vc_model.parameters():
@@ -441,10 +536,16 @@ class Stage3JointTrainer:
     def train(self):
         """完整训练循环"""
         max_epoch = self.cfg.epochs
-        
-        for epoch in range(max_epoch):
+        train_loss = 0.0
+        if self.start_epoch >= max_epoch:
+            print(f"Resume checkpoint already reached epoch {self.start_epoch - 1}; target epochs={max_epoch}.")
+            if self.writer is not None:
+                self.writer.close()
+            return
+	        
+        for epoch in range(self.start_epoch, max_epoch):
             train_loss, train_components = self.train_epoch(epoch)
-            
+	            
             print(f'\rEpoch {epoch}, Train Loss: {train_loss:.4f}', end='')
             
             if epoch % 10 == 0 and self.test_loader is not None:
@@ -452,10 +553,19 @@ class Stage3JointTrainer:
                 
                 if test_loss is not None:
                     print(f', Test Loss: {test_loss:.4f}')
-                    
+	                    
                     if test_loss < self.best_loss:
                         self.best_loss = test_loss
-                        self._save_models(epoch, test_loss, 'best')
+                        self._save_models(
+                            epoch,
+                            test_loss,
+                            'best',
+                            {
+                                'test_components': test_components,
+                                'best_loss': self.best_loss,
+                                'n_iter': self.n_iter,
+                            },
+                        )
                         print(f'新的最佳测试损失: {self.best_loss:.4f}')
                     
                     if self.writer is not None:
@@ -469,37 +579,82 @@ class Stage3JointTrainer:
                                 self.writer.add_scalar(f'test/{key}', value, self.n_iter)
             else:
                 print()
-            
+	            
             self.scheduler.step()
-        
+            self._save_models(
+                epoch,
+                train_loss,
+                'last',
+                {
+                    'train_components': train_components,
+                    'best_loss': self.best_loss,
+                    'n_iter': self.n_iter,
+                },
+            )
+	        
         # 保存最终模型
-        self._save_models(max_epoch - 1, train_loss, 'final')
-        
+        self._save_models(
+            max_epoch - 1,
+            train_loss,
+            'final',
+            {
+                'best_loss': self.best_loss,
+                'n_iter': self.n_iter,
+            },
+        )
+	        
         if self.writer is not None:
             self.writer.close()
-    
-    def _save_models(self, epoch, loss, prefix):
-        """保存模型"""
-        # 单独训练OT时保持和其他stage一致：best.pt/final.pt。
-        # 联合训练时保存分模块权重，避免覆盖VC权重语义。
-        ot_name = f'{prefix}_object_trans.pt' if self.joint_train else f'{prefix}.pt'
-        ot_path = os.path.join(self.cfg.save_dir, ot_name)
-        ot_state = self.ot_model.module.state_dict() if isinstance(self.ot_model, torch.nn.DataParallel) else self.ot_model.state_dict()
-        torch.save({
+	    
+    def _write_checkpoint(self, path, checkpoint):
+        tmp_path = f"{path}.tmp"
+        torch.save(checkpoint, tmp_path)
+        os.replace(tmp_path, path)
+
+    def _build_joint_checkpoint(self, epoch, loss, extra=None):
+        ot_state = get_model_state_dict(self.ot_model)
+        checkpoint = {
             'epoch': epoch,
-            'module_state_dict': ot_state,
             'loss': loss,
-        }, ot_path)
-        
+            'model_state_dict': ot_state,
+            'module_state_dict': ot_state,
+            'object_trans_state_dict': ot_state,
+            'optimizer_state_dict': self.optimizer.state_dict() if self.optimizer else None,
+            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+            'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
+            'rng_state': _capture_rng_state(),
+        }
         if self.joint_train:
-            # 联合训练时只保存OT和VC，HP始终冻结不输出
-            vc_path = os.path.join(self.cfg.save_dir, f'{prefix}_velocity_contact.pt')
-            vc_state = self.vc_model.module.state_dict() if isinstance(self.vc_model, torch.nn.DataParallel) else self.vc_model.state_dict()
-            torch.save({
+            checkpoint['velocity_contact_state_dict'] = get_model_state_dict(self.vc_model)
+        if extra:
+            checkpoint.update(extra)
+        return checkpoint
+
+    def _save_module_checkpoint(self, path, state_dict, epoch, loss):
+        self._write_checkpoint(
+            path,
+            {
                 'epoch': epoch,
-                'module_state_dict': vc_state,
+                'module_state_dict': state_dict,
+                'model_state_dict': state_dict,
                 'loss': loss,
-            }, vc_path)
+                'best_loss': self.best_loss,
+                'n_iter': self.n_iter,
+            },
+        )
+
+    def _save_models(self, epoch, loss, prefix, extra=None):
+        """保存模型"""
+        checkpoint_path = os.path.join(self.cfg.save_dir, f'{prefix}.pt')
+        checkpoint = self._build_joint_checkpoint(epoch, loss, extra=extra)
+        self._write_checkpoint(checkpoint_path, checkpoint)
+	        
+        if self.joint_train:
+            # 联合训练额外保存分模块权重，保留旧脚本直接指定模块ckpt的用法。
+            ot_path = os.path.join(self.cfg.save_dir, f'{prefix}_object_trans.pt')
+            vc_path = os.path.join(self.cfg.save_dir, f'{prefix}_velocity_contact.pt')
+            self._save_module_checkpoint(ot_path, checkpoint['object_trans_state_dict'], epoch, loss)
+            self._save_module_checkpoint(vc_path, checkpoint['velocity_contact_state_dict'], epoch, loss)
 
         print(f'保存模型: {prefix}')
 
@@ -508,14 +663,33 @@ def main():
     """主函数"""
     args = get_args()
     cfg = merge_config(args)
-    
+    cfg.ablate_vc_boundary = (
+        bool(args.ablate_vc_boundary)
+        if args.ablate_vc_boundary is not None
+        else bool(getattr(cfg, "ablate_vc_boundary", False))
+    )
+    cfg.ablate_ot_obs_encoder = (
+        bool(args.ablate_ot_obs_encoder)
+        if args.ablate_ot_obs_encoder is not None
+        else bool(getattr(cfg, "ablate_ot_obs_encoder", False))
+    )
+    joint_train = bool(args.joint_train) or bool(getattr(cfg, "joint_train", False))
+    cfg.joint_train = joint_train
+		    
     setup_seed(cfg.seed)
     cfg = setup_device(cfg)
-    
-    module_name = 'joint_train' if args.joint_train else 'object_trans'
+	    
+    module_name = 'joint_train' if joint_train else 'object_trans'
+    ablation_suffix = ""
+    if cfg.ablate_vc_boundary:
+        ablation_suffix += "_vc_boundary_zero"
+    if cfg.ablate_ot_obs_encoder:
+        ablation_suffix += "_ot_obs_encoder_zero"
+    module_name = f"{module_name}{ablation_suffix}"
     save_dir = create_save_dir(cfg, module_name)
+    save_config_snapshot(cfg)
     
-    mode_str = "联合训练" if args.joint_train else "Stage 3"
+    mode_str = "联合训练" if joint_train else "Stage 3"
     trans_str = "noTrans" if cfg.no_trans else "普通"
     
     print("=" * 50)
@@ -524,6 +698,8 @@ def main():
     print(f"批次大小: {cfg.batch_size}")
     print(f"训练轮数: {cfg.epochs}")
     print(f"noTrans模式: {cfg.no_trans}")
+    print(f"VC boundary ablation: {'enabled' if cfg.ablate_vc_boundary else 'disabled'}")
+    print(f"OT obs_encoder ablation: {'enabled' if cfg.ablate_ot_obs_encoder else 'disabled'}")
     print(f"保存目录: {save_dir}")
     print("=" * 50)
     
@@ -544,11 +720,17 @@ def main():
     if ot_ckpt is None:
         ot_ckpt = find_latest_checkpoint(base_save_dir, 'object_trans')
         ot_source = "auto"
-        if args.joint_train:
+        if joint_train:
             print(f"ObjectTrans预训练权重({ot_source or 'missing'}, 用于联合微调): {ot_ckpt}")
-    elif args.joint_train:
+    elif joint_train:
         print(f"ObjectTrans预训练权重({ot_source or 'missing'}, 用于联合微调): {ot_ckpt}")
-    
+	    
+    cfg.vc_ckpt = vc_ckpt
+    cfg.hp_ckpt = hp_ckpt
+    cfg.ot_ckpt = ot_ckpt
+    cfg.joint_train = joint_train
+    save_config_snapshot(cfg)
+
     if vc_ckpt is None or hp_ckpt is None:
         print("警告: 未找到预训练权重，将使用随机初始化")
         print("建议先训练Stage1和Stage2，或使用--auto_find_ckpt自动搜索")
@@ -576,12 +758,14 @@ def main():
         print(f"警告: HumanPose权重不存在: {hp_ckpt}")
     
     ot_model = ObjectTransModule(cfg)
-    if args.joint_train:
+    if joint_train and not getattr(cfg, "resume_dir", None):
         if ot_ckpt and os.path.exists(ot_ckpt):
             load_checkpoint(ot_model, ot_ckpt, device, strict=False)
             print(f"联合微调起点加载ObjectTrans权重: {ot_ckpt}")
         else:
             raise ValueError("联合微调需要已训练的ObjectTrans权重，请先进行单独Stage3训练或指定 --ot_ckpt")
+    elif joint_train and getattr(cfg, "resume_dir", None):
+        print("检测到 --resume_dir，联合训练的ObjectTrans权重将从断点恢复。")
     
     print(f"VelocityContact参数量: {sum(p.numel() for p in vc_model.parameters())}")
     print(f"HumanPose参数量: {sum(p.numel() for p in hp_model.parameters())}")
@@ -591,25 +775,13 @@ def main():
     trainer = Stage3JointTrainer(
         cfg, vc_model, hp_model, ot_model,
         train_loader, test_loader,
-        joint_train=args.joint_train
+        joint_train=joint_train
     )
     
     # 开始训练
     trainer.train()
     
     print(f"\n训练完成！模型保存到: {save_dir}")
-    
-    # 保存配置
-    if not cfg.debug:
-        import yaml
-        config_path = os.path.join(save_dir, 'config.yaml')
-        with open(config_path, 'w') as f:
-            cfg_dict = dict(cfg)
-            cfg_dict['vc_ckpt'] = vc_ckpt
-            cfg_dict['hp_ckpt'] = hp_ckpt
-            cfg_dict['ot_ckpt'] = ot_ckpt
-            cfg_dict['joint_train'] = args.joint_train
-            yaml.dump(cfg_dict, f)
 
 
 if __name__ == "__main__":
