@@ -954,7 +954,7 @@ def main():
     parser.add_argument('--pred_offset', type=float, nargs=3, default=[0.0, 0.0, 0.0], help='Prediction translation offset')
     parser.add_argument('--overlay_frames', type=int, nargs='+', default=None, help='Overlay selected 0-based frames in one scene')
     parser.add_argument('--no_trans', action='store_true', help='Enable noTrans mode')
-    parser.add_argument('--inference_mode', '--inference-mode', choices=['online', 'offline'], default='online', help='RNN inference mode')
+    parser.add_argument('--inference_mode', '--inference-mode', choices=['online', 'offline'], default='offline', help='RNN inference mode')
     parser.add_argument('--online_window', '--online-window', type=int, default=None, help='RNN online sliding window size')
     refine_group = parser.add_mutually_exclusive_group()
     refine_group.add_argument(

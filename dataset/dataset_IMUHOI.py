@@ -573,6 +573,7 @@ class IMUDataset(Dataset):
                 "obj_imu": obj_imu.float(),  # [seq, 9]
                 "imu_noise_applied": bool(imu_noise_applied),
                 "seq_name": seq_name,
+                "seq_path": file_path,
                 "seq_file": os.path.basename(file_path),
                 "window_start": int(start_idx),
                 "window_end": int(end_idx),

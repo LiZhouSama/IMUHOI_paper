@@ -73,8 +73,10 @@ cond_mode_probs: [0.4, 0.4, 0.2]  # mesh/obs/null
 vq_commit_beta: 0.25
 
 # ============ 噪声配置 ============
-imu_noise_std: 0.3
-obj_imu_noise_std: 0.3
+imu_acc_noise_std: 0.3
+imu_rot_noise_std: 0.3
+obj_imu_acc_noise_std: 0.3
+obj_imu_rot_noise_std: 0.3
 
 # ============ 要使用的数据集 ============
 # 修改此项来选择训练数据

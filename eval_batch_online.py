@@ -479,7 +479,7 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--smpl_model_path", type=str, default="datasets/smpl_models/smplh/male/model.npz")
     parser.add_argument("--test_data_dir", type=str, default=None)
     parser.add_argument("--num_workers", type=int, default=12, help="Kept for dataset parity; metric pass uses cached samples.")
-    parser.add_argument("--online_batch_size", "--online-batch-size", type=int, default=16)
+    parser.add_argument("--online_batch_size", "--online-batch-size", type=int, default=64)
     parser.add_argument("--online_window", "--online-window", type=int, default=None)
     parser.add_argument("--sort_asc", action="store_true", help="Sort sequence lengths ascending instead of descending.")
     parser.add_argument("--no_trans", action="store_true")
@@ -594,7 +594,7 @@ def main() -> int:
             data_dir=str(data_path),
             window_size=test_window,
             debug=config.get("debug", False),
-            simulate_imu_noise=True,
+            simulate_imu_noise=False,
             min_obj_contact_frames=0,
             full_sequence=True,
         )

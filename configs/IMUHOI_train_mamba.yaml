@@ -78,8 +78,10 @@ mesh_downsample_points: 256
 object_geo_root: "datasets/OMOMO/captured_objects"
 
 # ============ 噪声配置 ============
-imu_noise_std: 0.3
-obj_imu_noise_std: 0.3
+imu_acc_noise_std: 0.3
+imu_rot_noise_std: 0.3
+obj_imu_acc_noise_std: 0.3
+obj_imu_rot_noise_std: 0.3
 
 # ============ 要使用的数据集 ============
 train_datasets: ["omomo"]  # 可选: behave, imhd, omomo, amass

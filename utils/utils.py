@@ -258,20 +258,56 @@ def build_model_input_dict(batch, cfg, device, add_noise=True):
         skip_mask = skip_mask[:1].expand(bs)
     skip_mask_human = skip_mask.view(bs, *([1] * (human_imu.dim() - 1)))
     
-    # 添加噪声
-    imu_noise_std = getattr(cfg, 'imu_noise_std', 0.1)
-    if add_noise and imu_noise_std > 0:
-        human_noise = torch.randn_like(human_imu) * imu_noise_std
-        human_imu = torch.where(skip_mask_human, human_imu, human_imu + human_noise)
+    def _cfg_float(name, default):
+        return float(getattr(cfg, name, default))
+
+    def _add_split_imu_noise(imu, skip_mask_view, acc_std, rot_std):
+        if not add_noise or (acc_std <= 0 and rot_std <= 0):
+            return imu
+
+        noisy = imu
+        if acc_std > 0:
+            if noisy is imu:
+                noisy = imu.clone()
+            acc = imu[..., :3]
+            noisy[..., :3] = torch.where(
+                skip_mask_view,
+                acc,
+                acc + torch.randn_like(acc) * acc_std,
+            )
+        if rot_std > 0 and imu.shape[-1] > 3:
+            if noisy is imu:
+                noisy = imu.clone()
+            rot = imu[..., 3:]
+            noisy[..., 3:] = torch.where(
+                skip_mask_view,
+                rot,
+                rot + torch.randn_like(rot) * rot_std,
+            )
+        return noisy
+
+    # 添加噪声。加速度和rotation-6d使用独立std。
+    imu_acc_noise_std = _cfg_float('imu_acc_noise_std', 0.0)
+    imu_rot_noise_std = _cfg_float('imu_rot_noise_std', 0.0)
+    human_imu = _add_split_imu_noise(
+        human_imu,
+        skip_mask_human,
+        imu_acc_noise_std,
+        imu_rot_noise_std,
+    )
     
     obj_imu = batch.get('obj_imu')
     if isinstance(obj_imu, torch.Tensor):
         obj_imu = obj_imu.to(device)
-        obj_noise_std = getattr(cfg, 'obj_imu_noise_std', 0.1)
-        if add_noise and obj_noise_std > 0:
-            skip_mask_obj = skip_mask.view(bs, *([1] * (obj_imu.dim() - 1)))
-            obj_noise = torch.randn_like(obj_imu) * obj_noise_std
-            obj_imu = torch.where(skip_mask_obj, obj_imu, obj_imu + obj_noise)
+        obj_acc_noise_std = _cfg_float('obj_imu_acc_noise_std', 0.0)
+        obj_rot_noise_std = _cfg_float('obj_imu_rot_noise_std', 0.0)
+        skip_mask_obj = skip_mask.view(bs, *([1] * (obj_imu.dim() - 1)))
+        obj_imu = _add_split_imu_noise(
+            obj_imu,
+            skip_mask_obj,
+            obj_acc_noise_std,
+            obj_rot_noise_std,
+        )
     else:
         obj_feat_dim = getattr(cfg, 'obj_imu_dim', 9)
         obj_imu = torch.zeros(bs, seq, obj_feat_dim, device=device, dtype=dtype)

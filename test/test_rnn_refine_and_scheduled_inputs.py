@@ -437,8 +437,10 @@ def test_build_model_input_dict_passes_object_prior_fields():
         imu_dim=9,
         obj_imu_dim=9,
         mesh_downsample_points=5,
-        imu_noise_std=0.0,
-        obj_imu_noise_std=0.0,
+        imu_acc_noise_std=0.0,
+        imu_rot_noise_std=0.0,
+        obj_imu_acc_noise_std=0.0,
+        obj_imu_rot_noise_std=0.0,
     )
     batch_size, seq_len = 2, 4
     batch = {

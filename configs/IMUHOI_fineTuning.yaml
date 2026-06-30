@@ -89,8 +89,10 @@ cond_mode_probs: [0.4, 0.4, 0.2]  # mesh/obs/null
 vq_commit_beta: 0.25
 
 # ============ 噪声配置 ============
-imu_noise_std: 0.3
-obj_imu_noise_std: 0.3
+imu_acc_noise_std: 0.3
+imu_rot_noise_std: 0.3
+obj_imu_acc_noise_std: 0.3
+obj_imu_rot_noise_std: 0.3
 
 # ============ 物体参数 ============
 obj_imu_change_threshold: 0.1

@@ -336,9 +336,27 @@ def build_model_input_dict(batch, cfg, device, add_noise=True):
 
     skip_extra_noise = batch.get("imu_noise_applied", False)
     skip_noise = bool(skip_extra_noise) if not isinstance(skip_extra_noise, torch.Tensor) else bool(skip_extra_noise.flatten()[0].item())
-    imu_noise_std = float(getattr(cfg, "imu_noise_std", 0.1))
-    if add_noise and imu_noise_std > 0.0 and not skip_noise:
-        human_imu = human_imu + torch.randn_like(human_imu) * imu_noise_std
+
+    def _add_split_imu_noise(imu, acc_std, rot_std):
+        if not add_noise or skip_noise or (acc_std <= 0 and rot_std <= 0):
+            return imu
+
+        noisy = imu
+        if acc_std > 0:
+            if noisy is imu:
+                noisy = imu.clone()
+            noisy[..., :3] = imu[..., :3] + torch.randn_like(imu[..., :3]) * acc_std
+        if rot_std > 0 and imu.shape[-1] > 3:
+            if noisy is imu:
+                noisy = imu.clone()
+            noisy[..., 3:] = imu[..., 3:] + torch.randn_like(imu[..., 3:]) * rot_std
+        return noisy
+
+    human_imu = _add_split_imu_noise(
+        human_imu,
+        float(getattr(cfg, "imu_acc_noise_std", 0.0)),
+        float(getattr(cfg, "imu_rot_noise_std", 0.0)),
+    )
 
     sensor_vel_root = _ensure_bt(
         batch.get("sensor_vel_root"),
@@ -377,9 +395,11 @@ def build_model_input_dict(batch, cfg, device, add_noise=True):
         obj_imu = obj_imu.to(device=device, dtype=dtype)
     else:
         obj_imu = torch.zeros(batch_size, seq_len, int(getattr(cfg, "obj_imu_dim", 9)), device=device, dtype=dtype)
-    obj_noise_std = float(getattr(cfg, "obj_imu_noise_std", 0.1))
-    if add_noise and obj_noise_std > 0.0 and not skip_noise:
-        obj_imu = obj_imu + torch.randn_like(obj_imu) * obj_noise_std
+    obj_imu = _add_split_imu_noise(
+        obj_imu,
+        float(getattr(cfg, "obj_imu_acc_noise_std", 0.0)),
+        float(getattr(cfg, "obj_imu_rot_noise_std", 0.0)),
+    )
 
     obj_vel = _ensure_bt(batch.get("obj_vel"), (batch_size, seq_len, 3), device, dtype)
     obj_trans = _ensure_bt(batch.get("obj_trans"), (batch_size, seq_len, 3), device, dtype)

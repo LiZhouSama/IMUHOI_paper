@@ -72,8 +72,10 @@ def _make_cfg():
             "obj_imu_dim": 9,
             "frame_rate": 30,
             "body_model_path": "dummy_smpl_path",
-            "imu_noise_std": 0.5,
-            "obj_imu_noise_std": 0.5,
+            "imu_acc_noise_std": 0.5,
+            "imu_rot_noise_std": 0.5,
+            "obj_imu_acc_noise_std": 0.5,
+            "obj_imu_rot_noise_std": 0.5,
             "train": {"window": 32},
             "test": {"window": 32},
             "dit": {

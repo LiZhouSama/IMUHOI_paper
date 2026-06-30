@@ -991,7 +991,7 @@ def main():
             data_dir=str(data_path),
             window_size=test_window,
             debug=config.get("debug", False),
-            simulate_imu_noise=True,
+            simulate_imu_noise=False,
             min_obj_contact_frames=0,
             full_sequence=True,
         )

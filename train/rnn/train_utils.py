@@ -65,6 +65,7 @@ def get_base_args():
     parser.add_argument('--debug', action='store_true', help='调试模式')
     parser.add_argument('--no_trans', action='store_true', help='禁用根节点位移预测')
     parser.add_argument('--model_arch', type=str, choices=['rnn', 'dit', 'mamba_simple'], default=None, help='选择模型架构(rnn/dit/mamba_simple)')
+    parser.add_argument('--run_suffix', type=str, default=None, help='追加到本次训练输出目录名的后缀')
     return parser
 
 
@@ -113,6 +114,7 @@ def merge_config(args):
     cfg.resume_config_missing = resume_config_missing
     cfg.debug = bool(args.debug) if (not is_resume or _cli_has_option("debug")) else bool(getattr(cfg, 'debug', False))
     cfg.no_trans = bool(args.no_trans) if (not is_resume or _cli_has_option("no_trans")) else bool(getattr(cfg, 'no_trans', False))
+    cfg.run_suffix = getattr(args, "run_suffix", None) or getattr(cfg, "run_suffix", None)
     cfg.cfg_file = config_path
     cfg.model_arch = args.model_arch or getattr(cfg, 'model_arch', 'rnn')
     
@@ -135,6 +137,9 @@ def create_save_dir(cfg, module_name):
     time_stamp = datetime.now().strftime("%m%d%H%M")
     suffix = "_noTrans" if cfg.no_trans else ""
     run_name = f"{module_name}{suffix}_{time_stamp}"
+    run_suffix = getattr(cfg, "run_suffix", None)
+    if run_suffix:
+        run_name = f"{run_name}_{run_suffix}"
     if cfg.debug:
         run_name = f"{run_name}_debug"
     save_dir = os.path.join(cfg.save_dir, run_name)
@@ -219,7 +224,7 @@ def create_dataloaders(cfg, project_root=None):
         window_size=cfg.train.window,
         debug=cfg.debug,
         obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
-        simulate_imu_noise=True,
+        simulate_imu_noise=False,
     )
     
     train_loader = DataLoader(
