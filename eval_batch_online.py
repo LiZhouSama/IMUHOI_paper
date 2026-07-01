@@ -494,7 +494,7 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ablate_vc_boundary", action="store_true")
     parser.add_argument("--ablate_ot_obs_encoder", action="store_true")
     parser.add_argument("--output_json", type=str, default=None)
-    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--interaction_human_source", type=str, default="pred", choices=["pred", "gt"])
     refine_group = parser.add_mutually_exclusive_group()
     refine_group.add_argument("--enable_ot_refine", dest="ot_refine", action="store_true", default=None)

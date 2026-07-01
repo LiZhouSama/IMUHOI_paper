@@ -31,6 +31,12 @@ ROT_Z90 = np.array(
     dtype=np.float32,
 )
 
+IMHD_HEAD_JOINT = 15
+IMHD_FOOT_JOINTS = (7, 8, 10, 11)
+IMHD_TARGET_UP = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+IMHD_UP_ALIGNMENT_MIN_LEN = 0.25
+IMHD_UP_ALIGNMENT_EPS = 1e-6
+
 
 def _moving_avg_timewise(x, k=3):
     """
@@ -217,6 +223,117 @@ def compute_rotation_features_chunk(
     )
     rotation_global_matrot = rotation_global_matrot.reshape(rotation_global_matrot.shape[0], -1, 3, 3)
     return rotation_local_full_gt.detach().cpu(), rotation_global_matrot.detach().cpu()
+
+
+def left_multiply_axis_angles(
+    axis_angles: np.ndarray,
+    rotation: np.ndarray,
+    device: torch.device,
+) -> np.ndarray:
+    rot_t = torch.from_numpy(rotation).float().to(device).unsqueeze(0)
+    aa_t = torch.from_numpy(axis_angles).float().to(device)
+    mat = transforms.axis_angle_to_matrix(aa_t)
+    mat = torch.matmul(rot_t.expand(mat.shape[0], -1, -1), mat)
+    return transforms.matrix_to_axis_angle(mat).detach().cpu().numpy().astype(np.float32)
+
+
+def rotate_smpl_translation(
+    trans: np.ndarray,
+    rotation: np.ndarray,
+    root_rest_offset: np.ndarray,
+) -> np.ndarray:
+    return ((trans + root_rest_offset) @ rotation.T - root_rest_offset).astype(np.float32)
+
+
+def rotate_world_vectors(vectors: np.ndarray, rotation: np.ndarray) -> np.ndarray:
+    return (vectors @ rotation.T).astype(np.float32)
+
+
+def rotation_matrix_from_vectors(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    source_norm = np.linalg.norm(source)
+    target_norm = np.linalg.norm(target)
+    if source_norm < IMHD_UP_ALIGNMENT_EPS or target_norm < IMHD_UP_ALIGNMENT_EPS:
+        return np.eye(3, dtype=np.float32)
+
+    a = source / source_norm
+    b = target / target_norm
+    dot = float(np.clip(np.dot(a, b), -1.0, 1.0))
+    if dot > 1.0 - 1e-6:
+        return np.eye(3, dtype=np.float32)
+
+    if dot < -1.0 + 1e-6:
+        basis = np.eye(3, dtype=np.float64)
+        axis = np.cross(a, basis[int(np.argmin(np.abs(a)))])
+        axis /= np.linalg.norm(axis)
+        return R.from_rotvec(axis * np.pi).as_matrix().astype(np.float32)
+
+    axis = np.cross(a, b)
+    axis_norm = np.linalg.norm(axis)
+    if axis_norm < IMHD_UP_ALIGNMENT_EPS:
+        return np.eye(3, dtype=np.float32)
+    axis /= axis_norm
+    angle = np.arccos(dot)
+    return R.from_rotvec(axis * angle).as_matrix().astype(np.float32)
+
+
+def compute_body_up_vector(
+    bm: BodyModel,
+    root_orient: np.ndarray,
+    pose_body: np.ndarray,
+    trans: np.ndarray,
+    betas: np.ndarray,
+    device: torch.device,
+    batch_size: int = 256,
+) -> np.ndarray:
+    """Estimate the sequence-level body-up direction from feet center to head."""
+    smpl_input = build_smpl_input(root_orient, pose_body, trans, betas, device)
+    directions: List[torch.Tensor] = []
+    total_frames = root_orient.shape[0]
+    with torch.no_grad():
+        for start in range(0, total_frames, batch_size):
+            end = min(start + batch_size, total_frames)
+            kwargs = {key: value[start:end] for key, value in smpl_input.items()}
+            body_out = bm(**kwargs)
+            joints = body_out.Jtr[:, :22, :]
+            body_up = joints[:, IMHD_HEAD_JOINT, :] - joints[:, IMHD_FOOT_JOINTS, :].mean(dim=1)
+            valid = torch.linalg.norm(body_up, dim=1) > IMHD_UP_ALIGNMENT_MIN_LEN
+            if valid.any():
+                body_up = F.normalize(body_up[valid], dim=1)
+                directions.append(body_up.detach().cpu())
+            del body_out
+    if not directions:
+        return IMHD_TARGET_UP.copy()
+    up = torch.cat(directions, dim=0).median(dim=0).values.numpy().astype(np.float32)
+    norm = float(np.linalg.norm(up))
+    if norm < IMHD_UP_ALIGNMENT_EPS:
+        return IMHD_TARGET_UP.copy()
+    return (up / norm).astype(np.float32)
+
+
+def compute_up_alignment_rotation(
+    bm: BodyModel,
+    root_orient: np.ndarray,
+    pose_body: np.ndarray,
+    trans: np.ndarray,
+    betas: np.ndarray,
+    device: torch.device,
+    batch_size: int = 256,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    body_up = compute_body_up_vector(
+        bm,
+        root_orient,
+        pose_body,
+        trans,
+        betas,
+        device,
+        batch_size=batch_size,
+    )
+    rotation = rotation_matrix_from_vectors(body_up, IMHD_TARGET_UP)
+    aligned_up = rotation @ body_up
+    alignment_cos = float(np.clip(np.dot(body_up, IMHD_TARGET_UP), -1.0, 1.0))
+    return rotation, body_up.astype(np.float32), aligned_up.astype(np.float32), alignment_cos
 
 
 def forward_smpl_in_batches(
@@ -460,24 +577,34 @@ def process_imhd_sequence(
         }
     Jtr_0 = np.asarray(bm(**smpl_init_input).Jtr[:, 0, :].cpu(), dtype=np.float32)
 
-    rot_z90_torch = torch.from_numpy(ROT_Z90).float().to(device)
-    rot_z90_repeat = rot_z90_torch.unsqueeze(0)
+    root_orient = left_multiply_axis_angles(root_orient, ROT_Z90, device)
+    trans = rotate_smpl_translation(trans, ROT_Z90, Jtr_0)
 
-    root_orient_t = torch.from_numpy(root_orient).float().to(device)
-    root_rot_mat = transforms.axis_angle_to_matrix(root_orient_t)
-    root_rot_mat = torch.matmul(rot_z90_repeat.expand(root_rot_mat.shape[0], -1, -1), root_rot_mat)
-    root_orient_t = transforms.matrix_to_axis_angle(root_rot_mat)
-    root_orient = root_orient_t.detach().cpu().numpy().astype(np.float32)
+    object_angles = left_multiply_axis_angles(object_angles, ROT_Z90, device)
+    object_trans = rotate_world_vectors(object_trans, ROT_Z90)
 
-    trans = (trans + Jtr_0) @ ROT_Z90.T - Jtr_0
-
-    object_angles_t = torch.from_numpy(object_angles).float().to(device)
-    obj_rot_mat = transforms.axis_angle_to_matrix(object_angles_t)
-    obj_rot_mat = torch.matmul(rot_z90_repeat.expand(obj_rot_mat.shape[0], -1, -1), obj_rot_mat)
-    object_angles_t = transforms.matrix_to_axis_angle(obj_rot_mat)
-    object_angles = object_angles_t.detach().cpu().numpy().astype(np.float32)
-
-    object_trans = object_trans @ ROT_Z90.T
+    # ---------- 在地面对齐前将序列级身体上方向对齐到 +Y ----------
+    betas_for_floor = pad_betas(betas_raw, bm_loader.num_betas, T)
+    up_alignment_rot, body_up_before, aligned_body_up, up_alignment_cos = compute_up_alignment_rotation(
+        bm,
+        root_orient,
+        pose_body,
+        trans,
+        betas_for_floor,
+        device,
+        batch_size=smpl_batch,
+    )
+    if not np.allclose(up_alignment_rot, np.eye(3, dtype=np.float32), atol=1e-5):
+        root_orient = left_multiply_axis_angles(root_orient, up_alignment_rot, device)
+        trans = rotate_smpl_translation(trans, up_alignment_rot, Jtr_0)
+        object_angles = left_multiply_axis_angles(object_angles, up_alignment_rot, device)
+        object_trans = rotate_world_vectors(object_trans, up_alignment_rot)
+        print(
+            f"[IMHD] Aligned body up for {entry.seq_name} "
+            f"(body_up_before={body_up_before.tolist()}, "
+            f"cos_to_y_before={up_alignment_cos:.3f}, "
+            f"aligned_up={aligned_body_up.tolist()})"
+        )
 
     # 真实物体 IMU（IMHD 不含人体 IMU）
     human_imu_tensor: Optional[torch.Tensor] = None
@@ -491,16 +618,19 @@ def process_imhd_sequence(
 
             obj_ori_t = torch.from_numpy(obj_ori_np).float().to(device)
             obj_ori_mat = transforms.axis_angle_to_matrix(obj_ori_t)
-            obj_ori_mat = torch.matmul(rot_z90_repeat.expand(obj_ori_mat.shape[0], -1, -1), obj_ori_mat)
+            rot_z90_torch = torch.from_numpy(ROT_Z90).float().to(device).unsqueeze(0)
+            obj_ori_mat = torch.matmul(rot_z90_torch.expand(obj_ori_mat.shape[0], -1, -1), obj_ori_mat)
+            up_alignment_torch = torch.from_numpy(up_alignment_rot).float().to(device).unsqueeze(0)
+            obj_ori_mat = torch.matmul(up_alignment_torch.expand(obj_ori_mat.shape[0], -1, -1), obj_ori_mat)
             obj_ori_6d = transforms.matrix_to_rotation_6d(obj_ori_mat).detach().cpu()
 
-            obj_acc_np = obj_acc_np @ ROT_Z90.T
+            obj_acc_np = rotate_world_vectors(obj_acc_np, ROT_Z90)
+            obj_acc_np = rotate_world_vectors(obj_acc_np, up_alignment_rot)
             obj_acc_t = torch.from_numpy(obj_acc_np).float()
 
             obj_imu_tensor = torch.cat([obj_acc_t, obj_ori_6d], dim=-1).float()
 
     # ---------- 计算双脚最低点偏移 ----------
-    betas_for_floor = pad_betas(betas_raw, bm_loader.num_betas, T)
     foot_floor_y = compute_foot_floor_offset(
         bm, root_orient, pose_body, trans, betas_for_floor, device, batch_size=smpl_batch
     )
@@ -607,6 +737,10 @@ def process_imhd_sequence(
         "rhand_contact": rhand_contact,
         "obj_contact": obj_contact,
         "source_pkls": [os.path.relpath(path, entry.motion_dir) for path in entry.pkl_files],
+        "imhd_up_alignment_rotation": torch.from_numpy(up_alignment_rot).float(),
+        "imhd_body_up_before_alignment": torch.from_numpy(body_up_before).float(),
+        "imhd_aligned_body_up": torch.from_numpy(aligned_body_up).float(),
+        "imhd_up_alignment_cos_to_y_before": float(up_alignment_cos),
     }
 
     os.makedirs(output_dir, exist_ok=True)
@@ -634,7 +768,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="process/processed_split_data_IMHD",
+        default="process/processed_split_data_IMHD_bps",
         help="Directory where processed sequence tensors will be written.",
     )
     parser.add_argument(
