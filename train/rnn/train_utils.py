@@ -66,6 +66,12 @@ def get_base_args():
     parser.add_argument('--no_trans', action='store_true', help='禁用根节点位移预测')
     parser.add_argument('--model_arch', type=str, choices=['rnn', 'dit', 'mamba_simple'], default=None, help='选择模型架构(rnn/dit/mamba_simple)')
     parser.add_argument('--run_suffix', type=str, default=None, help='追加到本次训练输出目录名的后缀')
+    parser.add_argument(
+        '--train_datasets',
+        nargs='+',
+        default=None,
+        help='覆盖配置文件中的 train_datasets，例如: --train_datasets hodome 或 --train_datasets imhd behave',
+    )
     return parser
 
 
@@ -76,6 +82,19 @@ def _cli_has_option(name):
         if arg in flags or any(arg.startswith(prefix) for prefix in prefixes):
             return True
     return False
+
+
+def _normalize_train_datasets(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        parts = value.split(",")
+    else:
+        parts = []
+        for item in value:
+            parts.extend(str(item).split(","))
+    datasets = [item.strip() for item in parts if item.strip()]
+    return datasets or None
 
 
 def merge_config(args):
@@ -117,6 +136,9 @@ def merge_config(args):
     cfg.run_suffix = getattr(args, "run_suffix", None) or getattr(cfg, "run_suffix", None)
     cfg.cfg_file = config_path
     cfg.model_arch = args.model_arch or getattr(cfg, 'model_arch', 'rnn')
+    train_datasets = _normalize_train_datasets(getattr(args, "train_datasets", None))
+    if train_datasets is not None:
+        cfg.train_datasets = train_datasets
     
     if cfg.debug:
         cfg.batch_size = min(cfg.batch_size, 4)

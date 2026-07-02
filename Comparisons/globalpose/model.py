@@ -43,6 +43,7 @@ class GlobalPoseHOIModel(nn.Module):
             n_layers=3,
             bidirectional=False,
             dropout=dropout,
+            input_linear=False,
         )
         self.iknet2 = BatchRNN(
             n_input=117,
@@ -51,6 +52,7 @@ class GlobalPoseHOIModel(nn.Module):
             n_layers=3,
             bidirectional=False,
             dropout=dropout,
+            input_linear=False,
         )
         self.vrnet = BatchRNNWithInit(
             input_size=243 + obj_imu_dim,

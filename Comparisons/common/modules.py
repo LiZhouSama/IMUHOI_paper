@@ -17,11 +17,13 @@ class BatchRNN(nn.Module):
         n_layers: int = 2,
         bidirectional: bool = True,
         dropout: float = 0.2,
+        input_linear: bool = True,
     ):
         super().__init__()
-        self.linear1 = nn.Linear(n_input, n_hidden)
+        rnn_input = n_hidden if input_linear else n_input
+        self.linear1 = nn.Linear(n_input, n_hidden) if input_linear else nn.Identity()
         self.rnn = nn.LSTM(
-            n_hidden,
+            rnn_input,
             n_hidden,
             n_layers,
             batch_first=True,
@@ -30,9 +32,13 @@ class BatchRNN(nn.Module):
         )
         self.linear2 = nn.Linear(n_hidden * (2 if bidirectional else 1), n_output)
         self.dropout = nn.Dropout(dropout)
+        self.input_linear = input_linear
 
     def forward(self, x: torch.Tensor, h=None) -> tuple[torch.Tensor, tuple]:
-        y = F.relu(self.linear1(self.dropout(x)))
+        if self.input_linear:
+            y = F.relu(self.linear1(self.dropout(x)))
+        else:
+            y = x
         y, h = self.rnn(y, h)
         return self.linear2(y), h
 
@@ -55,7 +61,9 @@ class BatchRNNWithInit(nn.Module):
         self.init_net = nn.Sequential(
             nn.Linear(init_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_size, 2 * num_layers * hidden_size),
+            nn.Linear(hidden_size, hidden_size * num_layers),
+            nn.ReLU(),
+            nn.Linear(hidden_size * num_layers, 2 * num_layers * hidden_size),
         )
         self.rnn = nn.LSTM(
             input_size,
@@ -74,4 +82,3 @@ class BatchRNNWithInit(nn.Module):
         hc = hc.permute(1, 2, 0, 3).contiguous()
         y, _ = self.rnn(x, (hc[0], hc[1]))
         return self.linear2(y)
-

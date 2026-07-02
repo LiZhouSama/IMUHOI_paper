@@ -69,26 +69,30 @@ hand_contact_threshold: 0.15
 object_contact_threshold: 0.5
 
 # ============ 要使用的数据集 ============
-train_datasets: ["omomo"]  # 可选: behave, imhd, omomo, amass
+train_datasets: ["omomo"]  # 可选: behave, imhd, omomo, pahoi, hodome
 
 # ============ 数据集路径 ============
 datasets:
-  amass:
-    train_path: "process/processed_amass_data_0703/train"
-    test_path: "process/processed_amass_data_0703/test"
-    debug_path: "process/processed_amass_data_0703/debug"
   omomo:
     train_path: "process/processed_split_data_OMOMO_bps/train"
     test_path: "process/processed_split_data_OMOMO_bps/test"
     debug_path: "process/processed_split_data_OMOMO_bps/debug"
   imhd:
-    train_path: "process/processed_seg_data_IMHD/train"
-    test_path: "process/processed_seg_data_IMHD/test"
-    debug_path: "process/processed_seg_data_IMHD/debug"
+    train_path: "process/processed_seg_data_IMHD_bps/train"
+    test_path: "process/processed_seg_data_IMHD_bps/test"
+    debug_path: "process/processed_seg_data_IMHD_bps/debug"
   behave:
-    train_path: "process/processed_seg_data_BEHAVE/train"
-    test_path: "process/processed_seg_data_BEHAVE/test"
-    debug_path: "process/processed_seg_data_BEHAVE/debug"
+    train_path: "process/processed_seg_data_BEHAVE_bps/train"
+    test_path: "process/processed_seg_data_BEHAVE_bps/test"
+    debug_path: "process/processed_seg_data_BEHAVE_bps/debug"
+  pahoi:
+    train_path: "process/processed_seg_data_PAHOI_bps/train"
+    test_path: "process/processed_seg_data_PAHOI_bps/test"
+    debug_path: "process/processed_seg_data_PAHOI_bps/debug"
+  hodome:
+    train_path: "process/processed_seg_data_HODOME_bps/train"
+    test_path: "process/processed_seg_data_HODOME_bps/test"
+    debug_path: "process/processed_seg_data_HODOME_bps/debug"
 
 # ============ 损失权重 ============
 loss_weights:

@@ -29,6 +29,8 @@ TIP_POSE_18 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16, 17, 18, 19]
 TRANSPOSE_LEAF = [7, 8, 12, 20, 21]
 TRANSPOSE_FULL = list(range(1, 24))
 TRANSPOSE_REDUCED = DIP_REDUCED_15
+TIP_ACC_SUM_WIN_LEN = 40
+TIP_ACC_SUM_DOWN_SCALE = 15.0
 
 
 def tensor_to_device(batch: Dict, device: torch.device) -> Dict:
@@ -69,6 +71,18 @@ def _human_imu_rotmat_input(batch: Dict, orientation_first: bool = True) -> torc
     if orientation_first:
         return torch.cat([rot.flatten(2), acc.flatten(2)], dim=-1)
     return torch.cat([acc.flatten(2), rot.flatten(2)], dim=-1)
+
+
+def _tip_input(batch: Dict) -> torch.Tensor:
+    imu = _human_imu_rotmat_input(batch, orientation_first=True)
+    acc = imu[:, :, 6 * 9 : 6 * 9 + 18]
+    cumsum = torch.cumsum(acc, dim=1)
+    if cumsum.shape[1] > TIP_ACC_SUM_WIN_LEN:
+        recent = cumsum[:, TIP_ACC_SUM_WIN_LEN:] - cumsum[:, :-TIP_ACC_SUM_WIN_LEN]
+        acc_sum = torch.cat([cumsum[:, :TIP_ACC_SUM_WIN_LEN], recent], dim=1)
+    else:
+        acc_sum = cumsum
+    return torch.cat([imu, acc_sum / TIP_ACC_SUM_DOWN_SCALE], dim=-1)
 
 
 def _dip_input(batch: Dict) -> torch.Tensor:
@@ -165,7 +179,7 @@ def adapt_batch(batch: Dict, method: str, n_sbps: int = 5, fps: float = FRAME_RA
         state_target = torch.cat([state_core, sbp], dim=-1)
         return {
             **obj,
-            "imu": _human_imu_rotmat_input(batch, orientation_first=True),
+            "imu": _tip_input(batch),
             "prev_state": _shift_state_right(state_target.nan_to_num(0.0)),
             "state_target": state_target,
             "sbp_valid": sbp_valid,
@@ -233,4 +247,3 @@ def adapt_batch(batch: Dict, method: str, n_sbps: int = 5, fps: float = FRAME_RA
         }
 
     raise ValueError(f"Unknown comparison method: {method}")
-

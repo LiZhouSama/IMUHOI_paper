@@ -34,6 +34,12 @@ from utils.utils import setup_seed
 
 
 METHODS = ("dip18", "tip", "transpose", "globalpose")
+METHOD_TRAINING_DEFAULTS = {
+    "dip18": {"batch_size": 16, "lr": 1e-4},
+    "transpose": {"batch_size": 80, "lr": 1e-3},
+    "tip": {"batch_size": 256, "lr": 1e-4},
+    "globalpose": {"batch_size": 48, "lr": 3e-4},
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,6 +67,9 @@ def parse_args() -> argparse.Namespace:
 def load_cfg(args: argparse.Namespace):
     with open(args.cfg, "r") as f:
         cfg = edict(yaml.safe_load(f))
+    method_defaults = METHOD_TRAINING_DEFAULTS[args.method]
+    cfg.batch_size = method_defaults["batch_size"]
+    cfg.lr = method_defaults["lr"]
     if args.epochs is not None:
         cfg.epochs = args.epochs
     if args.batch_size is not None:

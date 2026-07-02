@@ -15,10 +15,23 @@ TIP note: the current IMUHOI dataset does not contain TIP's SBP terrain labels. 
 
 GlobalPose note: the paper's physics optimizer is a per-frame non-neural inference procedure with external dynamics dependencies. The training baseline here preserves the PL/IK/VR prediction chain and object extension. Online physics refinement should wrap the `vr` outputs rather than be trained as a supervised network layer.
 
+For Windows-side GlobalPose physics refinement, export the Linux neural outputs
+as per-sequence artifacts first:
+
+```bash
+python -m Comparisons.export_globalpose_for_physics \
+  --checkpoint outputs/Comparisons/<globalpose_run>/best.pt \
+  --dataset omomo --split test \
+  --output_dir outputs/Comparisons/globalpose_physics_export/omomo_test
+```
+
+By default this exports full sequences with batch size 1. Use `--windowed
+--window_size 120` only when the downstream script is meant to refine isolated
+120-frame windows instead of complete sequences.
+
 Run a smoke training command from the project root:
 
 ```bash
 conda activate SAGE
 python -m Comparisons.train_comparison --method transpose --debug --epochs 1
 ```
-

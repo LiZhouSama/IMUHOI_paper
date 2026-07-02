@@ -73,6 +73,15 @@ def parse_args() -> argparse.Namespace:
         help="Forward --model_arch to every stage.",
     )
     parser.add_argument(
+        "--train_datasets",
+        nargs="+",
+        default=None,
+        help=(
+            "Override cfg train_datasets for every stage, e.g. "
+            "--train_datasets hodome or --train_datasets imhd behave."
+        ),
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Print/write the planned commands without launching training.",
@@ -154,6 +163,8 @@ def common_args(args: argparse.Namespace, cfg_path: Path, run_suffix: str) -> li
         values.append("--no_trans")
     if args.model_arch:
         values.extend(["--model_arch", args.model_arch])
+    if args.train_datasets:
+        values.extend(["--train_datasets", *args.train_datasets])
     return values
 
 

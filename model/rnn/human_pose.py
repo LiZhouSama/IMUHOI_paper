@@ -9,6 +9,8 @@ import torch.nn.functional as F
 from human_body_prior.body_model.body_model import BodyModel
 from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_axis_angle, matrix_to_rotation_6d
 
+from utils.human_pose import forward_body_model_joints
+
 from .base import RNN, RNNWithInit, SubPoser
 from .online import (
     append_stream_data,
@@ -228,11 +230,13 @@ class HumanPoseModule(nn.Module):
 
         try:
             with torch.no_grad():
-                body_out = self.body_model(
+                joints = forward_body_model_joints(
+                    self.body_model,
                     pose_body=pose_aa[:, 1:22].reshape(BT, 63),
                     root_orient=pose_aa[:, 0].reshape(BT, 3),
+                    fallback_to_full=False,
                 )
-            joints = body_out.Jtr[:, :24, :]
+            joints = joints[:, :24, :]
             return joints.reshape(batch_size, seq_len, 24, 3)
         except Exception as exc:
             print(f"FK计算失败: {exc}")

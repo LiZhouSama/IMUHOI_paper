@@ -10,6 +10,7 @@ from utils.rotation_conversions import matrix_to_axis_angle, matrix_to_rotation_
 
 
 SMPL_PARENTS = [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19, 20, 21]
+_NO_SHAPE_ARG = object()
 
 
 def load_body_model(body_model_path: str, num_betas: int = 16):
@@ -29,6 +30,256 @@ def ensure_body_model_device(module, device: torch.device):
     if body_model is not None and getattr(module, "body_model_device", None) != device:
         module.body_model = body_model.to(device)
         module.body_model_device = device
+
+
+def _body_model_batch_size(*args) -> int:
+    for arg in args:
+        if arg is not None:
+            return int(arg.shape[0])
+    return 1
+
+
+def _expand_body_model_buffer(body_model, name: str, batch_size: int) -> torch.Tensor:
+    value = getattr(body_model, name)
+    return value.expand(batch_size, *value.shape[1:])
+
+
+def _body_model_shape_components(
+    body_model,
+    *,
+    batch_size: int,
+    betas: Optional[torch.Tensor],
+    dmpls: Optional[torch.Tensor],
+    expression: Optional[torch.Tensor],
+):
+    model_type = getattr(body_model, "model_type", "")
+    use_dmpl = bool(getattr(body_model, "use_dmpl", False))
+    use_expression = bool(getattr(body_model, "use_expression", False)) or (
+        model_type in {"smplx", "flame"} and hasattr(body_model, "exprdirs")
+    )
+
+    if use_dmpl:
+        if betas is None:
+            betas = _expand_body_model_buffer(body_model, "init_betas", batch_size)
+        if dmpls is None:
+            dmpls = _expand_body_model_buffer(body_model, "init_dmpls", batch_size)
+        return torch.cat([betas, dmpls], dim=-1), torch.cat([body_model.shapedirs, body_model.dmpldirs], dim=-1)
+
+    if use_expression:
+        if betas is None:
+            betas = _expand_body_model_buffer(body_model, "init_betas", batch_size)
+        if expression is None:
+            expression = _expand_body_model_buffer(body_model, "init_expression", batch_size)
+        return torch.cat([betas, expression], dim=-1), torch.cat([body_model.shapedirs, body_model.exprdirs], dim=-1)
+
+    if betas is None:
+        return _NO_SHAPE_ARG, body_model.shapedirs
+    return betas, body_model.shapedirs
+
+
+def _body_model_full_pose(
+    body_model,
+    *,
+    batch_size: int,
+    root_orient: Optional[torch.Tensor],
+    pose_body: Optional[torch.Tensor],
+    pose_hand: Optional[torch.Tensor],
+    pose_jaw: Optional[torch.Tensor],
+    pose_eye: Optional[torch.Tensor],
+) -> torch.Tensor:
+    model_type = getattr(body_model, "model_type", "")
+    if root_orient is None:
+        root_orient = _expand_body_model_buffer(body_model, "init_root_orient", batch_size)
+
+    if model_type in {"smpl", "smplh"}:
+        if pose_body is None:
+            pose_body = _expand_body_model_buffer(body_model, "init_pose_body", batch_size)
+        if pose_hand is None:
+            pose_hand = _expand_body_model_buffer(body_model, "init_pose_hand", batch_size)
+        return torch.cat([root_orient, pose_body, pose_hand], dim=-1)
+
+    if model_type == "smplx":
+        if pose_body is None:
+            pose_body = _expand_body_model_buffer(body_model, "init_pose_body", batch_size)
+        if pose_hand is None:
+            pose_hand = _expand_body_model_buffer(body_model, "init_pose_hand", batch_size)
+        if pose_jaw is None:
+            pose_jaw = _expand_body_model_buffer(body_model, "init_pose_jaw", batch_size)
+        if pose_eye is None:
+            pose_eye = _expand_body_model_buffer(body_model, "init_pose_eye", batch_size)
+        return torch.cat([root_orient, pose_body, pose_jaw, pose_eye, pose_hand], dim=-1)
+
+    if model_type == "flame":
+        if pose_body is None:
+            pose_body = _expand_body_model_buffer(body_model, "init_pose_body", batch_size)
+        if pose_jaw is None:
+            pose_jaw = _expand_body_model_buffer(body_model, "init_pose_jaw", batch_size)
+        if pose_eye is None:
+            pose_eye = _expand_body_model_buffer(body_model, "init_pose_eye", batch_size)
+        return torch.cat([root_orient, pose_body, pose_jaw, pose_eye], dim=-1)
+
+    if model_type == "mano":
+        if pose_hand is None:
+            pose_hand = _expand_body_model_buffer(body_model, "init_pose_hand", batch_size)
+        return torch.cat([root_orient, pose_hand], dim=-1)
+
+    if model_type in {"animal_horse", "animal_dog", "animal_rat"}:
+        if pose_body is None:
+            pose_body = _expand_body_model_buffer(body_model, "init_pose_body", batch_size)
+        return torch.cat([root_orient, pose_body], dim=-1)
+
+    raise ValueError(f"Unsupported body model type: {model_type}")
+
+
+def _body_model_joints_from_shape(
+    body_model,
+    *,
+    batch_size: int,
+    shape_components,
+    shapedirs: torch.Tensor,
+    v_template: Optional[torch.Tensor],
+    joints: Optional[torch.Tensor],
+    v_shaped: Optional[torch.Tensor],
+) -> torch.Tensor:
+    from human_body_prior.body_model.lbs import vertices2joints
+
+    if joints is not None:
+        return joints
+    if v_shaped is not None:
+        return vertices2joints(body_model.J_regressor, v_shaped)
+
+    if v_template is None:
+        template_joints = vertices2joints(body_model.J_regressor, body_model.init_v_template)
+        template_joints = template_joints.expand(batch_size, -1, -1)
+    else:
+        template_joints = vertices2joints(body_model.J_regressor, v_template)
+
+    if shape_components is _NO_SHAPE_ARG:
+        return template_joints
+
+    joint_shapedirs = torch.einsum("ji,ikl->jkl", body_model.J_regressor, shapedirs)
+    return template_joints + torch.einsum("bl,jkl->bjk", shape_components, joint_shapedirs)
+
+
+def _full_body_model_joints_fallback(
+    body_model,
+    *,
+    root_orient: Optional[torch.Tensor],
+    pose_body: Optional[torch.Tensor],
+    pose_hand: Optional[torch.Tensor],
+    pose_jaw: Optional[torch.Tensor],
+    pose_eye: Optional[torch.Tensor],
+    betas: Optional[torch.Tensor],
+    trans: Optional[torch.Tensor],
+    dmpls: Optional[torch.Tensor],
+    expression: Optional[torch.Tensor],
+    v_template: Optional[torch.Tensor],
+    joints: Optional[torch.Tensor],
+    v_shaped: Optional[torch.Tensor],
+) -> torch.Tensor:
+    body_out = body_model(
+        root_orient=root_orient,
+        pose_body=pose_body,
+        pose_hand=pose_hand,
+        pose_jaw=pose_jaw,
+        pose_eye=pose_eye,
+        betas=betas,
+        trans=trans,
+        dmpls=dmpls,
+        expression=expression,
+        v_template=v_template,
+        joints=joints,
+        v_shaped=v_shaped,
+    )
+    if isinstance(body_out, dict):
+        return body_out["Jtr"]
+    return body_out.Jtr
+
+
+def forward_body_model_joints(
+    body_model,
+    *,
+    root_orient: Optional[torch.Tensor] = None,
+    pose_body: Optional[torch.Tensor] = None,
+    pose_hand: Optional[torch.Tensor] = None,
+    pose_jaw: Optional[torch.Tensor] = None,
+    pose_eye: Optional[torch.Tensor] = None,
+    betas: Optional[torch.Tensor] = None,
+    trans: Optional[torch.Tensor] = None,
+    dmpls: Optional[torch.Tensor] = None,
+    expression: Optional[torch.Tensor] = None,
+    v_template: Optional[torch.Tensor] = None,
+    joints: Optional[torch.Tensor] = None,
+    v_shaped: Optional[torch.Tensor] = None,
+    fallback_to_full: bool = True,
+) -> torch.Tensor:
+    """BodyModel forward variant that returns Jtr without computing mesh vertices."""
+    try:
+        from human_body_prior.body_model.lbs import batch_rigid_transform, batch_rodrigues
+
+        batch_size = _body_model_batch_size(
+            root_orient,
+            pose_body,
+            pose_hand,
+            pose_jaw,
+            pose_eye,
+            betas,
+            trans,
+            dmpls,
+            expression,
+            v_template,
+            joints,
+        )
+        full_pose = _body_model_full_pose(
+            body_model,
+            batch_size=batch_size,
+            root_orient=root_orient,
+            pose_body=pose_body,
+            pose_hand=pose_hand,
+            pose_jaw=pose_jaw,
+            pose_eye=pose_eye,
+        )
+        shape_components, shapedirs = _body_model_shape_components(
+            body_model,
+            batch_size=batch_size,
+            betas=betas,
+            dmpls=dmpls,
+            expression=expression,
+        )
+        joint_rest = _body_model_joints_from_shape(
+            body_model,
+            batch_size=batch_size,
+            shape_components=shape_components,
+            shapedirs=shapedirs,
+            v_template=v_template,
+            joints=joints,
+            v_shaped=v_shaped,
+        )
+
+        dtype = getattr(body_model, "dtype", full_pose.dtype)
+        rot_mats = batch_rodrigues(full_pose.view(-1, 3), dtype=dtype).view(batch_size, -1, 3, 3)
+        jtr, _ = batch_rigid_transform(rot_mats, joint_rest, body_model.kintree_table[0].long(), dtype=dtype)
+        if trans is None:
+            trans = _expand_body_model_buffer(body_model, "init_trans", batch_size)
+        return jtr + trans.unsqueeze(dim=1)
+    except Exception:
+        if not fallback_to_full:
+            raise
+        return _full_body_model_joints_fallback(
+            body_model,
+            root_orient=root_orient,
+            pose_body=pose_body,
+            pose_hand=pose_hand,
+            pose_jaw=pose_jaw,
+            pose_eye=pose_eye,
+            betas=betas,
+            trans=trans,
+            dmpls=dmpls,
+            expression=expression,
+            v_template=v_template,
+            joints=joints,
+            v_shaped=v_shaped,
+        )
 
 
 def global_to_local_rotmats(
@@ -131,14 +382,14 @@ def compute_smpl_joints_from_global(
     pose_aa = matrix_to_axis_angle(local_pose.reshape(-1, 3, 3)).reshape(bt, num_joints, 3)
 
     try:
-        body_out = body_model(
+        joints = forward_body_model_joints(
+            body_model,
             pose_body=pose_aa[:, 1:22].reshape(bt, 63),
             root_orient=pose_aa[:, 0].reshape(bt, 3),
         )
     except Exception:
         return None
 
-    joints = body_out.Jtr
     if joints.size(1) > num_joints:
         joints = joints[:, :num_joints]
     elif joints.size(1) < num_joints:

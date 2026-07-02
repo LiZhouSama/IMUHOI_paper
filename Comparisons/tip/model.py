@@ -15,15 +15,15 @@ class TIPHOIModel(nn.Module):
 
     def __init__(
         self,
-        input_size_imu: int = 72,
+        input_size_imu: int = 90,
         obj_imu_dim: int = 12,
         n_sbps: int = 5,
         rnn_hidden_size: int = 512,
         tf_hidden_size: int = 1024,
         tf_input_dim: int = 256,
-        n_heads: int = 8,
+        n_heads: int = 16,
         tf_layers: int = 4,
-        dropout: float = 0.0,
+        dropout: float = 0.1,
         in_dropout: float = 0.0,
         past_state_dropout: float = 0.8,
         with_rnn: bool = True,
@@ -35,6 +35,7 @@ class TIPHOIModel(nn.Module):
         self.human_state_dim = 18 * 6 + 3 + n_sbps * 4
         self.output_dim = self.human_state_dim + 3
         self.with_rnn = with_rnn
+        self.n_heads = n_heads
         self.in_dropout = nn.Dropout(in_dropout)
         self.past_dropout = nn.Dropout(past_state_dropout)
         self.in_linear = nn.Linear(input_size_imu + obj_imu_dim + self.human_state_dim, tf_input_dim)
@@ -65,12 +66,17 @@ class TIPHOIModel(nn.Module):
     def _causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
         return torch.triu(torch.ones(seq_len, seq_len, device=device) * float("-inf"), diagonal=1)
 
+    def _official_head_shuffle(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, dim = x.shape
+        return x.reshape(batch_size, seq_len, self.n_heads, -1).transpose(2, 3).reshape(batch_size, seq_len, dim)
+
     def forward(self, imu: torch.Tensor, prev_state: torch.Tensor, obj_imu: torch.Tensor) -> dict[str, torch.Tensor]:
         state = prev_state.clone().nan_to_num(0.0)
         # Keep TIP's no-teacher-forcing rule for historical root velocity.
         state[:, :, 18 * 6 : 18 * 6 + 3] = 0.0
         x = torch.cat([self.in_dropout(imu), obj_imu, self.past_dropout(state)], dim=-1)
         x = self.in_linear(x)
+        x = self._official_head_shuffle(x)
         x = self.tf_encode(x, mask=self._causal_mask(x.shape[1], x.device))
         if self.rnn is not None:
             h0 = torch.zeros(1, x.shape[0], self.rnn.hidden_size, device=x.device, dtype=x.dtype)
@@ -80,4 +86,3 @@ class TIPHOIModel(nn.Module):
             "state": y[:, :, : self.human_state_dim],
             "obj_trans": y[:, :, self.human_state_dim :],
         }
-
