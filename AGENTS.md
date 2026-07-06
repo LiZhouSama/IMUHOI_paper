@@ -39,9 +39,10 @@ Avoid committing new checkpoints, TensorBoard logs, or bulk processed `.pt` data
 有你认为不合理或不够优的点需要先提出来，不要完全按照我的指令修改，没有的话直接修改
 请使用第一性原理思考。你不能总是假设我非常清楚自己想要什么和该怎么得到。请保持审慎，从原始需求和问题出发，如果动机和目标不清晰，停下来和我讨论。如果目标清晰但是路径不是最短，告诉我，并且建议更好的办法
 
-当前处于docker环境，请检查，并用下面环境：
-docker start mmzhou_imuhoi
-docker exec -it mmzhou_imuhoi /bin/bash
+当前已处于docker环境，用下面环境：
 conda activate /workspace/envs/IMUHOI
+否则尝试：
+conda SAGE
+
 
 每次运行代码前先看下各个gpu的显存余量再选择空的gpu跑

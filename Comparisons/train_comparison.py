@@ -35,10 +35,10 @@ from utils.utils import setup_seed
 
 METHODS = ("dip18", "tip", "transpose", "globalpose")
 METHOD_TRAINING_DEFAULTS = {
-    "dip18": {"batch_size": 16, "lr": 1e-4},
-    "transpose": {"batch_size": 80, "lr": 1e-3},
+    "dip18": {"batch_size": 160, "lr": 1e-3},
+    "transpose": {"batch_size": 200, "lr": 2e-3},
     "tip": {"batch_size": 256, "lr": 1e-4},
-    "globalpose": {"batch_size": 48, "lr": 3e-4},
+    "globalpose": {"batch_size": 200, "lr": 3e-3},
 }
 
 
@@ -61,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--obj_loss_weight", type=float, default=10.0)
     parser.add_argument("--save_dir", default="outputs/Comparisons")
+    parser.add_argument("--run_name", default=None, help="Optional fixed run directory name under --save_dir")
     return parser.parse_args()
 
 
@@ -216,8 +217,8 @@ def main() -> None:
         weight_decay=float(getattr(cfg, "weight_decay", 1e-5)),
     )
 
-    run_name = f"{args.method}_{datetime.now().strftime('%m%d%H%M')}"
-    if cfg.debug:
+    run_name = args.run_name or f"{args.method}_{datetime.now().strftime('%m%d%H%M')}"
+    if cfg.debug and args.run_name is None:
         run_name += "_debug"
     save_dir = Path(args.save_dir) / run_name
     save_dir.mkdir(parents=True, exist_ok=True)

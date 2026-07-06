@@ -1,14 +1,15 @@
 """
-ObjectTransModule训练脚本 (Stage 3) + 联合训练
+ObjectTransModule训练脚本 (Stage 3) + 可选自动联合训练
 依赖Stage1和Stage2的预训练权重
 
 用法:
     # 仅训练Stage3 (Object Trans)
     python train_object_trans.py --cfg config.yaml --vc_ckpt path/to/vc.pt --hp_ckpt path/to/hp.pt
 
-    # 联合微调ObjectTrans + VelocityContact
+    # 先训练Stage3，结束后在同一输出目录自动联合微调ObjectTrans + VelocityContact
     python train_object_trans.py --cfg config.yaml --vc_ckpt path/to/vc.pt --hp_ckpt path/to/hp.pt --joint_train
 """
+import copy
 import os
 import sys
 import glob
@@ -65,9 +66,9 @@ def get_args():
     parser.add_argument('--hp_ckpt', type=str, default=None, 
                         help='HumanPoseModule权重路径')
     parser.add_argument('--ot_ckpt', type=str, default=None,
-                        help='ObjectTransModule预训练权重路径（联合微调起点）')
+                        help='保留兼容；自动joint训练固定使用本次ObjectTrans训练得到的best.pt')
     parser.add_argument('--joint_train', action='store_true', 
-                        help='是否进行联合训练（先微调ObjectTrans，到预设epoch后联合微调VelocityContact）')
+                        help='Stage3训练完成后，自动在同一输出目录进行ObjectTrans + VelocityContact联合训练')
     parser.add_argument('--ablate_vc_boundary', action='store_true', default=None,
                         help='训练时将VelocityContact boundary输出置零')
     parser.add_argument('--ablate_ot_obs_encoder', action='store_true', default=None,
@@ -136,22 +137,18 @@ class Stage3JointTrainer:
         self.best_loss = float('inf')
         self.n_iter = 0
 	        
-        self.joint_vc_unfreeze_epoch = int(getattr(cfg, "joint_vc_unfreeze_epoch", 0))
-        self.vc_unfrozen = False
+        self.vc_trainable = bool(joint_train)
 
-        # 设置训练/冻结状态：HP始终冻结；VC只在joint阶段达到阈值后解冻
+        # 设置训练/冻结状态：HP始终冻结；VC仅在joint阶段参与训练
         print("Stage3模式：冻结HumanPose，训练ObjectTrans")
         for param in self.hp_model.parameters():
             param.requires_grad = False
         for param in self.vc_model.parameters():
-            param.requires_grad = False
+            param.requires_grad = self.vc_trainable
         for param in self.ot_model.parameters():
             param.requires_grad = True
         if joint_train:
-            if self.joint_vc_unfreeze_epoch <= 0:
-                print("联合训练模式：立即微调VelocityContact + ObjectTrans")
-            else:
-                print(f"联合训练模式：epoch {self.joint_vc_unfreeze_epoch} 后微调VelocityContact + ObjectTrans")
+            print("联合训练模式：从epoch 0开始微调VelocityContact + ObjectTrans")
 
         if self.resume_path:
             print(f"Resume checkpoint: {self.resume_path}")
@@ -171,8 +168,6 @@ class Stage3JointTrainer:
         
         # 优化器
         base_lr = cfg.lr
-        if joint_train:
-            base_lr = base_lr * float(getattr(cfg, "joint_ot_lr_factor", 0.1))
         if cfg.use_multi_gpu:
             base_lr = base_lr * len(cfg.gpus)
 
@@ -184,11 +179,10 @@ class Stage3JointTrainer:
             }
         ]
         if joint_train:
-            vc_lr = base_lr * float(getattr(cfg, "joint_vc_lr_ratio", 0.1))
             param_groups.append(
                 {
-                    "params": list(self.vc_model.parameters()),
-                    "lr": vc_lr,
+                    "params": [p for p in self.vc_model.parameters() if p.requires_grad],
+                    "lr": base_lr,
                     "name": "velocity_contact",
                 }
             )
@@ -205,10 +199,7 @@ class Stage3JointTrainer:
         vc_params = sum(p.numel() for p in self.vc_model.parameters())
         print(f"ObjectTrans可训练参数数量: {ot_trainable}, lr={base_lr}")
         if joint_train:
-            if self.joint_vc_unfreeze_epoch <= 0:
-                print(f"VelocityContact将从epoch 0开始解冻，参数数量: {vc_params}, lr={vc_lr}")
-            else:
-                print(f"VelocityContact将在epoch {self.joint_vc_unfreeze_epoch}解冻，参数数量: {vc_params}, lr={vc_lr}")
+            print(f"VelocityContact可训练参数数量: {vc_params}, lr={base_lr}")
         
         # 损失函数
         loss_weights = getattr(cfg, 'loss_weights', {})
@@ -299,24 +290,10 @@ class Stage3JointTrainer:
                 print(f"警告：读取 best.pt 的 best_loss 失败: {exc}")
         return float("inf")
 
-    def _set_vc_trainable(self, trainable: bool):
-        for param in self.vc_model.parameters():
-            param.requires_grad = trainable
-        self.vc_unfrozen = trainable
-
-    def _update_joint_state(self, epoch: int):
-        should_unfreeze = self.joint_train and epoch >= self.joint_vc_unfreeze_epoch
-        if should_unfreeze and not self.vc_unfrozen:
-            self._set_vc_trainable(True)
-            flatten_lstm_parameters(self.vc_model)
-            print(f"\n解冻VelocityContact进行联合微调 (epoch {epoch})")
-        elif (not should_unfreeze) and self.vc_unfrozen:
-            self._set_vc_trainable(False)
-
     def forward_all(self, data_dict, batch=None, epoch: int = 0, training: bool = True):
         """完整的前向传播"""
         self.hp_model.eval()
-        if self.vc_unfrozen and training:
+        if self.vc_trainable and training:
             self.vc_model.train()
         else:
             self.vc_model.eval()
@@ -345,7 +322,7 @@ class Stage3JointTrainer:
         else:
             hp_for_vc = hp_out
 
-        vc_grad_enabled = self.vc_unfrozen and training
+        vc_grad_enabled = self.vc_trainable and training
         with torch.set_grad_enabled(vc_grad_enabled):
             vc_out = call_model_inference(self.vc_model, data_dict, hp_out=hp_for_vc, inference_mode="offline")
 
@@ -420,8 +397,7 @@ class Stage3JointTrainer:
 
     def train_epoch(self, epoch):
             """训练一个epoch"""
-            self._update_joint_state(epoch)
-            self.vc_model.train() if self.vc_unfrozen else self.vc_model.eval()
+            self.vc_model.train() if self.vc_trainable else self.vc_model.eval()
             self.hp_model.eval()
             self.ot_model.train()
             
@@ -442,7 +418,7 @@ class Stage3JointTrainer:
                 ot_losses = {}
                 vc_losses = {}
 
-                if self.joint_train and self.vc_unfrozen and self.vc_loss_fn:
+                if self.joint_train and self.vc_trainable and self.vc_loss_fn:
                     vc_loss, vc_losses, vc_weighted_losses = self.vc_loss_fn(vc_out, batch, self.device)
                     losses.update({f'vc_{k}': v for k, v in vc_weighted_losses.items()})
                 else:
@@ -466,19 +442,19 @@ class Stage3JointTrainer:
                 
                 # 更新进度条
                 postfix = {'loss': batch_loss.item(), 'ot': ot_loss.item()}
-                if self.joint_train and self.vc_unfrozen:
+                if self.joint_train and self.vc_trainable:
                     postfix['vc'] = vc_loss.item()
                 train_iter.set_postfix(postfix)
                 
                 if self.writer is not None:
                     self.writer.add_scalar('train/total_loss', batch_loss.item(), self.n_iter)
                     self.writer.add_scalar('train/ot_loss', ot_loss.item(), self.n_iter)
-                    if self.joint_train and self.vc_unfrozen:
+                    if self.joint_train and self.vc_trainable:
                         self.writer.add_scalar('train/vc_loss', vc_loss.item(), self.n_iter)
                     for key, value in ot_weighted_losses.items():
                         if isinstance(value, torch.Tensor):
                             self.writer.add_scalar(f'train/ot/{key}', value.item(), self.n_iter)
-                    if self.joint_train and self.vc_unfrozen:
+                    if self.joint_train and self.vc_trainable:
                         for key, value in vc_weighted_losses.items():
                             if isinstance(value, torch.Tensor):
                                 self.writer.add_scalar(f'train/vc/{key}', value.item(), self.n_iter)
@@ -513,7 +489,7 @@ class Stage3JointTrainer:
                 # 计算测试损失
                 vc_loss = torch.tensor(0.0, device=self.device)
                 vc_losses = {}
-                if self.joint_train and self.vc_unfrozen and self.vc_loss_fn:
+                if self.joint_train and self.vc_trainable and self.vc_loss_fn:
                     vc_loss, vc_losses, _ = self.vc_loss_fn(vc_out, batch, self.device)
 
                 ot_loss, ot_losses = self.ot_loss_fn.compute_test_loss(ot_out, batch, self.device)
@@ -579,6 +555,19 @@ class Stage3JointTrainer:
                                 self.writer.add_scalar(f'test/{key}', value, self.n_iter)
             else:
                 print()
+                if self.test_loader is None and train_loss < self.best_loss:
+                    self.best_loss = train_loss
+                    self._save_models(
+                        epoch,
+                        train_loss,
+                        'best',
+                        {
+                            'train_components': train_components,
+                            'best_loss': self.best_loss,
+                            'n_iter': self.n_iter,
+                        },
+                    )
+                    print(f'新的最佳训练损失: {self.best_loss:.4f}')
 	            
             self.scheduler.step()
             self._save_models(
@@ -645,18 +634,83 @@ class Stage3JointTrainer:
 
     def _save_models(self, epoch, loss, prefix, extra=None):
         """保存模型"""
-        checkpoint_path = os.path.join(self.cfg.save_dir, f'{prefix}.pt')
         checkpoint = self._build_joint_checkpoint(epoch, loss, extra=extra)
-        self._write_checkpoint(checkpoint_path, checkpoint)
-	        
+
         if self.joint_train:
-            # 联合训练额外保存分模块权重，保留旧脚本直接指定模块ckpt的用法。
+            # joint阶段与OT阶段共用目录，但不覆盖OT的best.pt/last.pt/final.pt。
             ot_path = os.path.join(self.cfg.save_dir, f'{prefix}_object_trans.pt')
             vc_path = os.path.join(self.cfg.save_dir, f'{prefix}_velocity_contact.pt')
             self._save_module_checkpoint(ot_path, checkpoint['object_trans_state_dict'], epoch, loss)
             self._save_module_checkpoint(vc_path, checkpoint['velocity_contact_state_dict'], epoch, loss)
+        else:
+            checkpoint_path = os.path.join(self.cfg.save_dir, f'{prefix}.pt')
+            self._write_checkpoint(checkpoint_path, checkpoint)
 
         print(f'保存模型: {prefix}')
+
+
+def _unwrap_model(model):
+    return model.module if isinstance(model, torch.nn.DataParallel) else model
+
+
+def _load_object_trans_best_for_joint(ot_model, best_path, device):
+    if not os.path.isfile(best_path):
+        raise FileNotFoundError(f"自动joint训练需要ObjectTrans训练结果，但未找到: {best_path}")
+    checkpoint = _torch_load_checkpoint(best_path, map_location=device)
+    state_key = "object_trans_state_dict" if isinstance(checkpoint, dict) and checkpoint.get("object_trans_state_dict") is not None else None
+    load_model_state_from_checkpoint(
+        _unwrap_model(ot_model),
+        checkpoint,
+        strict=False,
+        state_key=state_key,
+        name="ObjectTrans",
+    )
+    print(f"joint训练起点加载ObjectTrans最佳权重: {best_path}")
+
+
+def _run_auto_joint_train(cfg, trainer, train_loader, test_loader, base_lr):
+    joint_epochs = int(getattr(cfg, "joint_train_epochs", 0))
+    if joint_epochs <= 0:
+        raise ValueError("启用 --joint_train 时，配置 joint_train_epochs 必须大于0")
+
+    joint_milestones = list(getattr(cfg, "joint_train_milestones", []))
+    joint_cfg = copy.deepcopy(cfg)
+    joint_cfg.joint_train = True
+    joint_cfg.epochs = joint_epochs
+    joint_cfg.milestones = joint_milestones
+    joint_cfg.lr = float(base_lr) * 0.1
+    joint_cfg.resume_dir = None
+
+    best_ot_path = os.path.join(cfg.save_dir, "best.pt")
+    _load_object_trans_best_for_joint(trainer.ot_model, best_ot_path, trainer.device)
+    save_config_snapshot(
+        joint_cfg,
+        extra={
+            "joint_train_auto_started_from": best_ot_path,
+            "joint_train_lr_source": "lr * 0.1",
+        },
+        filename="joint_train_config.yaml",
+    )
+
+    print("=" * 50)
+    print("自动联合训练: ObjectTrans + VelocityContact")
+    print(f"训练轮数: {joint_cfg.epochs}")
+    print(f"学习率: {joint_cfg.lr}")
+    print(f"milestones: {joint_cfg.milestones}")
+    print(f"保存目录: {joint_cfg.save_dir}")
+    print("=" * 50)
+
+    joint_trainer = Stage3JointTrainer(
+        joint_cfg,
+        _unwrap_model(trainer.vc_model),
+        _unwrap_model(trainer.hp_model),
+        _unwrap_model(trainer.ot_model),
+        train_loader,
+        test_loader,
+        joint_train=True,
+    )
+    joint_trainer.train()
+    return joint_trainer
 
 
 def main():
@@ -673,13 +727,16 @@ def main():
         if args.ablate_ot_obs_encoder is not None
         else bool(getattr(cfg, "ablate_ot_obs_encoder", False))
     )
-    joint_train = bool(args.joint_train) or bool(getattr(cfg, "joint_train", False))
-    cfg.joint_train = joint_train
+    if cfg.ablate_ot_obs_encoder:
+        cfg.cond_mode_probs = [0.0, 1.0, 0.0]
+    auto_joint_train = bool(args.joint_train) or bool(getattr(cfg, "joint_train", False))
+    base_train_lr = float(cfg.lr)
+    cfg.joint_train = auto_joint_train
 		    
     setup_seed(cfg.seed)
     cfg = setup_device(cfg)
 	    
-    module_name = 'joint_train' if joint_train else 'object_trans'
+    module_name = 'object_trans'
     ablation_suffix = ""
     if cfg.ablate_vc_boundary:
         ablation_suffix += "_vc_boundary_zero"
@@ -689,7 +746,7 @@ def main():
     save_dir = create_save_dir(cfg, module_name)
     save_config_snapshot(cfg)
     
-    mode_str = "联合训练" if joint_train else "Stage 3"
+    mode_str = "Stage 3 + 自动联合训练" if auto_joint_train else "Stage 3"
     trans_str = "noTrans" if cfg.no_trans else "普通"
     
     print("=" * 50)
@@ -717,18 +774,13 @@ def main():
         hp_ckpt = find_latest_checkpoint(base_save_dir, 'human_pose')
         hp_source = "auto"
     print(f"HumanPose权重({hp_source or 'missing'}): {hp_ckpt}")
-    if ot_ckpt is None:
-        ot_ckpt = find_latest_checkpoint(base_save_dir, 'object_trans')
-        ot_source = "auto"
-        if joint_train:
-            print(f"ObjectTrans预训练权重({ot_source or 'missing'}, 用于联合微调): {ot_ckpt}")
-    elif joint_train:
-        print(f"ObjectTrans预训练权重({ot_source or 'missing'}, 用于联合微调): {ot_ckpt}")
+    if ot_ckpt:
+        print(f"ObjectTrans权重配置({ot_source or 'missing'})已记录但不会作为自动joint起点: {ot_ckpt}")
 	    
     cfg.vc_ckpt = vc_ckpt
     cfg.hp_ckpt = hp_ckpt
     cfg.ot_ckpt = ot_ckpt
-    cfg.joint_train = joint_train
+    cfg.joint_train = auto_joint_train
     save_config_snapshot(cfg)
 
     if vc_ckpt is None or hp_ckpt is None:
@@ -758,14 +810,8 @@ def main():
         print(f"警告: HumanPose权重不存在: {hp_ckpt}")
     
     ot_model = ObjectTransModule(cfg)
-    if joint_train and not getattr(cfg, "resume_dir", None):
-        if ot_ckpt and os.path.exists(ot_ckpt):
-            load_checkpoint(ot_model, ot_ckpt, device, strict=False)
-            print(f"联合微调起点加载ObjectTrans权重: {ot_ckpt}")
-        else:
-            raise ValueError("联合微调需要已训练的ObjectTrans权重，请先进行单独Stage3训练或指定 --ot_ckpt")
-    elif joint_train and getattr(cfg, "resume_dir", None):
-        print("检测到 --resume_dir，联合训练的ObjectTrans权重将从断点恢复。")
+    if getattr(cfg, "resume_dir", None):
+        print("检测到 --resume_dir，ObjectTrans权重将由训练器从断点恢复。")
     
     print(f"VelocityContact参数量: {sum(p.numel() for p in vc_model.parameters())}")
     print(f"HumanPose参数量: {sum(p.numel() for p in hp_model.parameters())}")
@@ -775,11 +821,14 @@ def main():
     trainer = Stage3JointTrainer(
         cfg, vc_model, hp_model, ot_model,
         train_loader, test_loader,
-        joint_train=joint_train
+        joint_train=False
     )
     
     # 开始训练
     trainer.train()
+
+    if auto_joint_train:
+        _run_auto_joint_train(cfg, trainer, train_loader, test_loader, base_train_lr)
     
     print(f"\n训练完成！模型保存到: {save_dir}")
 

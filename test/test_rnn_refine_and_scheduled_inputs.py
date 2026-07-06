@@ -459,7 +459,7 @@ def test_build_model_input_dict_passes_object_prior_fields():
     assert out["obj_points_canonical"].shape == (batch_size, 5, 3)
 
 
-def test_stage3_joint_unfreezes_vc_only_after_boundary():
+def test_stage3_joint_trains_vc_immediately():
     class TinyModule(nn.Module):
         def __init__(self):
             super().__init__()
@@ -467,7 +467,6 @@ def test_stage3_joint_unfreezes_vc_only_after_boundary():
 
     cfg = SimpleNamespace(
         device="cpu",
-        joint_vc_unfreeze_epoch=2,
         use_multi_gpu=False,
         lr=1e-3,
         weight_decay=0.0,
@@ -489,44 +488,5 @@ def test_stage3_joint_unfreezes_vc_only_after_boundary():
     )
 
     assert all(not p.requires_grad for p in trainer.hp_model.parameters())
-    assert all(not p.requires_grad for p in trainer.vc_model.parameters())
+    assert all(p.requires_grad for p in trainer.vc_model.parameters())
     assert any(p.requires_grad for p in trainer.ot_model.parameters())
-
-    trainer._update_joint_state(1)
-    assert all(not p.requires_grad for p in trainer.vc_model.parameters())
-
-    trainer._update_joint_state(2)
-    assert all(not p.requires_grad for p in trainer.hp_model.parameters())
-    assert all(p.requires_grad for p in trainer.vc_model.parameters())
-
-
-def test_stage3_joint_unfreezes_vc_immediately_by_default():
-    class TinyModule(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.layer = nn.Linear(2, 2)
-
-    cfg = SimpleNamespace(
-        device="cpu",
-        use_multi_gpu=False,
-        lr=1e-3,
-        weight_decay=0.0,
-        milestones=[],
-        gamma=0.1,
-        use_tensorboard=False,
-        debug=True,
-        no_trans=False,
-        loss_weights={},
-    )
-    trainer = Stage3JointTrainer(
-        cfg,
-        vc_model=TinyModule(),
-        hp_model=TinyModule(),
-        ot_model=TinyModule(),
-        train_loader=[],
-        test_loader=None,
-        joint_train=True,
-    )
-
-    trainer._update_joint_state(0)
-    assert all(p.requires_grad for p in trainer.vc_model.parameters())

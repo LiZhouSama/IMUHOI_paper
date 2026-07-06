@@ -122,7 +122,7 @@ def test_object_trans_online_shapes_for_short_equal_long_windows():
                 online_window=3,
             )
         assert out["pred_obj_trans"].shape == (1, seq_len, 3)
-        assert out["gating_weights"].shape == (1, seq_len, 3)
+        assert out["gating_weights"].shape == (1, seq_len, 4)
 
 
 def test_object_trans_forward_preserves_known_online_prefix():
@@ -234,7 +234,7 @@ class _FakeObjectTrans(nn.Module):
             out[:, t] = prev + 1.0
         return {
             "pred_obj_trans": out,
-            "gating_weights": torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype),
+            "gating_weights": torch.zeros(batch_size, seq_len, 4, device=device, dtype=dtype),
             "pred_obj_vel_from_posdiff": torch.zeros_like(out),
             "pred_obj_acc_from_posdiff": torch.zeros_like(out),
         }

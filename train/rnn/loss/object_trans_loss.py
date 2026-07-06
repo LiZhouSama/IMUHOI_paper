@@ -44,6 +44,7 @@ class ObjectTransLoss:
         'refine_pose',
         'refine_root_trans',
         'interaction_code_align',
+        'gate_weak',
     }
     
     # 测试阶段用于模型选择的损失键
@@ -65,6 +66,28 @@ class ObjectTransLoss:
             weights: dict, 各损失项的权重，默认为1.0
         """
         self.weights = weights or {}
+
+    @staticmethod
+    def _build_gate_weak_target(contact_prob, eps=1e-6):
+        """Build soft targets for [left_fk, right_fk, imu_velocity, static_hold]."""
+        p_l = contact_prob[..., 0:1].clamp(0.0, 1.0)
+        p_r = contact_prob[..., 1:2].clamp(0.0, 1.0)
+        p_move = contact_prob[..., 2:3].clamp(0.0, 1.0)
+
+        p_l_cond = (p_l / p_move.clamp_min(eps)).clamp(0.0, 1.0)
+        p_r_cond = (p_r / p_move.clamp_min(eps)).clamp(0.0, 1.0)
+        no_hand_cond = (1.0 - p_l_cond) * (1.0 - p_r_cond)
+
+        scores = torch.cat(
+            (
+                p_l,
+                p_r,
+                p_move * no_hand_cond,
+                1.0 - p_move,
+            ),
+            dim=-1,
+        ).clamp_min(0.0)
+        return scores / scores.sum(dim=-1, keepdim=True).clamp_min(eps)
     
     def __call__(self, pred_dict, batch, device):
         return self.compute_loss(pred_dict, batch, device)
@@ -191,6 +214,25 @@ class ObjectTransLoss:
         if 'pred_obj_acc_from_posdiff' in pred_dict and obj_imu_gt is not None:
             losses['obj_acc_cons'] = _masked_mse(pred_dict['pred_obj_acc_from_posdiff'], obj_imu_gt[:, :, :3], obj_mask, zero)
 
+        gating_weights = pred_dict.get('gating_weights') if isinstance(pred_dict, dict) else None
+        gating_contact_prob = pred_dict.get('gating_contact_prob') if isinstance(pred_dict, dict) else None
+        if (
+            isinstance(gating_weights, torch.Tensor)
+            and isinstance(gating_contact_prob, torch.Tensor)
+            and gating_weights.shape[:2] == (bs, seq)
+            and gating_contact_prob.shape[:2] == (bs, seq)
+            and gating_weights.shape[-1] == 4
+            and gating_contact_prob.shape[-1] >= 3
+        ):
+            target = self._build_gate_weak_target(gating_contact_prob[..., :3].to(device=device, dtype=dtype)).detach()
+            smooth = float(self.weights.get('gate_weak_target_smoothing', 0.1))
+            if smooth > 0.0:
+                smooth = min(max(smooth, 0.0), 1.0)
+                target = (1.0 - smooth) * target + smooth / target.shape[-1]
+            gate_log_prob = torch.log(gating_weights.to(device=device, dtype=dtype).clamp_min(1e-6))
+            gate_ce = -(target * gate_log_prob).sum(dim=-1)
+            losses['gate_weak'] = _masked_mean(gate_ce, obj_mask, zero)
+
         if pose_gt_6d is not None and 'refined_pose' in pred_dict:
             refined_pose = pred_dict['refined_pose']
             if refined_pose.dim() == 4:
@@ -269,7 +311,8 @@ class ObjectTransLoss:
         total_loss = zero.clone()
         weighted_losses = {}
         for key, loss in losses.items():
-            weight = self.weights.get(key, 1.0)
+            default_weight = 0.0 if key == 'gate_weak' else 1.0
+            weight = self.weights.get(key, default_weight)
             weighted_losses[key] = loss * weight
             total_loss = total_loss + weighted_losses[key]
         
