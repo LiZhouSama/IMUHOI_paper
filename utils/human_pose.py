@@ -10,7 +10,138 @@ from utils.rotation_conversions import matrix_to_axis_angle, matrix_to_rotation_
 
 
 SMPL_PARENTS = [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19, 20, 21]
+WRIST_JOINT_INDICES = (20, 21)
+FOREARM_PARENT_JOINT_INDICES = (18, 19)
+VIRTUAL_PALM_JOINT_INDICES = (22, 23)
+# Estimated from zero-pose SMPL-H middle metacarpal offsets. The virtual palm
+# anchor intentionally follows the forearm extension instead of native SMPL-H
+# hand-joint ordering, where Jtr[22:24] are not left/right palm roots.
+PALM_EXTENSION_RATIOS = (0.43, 0.42)
 _NO_SHAPE_ARG = object()
+
+
+def compute_virtual_palm_positions(
+    joints: torch.Tensor,
+    *,
+    forearm_parent_indices: Sequence[int] = FOREARM_PARENT_JOINT_INDICES,
+    wrist_indices: Sequence[int] = WRIST_JOINT_INDICES,
+    extension_ratios: Sequence[float] = PALM_EXTENSION_RATIOS,
+) -> torch.Tensor:
+    """Compute left/right virtual palm anchors from elbow and wrist positions."""
+    if not isinstance(joints, torch.Tensor):
+        raise TypeError("joints must be a torch.Tensor")
+    if joints.shape[-1] != 3:
+        raise ValueError(f"joints must end with xyz coordinates, got {joints.shape}")
+
+    joint_count = int(joints.shape[-2])
+    max_wrist_idx = max(int(idx) for idx in wrist_indices)
+    if joint_count <= max_wrist_idx:
+        shape = (*joints.shape[:-2], 2, 3)
+        return torch.zeros(shape, device=joints.device, dtype=joints.dtype)
+
+    wrists = torch.stack(
+        [joints[..., int(wrist_indices[0]), :], joints[..., int(wrist_indices[1]), :]],
+        dim=-2,
+    )
+
+    max_parent_idx = max(int(idx) for idx in forearm_parent_indices)
+    if joint_count <= max_parent_idx:
+        return wrists
+
+    forearms = torch.stack(
+        [
+            joints[..., int(wrist_indices[0]), :] - joints[..., int(forearm_parent_indices[0]), :],
+            joints[..., int(wrist_indices[1]), :] - joints[..., int(forearm_parent_indices[1]), :],
+        ],
+        dim=-2,
+    )
+    ratios = torch.as_tensor(extension_ratios, device=joints.device, dtype=joints.dtype)
+    ratio_shape = (1,) * (forearms.dim() - 2) + (2, 1)
+    return wrists + forearms * ratios.view(ratio_shape)
+
+
+def append_virtual_palm_joints(
+    joints: torch.Tensor,
+    *,
+    num_joints: int = 24,
+    palm_indices: Sequence[int] = VIRTUAL_PALM_JOINT_INDICES,
+) -> torch.Tensor:
+    """Return a custom 24-joint tensor whose 22/23 entries are virtual palms."""
+    if joints.shape[-1] != 3:
+        raise ValueError(f"joints must end with xyz coordinates, got {joints.shape}")
+
+    joint_count = int(joints.shape[-2])
+    if joint_count >= num_joints:
+        out = joints[..., :num_joints, :].clone()
+    else:
+        pad_shape = (*joints.shape[:-2], num_joints - joint_count, 3)
+        pad = torch.zeros(pad_shape, device=joints.device, dtype=joints.dtype)
+        out = torch.cat((joints, pad), dim=-2)
+
+    palms = compute_virtual_palm_positions(joints)
+    left_idx, right_idx = (int(palm_indices[0]), int(palm_indices[1]))
+    if left_idx < num_joints:
+        out[..., left_idx, :] = palms[..., 0, :]
+    if right_idx < num_joints:
+        out[..., right_idx, :] = palms[..., 1, :]
+    return out
+
+
+def append_virtual_palm_rotations(
+    rotations: torch.Tensor,
+    *,
+    num_joints: int = 24,
+    wrist_indices: Sequence[int] = WRIST_JOINT_INDICES,
+    palm_indices: Sequence[int] = VIRTUAL_PALM_JOINT_INDICES,
+) -> torch.Tensor:
+    """Append virtual palm global rotations by inheriting wrist rotations."""
+    if rotations.shape[-2:] != (3, 3):
+        raise ValueError(f"rotations must end with [3,3], got {rotations.shape}")
+
+    joint_count = int(rotations.shape[-3])
+    if joint_count >= num_joints:
+        out = rotations[..., :num_joints, :, :].clone()
+    else:
+        eye = torch.eye(3, device=rotations.device, dtype=rotations.dtype)
+        view_shape = (1,) * (rotations.dim() - 3) + (1, 3, 3)
+        pad_shape = (*rotations.shape[:-3], num_joints - joint_count, 3, 3)
+        pad = eye.view(view_shape).expand(pad_shape)
+        out = torch.cat((rotations, pad), dim=-3)
+
+    left_wrist, right_wrist = (int(wrist_indices[0]), int(wrist_indices[1]))
+    left_palm, right_palm = (int(palm_indices[0]), int(palm_indices[1]))
+    if joint_count > left_wrist and left_palm < num_joints:
+        out[..., left_palm, :, :] = rotations[..., left_wrist, :, :]
+    if joint_count > right_wrist and right_palm < num_joints:
+        out[..., right_palm, :, :] = rotations[..., right_wrist, :, :]
+    return out
+
+
+def select_hand_anchor_positions(joints: torch.Tensor) -> torch.Tensor:
+    """Select the left/right hand anchor used by VC/OT: virtual palm positions."""
+    return compute_virtual_palm_positions(joints)
+
+
+def select_wrist_positions(
+    joints: torch.Tensor,
+    *,
+    wrist_indices: Sequence[int] = WRIST_JOINT_INDICES,
+) -> torch.Tensor:
+    """Select the left/right wrist positions used for wrist-mounted IMU supervision."""
+    if not isinstance(joints, torch.Tensor):
+        raise TypeError("joints must be a torch.Tensor")
+    if joints.shape[-1] != 3:
+        raise ValueError(f"joints must end with xyz coordinates, got {joints.shape}")
+
+    joint_count = int(joints.shape[-2])
+    max_wrist_idx = max(int(idx) for idx in wrist_indices)
+    shape = (*joints.shape[:-2], 2, 3)
+    if joint_count <= max_wrist_idx:
+        return torch.zeros(shape, device=joints.device, dtype=joints.dtype)
+    return torch.stack(
+        [joints[..., int(wrist_indices[0]), :], joints[..., int(wrist_indices[1]), :]],
+        dim=-2,
+    )
 
 
 def load_body_model(body_model_path: str, num_betas: int = 16):

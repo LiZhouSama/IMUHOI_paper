@@ -9,7 +9,13 @@ import torch.nn.functional as F
 from human_body_prior.body_model.body_model import BodyModel
 from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_axis_angle, matrix_to_rotation_6d
 
-from utils.human_pose import forward_body_model_joints
+from utils.human_pose import (
+    WRIST_JOINT_INDICES,
+    append_virtual_palm_joints,
+    forward_body_model_joints,
+    select_hand_anchor_positions,
+    select_wrist_positions,
+)
 
 from .base import RNN, RNNWithInit, SubPoser
 from .online import (
@@ -163,7 +169,7 @@ class HumanPoseModule(nn.Module):
             self.vel_indices = list(_VEL_SELECTION_INDICES)
 
         self._generate_indices_list()
-        self.hand_joint_indices = (20, 21)
+        self.hand_joint_indices = tuple(WRIST_JOINT_INDICES)
 
     def _find_indices(self, names, pool):
         return [pool.index(name) for name in names]
@@ -236,7 +242,7 @@ class HumanPoseModule(nn.Module):
                     root_orient=pose_aa[:, 0].reshape(BT, 3),
                     fallback_to_full=False,
                 )
-            joints = joints[:, :24, :]
+            joints = append_virtual_palm_joints(joints[:, :22, :], num_joints=24)
             return joints.reshape(batch_size, seq_len, 24, 3)
         except Exception as exc:
             print(f"FK计算失败: {exc}")
@@ -428,11 +434,12 @@ class HumanPoseModule(nn.Module):
                     trans_gt = trans_gt.unsqueeze(1).expand(batch_size, seq_len, 3)
 
             if joints_pos is not None:
-                lhand = joints_pos[:, :, self.hand_joint_indices[0], :] + trans_gt
-                rhand = joints_pos[:, :, self.hand_joint_indices[1], :] + trans_gt
-                pred_hand_glb_pos = torch.stack((lhand, rhand), dim=2)
+                joints_global = joints_pos + trans_gt.unsqueeze(2)
+                pred_hand_glb_pos = select_wrist_positions(joints_global)
+                pred_palm_glb_pos = select_hand_anchor_positions(joints_global)
             else:
                 pred_hand_glb_pos = torch.zeros(batch_size, seq_len, 2, 3, device=device, dtype=human_imu.dtype)
+                pred_palm_glb_pos = torch.zeros_like(pred_hand_glb_pos)
 
             root_vel_pred = self._compute_root_velocity_from_trans(trans_gt)
             if root_vel_pred is None:
@@ -440,6 +447,7 @@ class HumanPoseModule(nn.Module):
 
             results.update({
                 "pred_hand_glb_pos": pred_hand_glb_pos,
+                "pred_palm_glb_pos": pred_palm_glb_pos,
                 "root_vel_pred": root_vel_pred,
                 "root_trans_pred": trans_gt,
             })
@@ -470,11 +478,12 @@ class HumanPoseModule(nn.Module):
             root_trans_pred = root_trans_delta + trans_init.unsqueeze(1)
 
             if joints_pos is not None:
-                lhand = joints_pos[:, :, self.hand_joint_indices[0], :] + root_trans_pred
-                rhand = joints_pos[:, :, self.hand_joint_indices[1], :] + root_trans_pred
-                pred_hand_glb_pos = torch.stack((lhand, rhand), dim=2)
+                joints_global = joints_pos + root_trans_pred.unsqueeze(2)
+                pred_hand_glb_pos = select_wrist_positions(joints_global)
+                pred_palm_glb_pos = select_hand_anchor_positions(joints_global)
             else:
                 pred_hand_glb_pos = torch.zeros(batch_size, seq_len, 2, 3, device=device, dtype=human_imu.dtype)
+                pred_palm_glb_pos = torch.zeros_like(pred_hand_glb_pos)
 
             results.update({
                 "contact_pred": contact_pred,
@@ -482,6 +491,7 @@ class HumanPoseModule(nn.Module):
                 "root_vel_pred": root_vel_pred,
                 "root_trans_pred": root_trans_pred,
                 "pred_hand_glb_pos": pred_hand_glb_pos,
+                "pred_palm_glb_pos": pred_palm_glb_pos,
             })
 
         if joints_pos is not None:
@@ -560,6 +570,7 @@ class HumanPoseModule(nn.Module):
             "v_pred": torch.zeros(batch_size, seq_len, len(_SENSOR_VEL_NAMES) * 3, device=device),
             "p_pred": torch.zeros(batch_size, seq_len, len(_REDUCED_POSE_NAMES) * 6, device=device),
             "pred_hand_glb_pos": torch.zeros(batch_size, seq_len, 2, 3, device=device),
+            "pred_palm_glb_pos": torch.zeros(batch_size, seq_len, 2, 3, device=device),
             "root_vel_pred": torch.zeros(batch_size, seq_len, 3, device=device),
             "root_trans_pred": torch.zeros(batch_size, seq_len, 3, device=device),
             "pred_joints_local": torch.zeros(batch_size, seq_len, 24, 3, device=device),

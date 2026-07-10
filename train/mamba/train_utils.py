@@ -164,7 +164,14 @@ def create_dataloaders(cfg, project_root=None):
         raise ValueError("训练数据路径不存在")
 
     print(f"训练数据路径: {train_paths}")
-    train_dataset = IMUDataset(data_dir=train_paths, window_size=cfg.train.window, debug=cfg.debug, simulate_imu_noise=False)
+    resolve_bimanual_contact_conflicts = bool(getattr(cfg, "resolve_bimanual_contact_conflicts", True))
+    train_dataset = IMUDataset(
+        data_dir=train_paths,
+        window_size=cfg.train.window,
+        debug=cfg.debug,
+        simulate_imu_noise=False,
+        resolve_bimanual_contact_conflicts=resolve_bimanual_contact_conflicts,
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg.batch_size,
@@ -177,7 +184,12 @@ def create_dataloaders(cfg, project_root=None):
 
     test_loader = None
     if test_paths:
-        test_dataset = IMUDataset(data_dir=test_paths, window_size=cfg.test.window, debug=cfg.debug)
+        test_dataset = IMUDataset(
+            data_dir=test_paths,
+            window_size=cfg.test.window,
+            debug=cfg.debug,
+            resolve_bimanual_contact_conflicts=resolve_bimanual_contact_conflicts,
+        )
         if len(test_dataset) > 0:
             test_loader = DataLoader(
                 test_dataset,

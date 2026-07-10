@@ -314,6 +314,7 @@ class Stage3JointTrainer:
                     "pred_joints_local",
                     "pred_joints_global",
                     "pred_hand_glb_pos",
+                    "pred_palm_glb_pos",
                     "root_vel_pred",
                     "root_trans_pred",
                 ),
@@ -332,8 +333,8 @@ class Stage3JointTrainer:
                 gt_hp = build_gt_human_pose_outputs(batch, self.device, dtype=hp_out['pred_hand_glb_pos'].dtype)
             gt_vc = build_gt_velocity_contact_outputs(batch, self.device, dtype=vc_out['pred_obj_vel'].dtype)
             hand_positions, ot_mask = sample_mix_tensor(
-                gt_hp['pred_hand_glb_pos'],
-                hp_out['pred_hand_glb_pos'],
+                gt_hp.get('pred_palm_glb_pos', gt_hp['pred_hand_glb_pos']),
+                hp_out.get('pred_palm_glb_pos', hp_out['pred_hand_glb_pos']),
                 pred_prob,
                 return_mask=True,
             )
@@ -362,7 +363,7 @@ class Stage3JointTrainer:
                 mask=ot_mask,
             )
         else:
-            hand_positions = hp_out['pred_hand_glb_pos']
+            hand_positions = hp_out.get('pred_palm_glb_pos', hp_out['pred_hand_glb_pos'])
             contact_prob = vc_out['pred_hand_contact_prob']
             obj_vel_input = vc_out['pred_obj_vel']
             human_pose_input = hp_out.get('p_pred')

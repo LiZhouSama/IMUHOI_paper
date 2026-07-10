@@ -142,6 +142,7 @@ def create_dataloaders(cfg, project_root=None):
         raise ValueError("训练数据路径不存在")
 
     print(f"训练数据路径: {train_paths}")
+    resolve_bimanual_contact_conflicts = bool(getattr(cfg, "resolve_bimanual_contact_conflicts", True))
 
     train_cfg = getattr(cfg, "train", {})
     test_cfg = getattr(cfg, "test", {})
@@ -163,6 +164,7 @@ def create_dataloaders(cfg, project_root=None):
         simulate_imu_noise=True,
         full_sequence=bool(train_full_sequence),
         obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
+        resolve_bimanual_contact_conflicts=resolve_bimanual_contact_conflicts,
     )
 
     train_loader = DataLoader(
@@ -185,6 +187,7 @@ def create_dataloaders(cfg, project_root=None):
             simulate_imu_noise=False,
             full_sequence=bool(test_full_sequence),
             obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
+            resolve_bimanual_contact_conflicts=resolve_bimanual_contact_conflicts,
         )
         if len(test_dataset) > 0:
             test_loader = DataLoader(

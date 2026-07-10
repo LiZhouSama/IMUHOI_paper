@@ -6,6 +6,12 @@ from typing import Dict, Iterable, Optional, Tuple
 import torch
 
 from configs import _REDUCED_POSE_NAMES
+from utils.human_pose import (
+    append_virtual_palm_joints,
+    append_virtual_palm_rotations,
+    select_hand_anchor_positions,
+    select_wrist_positions,
+)
 from utils.rotation_conversions import matrix_to_rotation_6d
 
 
@@ -133,9 +139,10 @@ def build_gt_human_pose_outputs(batch, device, dtype=None, num_joints: int = 24)
         position_global = None
     if position_global is None:
         position_global = torch.zeros(batch_size, seq_len, num_joints, 3, device=device, dtype=dtype)
-    position_global = _pad_joints(position_global, num_joints)
+    position_global = append_virtual_palm_joints(_pad_joints(position_global, num_joints), num_joints=num_joints)
     joints_local = position_global - trans.unsqueeze(2)
-    hand_pos = torch.stack((position_global[:, :, 20], position_global[:, :, 21]), dim=2)
+    hand_pos = select_wrist_positions(position_global)
+    palm_pos = select_hand_anchor_positions(position_global)
 
     rotation_global = batch.get("rotation_global")
     if isinstance(rotation_global, torch.Tensor):
@@ -151,7 +158,10 @@ def build_gt_human_pose_outputs(batch, device, dtype=None, num_joints: int = 24)
     if rotation_global is None:
         eye = torch.eye(3, device=device, dtype=dtype).view(1, 1, 1, 3, 3)
         rotation_global = eye.expand(batch_size, seq_len, num_joints, -1, -1)
-    rotation_global = _pad_joints(rotation_global, num_joints, fill_identity=True)
+    rotation_global = append_virtual_palm_rotations(
+        _pad_joints(rotation_global, num_joints, fill_identity=True),
+        num_joints=num_joints,
+    )
     full_pose_6d = matrix_to_rotation_6d(rotation_global.reshape(-1, 3, 3)).reshape(
         batch_size, seq_len, num_joints, 6
     )
@@ -178,6 +188,7 @@ def build_gt_human_pose_outputs(batch, device, dtype=None, num_joints: int = 24)
         "pred_joints_local": joints_local,
         "pred_joints_global": position_global,
         "pred_hand_glb_pos": hand_pos,
+        "pred_palm_glb_pos": palm_pos,
         "root_vel_pred": root_vel,
         "root_trans_pred": trans,
     }

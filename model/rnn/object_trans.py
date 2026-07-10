@@ -780,9 +780,15 @@ class ObjectTransModule(nn.Module):
 
         # 应用mask
         if has_object_mask is not None:
-            if has_object_mask.dim() > 1:
-                has_object_mask = has_object_mask.view(bs)
-            mask = has_object_mask.to(dtype=dtype, device=device).view(bs, 1, 1)
+            if has_object_mask.dim() == 0:
+                has_object_mask = has_object_mask.view(1).expand(bs)
+            elif has_object_mask.dim() > 1:
+                has_object_mask = has_object_mask.reshape(bs, -1)[:, 0]
+            elif has_object_mask.shape[0] == 1 and bs > 1:
+                has_object_mask = has_object_mask.expand(bs)
+            sample_mask = has_object_mask.to(dtype=dtype, device=device).view(bs)
+            mask = sample_mask.view(bs, 1, 1)
+            init_mask = sample_mask.view(bs, 1)
             fused_pos = fused_pos * mask
             vel_from_pos = vel_from_pos * mask
             acc_from_pos = acc_from_pos * mask
@@ -794,12 +800,12 @@ class ObjectTransModule(nn.Module):
             static_pos = static_pos * mask
             l_dir = l_dir * mask
             r_dir = r_dir * mask
-            l_len = l_len * mask.squeeze(-1)
-            r_len = r_len * mask.squeeze(-1)
-            l_oe0 = l_oe0 * mask.squeeze(-1)
-            r_oe0 = r_oe0 * mask.squeeze(-1)
-            l_lb0 = (l_lb0 * mask.squeeze(-1).unsqueeze(-1)).squeeze(-1)
-            r_lb0 = (r_lb0 * mask.squeeze(-1).unsqueeze(-1)).squeeze(-1)
+            l_len = l_len * init_mask
+            r_len = r_len * init_mask
+            l_oe0 = l_oe0 * init_mask
+            r_oe0 = r_oe0 * init_mask
+            l_lb0 = (l_lb0 * init_mask).squeeze(-1)
+            r_lb0 = (r_lb0 * init_mask).squeeze(-1)
         else:
             l_lb0 = l_lb0.squeeze(-1)
             r_lb0 = r_lb0.squeeze(-1)

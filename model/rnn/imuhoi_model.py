@@ -23,6 +23,7 @@ from .online import (
     TimeDictAccumulator,
     update_data_inits_from_history,
 )
+from utils.human_pose import select_hand_anchor_positions, select_wrist_positions
 
 
 class IMUHOIModel(nn.Module):
@@ -154,6 +155,18 @@ class IMUHOIModel(nn.Module):
         self.velocity_contact_module = VelocityContactModule(cfg)
         self.human_pose_module = HumanPoseModule(cfg, device, no_trans=no_trans)
         self.object_trans_module = ObjectTransModule(cfg)
+
+    @staticmethod
+    def _resolve_hoi_hand_positions(hp_out: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Return the palm anchor positions used by VC/OT geometry."""
+        if isinstance(hp_out, dict):
+            palm_pos = hp_out.get("pred_palm_glb_pos")
+            if isinstance(palm_pos, torch.Tensor):
+                return palm_pos
+            hand_pos = hp_out.get("pred_hand_glb_pos")
+            if isinstance(hand_pos, torch.Tensor):
+                return hand_pos
+        raise KeyError("hp_out must contain pred_palm_glb_pos or pred_hand_glb_pos")
     
     def load_pretrained_modules(self, module_paths: Dict[str, str], strict: bool = True):
         """
@@ -198,6 +211,7 @@ class IMUHOIModel(nn.Module):
             "pred_joints_local",
             "pred_joints_global",
             "pred_hand_glb_pos",
+            "pred_palm_glb_pos",
             "pred_full_pose_rotmat",
             "pred_full_pose_6d",
         ):
@@ -243,10 +257,8 @@ class IMUHOIModel(nn.Module):
                 joints_global = joints_local + refined_root.unsqueeze(2)
                 results["pred_joints_global"] = joints_global
                 if joints_global.shape[2] > 21:
-                    results["pred_hand_glb_pos"] = torch.stack(
-                        (joints_global[:, :, 20], joints_global[:, :, 21]),
-                        dim=2,
-                    )
+                    results["pred_hand_glb_pos"] = select_wrist_positions(joints_global)
+                    results["pred_palm_glb_pos"] = select_hand_anchor_positions(joints_global)
 
             if hasattr(hp_module, "_reduced_glb_6d_to_full_glb_mat"):
                 bt = batch_size * seq_len
@@ -327,12 +339,13 @@ class IMUHOIModel(nn.Module):
         }
         vc_out = self.velocity_contact_module(vc_input_dict, hp_out=hp_out)
         results.update(vc_out)
+        hoi_hand_positions = self._resolve_hoi_hand_positions(hp_out)
         
         # Stage 3: ObjectTrans - 预测物体位置
         has_object = data_dict.get("has_object")
         if use_object_data and (has_object is None or has_object.any()):
             ot_out = self.object_trans_module(
-                hp_out["pred_hand_glb_pos"],
+                hoi_hand_positions,
                 vc_out["pred_hand_contact_prob"],
                 data_dict["obj_trans_init"],
                 obj_imu=data_dict["obj_imu"],
@@ -359,7 +372,7 @@ class IMUHOIModel(nn.Module):
                 obj_rotm = rotation_6d_to_matrix(obj_rot6d.reshape(-1, 6)).reshape(batch_size, seq_len, 3, 3)
                 results["pred_obj_trans_fk"] = self._fk_obj_trans_baseline_hard(
                     vc_out["pred_hand_contact_prob"],
-                    results.get("pred_hand_glb_pos", hp_out["pred_hand_glb_pos"]),
+                    results.get("pred_palm_glb_pos", hoi_hand_positions),
                     obj_rotm,
                     data_dict["obj_trans_init"],
                 )
@@ -391,7 +404,7 @@ class IMUHOIModel(nn.Module):
         obj_imu = data_dict["obj_imu"]
         obj_rot6d = obj_imu[..., 3:9]
         obj_rotm = rotation_6d_to_matrix(obj_rot6d.reshape(-1, 6)).reshape(batch_size, seq_len, 3, 3)
-        hand_pos = results["pred_hand_glb_pos"]
+        hand_pos = self._resolve_hoi_hand_positions(results)
         results["pred_obj_trans_fk"] = self._fk_obj_trans_baseline_hard(
             vc_out["pred_hand_contact_prob"],
             hand_pos,
@@ -469,7 +482,7 @@ class IMUHOIModel(nn.Module):
                 else:
                     ot_obj_trans_init = window_data["obj_trans_init"]
                 ot_out = self.object_trans_module.forward(
-                    hp_context["pred_hand_glb_pos"],
+                    self._resolve_hoi_hand_positions(hp_context),
                     vc_context["pred_hand_contact_prob"],
                     ot_obj_trans_init,
                     obj_imu=window_data["obj_imu"],

@@ -4,6 +4,7 @@ HumanPoseModule的损失函数
 import torch
 import torch.nn.functional as F
 from utils.rotation_conversions import rotation_6d_to_matrix, matrix_to_rotation_6d
+from utils.human_pose import select_wrist_positions
 
 from configs import _SENSOR_VEL_NAMES, _REDUCED_POSE_NAMES
 
@@ -109,10 +110,7 @@ class HumanPoseLoss:
         
         # 手部位置损失
         if 'pred_hand_glb_pos' in pred_dict and position_global_gt is not None:
-            hand_pos_gt = torch.stack([
-                position_global_gt[:, :, 20, :],
-                position_global_gt[:, :, 21, :],
-            ], dim=2)
+            hand_pos_gt = select_wrist_positions(position_global_gt)
             losses['hand_pos'] = F.mse_loss(pred_dict['pred_hand_glb_pos'], hand_pos_gt)
 
         if 'contact_pred' in pred_dict:

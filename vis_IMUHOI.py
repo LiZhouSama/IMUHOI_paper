@@ -37,6 +37,7 @@ from dataset.dataset_IMUHOI import IMUDataset
 from process.preprocess import load_object_geometry
 from model import IMUHOIModel, load_model
 from utils.utils import (
+    apply_eval_imu_noise_to_sequence,
     load_config,
     load_smpl_model,
     build_model_input_dict,
@@ -956,6 +957,19 @@ def main():
     parser.add_argument('--no_trans', action='store_true', help='Enable noTrans mode')
     parser.add_argument('--inference_mode', '--inference-mode', choices=['online', 'offline'], default='offline', help='RNN inference mode')
     parser.add_argument('--online_window', '--online-window', type=int, default=None, help='RNN online sliding window size')
+    parser.add_argument(
+        '--eval_imu_noise',
+        '--eval-imu-noise',
+        action='store_true',
+        help='Apply one fixed split-Gaussian IMU noise draw per full sequence before visualization.',
+    )
+    parser.add_argument(
+        '--eval_imu_noise_seed',
+        '--eval-imu-noise-seed',
+        type=int,
+        default=42,
+        help='Base seed for sequence-level noisy eval; sequence path is mixed in for stable per-sequence noise.',
+    )
     refine_group = parser.add_mutually_exclusive_group()
     refine_group.add_argument(
         '--enable_ot_refine',
@@ -976,6 +990,11 @@ def main():
     print(f"Using device: {device}")
     print(f"Mode: {'noTrans' if args.no_trans else 'Normal'}")
     print(f"Inference mode: {args.inference_mode} | online_window: {args.online_window or 'config/default'}")
+    print(
+        "Eval IMU noise: "
+        f"{'enabled' if args.eval_imu_noise else 'disabled'}"
+        + (f" | base_seed={args.eval_imu_noise_seed}" if args.eval_imu_noise else "")
+    )
 
     print(f"Loading config from: {args.config}")
     config = load_config(args.config)
@@ -1032,7 +1051,8 @@ def main():
             window_size=test_window_size,
             debug=dataset_debug,
             full_sequence=True,
-            simulate_imu_noise=False
+            simulate_imu_noise=False,
+            resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", True),
         )
     elif os.path.isfile(test_data_input) and test_data_input.lower().endswith(".pt"):
         target_pt = os.path.normcase(os.path.normpath(os.path.abspath(test_data_input)))
@@ -1045,7 +1065,8 @@ def main():
             debug=dataset_debug,
             full_sequence=True,
             sequence_paths=[target_pt],
-            simulate_imu_noise=False
+            simulate_imu_noise=False,
+            resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", True),
         )
         if len(test_dataset.sequence_info) != 1:
             try:
@@ -1095,6 +1116,13 @@ def main():
             file_name_i = os.path.basename(file_path_i) if file_path_i else ''
         except Exception:
             file_path_i, file_name_i = '', ''
+        if args.eval_imu_noise:
+            batch = apply_eval_imu_noise_to_sequence(
+                batch,
+                config,
+                seed=args.eval_imu_noise_seed,
+                sequence_key=os.path.realpath(os.path.abspath(file_path_i)) if file_path_i else i,
+            )
         data_list.append({
             'batch': batch,
             'seq_file_path': file_path_i,

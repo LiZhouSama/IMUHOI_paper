@@ -17,6 +17,7 @@ from .online import (
     update_data_inits_from_history,
 )
 from configs import FRAME_RATE, _SENSOR_NAMES
+from utils.human_pose import select_hand_anchor_positions
 from utils.utils import _central_diff, _smooth_acceleration
 
 
@@ -193,7 +194,9 @@ class VelocityContactModule(nn.Module):
             joint_pos = hp_out.get("pred_joints_local")
             root_vel = hp_out.get("root_vel_pred")
             root_trans = hp_out.get("root_trans_pred")
-            hand_pos = hp_out.get("pred_hand_glb_pos")
+            hand_pos = hp_out.get("pred_palm_glb_pos")
+            if hand_pos is None:
+                hand_pos = hp_out.get("pred_hand_glb_pos")
 
         if pose_6d is None:
             pose_6d = torch.zeros(batch_size, seq_len, 24, 6, device=device, dtype=dtype)
@@ -221,13 +224,7 @@ class VelocityContactModule(nn.Module):
                 root_trans = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
         if hand_pos is None:
             if joint_pos.shape[2] > 21:
-                hand_pos = torch.stack(
-                    (
-                        joint_pos[:, :, 20, :] + root_trans,
-                        joint_pos[:, :, 21, :] + root_trans,
-                    ),
-                    dim=2,
-                )
+                hand_pos = select_hand_anchor_positions(joint_pos) + root_trans.unsqueeze(2)
             else:
                 hand_pos = torch.zeros(batch_size, seq_len, 2, 3, device=device, dtype=dtype)
         else:

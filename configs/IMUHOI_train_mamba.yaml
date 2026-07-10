@@ -83,6 +83,9 @@ imu_rot_noise_std: 0.3
 obj_imu_acc_noise_std: 0.3
 obj_imu_rot_noise_std: 0.3
 
+# ============ 数据加载后处理 ============
+resolve_bimanual_contact_conflicts: true
+
 # ============ 要使用的数据集 ============
 train_datasets: ["omomo"]  # 可选: behave, imhd, omomo, amass
 

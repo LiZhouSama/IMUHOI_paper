@@ -14,7 +14,18 @@ from configs import (
     _REDUCED_INDICES, _IGNORED_INDICES, _SENSOR_NAMES, _SENSOR_VEL_NAMES, _REDUCED_POSE_NAMES
 )
 from process.imu_noise import apply_imu_noise, merge_noise_cfg, NOITOM_IMU_NOISE_CFG
+from utils.human_pose import (
+    append_virtual_palm_joints,
+    append_virtual_palm_rotations,
+    select_hand_anchor_positions,
+)
 from utils.utils import _central_diff, _smooth_acceleration
+
+_VEL_SELECTION_INDEX_LIST = (
+    _VEL_SELECTION_INDICES.tolist()
+    if isinstance(_VEL_SELECTION_INDICES, torch.Tensor)
+    else list(_VEL_SELECTION_INDICES)
+)
 
 # --- IMU 计算函数（公共） ---
 
@@ -89,6 +100,37 @@ def find_contact_segments(contact_mask):
     segments.append((start, end))
     return segments
 
+def suppress_bimanual_contact_by_bone_variation(
+    lhand_contact: torch.Tensor,
+    rhand_contact: torch.Tensor,
+    lhand_bone_length: torch.Tensor,
+    rhand_bone_length: torch.Tensor,
+    eps: float = 1e-6,
+):
+    """Drop the less stable hand label inside simultaneous hand-contact segments."""
+    lhand_contact = lhand_contact.clone().bool()
+    rhand_contact = rhand_contact.clone().bool()
+    both_contact = lhand_contact & rhand_contact
+    if not bool(both_contact.any()):
+        return lhand_contact, rhand_contact
+
+    def _variation(values: torch.Tensor) -> float:
+        finite_values = values[torch.isfinite(values)]
+        if finite_values.numel() < 2:
+            return 0.0
+        return float(finite_values.max() - finite_values.min())
+
+    for seg_start, seg_end in find_contact_segments(both_contact):
+        seg_slice = slice(seg_start, seg_end + 1)
+        l_var = _variation(lhand_bone_length[seg_slice])
+        r_var = _variation(rhand_bone_length[seg_slice])
+        if l_var > r_var + eps:
+            lhand_contact[seg_slice] = False
+        elif r_var > l_var + eps:
+            rhand_contact[seg_slice] = False
+
+    return lhand_contact, rhand_contact
+
 def gaussian_label_from_indices(indices, length, sigma=2.0, device=None, dtype=None):
     """根据接触起止帧生成高斯平滑标签"""
     if device is None:
@@ -126,10 +168,11 @@ def compute_obj_direction_supervision(position_global, obj_trans, obj_rot,
         "rhand_obj_direction": torch.zeros(seq_len, 3, device=device),
     }
     
-    # 提取手腕位置
-    wrist_pos = {
-        'left': position_global[:, 20, :],   # [seq, 3] - 左手腕位置（关节20）
-        'right': position_global[:, 21, :]  # [seq, 3] - 右手腕位置（关节21）
+    # 使用虚拟掌根位置作为手-物几何锚点。
+    hand_anchor_pos = select_hand_anchor_positions(position_global)
+    hand_pos = {
+        'left': hand_anchor_pos[:, 0, :],
+        'right': hand_anchor_pos[:, 1, :],
     }
     
     contacts = {'left': lhand_contact, 'right': rhand_contact}
@@ -148,12 +191,12 @@ def compute_obj_direction_supervision(position_global, obj_trans, obj_rot,
             seg_indices = torch.arange(seg_start, seg_end + 1, device=obj_trans.device)
             
             # 批量获取接触段的数据
-            wrist_pos_seg = wrist_pos[hand_name][seg_indices]  # [seg_len, 3]
+            hand_pos_seg = hand_pos[hand_name][seg_indices]  # [seg_len, 3]
             obj_trans_seg = obj_trans[seg_indices]  # [seg_len, 3]
             obj_rot_mat_seg = obj_rot_mat[seg_indices]  # [seg_len, 3, 3]
-            
-            # 1. 计算世界坐标系下手腕指向物体的向量
-            v_HO_world = obj_trans_seg - wrist_pos_seg  # [seg_len, 3]
+
+            # 1. 计算世界坐标系下掌根指向物体的向量
+            v_HO_world = obj_trans_seg - hand_pos_seg  # [seg_len, 3]
             
             # 2. 归一化得到世界坐标系下的单位向量
             v_HO_world_unit = v_HO_world / (torch.norm(v_HO_world, dim=1, keepdim=True) + 1e-8)  # [seg_len, 3]
@@ -182,6 +225,7 @@ class IMUDataset(Dataset):
         simulate_imu_noise=False,
         sequence_paths=None,
         obj_points_sample_count=256,
+        resolve_bimanual_contact_conflicts=True,
     ):
         """
         IMU数据集 - 每个epoch为每个序列随机采样一个窗口
@@ -193,6 +237,7 @@ class IMUDataset(Dataset):
             full_sequence: 是否使用整段模式
             imu_noise_cfg: 可选，IMU 噪声配置（None 使用 Noitom 风格默认值）
             simulate_imu_noise: 是否对合成 IMU 施加真实感噪声模型
+            resolve_bimanual_contact_conflicts: 是否后处理双手同时接触段，清掉骨长变化更大的手部接触标签
         """
         # 支持单个目录或多个目录
         if isinstance(data_dir, str):
@@ -209,6 +254,7 @@ class IMUDataset(Dataset):
         self.simulate_imu_noise = simulate_imu_noise
         self.imu_noise_cfg = merge_noise_cfg(imu_noise_cfg)
         self.obj_points_sample_count = int(max(1, obj_points_sample_count))
+        self.resolve_bimanual_contact_conflicts = bool(resolve_bimanual_contact_conflicts)
 
         # 查找所有目录中的序列文件，或使用显式传入的序列文件列表
         self.sequence_files = []
@@ -407,6 +453,8 @@ class IMUDataset(Dataset):
                 seq_data["rotation_local_full_gt_list"].reshape(seq_len, -1, 6)[start_idx:end_idx])).reshape(actual_seq_len, -1) # [seq, 66]
             position_global_full = seq_data["position_global_full_gt_world"][start_idx:end_idx]  # [seq, J, 3]
             rotation_global_full = seq_data["rotation_global"][start_idx:end_idx]  # [seq, J, 3, 3]
+            position_global_full = append_virtual_palm_joints(position_global_full, num_joints=24)
+            rotation_global_full = append_virtual_palm_rotations(rotation_global_full, num_joints=24)
             ori_glb_reduced = rotation_global_full[:, _REDUCED_INDICES] # [seq, n_reduced, 3, 3]
             ori_root_reduced = rotation_global_full[:, :1].transpose(-1, -2).matmul(ori_glb_reduced)
 
@@ -449,7 +497,7 @@ class IMUDataset(Dataset):
                     imu_noise_applied = True
             joint_vel_root = _compute_joint_velocity_root(rotation_global_full, position_global_full, FRAME_RATE)
             root_vel = _central_diff(position_global_full[:, 0, :], 1.0 / FRAME_RATE)
-            sensor_vel_root = joint_vel_root[:, _VEL_SELECTION_INDICES, :] # [seq, 6, 3]
+            sensor_vel_root = joint_vel_root[:, _VEL_SELECTION_INDEX_LIST, :] # [seq, 6, 3]
             sensor_vel_glb = _central_diff(position_global_full[:, _SENSOR_POS_INDICES, :], 1.0 / FRAME_RATE)
 
             # --- 物体数据准备 ---
@@ -511,15 +559,33 @@ class IMUDataset(Dataset):
                 obj_rot_6d = matrix_to_rotation_6d(obj_rot.reshape(-1, 3, 3)).reshape(actual_seq_len, 6)
 
             # --- 提前初始化所有接触窗口变量 ---
-            lfoot_contact_window = seq_data.get("lfoot_contact", torch.zeros(seq_len, dtype=torch.float))[start_idx:end_idx]
-            rfoot_contact_window = seq_data.get("rfoot_contact", torch.zeros(seq_len, dtype=torch.float))[start_idx:end_idx]
-            lhand_contact_window = seq_data.get("lhand_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
-            rhand_contact_window = seq_data.get("rhand_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
-            obj_contact_window = seq_data.get("obj_contact", torch.zeros(seq_len, dtype=torch.bool))[start_idx:end_idx]
+            def _slice_contact_window(key, default_dtype):
+                value = seq_data.get(key)
+                if value is None:
+                    return torch.zeros(actual_seq_len, dtype=default_dtype)
+                if isinstance(value, torch.Tensor):
+                    return value[start_idx:end_idx].clone()
+                return torch.from_numpy(np.asarray(value))[start_idx:end_idx].clone()
+
+            lfoot_contact_window = _slice_contact_window("lfoot_contact", torch.float).float()
+            rfoot_contact_window = _slice_contact_window("rfoot_contact", torch.float).float()
+            lhand_contact_window = _slice_contact_window("lhand_contact", torch.bool).bool()
+            rhand_contact_window = _slice_contact_window("rhand_contact", torch.bool).bool()
+            obj_contact_window = _slice_contact_window("obj_contact", torch.bool).bool()
             if not has_object:
                 lhand_contact_window = torch.zeros_like(lhand_contact_window)
                 rhand_contact_window = torch.zeros_like(rhand_contact_window)
                 obj_contact_window = torch.zeros_like(obj_contact_window)
+            elif self.resolve_bimanual_contact_conflicts:
+                hand_pos_for_contact = select_hand_anchor_positions(position_global_full)
+                lhand_raw_lb = torch.norm(obj_trans - hand_pos_for_contact[:, 0, :], dim=-1)
+                rhand_raw_lb = torch.norm(obj_trans - hand_pos_for_contact[:, 1, :], dim=-1)
+                lhand_contact_window, rhand_contact_window = suppress_bimanual_contact_by_bone_variation(
+                    lhand_contact_window,
+                    rhand_contact_window,
+                    lhand_raw_lb,
+                    rhand_raw_lb,
+                )
 
             # --- 虚拟关节监督 ---
             lhand_obj_direction = torch.zeros(actual_seq_len, 3, device=device, dtype=dtype)
@@ -538,8 +604,9 @@ class IMUDataset(Dataset):
                     rhand_obj_direction = virtual_joint_data["rhand_obj_direction"]
 
                     # 手-物距离（骨长），在无接触时置零
-                    lhand_pos_gt = position_global_full[:, 20, :]
-                    rhand_pos_gt = position_global_full[:, 21, :]
+                    hand_pos_gt = select_hand_anchor_positions(position_global_full)
+                    lhand_pos_gt = hand_pos_gt[:, 0, :]
+                    rhand_pos_gt = hand_pos_gt[:, 1, :]
                     lhand_lb = torch.norm(obj_trans - lhand_pos_gt, dim=-1)
                     rhand_lb = torch.norm(obj_trans - rhand_pos_gt, dim=-1)
                     lhand_lb = lhand_lb * lhand_contact_window.float()

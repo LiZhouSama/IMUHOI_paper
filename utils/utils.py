@@ -3,6 +3,7 @@
 """
 import os
 import random
+import hashlib
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -228,6 +229,131 @@ def smooth_acceleration(position: torch.Tensor, fps: float, smooth_n: int = 4) -
 _central_diff = central_diff
 _smooth_acceleration = smooth_acceleration
 
+
+def _cfg_float(cfg, name, default):
+    return float(getattr(cfg, name, default))
+
+
+def _randn_like(value, generator=None):
+    if generator is None:
+        return torch.randn_like(value)
+    return torch.randn(value.shape, device=value.device, dtype=value.dtype, generator=generator)
+
+
+def _add_split_imu_noise(imu, skip_mask_view, acc_std, rot_std, add_noise=True, generator=None):
+    if not add_noise or (acc_std <= 0 and rot_std <= 0):
+        return imu
+
+    noisy = imu
+    if acc_std > 0:
+        if noisy is imu:
+            noisy = imu.clone()
+        acc = imu[..., :3]
+        noisy[..., :3] = torch.where(
+            skip_mask_view,
+            acc,
+            acc + _randn_like(acc, generator=generator) * acc_std,
+        )
+    if rot_std > 0 and imu.shape[-1] > 3:
+        if noisy is imu:
+            noisy = imu.clone()
+        rot = imu[..., 3:]
+        noisy[..., 3:] = torch.where(
+            skip_mask_view,
+            rot,
+            rot + _randn_like(rot, generator=generator) * rot_std,
+        )
+    return noisy
+
+
+def _stable_sequence_seed(base_seed, sequence_key=None):
+    if base_seed is None:
+        return None
+    seed = int(base_seed)
+    if sequence_key is not None:
+        digest = hashlib.blake2b(str(sequence_key).encode("utf-8"), digest_size=8).digest()
+        seed += int.from_bytes(digest, byteorder="little", signed=False)
+    return seed % (2 ** 63 - 1)
+
+
+def _make_noise_generator(seed, device):
+    if seed is None:
+        return None
+    try:
+        return torch.Generator(device=device).manual_seed(int(seed))
+    except (TypeError, RuntimeError):
+        return torch.Generator().manual_seed(int(seed))
+
+
+def _bool_any(value, default=False):
+    if isinstance(value, torch.Tensor):
+        return bool(value.detach().bool().any().item()) if value.numel() > 0 else bool(default)
+    if isinstance(value, np.ndarray):
+        return bool(np.asarray(value).astype(bool).any()) if value.size > 0 else bool(default)
+    if isinstance(value, (list, tuple)):
+        return any(_bool_any(item, default=False) for item in value) if value else bool(default)
+    if value is None:
+        return bool(default)
+    return bool(value)
+
+
+def _mark_noise_applied_like(value):
+    if isinstance(value, torch.Tensor):
+        return torch.ones_like(value, dtype=torch.bool)
+    if isinstance(value, np.ndarray):
+        return np.ones_like(value, dtype=bool)
+    return True
+
+
+def apply_eval_imu_noise_to_sequence(sequence, cfg, seed=None, sequence_key=None):
+    """Apply one fixed split-Gaussian IMU noise draw to a full sequence."""
+    human_imu = sequence.get("human_imu") if isinstance(sequence, dict) else None
+    if not isinstance(human_imu, torch.Tensor):
+        return sequence
+    if _bool_any(sequence.get("imu_noise_applied", False)):
+        return sequence
+
+    imu_acc_noise_std = _cfg_float(cfg, "imu_acc_noise_std", 0.0)
+    imu_rot_noise_std = _cfg_float(cfg, "imu_rot_noise_std", 0.0)
+    obj_acc_noise_std = _cfg_float(cfg, "obj_imu_acc_noise_std", 0.0)
+    obj_rot_noise_std = _cfg_float(cfg, "obj_imu_rot_noise_std", 0.0)
+    if max(imu_acc_noise_std, imu_rot_noise_std, obj_acc_noise_std, obj_rot_noise_std) <= 0:
+        return sequence
+
+    result = dict(sequence)
+    noise_seed = _stable_sequence_seed(seed, sequence_key)
+    generator = _make_noise_generator(noise_seed, human_imu.device)
+    skip = torch.tensor(False, device=human_imu.device, dtype=torch.bool)
+    result["human_imu"] = _add_split_imu_noise(
+        human_imu,
+        skip,
+        imu_acc_noise_std,
+        imu_rot_noise_std,
+        add_noise=True,
+        generator=generator,
+    )
+
+    obj_imu = result.get("obj_imu")
+    if isinstance(obj_imu, torch.Tensor) and _bool_any(result.get("has_object", True), default=True):
+        obj_generator = generator
+        if obj_imu.device != human_imu.device:
+            obj_seed = None if noise_seed is None else (noise_seed + 1) % (2 ** 63 - 1)
+            obj_generator = _make_noise_generator(obj_seed, obj_imu.device)
+        result["obj_imu"] = _add_split_imu_noise(
+            obj_imu,
+            skip.to(device=obj_imu.device),
+            obj_acc_noise_std,
+            obj_rot_noise_std,
+            add_noise=True,
+            generator=obj_generator,
+        )
+
+    original_flag = sequence.get("imu_noise_applied", False)
+    result["imu_noise_applied"] = _mark_noise_applied_like(original_flag)
+    result["eval_imu_noise_applied"] = _mark_noise_applied_like(original_flag)
+    return result
+
+
 def build_model_input_dict(batch, cfg, device, add_noise=True):
     """
     构建模型输入字典
@@ -258,55 +384,29 @@ def build_model_input_dict(batch, cfg, device, add_noise=True):
         skip_mask = skip_mask[:1].expand(bs)
     skip_mask_human = skip_mask.view(bs, *([1] * (human_imu.dim() - 1)))
     
-    def _cfg_float(name, default):
-        return float(getattr(cfg, name, default))
-
-    def _add_split_imu_noise(imu, skip_mask_view, acc_std, rot_std):
-        if not add_noise or (acc_std <= 0 and rot_std <= 0):
-            return imu
-
-        noisy = imu
-        if acc_std > 0:
-            if noisy is imu:
-                noisy = imu.clone()
-            acc = imu[..., :3]
-            noisy[..., :3] = torch.where(
-                skip_mask_view,
-                acc,
-                acc + torch.randn_like(acc) * acc_std,
-            )
-        if rot_std > 0 and imu.shape[-1] > 3:
-            if noisy is imu:
-                noisy = imu.clone()
-            rot = imu[..., 3:]
-            noisy[..., 3:] = torch.where(
-                skip_mask_view,
-                rot,
-                rot + torch.randn_like(rot) * rot_std,
-            )
-        return noisy
-
     # 添加噪声。加速度和rotation-6d使用独立std。
-    imu_acc_noise_std = _cfg_float('imu_acc_noise_std', 0.0)
-    imu_rot_noise_std = _cfg_float('imu_rot_noise_std', 0.0)
+    imu_acc_noise_std = _cfg_float(cfg, 'imu_acc_noise_std', 0.0)
+    imu_rot_noise_std = _cfg_float(cfg, 'imu_rot_noise_std', 0.0)
     human_imu = _add_split_imu_noise(
         human_imu,
         skip_mask_human,
         imu_acc_noise_std,
         imu_rot_noise_std,
+        add_noise=add_noise,
     )
     
     obj_imu = batch.get('obj_imu')
     if isinstance(obj_imu, torch.Tensor):
         obj_imu = obj_imu.to(device)
-        obj_acc_noise_std = _cfg_float('obj_imu_acc_noise_std', 0.0)
-        obj_rot_noise_std = _cfg_float('obj_imu_rot_noise_std', 0.0)
+        obj_acc_noise_std = _cfg_float(cfg, 'obj_imu_acc_noise_std', 0.0)
+        obj_rot_noise_std = _cfg_float(cfg, 'obj_imu_rot_noise_std', 0.0)
         skip_mask_obj = skip_mask.view(bs, *([1] * (obj_imu.dim() - 1)))
         obj_imu = _add_split_imu_noise(
             obj_imu,
             skip_mask_obj,
             obj_acc_noise_std,
             obj_rot_noise_std,
+            add_noise=add_noise,
         )
     else:
         obj_feat_dim = getattr(cfg, 'obj_imu_dim', 9)

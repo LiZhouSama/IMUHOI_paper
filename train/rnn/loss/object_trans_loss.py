@@ -4,6 +4,7 @@ ObjectTransModule的损失函数
 import torch
 import torch.nn.functional as F
 from utils.rotation_conversions import matrix_to_rotation_6d
+from utils.human_pose import select_hand_anchor_positions
 from configs import _REDUCED_POSE_NAMES
 
 
@@ -246,8 +247,9 @@ class ObjectTransLoss:
                 losses['refine_root_trans'] = _masked_mse(refined_root_trans, trans_gt, obj_mask, zero)
         
         if position_global_gt is not None:
-            lhand_pos_gt = position_global_gt[:, :, 20, :]
-            rhand_pos_gt = position_global_gt[:, :, 21, :]
+            hand_pos_gt = select_hand_anchor_positions(position_global_gt)
+            lhand_pos_gt = hand_pos_gt[:, :, 0, :]
+            rhand_pos_gt = hand_pos_gt[:, :, 1, :]
             lb_l_gt = torch.norm(obj_trans_gt - lhand_pos_gt, dim=-1)
             lb_r_gt = torch.norm(obj_trans_gt - rhand_pos_gt, dim=-1)
             mask_l = (lhand_contact_gt & obj_mask)

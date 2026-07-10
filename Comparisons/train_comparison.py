@@ -128,6 +128,7 @@ def create_loader(cfg, split: str) -> DataLoader | None:
         debug=bool(cfg.debug),
         obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
         simulate_imu_noise=(split == "train"),
+        resolve_bimanual_contact_conflicts=bool(getattr(cfg, "resolve_bimanual_contact_conflicts", True)),
     )
     if len(dataset) == 0:
         return None

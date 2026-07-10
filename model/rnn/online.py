@@ -16,6 +16,7 @@ _SEQUENCE_LENGTH_KEYS = (
     "v_pred",
     "root_trans_pred",
     "pred_hand_glb_pos",
+    "pred_palm_glb_pos",
     "pred_hand_contact_prob",
     "pred_obj_vel",
     "pred_obj_trans",

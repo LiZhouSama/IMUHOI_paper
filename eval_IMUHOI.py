@@ -44,6 +44,7 @@ from utils.utils import (
     load_smpl_model,
     build_model_input_dict,
 )
+from utils.human_pose import select_hand_anchor_positions
 from configs import (
     FRAME_RATE,
     _IGNORED_INDICES,
@@ -626,9 +627,9 @@ def evaluate_model(
                     pred_hand_vel = pred_dict.get("pred_hand_glb_vel")
                     if pred_hand_vel is not None and T >= 2:
                         pred_hand_vel_seq = pred_hand_vel[sample_idx]
-                        wrist_l_idx, wrist_r_idx = 20, 21
-                        gt_lhand_pos = gt_joints_all[:, wrist_l_idx, :]
-                        gt_rhand_pos = gt_joints_all[:, wrist_r_idx, :]
+                        gt_hand_pos = select_hand_anchor_positions(gt_joints_all)
+                        gt_lhand_pos = gt_hand_pos[:, 0, :]
+                        gt_rhand_pos = gt_hand_pos[:, 1, :]
 
                         dt = 1.0 / float(FRAME_RATE)
                         gt_lhand_vel = (gt_lhand_pos[1:] - gt_lhand_pos[:-1]) / dt
@@ -707,12 +708,14 @@ def evaluate_model(
                     if pred_obj_trans_seq_ is None or gt_obj_trans_seq is None:
                         return float("nan")
 
-                    wrist_l_idx, wrist_r_idx, root_idx = 20, 21, 0
-                    pred_lhand_pos = pred_joints_all[:, wrist_l_idx, :]
-                    pred_rhand_pos = pred_joints_all[:, wrist_r_idx, :]
+                    root_idx = 0
+                    pred_hand_pos = select_hand_anchor_positions(pred_joints_all)
+                    gt_hand_pos = select_hand_anchor_positions(gt_joints_all)
+                    pred_lhand_pos = pred_hand_pos[:, 0, :]
+                    pred_rhand_pos = pred_hand_pos[:, 1, :]
                     pred_root_pos = pred_joints_all[:, root_idx, :]
-                    gt_lhand_pos = gt_joints_all[:, wrist_l_idx, :]
-                    gt_rhand_pos = gt_joints_all[:, wrist_r_idx, :]
+                    gt_lhand_pos = gt_hand_pos[:, 0, :]
+                    gt_rhand_pos = gt_hand_pos[:, 1, :]
                     gt_root_pos = gt_joints_all[:, root_idx, :]
 
                     rel_errors = []
@@ -994,6 +997,7 @@ def main():
             simulate_imu_noise=False,
             min_obj_contact_frames=0,
             full_sequence=True,
+            resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", True),
         )
 
         if len(test_dataset) == 0:

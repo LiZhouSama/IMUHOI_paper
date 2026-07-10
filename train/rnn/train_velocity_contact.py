@@ -116,6 +116,7 @@ class VelocityContactTrainer(BaseTrainer):
                         "pred_joints_local",
                         "pred_joints_global",
                         "pred_hand_glb_pos",
+                        "pred_palm_glb_pos",
                         "root_vel_pred",
                         "root_trans_pred",
                     ),

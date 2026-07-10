@@ -174,6 +174,7 @@ def create_loader(args: argparse.Namespace, cfg: edict, data_dirs: list[str]) ->
         full_sequence=not bool(args.windowed),
         obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
         simulate_imu_noise=False,
+        resolve_bimanual_contact_conflicts=bool(getattr(cfg, "resolve_bimanual_contact_conflicts", True)),
     )
     if len(dataset) == 0:
         raise RuntimeError(f"No valid sequences found under: {data_dirs}")

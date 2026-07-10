@@ -114,6 +114,8 @@ noitom
 process/processed_split_data_OMOMO
 *.png
 *.svg
+AGENTS.md
+CLAUDE.md
 
 # 特大文件
 *.pt

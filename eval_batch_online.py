@@ -39,7 +39,7 @@ from model.rnn.online import (
     take_latest_frame,
     update_data_inits_from_history,
 )
-from utils.utils import build_model_input_dict, load_config, load_smpl_model
+from utils.utils import apply_eval_imu_noise_to_sequence, build_model_input_dict, load_config, load_smpl_model
 
 
 TEMPORAL_SAMPLE_KEYS = {
@@ -417,6 +417,8 @@ def _batched_online_predict_dataset(
     compute_fk: bool,
     refine_human: bool,
     sort_desc: bool,
+    eval_imu_noise: bool,
+    eval_imu_noise_seed: Optional[int],
 ) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
     order = list(range(len(dataset)))
     order.sort(key=lambda idx: int(dataset.sequence_info[idx]["seq_len"]), reverse=sort_desc)
@@ -439,6 +441,13 @@ def _batched_online_predict_dataset(
             key = str(Path(info["file_path"]).resolve())
             sample = dict(dataset[dataset_idx])
             sample["_cache_key"] = key
+            if eval_imu_noise:
+                sample = apply_eval_imu_noise_to_sequence(
+                    sample,
+                    config,
+                    seed=eval_imu_noise_seed,
+                    sequence_key=key,
+                )
             samples.append(sample)
             sample_cache.append(sample)
             keys.append(key)
@@ -495,6 +504,19 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ablate_ot_obs_encoder", action="store_true")
     parser.add_argument("--output_json", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--eval_imu_noise",
+        "--eval-imu-noise",
+        action="store_true",
+        help="Apply one fixed split-Gaussian IMU noise draw per full sequence before online slicing.",
+    )
+    parser.add_argument(
+        "--eval_imu_noise_seed",
+        "--eval-imu-noise-seed",
+        type=int,
+        default=42,
+        help="Base seed for sequence-level noisy eval; sequence path is mixed in for stable per-sequence noise.",
+    )
     parser.add_argument("--interaction_human_source", type=str, default="pred", choices=["pred", "gt"])
     refine_group = parser.add_mutually_exclusive_group()
     refine_group.add_argument("--enable_ot_refine", dest="ot_refine", action="store_true", default=None)
@@ -519,6 +541,11 @@ def main() -> int:
         f"ot_obs_encoder={'zero' if args.ablate_ot_obs_encoder else 'normal'}"
     )
     print(f"Eval seed: {seed if seed is not None else 'unset'}")
+    print(
+        "Eval IMU noise: "
+        f"{'enabled' if args.eval_imu_noise else 'disabled'}"
+        + (f" | base_seed={args.eval_imu_noise_seed}" if args.eval_imu_noise else "")
+    )
 
     default_config = get_default_dataset_config(args.no_trans)
     try:
@@ -597,6 +624,7 @@ def main() -> int:
             simulate_imu_noise=False,
             min_obj_contact_frames=0,
             full_sequence=True,
+            resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", True),
         )
         if len(test_dataset) == 0:
             print(f"[BatchEval] Skipping '{dataset_name}' (dataset is empty).")
@@ -634,6 +662,8 @@ def main() -> int:
                 compute_fk=compute_fk,
                 refine_human=ot_refine,
                 sort_desc=not args.sort_asc,
+                eval_imu_noise=bool(args.eval_imu_noise),
+                eval_imu_noise_seed=args.eval_imu_noise_seed,
             )
 
         metric_model = IMUHOIModelCached(model, pred_cache, device).eval()
@@ -710,6 +740,8 @@ def main() -> int:
             "ablate_vc_boundary": bool(args.ablate_vc_boundary),
             "ablate_ot_obs_encoder": bool(args.ablate_ot_obs_encoder),
             "seed": seed,
+            "eval_imu_noise": bool(args.eval_imu_noise),
+            "eval_imu_noise_seed": args.eval_imu_noise_seed if args.eval_imu_noise else None,
             "results": all_results,
         }
         output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
