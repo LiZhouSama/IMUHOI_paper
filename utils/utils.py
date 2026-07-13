@@ -121,6 +121,10 @@ def load_checkpoint(model, checkpoint_path, device, strict=True, use_ema=True):
             state_dict = checkpoint['ema_state_dict']
         else:
             state_dict = checkpoint.get('module_state_dict', checkpoint.get('model_state_dict', checkpoint))
+    target_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+    validator = getattr(target_model, "validate_checkpoint_state_dict", None)
+    if callable(validator):
+        validator(state_dict)
     adapted_legacy = isinstance(state_dict, dict) and _maybe_adapt_legacy_velocity_contact(model, state_dict)
     if strict and adapted_legacy:
         print("检测到旧版VelocityContact结构漂移，自动使用兼容加载。")

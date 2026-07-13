@@ -150,193 +150,68 @@ def test_object_trans_loss_includes_refinement_terms():
     assert total.item() > 0
 
 
-def _small_prior_cfg(cond_mode_probs=None):
-    return SimpleNamespace(
-        imu_dim=9,
-        obj_imu_dim=9,
-        num_human_imus=6,
-        hidden_dim_multiplier=1,
-        interaction_code_dim=16,
-        prior_encoder_hidden_dim=32,
-        prior_encoder_layers=1,
-        prior_encoder_dropout=0.0,
-        dgcnn_k=4,
-        dgcnn_chunk_size=8,
-        cond_mode_probs=cond_mode_probs or [0.4, 0.4, 0.2],
-    )
-
-
-def _object_trans_prior_inputs(batch_size=2, seq_len=3, num_points=8, has_object=True):
-    eye = torch.eye(3).view(1, 1, 3, 3).expand(batch_size, seq_len, 3, 3)
-    obj_rot6d = eye[..., :2].reshape(batch_size, seq_len, 6).contiguous()
-    return {
-        "hand_pos": torch.randn(batch_size, seq_len, 2, 3),
-        "contact": torch.sigmoid(torch.randn(batch_size, seq_len, 3)),
-        "obj_trans_init": torch.randn(batch_size, 3),
-        "obj_imu": torch.cat((torch.randn(batch_size, seq_len, 3), obj_rot6d), dim=-1),
-        "human_imu": torch.randn(batch_size, seq_len, 6, 9),
-        "obj_vel": torch.randn(batch_size, seq_len, 3),
-        "pose": torch.randn(batch_size, seq_len, len(_REDUCED_POSE_NAMES) * 6),
-        "root": torch.randn(batch_size, seq_len, 3),
-        "obj_points": torch.randn(batch_size, num_points, 3),
-        "obj_rot": obj_rot6d,
-        "obj_trans": torch.randn(batch_size, seq_len, 3),
-        "obj_scale": torch.ones(batch_size, seq_len),
-        "has_object": torch.full((batch_size,), bool(has_object), dtype=torch.bool),
-    }
-
-
-def test_object_trans_interaction_prior_mesh_train_outputs_frame_codes():
-    torch.manual_seed(123)
-    model = ObjectTransModule(_small_prior_cfg(cond_mode_probs=[1.0, 0.0, 0.0])).train()
-    data = _object_trans_prior_inputs()
-
-    out = model(
-        data["hand_pos"],
-        data["contact"],
-        data["obj_trans_init"],
-        obj_imu=data["obj_imu"],
-        human_imu=data["human_imu"],
-        obj_vel_input=data["obj_vel"],
-        has_object_mask=data["has_object"],
-        human_pose_input=data["pose"],
-        root_trans_input=data["root"],
-        obj_points_canonical=data["obj_points"],
-        obj_rot_gt=data["obj_rot"],
-        obj_trans_gt=data["obj_trans"],
-        obj_scale_gt=data["obj_scale"],
-    )
-
-    aux = out["interaction_prior_aux"]
-    assert out["interaction_code"].shape == (2, 3, 16)
-    assert aux["mesh_code"].shape == (2, 3, 16)
-    assert aux["obs_code"].shape == (2, 3, 16)
-    assert bool((aux["mesh_valid_mask"] == 1).all())
-    assert bool((aux["mode"] == 0).all())
-    assert out["pred_obj_trans"].shape == (2, 3, 3)
-
-
-def test_object_trans_mesh_prior_does_not_require_gt_object_pose():
-    torch.manual_seed(127)
-    model = ObjectTransModule(_small_prior_cfg(cond_mode_probs=[1.0, 0.0, 0.0])).train()
-    data = _object_trans_prior_inputs()
-
-    out = model(
-        data["hand_pos"],
-        data["contact"],
-        data["obj_trans_init"],
-        obj_imu=data["obj_imu"],
-        human_imu=data["human_imu"],
-        obj_vel_input=data["obj_vel"],
-        has_object_mask=data["has_object"],
-        human_pose_input=data["pose"],
-        root_trans_input=data["root"],
-        obj_points_canonical=data["obj_points"],
-        obj_scale_gt=data["obj_scale"],
-    )
-
-    aux = out["interaction_prior_aux"]
-    assert bool((aux["mesh_valid_mask"] == 1).all())
-    assert bool((aux["mode"] == 0).all())
-
-
-def test_object_trans_interaction_prior_eval_uses_obs_without_mesh_gt():
-    torch.manual_seed(124)
-    model = ObjectTransModule(_small_prior_cfg(cond_mode_probs=[1.0, 0.0, 0.0])).eval()
-    data = _object_trans_prior_inputs()
+def test_object_trans_uses_one_shared_predictor_and_returns_raw_outputs():
+    cfg = SimpleNamespace(imu_dim=9, obj_imu_dim=9, num_human_imus=6, hidden_dim_multiplier=1)
+    model = ObjectTransModule(cfg).eval()
+    batch_size, seq_len = 2, 3
+    obj_imu = torch.zeros(batch_size, seq_len, 9)
+    obj_imu[..., 3:9] = torch.eye(3)[:, :2].reshape(6)
 
     with torch.no_grad():
         out = model(
-            data["hand_pos"],
-            data["contact"],
-            data["obj_trans_init"],
-            obj_imu=data["obj_imu"],
-            human_imu=data["human_imu"],
-            obj_vel_input=data["obj_vel"],
-            has_object_mask=data["has_object"],
-            human_pose_input=data["pose"],
-            root_trans_input=data["root"],
+            torch.randn(batch_size, seq_len, 2, 3),
+            torch.sigmoid(torch.randn(batch_size, seq_len, 3)),
+            torch.randn(batch_size, 3),
+            obj_imu=obj_imu,
+            human_imu=torch.randn(batch_size, seq_len, 6, 9),
+            obj_vel_input=torch.randn(batch_size, seq_len, 3),
         )
 
-    aux = out["interaction_prior_aux"]
-    assert out["interaction_code"].shape == (2, 3, 16)
-    assert bool((aux["mode"] == 1).all())
-    assert torch.allclose(aux["mesh_code"], torch.zeros_like(aux["mesh_code"]))
+    assert hasattr(model, "object_trans_head")
+    assert not hasattr(model, "lhand_fk_head")
+    assert not hasattr(model, "rhand_fk_head")
+    assert not hasattr(model, "gating_head")
+    assert not hasattr(model, "mesh_prior_encoder")
+    assert not hasattr(model, "obs_encoder")
+    assert out["lhand_fk_out"].shape == (batch_size, seq_len, 4)
+    assert out["rhand_fk_out"].shape == (batch_size, seq_len, 4)
+    assert out["gate_logits"].shape == (batch_size, seq_len, 4)
+    assert torch.allclose(torch.softmax(out["gate_logits"], dim=-1), out["gating_weights"])
 
 
-def test_object_trans_interaction_prior_mesh_missing_falls_back_to_obs():
-    torch.manual_seed(125)
-    model = ObjectTransModule(_small_prior_cfg(cond_mode_probs=[1.0, 0.0, 0.0])).train()
-    data = _object_trans_prior_inputs()
+def test_object_trans_rejects_legacy_checkpoint_architecture():
+    model = ObjectTransModule(SimpleNamespace(imu_dim=9, obj_imu_dim=9, num_human_imus=6))
+    model.validate_checkpoint_state_dict(model.state_dict())
 
-    out = model(
-        data["hand_pos"],
-        data["contact"],
-        data["obj_trans_init"],
-        obj_imu=data["obj_imu"],
-        human_imu=data["human_imu"],
-        obj_vel_input=data["obj_vel"],
-        has_object_mask=data["has_object"],
-        human_pose_input=data["pose"],
-        root_trans_input=data["root"],
-    )
-
-    aux = out["interaction_prior_aux"]
-    assert bool((aux["mesh_valid_mask"] == 0).all())
-    assert bool((aux["mode"] == 1).all())
+    try:
+        model.validate_checkpoint_state_dict({"lhand_fk_head.linear1.weight": torch.zeros(1)})
+    except ValueError as exc:
+        assert "removed mesh/obs or three-head architecture" in str(exc)
+    else:
+        raise AssertionError("legacy ObjectTrans checkpoint must be rejected")
 
 
-def test_object_trans_interaction_prior_no_object_forces_null_code():
-    torch.manual_seed(126)
-    model = ObjectTransModule(_small_prior_cfg(cond_mode_probs=[0.0, 1.0, 0.0])).train()
-    data = _object_trans_prior_inputs(has_object=False)
-
-    out = model(
-        data["hand_pos"],
-        data["contact"],
-        data["obj_trans_init"],
-        obj_imu=data["obj_imu"],
-        human_imu=data["human_imu"],
-        obj_vel_input=data["obj_vel"],
-        has_object_mask=data["has_object"],
-        human_pose_input=data["pose"],
-        root_trans_input=data["root"],
-        obj_points_canonical=data["obj_points"],
-        obj_rot_gt=data["obj_rot"],
-        obj_trans_gt=data["obj_trans"],
-        obj_scale_gt=data["obj_scale"],
-    )
-
-    aux = out["interaction_prior_aux"]
-    assert bool((aux["mode"] == 2).all())
-    assert torch.allclose(out["interaction_code"], torch.zeros_like(out["interaction_code"]))
-
-
-def test_object_trans_loss_interaction_code_align_term():
-    batch_size, seq_len, code_dim = 2, 3, 4
+def test_object_trans_loss_uses_gate_logits_when_available():
+    batch_size, seq_len = 1, 2
     batch = {
         "human_imu": torch.zeros(batch_size, seq_len, 6, 9),
         "has_object": torch.ones(batch_size, dtype=torch.bool),
         "obj_trans": torch.zeros(batch_size, seq_len, 3),
     }
+    gate_logits = torch.tensor([[[4.0, 0.0, 0.0, 0.0], [4.0, 0.0, 0.0, 0.0]]])
     pred = {
         "pred_obj_trans": torch.zeros(batch_size, seq_len, 3),
-        "interaction_prior_aux": {
-            "obs_code": torch.zeros(batch_size, seq_len, code_dim),
-            "mesh_code": torch.ones(batch_size, seq_len, code_dim),
-            "mesh_valid_mask": torch.tensor([True, False]),
-            "sample_has_object": torch.ones(batch_size, dtype=torch.bool),
-        },
+        "gate_logits": gate_logits,
+        "gating_weights": torch.tensor([[[0.0, 1.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]]),
+        "gating_contact_prob": torch.tensor([[[1.0, 0.0, 1.0], [1.0, 0.0, 1.0]]]),
     }
 
-    loss_fn = ObjectTransLoss(weights={"obj_trans": 0.0})
-    _, losses, weighted = loss_fn(pred, batch, torch.device("cpu"))
-    assert losses["interaction_code_align"].item() > 0
-    assert weighted["interaction_code_align"].item() > 0
-
-    pred_without_aux = {"pred_obj_trans": torch.zeros(batch_size, seq_len, 3)}
-    _, losses_no_aux, _ = loss_fn(pred_without_aux, batch, torch.device("cpu"))
-    assert losses_no_aux["interaction_code_align"].item() == 0
+    loss_fn = ObjectTransLoss(
+        weights={"obj_trans": 0.0, "gate_weak": 1.0, "gate_weak_target_smoothing": 0.0}
+    )
+    _, losses, _ = loss_fn(pred, batch, torch.device("cpu"))
+    expected = -torch.log_softmax(gate_logits, dim=-1)[..., 0].mean()
+    assert torch.allclose(losses["gate_weak"], expected)
 
 
 def test_object_trans_test_loss_records_obj_trans():
@@ -431,7 +306,7 @@ def test_velocity_contact_focal_binary_mask_denominator_expands_to_loss_shape():
     assert torch.allclose(loss, expected, atol=1e-6)
 
 
-def test_build_model_input_dict_passes_object_prior_fields():
+def test_build_model_input_dict_preserves_object_metadata_fields():
     cfg = SimpleNamespace(
         num_human_imus=6,
         imu_dim=9,

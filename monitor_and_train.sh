@@ -25,10 +25,8 @@ else
 
     python train/rnn/train_object_trans.py \
         --vc_ckpt outputs/IMUHOI_RNN_2/velocity_contact_vc_boundary_zero_06211816 \
-        --ot_ckpt outputs/IMUHOI_RNN_2/object_trans_vc_boundary_zero_ot_obs_encoder_zero_06222248 \
         --joint_train \
         --ablate_vc_boundary \
-        --ablate_ot_obs_encoder \
         --batch_size 40 \
         --epochs 100 \
         --lr 0.0002

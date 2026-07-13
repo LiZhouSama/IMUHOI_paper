@@ -59,6 +59,7 @@ def get_base_args():
     parser.add_argument('--seed', type=int, default=10, help='随机种子')
     parser.add_argument('--batch_size', type=int, default=None, help='批量大小')
     parser.add_argument('--epochs', type=int, default=None, help='训练轮数')
+    parser.add_argument('--num_workers', type=int, default=None, help='DataLoader worker 数；Docker 大数据预加载可设为 0')
     parser.add_argument('--lr', type=float, default=None, help='学习率（优先于配置文件）')
     parser.add_argument('--pretrained_ckpt', type=str, default=None, help='预训练权重路径')
     parser.add_argument('--resume_dir', type=str, default=None, help='从已有训练输出目录恢复训练')
@@ -124,6 +125,8 @@ def merge_config(args):
         cfg.batch_size = args.batch_size
     if args.epochs is not None:
         cfg.epochs = args.epochs
+    if args.num_workers is not None:
+        cfg.num_workers = max(0, int(args.num_workers))
     if args.lr is not None:
         cfg.lr = args.lr
     if args.pretrained_ckpt is not None or not hasattr(cfg, 'pretrained_ckpt'):
@@ -240,7 +243,7 @@ def create_dataloaders(cfg, project_root=None):
         raise ValueError("训练数据路径不存在")
     
     print(f"训练数据路径: {train_paths}")
-    resolve_bimanual_contact_conflicts = bool(getattr(cfg, "resolve_bimanual_contact_conflicts", True))
+    resolve_bimanual_contact_conflicts = bool(getattr(cfg, "resolve_bimanual_contact_conflicts", False))
     
     train_dataset = IMUDataset(
         data_dir=train_paths,
@@ -405,6 +408,10 @@ def load_model_state_from_checkpoint(model, checkpoint, strict=False, state_key=
     state_dict = _select_state_dict(checkpoint, key=state_key)
     if not isinstance(state_dict, dict):
         raise ValueError(f"Checkpoint does not contain a valid state_dict for {name}.")
+    target_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+    validator = getattr(target_model, "validate_checkpoint_state_dict", None)
+    if callable(validator):
+        validator(state_dict)
     load_state_dict_flexible(model, state_dict, strict=strict, name=name)
 
 

@@ -27,10 +27,27 @@ class RNN(nn.Module):
         self.linear2 = nn.Linear(n_hidden * self.num_directions, n_output)
         self.dropout = nn.Dropout(dropout)
 
+    def encode_input(self, x):
+        """Project raw features into the LSTM input space."""
+        return self.dropout(F.relu(self.linear1(x)))
+
+    def forward_with_state(self, x, state=None):
+        """Run a sequence and return both decoded output and LSTM state."""
+        x = self.encode_input(x)
+        output, state = self.rnn(x, state)
+        return self.linear2(output), state
+
+    def step(self, x, state=None):
+        """Run exactly one causal frame and keep the resulting LSTM state."""
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        if x.dim() != 3 or x.shape[1] != 1:
+            raise ValueError(f"RNN.step expects [B,D] or [B,1,D], got {tuple(x.shape)}")
+        output, state = self.forward_with_state(x, state=state)
+        return output[:, 0], state
+
     def forward(self, x, h=None):
-        x = self.dropout(F.relu(self.linear1(x)))
-        output, _ = self.rnn(x, h)
-        output = self.linear2(output)
+        output, _ = self.forward_with_state(x, h)
         return output
 
     def inference(self, x, h=None, inference_mode: str = "offline", **_):
@@ -53,9 +70,9 @@ class RNNWithInit(RNN):
             nn.Linear(n_hidden * n_rnn_layer, 2 * num_directions * n_rnn_layer * n_hidden),
         )
 
-    def forward(self, inputs, _=None):
-        x, x_init = inputs
-        batch_size = x.shape[0]
+    def initial_state(self, x_init):
+        """Construct the learned initial `(h, c)` state from sequence metadata."""
+        batch_size = x_init.shape[0]
         num_directions = self.num_directions
         nd = self.n_rnn_layer * num_directions
         nh = self.n_hidden
@@ -63,7 +80,19 @@ class RNNWithInit(RNN):
         init = self.init_net(x_init).view(batch_size, 2, nd, nh)
         h0 = init[:, 0].permute(1, 0, 2).contiguous()
         c0 = init[:, 1].permute(1, 0, 2).contiguous()
-        return super().forward(x, (h0, c0))
+        return h0, c0
+
+    def forward_with_state(self, x, x_init=None, state=None):
+        if state is None:
+            if x_init is None:
+                raise ValueError("RNNWithInit.forward_with_state requires x_init when state is None")
+            state = self.initial_state(x_init)
+        return super().forward_with_state(x, state)
+
+    def forward(self, inputs, _=None):
+        x, x_init = inputs
+        output, _ = self.forward_with_state(x, x_init=x_init)
+        return output
 
     def inference(self, inputs, _=None, inference_mode: str = "offline", **__):
         mode = normalize_inference_mode(inference_mode)

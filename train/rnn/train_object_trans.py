@@ -71,8 +71,20 @@ def get_args():
                         help='Stage3训练完成后，自动在同一输出目录进行ObjectTrans + VelocityContact联合训练')
     parser.add_argument('--ablate_vc_boundary', action='store_true', default=None,
                         help='训练时将VelocityContact boundary输出置零')
-    parser.add_argument('--ablate_ot_obs_encoder', action='store_true', default=None,
-                        help='训练时将ObjectTrans obs_encoder输出置零')
+    parser.add_argument(
+        '--object_trans_state_feedback', '--object-trans-state-feedback',
+        dest='object_trans_state_feedback',
+        choices=['none', 'fused'],
+        default=None,
+        help='覆盖 OT 融合状态反馈开关；none=shared-head无反馈，fused=显式OT state feedback',
+    )
+    parser.add_argument(
+        '--object_trans_online_mode', '--object-trans-online-mode',
+        dest='object_trans_online_mode',
+        choices=['window', 'stateful'],
+        default=None,
+        help='记录到本次配置快照的 OT online 评测模式；训练本身始终使用完整序列扫描',
+    )
 	    
     return parser.parse_args()
 
@@ -381,10 +393,6 @@ class Stage3JointTrainer:
             has_object_mask=data_dict['has_object'],
             human_pose_input=human_pose_input,
             root_trans_input=root_trans_input,
-            obj_points_canonical=data_dict.get('obj_points_canonical'),
-            obj_rot_gt=data_dict.get('obj_rot_gt'),
-            obj_trans_gt=data_dict.get('obj_trans_gt'),
-            obj_scale_gt=data_dict.get('obj_scale_gt'),
             enable_refine=getattr(self.cfg, "enable_ot_refine", False),
             inference_mode="offline",
         )
@@ -723,13 +731,14 @@ def main():
         if args.ablate_vc_boundary is not None
         else bool(getattr(cfg, "ablate_vc_boundary", False))
     )
-    cfg.ablate_ot_obs_encoder = (
-        bool(args.ablate_ot_obs_encoder)
-        if args.ablate_ot_obs_encoder is not None
-        else bool(getattr(cfg, "ablate_ot_obs_encoder", False))
-    )
-    if cfg.ablate_ot_obs_encoder:
-        cfg.cond_mode_probs = [0.0, 1.0, 0.0]
+    if args.object_trans_state_feedback is not None:
+        cfg.object_trans_state_feedback = args.object_trans_state_feedback == 'fused'
+    elif not hasattr(cfg, 'object_trans_state_feedback'):
+        cfg.object_trans_state_feedback = False
+    if args.object_trans_online_mode is not None:
+        cfg.object_trans_online_mode = args.object_trans_online_mode
+    elif not hasattr(cfg, 'object_trans_online_mode'):
+        cfg.object_trans_online_mode = 'window'
     auto_joint_train = bool(args.joint_train) or bool(getattr(cfg, "joint_train", False))
     base_train_lr = float(cfg.lr)
     cfg.joint_train = auto_joint_train
@@ -741,8 +750,6 @@ def main():
     ablation_suffix = ""
     if cfg.ablate_vc_boundary:
         ablation_suffix += "_vc_boundary_zero"
-    if cfg.ablate_ot_obs_encoder:
-        ablation_suffix += "_ot_obs_encoder_zero"
     module_name = f"{module_name}{ablation_suffix}"
     save_dir = create_save_dir(cfg, module_name)
     save_config_snapshot(cfg)
@@ -757,7 +764,15 @@ def main():
     print(f"训练轮数: {cfg.epochs}")
     print(f"noTrans模式: {cfg.no_trans}")
     print(f"VC boundary ablation: {'enabled' if cfg.ablate_vc_boundary else 'disabled'}")
-    print(f"OT obs_encoder ablation: {'enabled' if cfg.ablate_ot_obs_encoder else 'disabled'}")
+    print(
+        "OT state feedback: "
+        f"{'enabled' if bool(getattr(cfg, 'object_trans_state_feedback', False)) else 'disabled'}"
+    )
+    print(
+        "OT online mode snapshot: "
+        f"{getattr(cfg, 'object_trans_online_mode', 'window')} "
+        "(Stage3/joint training always scans complete training windows)"
+    )
     print(f"保存目录: {save_dir}")
     print("=" * 50)
     

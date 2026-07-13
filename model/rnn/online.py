@@ -20,8 +20,6 @@ _SEQUENCE_LENGTH_KEYS = (
     "pred_hand_contact_prob",
     "pred_obj_vel",
     "pred_obj_trans",
-    "interaction_code",
-    "obs_code",
 )
 
 

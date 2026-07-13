@@ -22,13 +22,13 @@ boundary_group_hidden: 64
 boundary_hidden_dim: 128
 
 hidden_dim_multiplier: 1
-interaction_code_dim: 128
-prior_encoder_hidden_dim: 256
-prior_encoder_layers: 2
-prior_encoder_dropout: 0.1
+object_trans_hidden_dim: 192
+object_trans_num_layers: 2
+object_trans_dropout: 0.2
+object_trans_state_feedback: false
+object_trans_feedback_hidden_dim: 64
+object_trans_online_mode: "window"  # window | stateful
 mesh_downsample_points: 256
-dgcnn_k: 16
-cond_mode_probs: [0.4, 0.4, 0.2]  # mesh/obs/null, obs-only warmup
 enable_ot_refine: true
 
 # ============ 训练超参数 ============
@@ -36,7 +36,7 @@ epochs: 300
 joint_train_epochs: 100
 input_mix_start_epoch: 0
 input_mix_end_epoch: 30  # 0 means use predicted HP/VC inputs from epoch 0
-batch_size: 200 # ot:40
+batch_size: 100 # ot:40
 lr: 0.002 # jt:0.0002
 weight_decay: 0.0001
 milestones: [100, 200, 300, 350, 400, 450, 500]
@@ -58,7 +58,7 @@ obj_imu_acc_noise_std: 0.2
 obj_imu_rot_noise_std: 0.005
 
 # ============ 数据加载后处理 ============
-resolve_bimanual_contact_conflicts: true
+resolve_bimanual_contact_conflicts: false
 
 # ============ 评估超参数 ============
 hand_contact_threshold: 0.15
@@ -73,22 +73,27 @@ datasets:
     train_path: "process/processed_split_data_OMOMO_bps/train"
     test_path: "process/processed_split_data_OMOMO_bps/test"
     debug_path: "process/processed_split_data_OMOMO_bps/debug"
+    object_geo_root: "datasets/OMOMO/captured_objects"
   imhd:
     train_path: "process/processed_seg_data_IMHD_bps/train"
     test_path: "process/processed_seg_data_IMHD_bps/test"
     debug_path: "process/processed_seg_data_IMHD_bps/debug"
+    object_geo_root: "datasets/IMHD/IMHD Dataset/object_templates"
   behave:
     train_path: "process/processed_seg_data_BEHAVE_bps/train"
     test_path: "process/processed_seg_data_BEHAVE_bps/test"
     debug_path: "process/processed_seg_data_BEHAVE_bps/debug"
+    object_geo_root: "datasets/BEHAVE/objects"
   pahoi:
     train_path: "process/processed_seg_data_PAHOI_bps/train"
     test_path: "process/processed_seg_data_PAHOI_bps/test"
     debug_path: "process/processed_seg_data_PAHOI_bps/debug"
+    object_geo_root: "datasets/PAHOI/Object_mesh"
   hodome:
     train_path: "process/processed_seg_data_HODOME_bps/train"
     test_path: "process/processed_seg_data_HODOME_bps/test"
     debug_path: "process/processed_seg_data_HODOME_bps/debug"
+    object_geo_root: "datasets/HODome/scaned_object"
 
 # ============ 损失权重 ============
 loss_weights:
@@ -126,7 +131,6 @@ loss_weights:
   obj_acc_cons: 0.00001
   gate_weak: 0.05
   gate_weak_target_smoothing: 0.1
-  interaction_code_align: 0.1
   refine_pose: 100
   refine_root_trans: 10
 
@@ -140,9 +144,9 @@ test:
 # ============ 预训练模块路径（可选）============
 pretrained_modules:
   human_pose: "outputs/IMUHOI_RNN_2/human_pose_06301344_seq_20260630_134410/best.pt"
-  velocity_contact: "outputs/IMUHOI_RNN_2/joint_train_06302238_seq_20260630_134410/best_velocity_contact.pt"
-  object_trans: "outputs/IMUHOI_RNN_2/joint_train_06302238_seq_20260630_134410/best_object_trans.pt"
+  velocity_contact: "outputs/IMUHOI_RNN_2/velocity_contact_06301534_seq_20260630_134410/best.pt"
+  # ObjectTrans v2 uses a shared prediction head and must be trained from scratch.
+  object_trans: null
 
   # human_pose: "outputs/IMUHOI_rnn/joint_train_01112057/best_human_pose.pt"
   # velocity_contact: "outputs/IMUHOI_rnn/joint_train_01112057/best_velocity_contact.pt"
-  # object_trans: "outputs/IMUHOI_rnn/joint_train_01112057/best_object_trans.pt"

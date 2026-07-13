@@ -16,8 +16,6 @@ from tqdm import tqdm
 CASES = (
     ("baseline", ()),
     ("vc_boundary_zero", ("--ablate_vc_boundary",)),
-    ("ot_obs_encoder_zero", ("--ablate_ot_obs_encoder",)),
-    ("vc_boundary_zero_ot_obs_encoder_zero", ("--ablate_vc_boundary", "--ablate_ot_obs_encoder")),
 )
 
 LOG_PROGRESS_RE = re.compile(r"(Evaluating|预加载和收集信息):\s*(\d+)%\|.*?\|\s*([0-9]+)/([0-9]+)")

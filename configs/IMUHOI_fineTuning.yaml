@@ -95,7 +95,7 @@ obj_imu_acc_noise_std: 0.3
 obj_imu_rot_noise_std: 0.3
 
 # ============ 数据加载后处理 ============
-resolve_bimanual_contact_conflicts: true
+resolve_bimanual_contact_conflicts: false
 
 # ============ 物体参数 ============
 obj_imu_change_threshold: 0.1
@@ -113,18 +113,22 @@ datasets:
     train_path: "process/processed_amass_data_0703/train"
     test_path: "process/processed_amass_data_0703/test"
     debug_path: "process/processed_amass_data_0703/debug"
+    object_geo_root: null
   omomo:
     train_path: "process/processed_split_data_OMOMO/train"
     test_path: "process/processed_split_data_OMOMO/test"
     debug_path: "process/processed_split_data_OMOMO/debug"
+    object_geo_root: "datasets/OMOMO/captured_objects"
   imhd:
     train_path: "process/processed_seg_data_IMHD/train"
     test_path: "process/processed_seg_data_IMHD/test"
     debug_path: "process/processed_seg_data_IMHD/debug"
+    object_geo_root: "datasets/IMHD/IMHD Dataset/object_templates"
   behave:
     train_path: "process/processed_seg_data_BEHAVE/train"
     test_path: "process/processed_seg_data_BEHAVE/test"
     debug_path: "process/processed_seg_data_BEHAVE/debug"
+    object_geo_root: "datasets/BEHAVE/objects"
 
 # ============ 损失权重 ============
 loss_weights:

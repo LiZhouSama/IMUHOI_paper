@@ -1131,7 +1131,7 @@ def main():
             debug=dataset_debug,
             simulate_imu_noise=False,
             full_sequence=True,
-            resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", True),
+            resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", False),
         )
     elif os.path.isfile(test_data_input) and test_data_input.lower().endswith(".pt"):
         target_pt = os.path.normcase(os.path.normpath(os.path.abspath(test_data_input)))
@@ -1145,7 +1145,7 @@ def main():
             full_sequence=True,
             simulate_imu_noise=False,
             sequence_paths=[target_pt],
-            resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", True),
+            resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", False),
         )
         if len(test_dataset.sequence_info) != 1:
             try:

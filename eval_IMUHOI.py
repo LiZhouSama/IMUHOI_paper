@@ -39,6 +39,7 @@ except Exception:
 
 from dataset.dataset_IMUHOI import IMUDataset
 from model import IMUHOIModel, load_model
+from utils.dataset_config import get_dataset_configs, resolve_dataset_path
 from utils.utils import (
     load_config,
     load_smpl_model,
@@ -53,77 +54,23 @@ from configs import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-PROCESS_ROOT = PROJECT_ROOT / "process"
-OUTPUT_ROOT = PROJECT_ROOT / "outputs"
 
 
-def get_default_dataset_config(no_trans: bool = False):
-    """获取默认数据集配置"""
-    # 保留 no_trans 参数用于与旧接口兼容
-
-    return {
-        # "processed_seg_data_BEHAVE": {
-        #     "data_dir": PROCESS_ROOT / "processed_split_data_BEHAVE_bps" ,
-        #     "modules": {
-        #         "velocity_contact": output_path / "behave" / "modules" / "velocity_contact_best.pt",
-        #         "human_pose": output_path / "behave" / "modules" / "human_pose_best.pt",
-        #         "object_trans": output_path / "behave" / "modules" / "object_trans_best.pt",
-        #     },
-        # },
-        # "processed_seg_data_IMHD": {
-        #     "data_dir": PROCESS_ROOT / "processed_seg_data_IMHD" / "test",
-        #     "modules": {
-        #         "velocity_contact": output_path / "imhd" / "modules" / "velocity_contact_best.pt",
-        #         "human_pose": output_path / "imhd" / "modules" / "human_pose_best.pt",
-        #         "object_trans": output_path / "imhd" / "modules" / "object_trans_best.pt",
-        #     },
-        # },
-        "processed_split_data_OMOMO": {
-            "data_dir": PROCESS_ROOT / "processed_split_data_OMOMO_bps" / "test",
-            # 默认不覆盖checkpoint路径，优先使用 config.pretrained_modules。
-            # 如需按数据集指定权重，可添加 modules 字段，例如：
-            # "modules": {
-            #     "human_pose": ".../human_pose/best.pt",
-            #     "interaction": ".../interaction/best.pt",
-            # }
-        # },
-        # "processed_split_data_HODOME": {
-        #     "data_dir": PROCESS_ROOT / "processed_split_data_HODOME" / "test",
-            # "modules": {
-            #     "velocity_contact": output_path / "behave" / "modules" / "velocity_contact_best.pt",
-            #     "human_pose": output_path / "behave" / "modules" / "human_pose_best.pt",
-            #     "object_trans": output_path / "behave" / "modules" / "object_trans_best.pt",
-            # },
-        # "processed_split_data_PAHOI": {
-        #     "data_dir": PROCESS_ROOT / "processed_split_data_PAHOI" / "test",
-            # "modules": {
-            #     "velocity_contact": output_path / "behave" / "modules" / "velocity_contact_best.pt",
-            #     "human_pose": output_path / "behave" / "modules" / "human_pose_best.pt",
-            #     "object_trans": output_path / "behave" / "modules" / "object_trans_best.pt",
-            # },
-        },
-    }
-
-
-
-
-def _select_path(override: Optional[str], default_path: Path) -> Path:
-    path = Path(override).expanduser() if override else default_path
-    if not path.is_absolute():
-        path = (Path.cwd() / path).resolve()
-    else:
-        path = path.resolve()
-    return path
+def get_default_dataset_config(no_trans: bool = False, config=None):
+    """Load dataset evaluation settings from the YAML ``datasets`` section."""
+    del no_trans  # Kept for compatibility with legacy diagnostic callers.
+    if config is None:
+        config = load_config(str(PROJECT_ROOT / "configs" / "IMUHOI_train_rnn.yaml"))
+    return get_dataset_configs(config)
 
 
 def _build_dataset_runs(args: argparse.Namespace, default_config: dict):
     runs = []
     if args.dataset:
+        if args.dataset not in default_config:
+            valid = ", ".join(sorted(default_config))
+            raise ValueError(f"Unknown dataset '{args.dataset}'. Valid datasets: {valid}")
         runs.append((args.dataset, copy.deepcopy(default_config[args.dataset])))
-        return runs
-    if args.test_data_dir:
-        run_cfg = {"data_dir": Path(args.test_data_dir).expanduser()}
-        runs.append(("custom", run_cfg))
         return runs
     for name, cfg in default_config.items():
         runs.append((name, copy.deepcopy(cfg)))
@@ -833,9 +780,8 @@ def evaluate_model(
 def main():
     parser = argparse.ArgumentParser(description="Evaluate IMUHOI Model")
     parser.add_argument("--config", type=str, default="configs/IMUHOI_train_rnn.yaml", help="配置文件路径")
-    parser.add_argument("--dataset", type=str, default=None, help="数据集名称")
+    parser.add_argument("--dataset", type=str, default="omomo", help="数据集名称（默认：omomo）")
     parser.add_argument("--smpl_model_path", type=str, default="datasets/smpl_models/smplh/male/model.npz", help="SMPL模型路径")
-    parser.add_argument("--test_data_dir", type=str, default=None, help="测试数据目录")
     parser.add_argument("--num_workers", type=int, default=12, help="DataLoader workers")
     parser.add_argument("--no_trans", action="store_true", help="使用noTrans模式")
     parser.add_argument("--no_eval_objects", action="store_true", help="跳过物体相关指标")
@@ -849,8 +795,23 @@ def main():
     parser.add_argument("--object_contact_threshold", type=float, default=None, help="物体接触评估阈值")
     parser.add_argument("--inference_mode", "--inference-mode", choices=["online", "offline"], default="online", help="RNN inference mode")
     parser.add_argument("--online_window", "--online-window", type=int, default=None, help="RNN online sliding window size")
+    parser.add_argument(
+        "--object_trans_state_feedback",
+        "--object-trans-state-feedback",
+        dest="object_trans_state_feedback",
+        choices=["none", "fused"],
+        default=None,
+        help="覆盖 OT 融合状态反馈开关；none=shared-head无反馈，fused=显式OT state feedback",
+    )
+    parser.add_argument(
+        "--object_trans_online_mode",
+        "--object-trans-online-mode",
+        dest="object_trans_online_mode",
+        choices=["window", "stateful"],
+        default=None,
+        help="覆盖 ObjectTrans online 运行方式",
+    )
     parser.add_argument("--ablate_vc_boundary", action="store_true", help="将RNN VC boundary输出置零，用于消融人体pose先验")
-    parser.add_argument("--ablate_ot_obs_encoder", action="store_true", help="将RNN OT obs_encoder输出置零，用于消融物体mesh/人体pose观测先验")
     parser.add_argument("--output_json", type=str, default=None, help="可选：保存评估结果JSON")
     parser.add_argument("--seed", type=int, default=None, help="可选：固定评估随机种子，用于可复现实验")
     parser.add_argument(
@@ -882,29 +843,44 @@ def main():
     print(f"Interaction human source: {args.interaction_human_source}")
     print(f"Inference mode: {args.inference_mode} | online_window: {args.online_window or 'config/default'}")
     print(
+        "OT overrides: "
+        f"state_feedback={args.object_trans_state_feedback or 'config'} | "
+        f"online_mode={args.object_trans_online_mode or 'config'}"
+    )
+    print(
         "Ablations: "
-        f"vc_boundary={'zero' if args.ablate_vc_boundary else 'normal'} | "
-        f"ot_obs_encoder={'zero' if args.ablate_ot_obs_encoder else 'normal'}"
+        f"vc_boundary={'zero' if args.ablate_vc_boundary else 'normal'}"
     )
     seed = _set_eval_seed(args.seed)
     print(f"Eval seed: {seed if seed is not None else 'unset'}")
 
-    default_config = get_default_dataset_config(args.no_trans)
-
     try:
+        config_for_dataset_lookup = load_config(args.config)
+        default_config = get_default_dataset_config(config=config_for_dataset_lookup)
         dataset_runs = _build_dataset_runs(args, default_config)
     except Exception as exc:
         print(f"[Eval] Argument error: {exc}")
         return
 
     all_results = {}
+    effective_ot_state_feedback = None
+    effective_ot_online_mode = None
     for dataset_name, dataset_cfg in dataset_runs:
         print(f"\n=== Evaluating dataset: {dataset_name} ===")
         config = load_config(args.config)
         if args.model_arch is not None:
             config.model_arch = args.model_arch
+        if args.object_trans_state_feedback is not None:
+            config.object_trans_state_feedback = args.object_trans_state_feedback == "fused"
+        elif not hasattr(config, "object_trans_state_feedback"):
+            config.object_trans_state_feedback = False
+        if args.object_trans_online_mode is not None:
+            config.object_trans_online_mode = args.object_trans_online_mode
+        elif not hasattr(config, "object_trans_online_mode"):
+            config.object_trans_online_mode = "window"
+        effective_ot_state_feedback = bool(getattr(config, "object_trans_state_feedback", False))
+        effective_ot_online_mode = str(getattr(config, "object_trans_online_mode", "window"))
         config.ablate_vc_boundary = bool(args.ablate_vc_boundary)
-        config.ablate_ot_obs_encoder = bool(args.ablate_ot_obs_encoder)
         ot_refine = (
             bool(args.ot_refine)
             if args.ot_refine is not None
@@ -971,17 +947,16 @@ def main():
                     "仅评估 VC 产生的 contact 和 obj_vel/IMU object baseline。"
                 )
 
-        data_dir_default = dataset_cfg.get("data_dir")
-        if data_dir_default is None and not args.test_data_dir:
+        data_dir_default = dataset_cfg.get("test_path") or dataset_cfg.get("data_dir")
+        if data_dir_default is None:
             print(f"[Eval] Skipping '{dataset_name}' (no dataset directory configured).")
             continue
 
-        base_data_path = data_dir_default
-        if base_data_path is None and args.test_data_dir:
-            base_data_path = Path(args.test_data_dir).expanduser()
-
-        data_override = args.test_data_dir if args.dataset else None
-        data_path = _select_path(data_override, base_data_path)
+        try:
+            data_path = resolve_dataset_path(data_dir_default, PROJECT_ROOT)
+        except ValueError as exc:
+            print(f"[Eval] Skipping '{dataset_name}': {exc}")
+            continue
 
         if not data_path.exists():
             print(f"[Eval] Skipping '{dataset_name}' (data not found at {data_path}).")
@@ -997,7 +972,7 @@ def main():
             simulate_imu_noise=False,
             min_obj_contact_frames=0,
             full_sequence=True,
-            resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", True),
+            resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", False),
         )
 
         if len(test_dataset) == 0:
@@ -1104,8 +1079,11 @@ def main():
             "config": args.config,
             "inference_mode": args.inference_mode,
             "online_window": args.online_window,
+            "object_trans_state_feedback": effective_ot_state_feedback,
+            "object_trans_online_mode": effective_ot_online_mode,
+            "object_trans_state_feedback_override": args.object_trans_state_feedback,
+            "object_trans_online_mode_override": args.object_trans_online_mode,
             "ablate_vc_boundary": bool(args.ablate_vc_boundary),
-            "ablate_ot_obs_encoder": bool(args.ablate_ot_obs_encoder),
             "seed": seed,
             "results": all_results,
         }

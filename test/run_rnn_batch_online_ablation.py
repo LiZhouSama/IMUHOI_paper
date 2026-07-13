@@ -16,8 +16,6 @@ from tqdm import tqdm
 CASES = (
     "baseline",
     "vc_boundary_zero",
-    "ot_obs_encoder_zero",
-    "vc_boundary_zero_ot_obs_encoder_zero",
 )
 
 LOG_PROGRESS_RE = re.compile(
@@ -191,22 +189,6 @@ def _case_flags(args: argparse.Namespace, case_name: str) -> List[str]:
             flags.extend(["--object_trans_ckpt", args.baseline_ot_ckpt])
         return flags
 
-    if case_name == "ot_obs_encoder_zero":
-        flags.append("--ablate_ot_obs_encoder")
-        if args.baseline_vc_ckpt:
-            flags.extend(["--velocity_contact_ckpt", args.baseline_vc_ckpt])
-        if args.ot_obs_encoder_zero_ot_ckpt:
-            flags.extend(["--object_trans_ckpt", args.ot_obs_encoder_zero_ot_ckpt])
-        return flags
-
-    if case_name == "vc_boundary_zero_ot_obs_encoder_zero":
-        flags.extend(["--ablate_vc_boundary", "--ablate_ot_obs_encoder"])
-        if args.double_vc_ckpt:
-            flags.extend(["--velocity_contact_ckpt", args.double_vc_ckpt])
-        if args.double_ot_ckpt:
-            flags.extend(["--object_trans_ckpt", args.double_ot_ckpt])
-        return flags
-
     raise ValueError(f"Unknown case: {case_name}")
 
 
@@ -214,12 +196,6 @@ def _validate_case_ckpts(args: argparse.Namespace) -> None:
     missing = []
     if not args.vc_boundary_zero_vc_ckpt:
         missing.append("--vc_boundary_zero_vc_ckpt")
-    if not args.ot_obs_encoder_zero_ot_ckpt:
-        missing.append("--ot_obs_encoder_zero_ot_ckpt")
-    if not args.double_vc_ckpt:
-        missing.append("--double_vc_ckpt")
-    if not args.double_ot_ckpt:
-        missing.append("--double_ot_ckpt")
     if missing and not args.allow_missing_case_ckpts:
         joined = ", ".join(missing)
         raise SystemExit(
@@ -245,9 +221,6 @@ def main() -> int:
     parser.add_argument("--baseline_vc_ckpt", default=None, help="Optional baseline VelocityContact checkpoint.")
     parser.add_argument("--baseline_ot_ckpt", default=None, help="Optional baseline ObjectTrans checkpoint.")
     parser.add_argument("--vc_boundary_zero_vc_ckpt", default="outputs/IMUHOI_RNN_2/velocity_contact_vc_boundary_zero_06211816/best.pt", help="VelocityContact checkpoint for vc_boundary_zero.")
-    parser.add_argument("--ot_obs_encoder_zero_ot_ckpt", default="outputs/IMUHOI_RNN_2/object_trans_ot_obs_encoder_zero_06221559/best.pt", help="ObjectTrans checkpoint for ot_obs_encoder_zero.")
-    parser.add_argument("--double_vc_ckpt", default=None, help="VelocityContact checkpoint for the double ablation.")
-    parser.add_argument("--double_ot_ckpt", default=None, help="ObjectTrans checkpoint for the double ablation.")
     parser.add_argument("--allow_missing_case_ckpts", action="store_true")
     refine_group = parser.add_mutually_exclusive_group()
     refine_group.add_argument("--enable_ot_refine", dest="ot_refine", action="store_true", default=None)

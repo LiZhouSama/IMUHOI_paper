@@ -142,7 +142,7 @@ def create_dataloaders(cfg, project_root=None):
         raise ValueError("训练数据路径不存在")
 
     print(f"训练数据路径: {train_paths}")
-    resolve_bimanual_contact_conflicts = bool(getattr(cfg, "resolve_bimanual_contact_conflicts", True))
+    resolve_bimanual_contact_conflicts = bool(getattr(cfg, "resolve_bimanual_contact_conflicts", False))
 
     train_cfg = getattr(cfg, "train", {})
     test_cfg = getattr(cfg, "test", {})

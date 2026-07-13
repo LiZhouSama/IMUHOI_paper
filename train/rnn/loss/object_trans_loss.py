@@ -44,7 +44,6 @@ class ObjectTransLoss:
         'obj_acc_cons',
         'refine_pose',
         'refine_root_trans',
-        'interaction_code_align',
         'gate_weak',
     }
     
@@ -215,14 +214,12 @@ class ObjectTransLoss:
         if 'pred_obj_acc_from_posdiff' in pred_dict and obj_imu_gt is not None:
             losses['obj_acc_cons'] = _masked_mse(pred_dict['pred_obj_acc_from_posdiff'], obj_imu_gt[:, :, :3], obj_mask, zero)
 
+        gate_logits = pred_dict.get('gate_logits') if isinstance(pred_dict, dict) else None
         gating_weights = pred_dict.get('gating_weights') if isinstance(pred_dict, dict) else None
         gating_contact_prob = pred_dict.get('gating_contact_prob') if isinstance(pred_dict, dict) else None
         if (
-            isinstance(gating_weights, torch.Tensor)
-            and isinstance(gating_contact_prob, torch.Tensor)
-            and gating_weights.shape[:2] == (bs, seq)
+            isinstance(gating_contact_prob, torch.Tensor)
             and gating_contact_prob.shape[:2] == (bs, seq)
-            and gating_weights.shape[-1] == 4
             and gating_contact_prob.shape[-1] >= 3
         ):
             target = self._build_gate_weak_target(gating_contact_prob[..., :3].to(device=device, dtype=dtype)).detach()
@@ -230,9 +227,22 @@ class ObjectTransLoss:
             if smooth > 0.0:
                 smooth = min(max(smooth, 0.0), 1.0)
                 target = (1.0 - smooth) * target + smooth / target.shape[-1]
-            gate_log_prob = torch.log(gating_weights.to(device=device, dtype=dtype).clamp_min(1e-6))
-            gate_ce = -(target * gate_log_prob).sum(dim=-1)
-            losses['gate_weak'] = _masked_mean(gate_ce, obj_mask, zero)
+            if (
+                isinstance(gate_logits, torch.Tensor)
+                and gate_logits.shape[:2] == (bs, seq)
+                and gate_logits.shape[-1] == 4
+            ):
+                gate_log_prob = F.log_softmax(gate_logits.to(device=device, dtype=dtype), dim=-1)
+                gate_ce = -(target * gate_log_prob).sum(dim=-1)
+                losses['gate_weak'] = _masked_mean(gate_ce, obj_mask, zero)
+            elif (
+                isinstance(gating_weights, torch.Tensor)
+                and gating_weights.shape[:2] == (bs, seq)
+                and gating_weights.shape[-1] == 4
+            ):
+                gate_log_prob = torch.log(gating_weights.to(device=device, dtype=dtype).clamp_min(1e-6))
+                gate_ce = -(target * gate_log_prob).sum(dim=-1)
+                losses['gate_weak'] = _masked_mean(gate_ce, obj_mask, zero)
 
         if pose_gt_6d is not None and 'refined_pose' in pred_dict:
             refined_pose = pred_dict['refined_pose']
@@ -282,33 +292,6 @@ class ObjectTransLoss:
                     diff_r = torch.norm(vec_pred_r - vec_gt_r, dim=-1)
                     losses['hoi_error_r'] = _masked_mean(diff_r, mask_r, zero)
 
-        prior_aux = pred_dict.get('interaction_prior_aux') if isinstance(pred_dict, dict) else None
-        if isinstance(prior_aux, dict):
-            obs_code = prior_aux.get('obs_code')
-            mesh_code = prior_aux.get('mesh_code')
-            mesh_valid_mask = prior_aux.get('mesh_valid_mask')
-            sample_has_object = prior_aux.get('sample_has_object')
-            if (
-                isinstance(obs_code, torch.Tensor)
-                and isinstance(mesh_code, torch.Tensor)
-                and obs_code.shape == mesh_code.shape
-                and obs_code.dim() == 3
-                and obs_code.shape[:2] == (bs, seq)
-            ):
-                if isinstance(mesh_valid_mask, torch.Tensor):
-                    valid = mesh_valid_mask.to(device=device, dtype=torch.bool)
-                else:
-                    valid = torch.zeros(bs, device=device, dtype=torch.bool)
-                if isinstance(sample_has_object, torch.Tensor):
-                    valid = valid & sample_has_object.to(device=device, dtype=torch.bool)
-                else:
-                    valid = valid & obj_mask.any(dim=1)
-                if valid.any():
-                    losses['interaction_code_align'] = F.mse_loss(
-                        obs_code.to(device=device, dtype=dtype)[valid],
-                        mesh_code.to(device=device, dtype=dtype).detach()[valid],
-                    )
-        
         # 加权求和
         total_loss = zero.clone()
         weighted_losses = {}

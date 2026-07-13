@@ -129,7 +129,7 @@ def _object_extent(data: Dict, length: int) -> Tuple[float, float, float, float]
     return (float(extent_np[0]), float(extent_np[1]), float(extent_np[2]), float(aspect))
 
 
-def collect_observations(data_dir: Path, resolve_bimanual_contact_conflicts: bool = True):
+def collect_observations(data_dir: Path, resolve_bimanual_contact_conflicts: bool = False):
     observations: List[Dict] = []
     sequence_rows: List[Dict] = []
     segment_rows: List[Dict] = []
@@ -771,11 +771,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip writing the raw per-hand contact observation CSV.",
     )
-    parser.add_argument(
-        "--no-resolve-bimanual-contact-conflicts",
+    resolve_group = parser.add_mutually_exclusive_group()
+    resolve_group.add_argument(
+        "--resolve-bimanual-contact-conflicts",
+        dest="resolve_bimanual_contact_conflicts",
         action="store_true",
-        help="Disable the same bimanual contact conflict postprocess used by IMUDataset.",
+        help="Enable the bimanual contact conflict postprocess used by IMUDataset.",
     )
+    resolve_group.add_argument(
+        "--no-resolve-bimanual-contact-conflicts",
+        dest="resolve_bimanual_contact_conflicts",
+        action="store_false",
+        help="Keep the preprocessed contact labels unchanged (default).",
+    )
+    parser.set_defaults(resolve_bimanual_contact_conflicts=False)
     return parser.parse_args()
 
 
@@ -790,7 +799,7 @@ def main() -> None:
     if not data_dir.is_dir():
         raise FileNotFoundError(f"Data directory not found: {data_dir}")
 
-    resolve_bimanual_contact_conflicts = not bool(args.no_resolve_bimanual_contact_conflicts)
+    resolve_bimanual_contact_conflicts = bool(args.resolve_bimanual_contact_conflicts)
     paths, observations, sequence_rows, segment_rows, skipped_rows = collect_observations(
         data_dir,
         resolve_bimanual_contact_conflicts=resolve_bimanual_contact_conflicts,

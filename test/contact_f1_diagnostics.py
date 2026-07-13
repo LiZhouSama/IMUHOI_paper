@@ -453,7 +453,7 @@ def main() -> None:
             debug=config.get("debug", False),
             simulate_imu_noise=False,
             full_sequence=True,
-            resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", True),
+            resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", False),
         )
         if len(dataset) == 0:
             print(f"[Skip] {dataset_name}: dataset is empty.")

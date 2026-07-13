@@ -1,5 +1,8 @@
 import argparse
 import os
+import sys
+import json
+import shutil
 import pickle
 import re
 import struct
@@ -18,6 +21,12 @@ import glob
 import xml.etree.ElementTree as ET
 from scipy.spatial.transform import Rotation as SciPyRotation
 
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from utils.human_pose import compute_virtual_palm_positions
+
 contact_threh = 0.25
 _CANONICAL_OBJ_POINTS_CACHE = {}
 _MESH_ARRAY_CACHE = {}
@@ -25,6 +34,11 @@ _FBX_BINARY_MAGIC = b"Kaydara FBX Binary  \x00\x1a\x00"
 _MAX_CONTACT_MESH_VERTICES = 4096
 _MESH_EXTENSIONS = {".obj", ".ply", ".fbx"}
 _INTERCAP_OBJECT_MESH_RE = re.compile(r"^(\d+)_second_obj\.(?:ply|obj)$", re.IGNORECASE)
+
+# Keep the sequence-level label rule in preprocessing aligned with the
+# geometry used by the RNN data loader.  The preprocessor still stores the
+# raw labels so this heuristic remains reversible for later experiments.
+_PALM_BONE_VARIATION_EPS = 1e-6
 
 _PAHOI_OBJECT_ALIASES = {
     "cup noodles": "noodles_cup",
@@ -778,6 +792,84 @@ def compute_improved_contact_labels(obj_trans, obj_rot, obj_scale, position_glob
 
     return lhand_contact, rhand_contact, obj_contact
 
+
+def resolve_bimanual_contact_labels_sequence(
+    lhand_contact: torch.Tensor,
+    rhand_contact: torch.Tensor,
+    obj_trans: torch.Tensor,
+    position_global_full_gt_world: torch.Tensor,
+    eps: float = _PALM_BONE_VARIATION_EPS,
+):
+    """Resolve simultaneous hand labels once on a complete sequence.
+
+    For every contiguous segment where both hands are labeled as contacting,
+    retain only the hand whose object-to-virtual-palm bone length has the
+    smaller range over that *full* segment.  Exact ties use the smaller mean
+    length and finally the left hand as a deterministic tie-breaker.
+
+    This is intentionally a preprocessing-time heuristic.  It must not be
+    reapplied to random training windows, otherwise the same source frame can
+    receive different labels depending on the sampled window.
+    """
+    if not isinstance(lhand_contact, torch.Tensor) or not isinstance(rhand_contact, torch.Tensor):
+        raise TypeError("hand contact labels must be torch.Tensor values")
+    if not isinstance(obj_trans, torch.Tensor) or not isinstance(position_global_full_gt_world, torch.Tensor):
+        raise TypeError("object and joint positions must be torch.Tensor values")
+    if lhand_contact.ndim != 1 or rhand_contact.ndim != 1:
+        raise ValueError("hand contact labels must have shape [T]")
+    if lhand_contact.shape != rhand_contact.shape:
+        raise ValueError("left/right hand contact labels must have the same shape")
+    if obj_trans.shape[0] != lhand_contact.shape[0] or position_global_full_gt_world.shape[0] != lhand_contact.shape[0]:
+        raise ValueError("sequence lengths do not match for bimanual contact resolution")
+
+    resolved_left = lhand_contact.bool().clone()
+    resolved_right = rhand_contact.bool().clone()
+    both = resolved_left & resolved_right
+    if not bool(both.any()):
+        return resolved_left, resolved_right
+
+    hand_anchor = compute_virtual_palm_positions(position_global_full_gt_world)
+    obj_trans = obj_trans.to(device=hand_anchor.device, dtype=hand_anchor.dtype)
+    left_length = torch.linalg.vector_norm(obj_trans - hand_anchor[:, 0, :], dim=-1)
+    right_length = torch.linalg.vector_norm(obj_trans - hand_anchor[:, 1, :], dim=-1)
+
+    contact_indices = torch.where(both)[0]
+    seg_start = int(contact_indices[0].item())
+    prev = seg_start
+    segments = []
+    for index in contact_indices[1:].tolist():
+        index = int(index)
+        if index != prev + 1:
+            segments.append((seg_start, prev))
+            seg_start = index
+        prev = index
+    segments.append((seg_start, prev))
+
+    for start, end in segments:
+        left_values = left_length[start:end + 1]
+        right_values = right_length[start:end + 1]
+        left_values = left_values[torch.isfinite(left_values)]
+        right_values = right_values[torch.isfinite(right_values)]
+        if left_values.numel() == 0 or right_values.numel() == 0:
+            # Keep both labels if the geometry is unusable; do not invent a
+            # hand assignment from missing measurements.
+            continue
+
+        left_range = float(left_values.max() - left_values.min())
+        right_range = float(right_values.max() - right_values.min())
+        left_mean = float(left_values.mean())
+        right_mean = float(right_values.mean())
+        keep_left = (
+            left_range < right_range - eps
+            or (abs(left_range - right_range) <= eps and left_mean <= right_mean)
+        )
+        if keep_left:
+            resolved_right[start:end + 1] = False
+        else:
+            resolved_left[start:end + 1] = False
+
+    return resolved_left, resolved_right
+
 def load_object_geometry(
     obj_name,
     obj_rot,
@@ -988,6 +1080,8 @@ def process_sequence(
     bps_points=None,
     obj_mesh_dir=None,
     obj_points_count: int = 256,
+    resolve_bimanual_contact_conflicts: bool = False,
+    output_name=None,
 ):
     import pytorch3d.transforms as transforms
     """处理单个序列并保存为pt文件"""
@@ -1117,6 +1211,15 @@ def process_sequence(
             obj_trans, obj_rot, obj_scale, position_global_full_gt_world,
             obj_mesh_dir, object_name, device, T
         )
+        lhand_contact_raw = lhand_contact.clone()
+        rhand_contact_raw = rhand_contact.clone()
+        if resolve_bimanual_contact_conflicts:
+            lhand_contact, rhand_contact = resolve_bimanual_contact_labels_sequence(
+                lhand_contact,
+                rhand_contact,
+                obj_trans,
+                position_global_full_gt_world,
+            )
         # --- 接触检测结束 ---
 
         # 预存canonical点云（可选）
@@ -1139,6 +1242,8 @@ def process_sequence(
             "obj_com_pos": obj_trans.cpu(),
             "lhand_contact": lhand_contact.cpu(), # 基于距离
             "rhand_contact": rhand_contact.cpu(), # 基于距离
+            "lhand_contact_raw": lhand_contact_raw.cpu(),
+            "rhand_contact_raw": rhand_contact_raw.cpu(),
             "obj_contact": obj_contact.cpu()      # 基于运动
         }
         if isinstance(canonical_points, torch.Tensor) and canonical_points.dim() == 2 and canonical_points.shape[-1] == 3:
@@ -1163,8 +1268,93 @@ def process_sequence(
         data.update(obj_data)
 
     # 保存处理后的数据
-    torch.save(data, os.path.join(save_dir, f"{seq_key}.pt"))
+    if output_name is None:
+        output_name = f"{seq_key}.pt"
+    output_name = str(output_name)
+    if not output_name.endswith(".pt"):
+        output_name += ".pt"
+    torch.save(data, os.path.join(save_dir, output_name))
     return 1
+
+def _process_unified_omomo(
+    data_dict_train,
+    data_dict_test,
+    save_dir,
+    bm,
+    device,
+    obj_mesh_dir,
+    obj_points_count,
+    resolve_bimanual_contact_conflicts,
+):
+    """Process train then test into one numerically ordered directory.
+
+    The source pickles both use keys ``0..N-1``.  Keeping those keys would
+    overwrite the test samples, so the test offset is explicitly added after
+    all training samples.  This produces the numbering expected by the
+    existing OMOMO ``split_info.json`` (0..5881 for train followed by test).
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    total = 0
+    for seq_key in tqdm(data_dict_train, desc="处理统一训练序列"):
+        process_sequence(
+            data_dict_train[seq_key],
+            seq_key,
+            save_dir,
+            bm,
+            device=device,
+            obj_mesh_dir=obj_mesh_dir,
+            obj_points_count=obj_points_count,
+            resolve_bimanual_contact_conflicts=resolve_bimanual_contact_conflicts,
+            output_name=f"{total}.pt",
+        )
+        total += 1
+
+    train_count = total
+    for seq_key in tqdm(data_dict_test, desc="处理统一测试序列"):
+        process_sequence(
+            data_dict_test[seq_key],
+            seq_key,
+            save_dir,
+            bm,
+            device=device,
+            obj_mesh_dir=obj_mesh_dir,
+            obj_points_count=obj_points_count,
+            resolve_bimanual_contact_conflicts=resolve_bimanual_contact_conflicts,
+            output_name=f"{total}.pt",
+        )
+        total += 1
+    return train_count, total
+
+
+def split_unified_by_json(input_dir, split_info_path, train_dir, test_dir, copy_files=True):
+    """Split numerically named unified files according to an existing JSON."""
+    with open(split_info_path, "r", encoding="utf-8") as handle:
+        split_info = json.load(handle)
+    train_files = list(split_info.get("train_files", []))
+    test_files = list(split_info.get("test_files", []))
+    expected_total = int(split_info.get("total_files", len(train_files) + len(test_files)))
+    all_names = train_files + test_files
+    if len(all_names) != expected_total or len(set(all_names)) != expected_total:
+        raise ValueError("split_info.json 的 train/test 文件列表不完整或存在重复")
+    expected_names = {f"{index}.pt" for index in range(expected_total)}
+    if set(all_names) != expected_names:
+        raise ValueError("split_info.json 文件名必须覆盖统一目录的 0.pt..N.pt")
+
+    os.makedirs(train_dir, exist_ok=True)
+    os.makedirs(test_dir, exist_ok=True)
+    operation = shutil.copy2 if copy_files else shutil.move
+    for file_name, target_dir in ((name, train_dir) for name in train_files):
+        source = os.path.join(input_dir, file_name)
+        if not os.path.isfile(source):
+            raise FileNotFoundError(source)
+        operation(source, os.path.join(target_dir, file_name))
+    for file_name, target_dir in ((name, test_dir) for name in test_files):
+        source = os.path.join(input_dir, file_name)
+        if not os.path.isfile(source):
+            raise FileNotFoundError(source)
+        operation(source, os.path.join(target_dir, file_name))
+    print(f"按 {split_info_path} 完成分割：训练 {len(train_files)}，测试 {len(test_files)}")
+
 
 # def preprocess_amass(args, bm):
 
@@ -1404,10 +1594,6 @@ def main(args):
         return
 
 
-    # 创建输出目录
-    os.makedirs(args.save_dir_train, exist_ok=True)
-    os.makedirs(args.save_dir_test, exist_ok=True)
-
     # # 创建BPS目录
     # bps_dir = os.path.join(args.save_dir, "bps_features")
     # os.makedirs(bps_dir, exist_ok=True)
@@ -1424,6 +1610,37 @@ def main(args):
     data_dict_test = joblib.load(args.data_path_test)
     print(f"测试数据集加载完成，共有{len(data_dict_test)}个序列")
 
+    # OMOMO must first be numbered as one concatenated dataset.  The source
+    # train/test pickles both start at key 0, so processing them directly into
+    # separate directories would make the numeric IDs incompatible with the
+    # checked-in split_info.json.
+    if args.save_dir_unified:
+        train_count, total_count = _process_unified_omomo(
+            data_dict_train,
+            data_dict_test,
+            args.save_dir_unified,
+            bm_male,
+            device,
+            args.obj_mesh_dir,
+            args.obj_points_count,
+            args.resolve_bimanual_contact_conflicts,
+        )
+        print(f"统一序列处理完成：训练 {train_count}，总计 {total_count}，目录：{args.save_dir_unified}")
+        if args.split_info:
+            split_unified_by_json(
+                args.save_dir_unified,
+                args.split_info,
+                args.save_dir_train,
+                args.save_dir_test,
+                copy_files=not args.move_after_split,
+            )
+        print("所有数据处理完成!")
+        return
+
+    # 创建旧式分目录输出（保留兼容性）
+    os.makedirs(args.save_dir_train, exist_ok=True)
+    os.makedirs(args.save_dir_test, exist_ok=True)
+
     # 处理所有序列
     print("开始处理训练序列...")
 
@@ -1436,6 +1653,7 @@ def main(args):
             device=device,
             obj_mesh_dir=args.obj_mesh_dir,
             obj_points_count=args.obj_points_count,
+            resolve_bimanual_contact_conflicts=args.resolve_bimanual_contact_conflicts,
         )
 
     print(f"训练序列处理完成，结果保存在：{args.save_dir_train}")
@@ -1450,6 +1668,7 @@ def main(args):
             device=device,
             obj_mesh_dir=args.obj_mesh_dir,
             obj_points_count=args.obj_points_count,
+            resolve_bimanual_contact_conflicts=args.resolve_bimanual_contact_conflicts,
         )
 
     print(f"测试序列处理完成，结果保存在：{args.save_dir_test}")
@@ -1466,12 +1685,43 @@ if __name__ == "__main__":
                         help="输出数据保存目录")
     parser.add_argument("--save_dir_test", type=str, default="process/processed_split_data_OMOMO_bps/test",
                         help="输出数据保存目录")
+    parser.add_argument(
+        "--save_dir_unified",
+        type=str,
+        default=None,
+        help="先将 train/test 输入按 train 后 test 的顺序编号并保存到同一目录（OMOMO 推荐）。",
+    )
+    parser.add_argument(
+        "--split_info",
+        type=str,
+        default=None,
+        help="统一处理后按已有 split_info.json 的文件名列表分割到 save_dir_train/save_dir_test。",
+    )
+    parser.add_argument(
+        "--move-after-split",
+        action="store_true",
+        help="按 split_info 分割时移动文件；默认复制，保留统一目录作为可审计副本。",
+    )
     parser.add_argument("--support_dir", type=str, default="datasets/smpl_models",
                         help="SMPL模型目录")
     parser.add_argument("--obj_mesh_dir", type=str, default="datasets/OMOMO/captured_objects",
                         help="物体网格目录")
     parser.add_argument("--obj_points_count", type=int, default=256,
                         help="canonical物体点云点数（保存到pt）")
+    resolve_group = parser.add_mutually_exclusive_group()
+    resolve_group.add_argument(
+        "--resolve-bimanual-contact-conflicts",
+        dest="resolve_bimanual_contact_conflicts",
+        action="store_true",
+        help="在完整序列预处理阶段，双手同时接触时只保留骨长变化更小的一只手。",
+    )
+    resolve_group.add_argument(
+        "--no-resolve-bimanual-contact-conflicts",
+        dest="resolve_bimanual_contact_conflicts",
+        action="store_false",
+        help="保留原始双手接触标签，不做序列级裁决。",
+    )
+    parser.set_defaults(resolve_bimanual_contact_conflicts=False)
     parser.add_argument("--process_amass", action="store_true",
                         help="是否处理AMASS数据集")
     parser.add_argument("--amass_dir", type=str, default="/mnt/d/a_WORK/Projects/PhD/datasets/AMASS_SMPL_H",

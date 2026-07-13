@@ -7,6 +7,7 @@ import argparse
 import yaml
 import re
 import types
+from pathlib import Path
 from aitviewer.renderables.meshes import Meshes
 from aitviewer.renderables.point_clouds import PointClouds
 from aitviewer.viewer import Viewer
@@ -36,6 +37,7 @@ except Exception:
 from dataset.dataset_IMUHOI import IMUDataset
 from process.preprocess import load_object_geometry
 from model import IMUHOIModel, load_model
+from utils.dataset_config import get_dataset_configs, resolve_dataset_path
 from utils.utils import (
     apply_eval_imu_noise_to_sequence,
     load_config,
@@ -53,6 +55,8 @@ from configs import (
     _SENSOR_POS_INDICES,
     _VEL_SELECTION_INDICES,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 import imgui
 try:
@@ -941,8 +945,7 @@ def main():
     parser.add_argument('--hp_ckpt', type=str, default=None, help='Override HumanPose checkpoint')
     parser.add_argument('--interaction_ckpt', type=str, default=None, help='Override Interaction/Object checkpoint')
     parser.add_argument('--smpl_model_path', type=str, default=None, help='Path to SMPL model file')
-    parser.add_argument('--test_data_dir', type=str, default='process/processed_split_data_IMHD_bps', help='Test data directory or a single .pt sequence file')
-    parser.add_argument('--obj_geo_root', type=str, default='datasets/IMHD/IMHD Dataset/object_templates', help='Root directory of object geometry files')
+    parser.add_argument('--dataset', type=str, default='imhd', help='Dataset key under config.datasets')
     parser.add_argument('--num_workers', type=int, default=0, help='DataLoader workers')
     parser.add_argument('--no_objects', action='store_true', help='Disable object mesh rendering')
     parser.add_argument('--vis_gt_only', action='store_true', help='Render GT only')
@@ -998,6 +1001,32 @@ def main():
 
     print(f"Loading config from: {args.config}")
     config = load_config(args.config)
+    try:
+        dataset_configs = get_dataset_configs(config)
+        if args.dataset not in dataset_configs:
+            valid = ', '.join(sorted(dataset_configs))
+            raise ValueError(f"Unknown dataset '{args.dataset}'. Valid datasets: {valid}")
+        dataset_config = dataset_configs[args.dataset]
+        test_data_input = str(resolve_dataset_path(
+            dataset_config.get('test_path') or dataset_config.get('data_dir'),
+            PROJECT_ROOT,
+        ))
+        obj_geo_setting = dataset_config.get('object_geo_root')
+        obj_geo_root = (
+            resolve_dataset_path(obj_geo_setting, PROJECT_ROOT)
+            if obj_geo_setting
+            else None
+        )
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"[Vis] Invalid dataset configuration: {exc}") from exc
+
+    print(f"Dataset: {args.dataset}")
+    print(f"Test data path: {test_data_input}")
+    if obj_geo_root:
+        print(f"Object mesh root: {obj_geo_root}")
+    elif not args.no_objects:
+        print("[Vis] No object mesh root configured for this dataset; object meshes may be unavailable.")
+
     if args.model_arch is not None:
         config.model_arch = args.model_arch
     ot_refine = (
@@ -1035,9 +1064,8 @@ def main():
     if _infer_model_kind(model) == "human_pose" and not args.no_objects:
         print("[Vis] 当前加载的是 human-only 模型；如需渲染预测物体，请提供 pretrained_modules.interaction 或 --interaction_ckpt。")
 
-    test_data_input = args.test_data_dir
     if not test_data_input or not os.path.exists(test_data_input):
-        print(f"Error: Test dataset path not found: {test_data_input}")
+        print(f"Error: Dataset test path not found: {test_data_input}")
         return
 
     test_window_size = config.test.get('window', config.train.get('window', 60))
@@ -1052,7 +1080,7 @@ def main():
             debug=dataset_debug,
             full_sequence=True,
             simulate_imu_noise=False,
-            resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", True),
+            resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", False),
         )
     elif os.path.isfile(test_data_input) and test_data_input.lower().endswith(".pt"):
         target_pt = os.path.normcase(os.path.normpath(os.path.abspath(test_data_input)))
@@ -1066,7 +1094,7 @@ def main():
             full_sequence=True,
             sequence_paths=[target_pt],
             simulate_imu_noise=False,
-            resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", True),
+            resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", False),
         )
         if len(test_dataset.sequence_info) != 1:
             try:
@@ -1076,7 +1104,7 @@ def main():
             required_key = "rotation_local_full_gt_list"
             if not isinstance(pt_data, dict) or required_key not in pt_data:
                 raise SystemExit(
-                    f"Unsupported pt format for --test_data_dir: {target_pt}. "
+                    f"Unsupported pt format for dataset test_path: {target_pt}. "
                     f"Missing required key '{required_key}'."
                 )
             raise SystemExit(
@@ -1084,7 +1112,7 @@ def main():
                 f"Valid sequence count after filtering: {len(test_dataset.sequence_info)}"
             )
     else:
-        raise SystemExit(f"--test_data_dir must be a directory or a .pt file: {test_data_input}")
+        raise SystemExit(f"Dataset test_path must be a directory or a .pt file: {test_data_input}")
 
     def _natural_key(s):
         return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
@@ -1147,7 +1175,7 @@ def main():
         smpl_model=smpl_model,
         config=config,
         device=device,
-        obj_geo_root=args.obj_geo_root,
+        obj_geo_root=obj_geo_root,
         show_objects=(not args.no_objects),
         vis_gt_only=args.vis_gt_only,
         show_foot_contact=args.show_foot_contact,

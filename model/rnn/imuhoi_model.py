@@ -13,6 +13,7 @@ from .human_pose import HumanPoseModule
 from .object_trans import ObjectTransModule
 from .online import (
     append_stream_data,
+    concat_time_dicts,
     infer_batch_seq,
     merge_latest_context,
     normalize_inference_mode,
@@ -167,6 +168,16 @@ class IMUHOIModel(nn.Module):
             if isinstance(hand_pos, torch.Tensor):
                 return hand_pos
         raise KeyError("hp_out must contain pred_palm_glb_pos or pred_hand_glb_pos")
+
+    @staticmethod
+    def _resolve_stage1_hoi_hand_positions(outputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Use the pre-refinement hand anchors when they are retained in history."""
+        if isinstance(outputs, dict):
+            for key in ("stage1_pred_palm_glb_pos", "stage1_pred_hand_glb_pos"):
+                hand_pos = outputs.get(key)
+                if isinstance(hand_pos, torch.Tensor):
+                    return hand_pos
+        return IMUHOIModel._resolve_hoi_hand_positions(outputs)
     
     def load_pretrained_modules(self, module_paths: Dict[str, str], strict: bool = True):
         """
@@ -355,10 +366,6 @@ class IMUHOIModel(nn.Module):
                 has_object_mask=has_object,
                 human_pose_input=hp_out.get("p_pred"),
                 root_trans_input=hp_out.get("root_trans_pred"),
-                obj_points_canonical=data_dict.get("obj_points_canonical"),
-                obj_rot_gt=data_dict.get("obj_rot_gt"),
-                obj_trans_gt=data_dict.get("obj_trans_gt"),
-                obj_scale_gt=data_dict.get("obj_scale_gt"),
                 enable_refine=refine_human,
             )
             results.update(ot_out)
@@ -417,6 +424,57 @@ class IMUHOIModel(nn.Module):
         stage_prefix = {key: prefix[key] for key in latest.keys() if key in prefix}
         return merge_latest_context(stage_prefix, latest)
 
+    @staticmethod
+    def _merge_raw_human_pose_context(
+        prefix: Dict[str, torch.Tensor],
+        latest: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Merge Stage-1 history without feeding OT-refined poses back upstream.
+
+        OT refinement is an output correction, not an additional causal input to
+        HP, VC, or the OT predictor.  Online history may contain promoted
+        refined values, while the original Stage-1 values are kept under
+        ``stage1_*``.  Prefer those values so online inputs match training.
+        """
+        raw_prefix = {}
+        for key in latest:
+            stage1_key = f"stage1_{key}"
+            if stage1_key in prefix:
+                raw_prefix[key] = prefix[stage1_key]
+            elif key in prefix:
+                raw_prefix[key] = prefix[key]
+        return merge_latest_context(raw_prefix, latest)
+
+    @staticmethod
+    def _stage1_history_for_inits(history: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Expose retained raw Stage-1 values under their ordinary init keys."""
+        if not isinstance(history, dict):
+            return history
+        raw_history = dict(history)
+        for key, value in history.items():
+            if key.startswith("stage1_"):
+                raw_history[key[len("stage1_"):]] = value
+        return raw_history
+
+    @staticmethod
+    def _append_stream_window(
+        previous: Optional[Dict[str, torch.Tensor]],
+        current: Dict[str, torch.Tensor],
+        max_len: int,
+        sequence_key: str = "human_imu",
+    ) -> Dict[str, torch.Tensor]:
+        """Append a chunk and retain only the causal sliding window."""
+        merged, _ = append_stream_data(previous, current, sequence_key=sequence_key)
+        batch_size, seq_len = infer_batch_seq(merged, key=sequence_key)
+        if seq_len <= max_len:
+            return merged
+        return slice_time_dict(merged, seq_len - max_len, seq_len, batch_size, seq_len)
+
+    @staticmethod
+    def _uses_stateful_ot(module: nn.Module) -> bool:
+        mode_fn = getattr(module, "online_mode", None)
+        return callable(mode_fn) and mode_fn() == "stateful"
+
     def _inference_online_sequence(
         self,
         data_dict: Dict[str, torch.Tensor],
@@ -425,6 +483,18 @@ class IMUHOIModel(nn.Module):
         refine_human: Optional[bool] = None,
         online_window: int = 120,
     ) -> Dict[str, torch.Tensor]:
+        if (
+            use_object_data
+            and self._uses_stateful_ot(self.object_trans_module)
+        ):
+            return self._inference_online_sequence_stateful_ot(
+                data_dict,
+                use_object_data=use_object_data,
+                compute_fk=compute_fk,
+                refine_human=refine_human,
+                online_window=online_window,
+            )
+
         refine_human = self._resolve_refine_human(refine_human)
         batch_size, seq_len = infer_batch_seq(data_dict)
         if seq_len <= online_window:
@@ -449,13 +519,17 @@ class IMUHOIModel(nn.Module):
         for end in range(warmup_len + 1, seq_len + 1):
             start = end - warmup_len
             window_data = slice_time_dict(data_dict, start, end, batch_size, seq_len)
-            window_data = update_data_inits_from_history(window_data, history, index=start - 1)
+            window_data = update_data_inits_from_history(
+                window_data,
+                self._stage1_history_for_inits(history),
+                index=start - 1,
+            )
             window_len = end - start
             prefix = select_time_context(history, start, end - 1)
 
             hp_out_raw = self.human_pose_module.forward(self._build_hp_input_dict(window_data))
             hp_latest = take_latest_frame(hp_out_raw, batch_size, window_len)
-            hp_context = self._merge_stage_context(prefix, hp_latest)
+            hp_context = self._merge_raw_human_pose_context(prefix, hp_latest)
 
             vc_input_dict = {
                 "human_imu": window_data["human_imu"],
@@ -477,6 +551,7 @@ class IMUHOIModel(nn.Module):
             has_object = window_data.get("has_object")
             if use_object_data and (has_object is None or has_object.any()):
                 obj_prefix = prefix.get("pred_obj_trans")
+                gate_prefix = prefix.get("gating_weights")
                 if isinstance(obj_prefix, torch.Tensor) and obj_prefix.shape[1] > 0:
                     ot_obj_trans_init = obj_prefix[:, 0]
                 else:
@@ -492,12 +567,9 @@ class IMUHOIModel(nn.Module):
                     has_object_mask=has_object,
                     human_pose_input=hp_context.get("p_pred"),
                     root_trans_input=hp_context.get("root_trans_pred"),
-                    obj_points_canonical=window_data.get("obj_points_canonical"),
-                    obj_rot_gt=window_data.get("obj_rot_gt"),
-                    obj_trans_gt=window_data.get("obj_trans_gt"),
-                    obj_scale_gt=window_data.get("obj_scale_gt"),
                     enable_refine=refine_human,
                     known_obj_trans_prefix=obj_prefix,
+                    known_gating_weights_prefix=gate_prefix,
                 )
                 results.update(ot_out)
                 if refine_human:
@@ -510,6 +582,169 @@ class IMUHOIModel(nn.Module):
             history = history_acc.append(latest)
 
         return history_acc.current()
+
+    def _inference_stateful_ot_stream(
+        self,
+        data_dict: Dict[str, torch.Tensor],
+        *,
+        online_state: Optional[dict],
+        use_object_data: bool,
+        compute_fk: bool,
+        refine_human: Optional[bool],
+        online_window: int,
+    ):
+        """Run bounded-memory online inference with a persistent OT predictor.
+
+        HP, VC, and the optional refine head deliberately retain the existing
+        sliding-window semantics.  Only the shared ObjectTrans predictor keeps
+        its learned LSTM state and fused OT state across calls, which isolates
+        the experimental variable without silently changing upstream models.
+        """
+        refine_human = self._resolve_refine_human(refine_human)
+        batch_size, chunk_len = infer_batch_seq(data_dict)
+        if chunk_len < 1:
+            raise ValueError("Stateful online inference requires at least one frame.")
+
+        state = dict(online_state or {})
+        input_window = state.get("input_window")
+        output_window = state.get("output_window")
+        prediction_state = state.get("ot_prediction_state")
+
+        for name, window_data, sequence_key in (
+            ("input_window", input_window, "human_imu"),
+            ("output_window", output_window, "p_pred"),
+        ):
+            if not isinstance(window_data, dict):
+                continue
+            state_batch, _ = infer_batch_seq(window_data, key=sequence_key)
+            if state_batch != batch_size:
+                raise ValueError(
+                    f"Stateful online {name} batch size ({state_batch}) does not match "
+                    f"the current chunk ({batch_size}); reset online_state between streams."
+                )
+        if (
+            isinstance(output_window, dict)
+            and isinstance(output_window.get("pred_obj_trans"), torch.Tensor)
+            and prediction_state is None
+        ):
+            raise ValueError(
+                "Stateful online state has prior outputs but no OT prediction state; "
+                "reset online_state instead of mixing incompatible streams."
+            )
+
+        emitted = []
+        for frame_index in range(chunk_len):
+            frame_data = slice_time_dict(data_dict, frame_index, frame_index + 1, batch_size, chunk_len)
+            input_window = self._append_stream_window(input_window, frame_data, online_window, sequence_key="human_imu")
+            _, window_len = infer_batch_seq(input_window)
+
+            history = output_window if isinstance(output_window, dict) else {}
+            history_len = 0
+            if history:
+                history_batch, history_len = infer_batch_seq(history, key="p_pred")
+                if history_batch != batch_size:
+                    raise ValueError("Stateful online output history has an incompatible batch size.")
+
+            # Once the input window advances, its predecessor is the first
+            # frame retained in output_window.  Before that, all frames still
+            # share the original start state and no init update is needed.
+            has_predecessor = history_len >= online_window
+            window_data = input_window
+            if has_predecessor:
+                window_data = update_data_inits_from_history(
+                    window_data,
+                    self._stage1_history_for_inits(history),
+                    index=0,
+                )
+                prefix = select_time_context(history, 1, history_len)
+            else:
+                prefix = history
+
+            hp_out_raw = self.human_pose_module.forward(self._build_hp_input_dict(window_data))
+            hp_latest = take_latest_frame(hp_out_raw, batch_size, window_len)
+            hp_context = self._merge_raw_human_pose_context(prefix, hp_latest)
+
+            vc_input_dict = {
+                "human_imu": window_data["human_imu"],
+                "obj_imu": window_data["obj_imu"],
+                "hand_vel_glb_init": window_data["hand_vel_glb_init"],
+                "obj_vel_init": window_data["obj_vel_init"],
+                "obj_trans_init": window_data["obj_trans_init"],
+                "contact_init": window_data.get("contact_init"),
+                "hp_out": hp_context,
+            }
+            vc_out_raw = self.velocity_contact_module.forward(vc_input_dict, hp_out=hp_context)
+            vc_latest = take_latest_frame(vc_out_raw, batch_size, window_len)
+            vc_context = self._merge_stage_context(prefix, vc_latest)
+
+            results: Dict[str, torch.Tensor] = {}
+            results.update(hp_context)
+            results.update(vc_context)
+            has_object = window_data.get("has_object")
+            if use_object_data and (has_object is None or has_object.any()):
+                ot_latest, prediction_state = self.object_trans_module.forward(
+                    self._resolve_hoi_hand_positions(hp_latest),
+                    vc_latest["pred_hand_contact_prob"],
+                    window_data["obj_trans_init"],
+                    obj_imu=window_data["obj_imu"][:, -1:],
+                    human_imu=window_data["human_imu"][:, -1:],
+                    obj_vel_input=vc_latest["pred_obj_vel"],
+                    contact_init=window_data.get("contact_init"),
+                    has_object_mask=has_object,
+                    enable_refine=False,
+                    compute_refine=False,
+                    prediction_state=prediction_state,
+                    return_prediction_state=True,
+                )
+                ot_context = self._merge_stage_context(prefix, ot_latest)
+                ot_context.update(
+                    self.object_trans_module.compute_human_refinement_from_prediction(
+                        ot_context,
+                        self._resolve_hoi_hand_positions(hp_context),
+                        vc_context["pred_hand_contact_prob"],
+                        obj_vel_input=vc_context["pred_obj_vel"],
+                        human_pose_input=hp_context.get("p_pred"),
+                        root_trans_input=hp_context.get("root_trans_pred"),
+                        has_object_mask=has_object,
+                        enable_refine=refine_human,
+                    )
+                )
+                results.update(ot_context)
+                if refine_human:
+                    self._promote_refined_human_outputs(results, ot_context, window_data)
+                if compute_fk:
+                    self._compute_fk_output(results, vc_context, window_data, data_dict["obj_trans_init"])
+
+            results["has_object"] = has_object
+            latest = take_latest_frame(results, batch_size, window_len)
+            output_window = self._append_stream_window(output_window, latest, online_window, sequence_key="p_pred")
+            emitted.append(latest)
+
+        state = {
+            "input_window": input_window,
+            "output_window": output_window,
+            "ot_prediction_state": prediction_state,
+        }
+        return concat_time_dicts(emitted), state
+
+    def _inference_online_sequence_stateful_ot(
+        self,
+        data_dict: Dict[str, torch.Tensor],
+        use_object_data: bool = True,
+        compute_fk: bool = False,
+        refine_human: Optional[bool] = None,
+        online_window: int = 120,
+    ) -> Dict[str, torch.Tensor]:
+        """Run one complete sequence through the same persistent streaming path."""
+        output, _ = self._inference_stateful_ot_stream(
+            data_dict,
+            online_state=None,
+            use_object_data=use_object_data,
+            compute_fk=compute_fk,
+            refine_human=refine_human,
+            online_window=online_window,
+        )
+        return output
 
     def inference(
         self,
@@ -546,6 +781,19 @@ class IMUHOIModel(nn.Module):
             return output
 
         window = resolve_online_window(self.cfg, online_window)
+        if use_object_data and self._uses_stateful_ot(self.object_trans_module):
+            output, state = self._inference_stateful_ot_stream(
+                data_dict,
+                online_state=online_state,
+                use_object_data=use_object_data,
+                compute_fk=compute_fk,
+                refine_human=refine_human,
+                online_window=window,
+            )
+            if return_online_state:
+                return output, state
+            return output
+
         run_data, previous_len = append_stream_data(
             online_state.get("data_dict") if isinstance(online_state, dict) else None,
             data_dict,

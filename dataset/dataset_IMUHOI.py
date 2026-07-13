@@ -225,7 +225,7 @@ class IMUDataset(Dataset):
         simulate_imu_noise=False,
         sequence_paths=None,
         obj_points_sample_count=256,
-        resolve_bimanual_contact_conflicts=True,
+        resolve_bimanual_contact_conflicts=False,
     ):
         """
         IMU数据集 - 每个epoch为每个序列随机采样一个窗口
@@ -304,8 +304,18 @@ class IMUDataset(Dataset):
              print("警告：没有找到有效的序列，数据集为空。请检查数据和窗口参数。")
 
     def _load_share_and_collect_info(self):
-        """加载所有序列数据，将其Tensor移动到共享内存，并收集序列信息"""
+        """加载序列数据，按需共享 Tensor，并收集序列信息。"""
         print("开始预加载、共享内存处理和序列信息收集...")
+        # Preloaded tensors are read-only and workers inherit them through
+        # Linux fork.  Calling ``share_memory_`` for every storage consumes a
+        # file descriptor per tensor (or requires a Docker-compatible shm
+        # filesystem), so it is opt-in for environments that explicitly need
+        # it rather than a correctness requirement.
+        share_memory_enabled = os.environ.get("IMUHOI_ENABLE_SHARED_MEMORY", "0") == "1"
+        print(
+            "共享内存策略: "
+            + ("enabled (IMUHOI_ENABLE_SHARED_MEMORY=1)" if share_memory_enabled else "disabled（只读预加载，避免fd/shm耗尽）")
+        )
         for file_path in tqdm(self.sequence_files, desc="预加载和收集信息"):
             try:
                 # 加载序列数据
@@ -353,10 +363,11 @@ class IMUDataset(Dataset):
                         # print(f"跳过文件 {file_path}，左右手接触帧数分别为 {l_contact_cnt}, {r_contact_cnt}，均少于最小要求 {self.min_obj_contact_frames}")
                         continue
 
-                # 将所有Tensor移动到共享内存
-                for key, value in seq_data.items():
-                    if isinstance(value, torch.Tensor):
-                        value.share_memory_()
+                # 将所有Tensor移动到共享内存（可选优化，默认关闭）
+                if share_memory_enabled:
+                    for key, value in seq_data.items():
+                        if isinstance(value, torch.Tensor):
+                            value.share_memory_()
 
                 # 记录真实 IMU 是否存在（一次全局统计，不重复打印）
                 if seq_data.get("human_imu_real") is not None:
