@@ -2,6 +2,8 @@
 ObjectTransModule: 预测物体位置
 Stage 3 - 依赖Stage1和Stage2的输出
 """
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,7 +29,8 @@ class ObjectTransModule(nn.Module):
     物体位置预测模块
     基于手部位置、接触概率和物体IMU预测物体位置
     """
-    ARCH_VERSION = 3
+    ARCH_VERSION = 5
+    LENGTH_EPS = 1e-4
     _LEGACY_HEAD_PREFIXES = (
         "lhand_fk_head.",
         "rhand_fk_head.",
@@ -57,11 +60,22 @@ class ObjectTransModule(nn.Module):
             n_input=n_prediction_input,
             n_output=12,  # left FK (4), right FK (4), four-way gate logits (4)
             n_hidden=predictor_hidden,
-            n_init=11,  # left/right initial geometry + initial contact state
+            # left/right initial geometry + initial contact state + the frozen
+            # diffusion output [left/right, q10/q50/q90].
+            n_init=17,
             n_rnn_layer=predictor_layers,
             bidirectional=False,
             dropout=predictor_dropout,
         )
+        self.object_trans_length_init = float(
+            max(getattr(cfg, "object_trans_length_init", 0.4), self.LENGTH_EPS * 2.0)
+        )
+        length_bias = math.log(
+            math.expm1(self.object_trans_length_init - self.LENGTH_EPS)
+        )
+        with torch.no_grad():
+            self.object_trans_head.linear2.bias[3] = length_bias
+            self.object_trans_head.linear2.bias[7] = length_bias
         self.n_prediction_input = n_prediction_input
         self.feedback_feature_dim = 13
         feedback_hidden_dim = int(getattr(cfg, "object_trans_feedback_hidden_dim", 64))
@@ -100,7 +114,7 @@ class ObjectTransModule(nn.Module):
 
     @staticmethod
     def _softplus_positive(x: torch.Tensor) -> torch.Tensor:
-        return F.softplus(x) + 1e-4
+        return F.softplus(x) + ObjectTransModule.LENGTH_EPS
 
     def _state_feedback_enabled(self) -> bool:
         value = getattr(self.cfg, "object_trans_state_feedback", False)
@@ -369,6 +383,7 @@ class ObjectTransModule(nn.Module):
         has_object_mask=None,
         human_pose_input=None,
         root_trans_input=None,
+        lb_prior_quantiles=None,
         prediction_state=None,
     ):
         if hand_positions is None:
@@ -421,6 +436,14 @@ class ObjectTransModule(nn.Module):
             raise ValueError(f"obj_trans_init must have shape [{batch_size},3], got {tuple(obj_trans_init.shape)}")
         l_oe0, l_lb0 = self._compute_init_dir_len(lhand_position[:, 0], obj_rotm[:, 0], obj_trans_init)
         r_oe0, r_lb0 = self._compute_init_dir_len(rhand_position[:, 0], obj_rotm[:, 0], obj_trans_init)
+        lb_prior_quantiles = self._prepare_lb_prior_quantiles(
+            lb_prior_quantiles,
+            l_lb0,
+            r_lb0,
+            batch_size,
+            device,
+            dtype,
+        )
         if contact_init is None:
             contact_init_vec = torch.zeros(batch_size, 3, device=device, dtype=dtype)
         else:
@@ -454,16 +477,54 @@ class ObjectTransModule(nn.Module):
             "obj_vel_input": obj_vel_input,
             "pred_hand_contact_prob": pred_hand_contact_prob,
             "prediction_input": prediction_input,
-            "prediction_init": torch.cat((l_oe0, l_lb0, r_oe0, r_lb0, contact_init_vec), dim=-1),
+            "prediction_init": torch.cat(
+                (
+                    l_oe0,
+                    l_lb0,
+                    r_oe0,
+                    r_lb0,
+                    contact_init_vec,
+                    lb_prior_quantiles.flatten(1),
+                ),
+                dim=-1,
+            ),
             "obj_trans_init": obj_trans_init,
             "l_oe0": l_oe0,
             "r_oe0": r_oe0,
             "l_lb0": l_lb0,
             "r_lb0": r_lb0,
+            "lb_prior_quantiles": lb_prior_quantiles,
             "has_object_mask": has_object_mask,
             "human_pose_input": human_pose_input,
             "root_trans_input": root_trans_input,
         }
+
+    def _prepare_lb_prior_quantiles(
+        self,
+        value,
+        l_lb0,
+        r_lb0,
+        batch_size,
+        device,
+        dtype,
+    ):
+        if value is None:
+            # Neutral fallback for direct module calls and prior ablations.
+            centers = torch.cat((l_lb0, r_lb0), dim=-1).clamp_min(0.0)
+            return centers.unsqueeze(-1).expand(-1, -1, 3)
+        if not isinstance(value, torch.Tensor):
+            value = torch.as_tensor(value, device=device, dtype=dtype)
+        value = value.to(device=device, dtype=dtype)
+        if value.shape != (batch_size, 2, 3):
+            raise ValueError(
+                f"lb_prior_quantiles must have shape [{batch_size},2,3], got {tuple(value.shape)}"
+            )
+        if not bool(torch.isfinite(value).all().item()):
+            raise ValueError("lb_prior_quantiles contains non-finite values")
+        # The decoder is ordered by construction; cummax also makes externally
+        # supplied priors safe without introducing a hard length interval.
+        value = value.clamp_min(0.0)
+        return torch.cummax(value, dim=-1).values
 
     def _init_prediction_state(self, context):
         batch_size = context["batch_size"]
@@ -689,6 +750,7 @@ class ObjectTransModule(nn.Module):
             "init_rhand_oe_ho": context["r_oe0"],
             "init_lhand_lb": context["l_lb0"].squeeze(-1),
             "init_rhand_lb": context["r_lb0"].squeeze(-1),
+            "lb_prior_quantiles": context["lb_prior_quantiles"],
             "gating_contact_prob": context["pred_hand_contact_prob"],
             "gating_smoothing_applied": False,
         }
@@ -774,6 +836,7 @@ class ObjectTransModule(nn.Module):
         has_object_mask: torch.Tensor = None,
         human_pose_input: torch.Tensor = None,
         root_trans_input: torch.Tensor = None,
+        lb_prior_quantiles: torch.Tensor = None,
         enable_refine: bool = True,
         known_obj_trans_prefix: torch.Tensor = None,
         known_obj_trans_prefix_mask: torch.Tensor = None,
@@ -794,6 +857,7 @@ class ObjectTransModule(nn.Module):
             has_object_mask=has_object_mask,
             human_pose_input=human_pose_input,
             root_trans_input=root_trans_input,
+            lb_prior_quantiles=lb_prior_quantiles,
             prediction_state=prediction_state,
         )
         prediction, next_state = self._scan_predictor(

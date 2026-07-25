@@ -21,6 +21,12 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 sys.path.insert(0, PROJECT_ROOT)
 
 from model import VelocityContactModule, HumanPoseModule, ObjectTransModule
+from model.rnn.object_trans_legacy import LegacyObjectTransModule
+from model.rnn.object_trans_legacy_mesh import LegacyMeshObjectTransModule
+from model.rnn.object_trans_mergeHeads_obsEncoder import (
+    ObjectTransModule as MergeHeadsObsObjectTransModule,
+)
+from model.rnn.lb_vq_diffusion import FrozenLBPriorPredictor
 from train.rnn.loss import VelocityContactLoss, ObjectTransLoss
 from train.rnn.scheduled_inputs import (
     build_gt_human_pose_outputs,
@@ -67,8 +73,22 @@ def get_args():
                         help='HumanPoseModule权重路径')
     parser.add_argument('--ot_ckpt', type=str, default=None,
                         help='保留兼容；自动joint训练固定使用本次ObjectTrans训练得到的best.pt')
+    parser.add_argument('--lb_vq_ckpt', type=str, default=None,
+                        help='冻结的 l_b VQ checkpoint；默认读取 lb_vq_prior.vq_checkpoint')
+    parser.add_argument('--lb_diffusion_ckpt', type=str, default=None,
+                        help='冻结的 l_b diffusion checkpoint；默认读取 lb_vq_prior.diffusion_checkpoint')
     parser.add_argument('--joint_train', action='store_true', 
                         help='Stage3训练完成后，自动在同一输出目录进行ObjectTrans + VelocityContact联合训练')
+    parser.add_argument(
+        '--object_trans_arch', '--object-trans-arch',
+        dest='object_trans_arch',
+        choices=['current', 'legacy', 'legacy_mesh', 'mergeHeads_obs'],
+        default=None,
+        help=(
+            'ObjectTrans架构；legacy为无prior多head，legacy_mesh为ObsEncoder多head，'
+            'mergeHeads_obs为共享head+ObsEncoder'
+        ),
+    )
     parser.add_argument('--ablate_vc_boundary', action='store_true', default=None,
                         help='训练时将VelocityContact boundary输出置零')
     parser.add_argument(
@@ -133,13 +153,26 @@ def _resolve_pretrained_ckpt(cfg, cli_path, module_key, fallback_attr=None):
 class Stage3JointTrainer:
     """Stage3和联合训练器"""
     
-    def __init__(self, cfg, vc_model, hp_model, ot_model, train_loader, test_loader=None, joint_train=False):
+    def __init__(
+        self,
+        cfg,
+        vc_model,
+        hp_model,
+        ot_model,
+        train_loader,
+        test_loader=None,
+        joint_train=False,
+        lb_prior_model=None,
+    ):
         self.cfg = cfg
         self.device = torch.device(cfg.device)
         self.joint_train = joint_train
         self.vc_model = vc_model.to(self.device)
         self.hp_model = hp_model.to(self.device)
         self.ot_model = ot_model.to(self.device)
+        self.lb_prior_model = (
+            lb_prior_model.to(self.device) if lb_prior_model is not None else None
+        )
         
         self.train_loader = train_loader
         self.test_loader = test_loader
@@ -159,6 +192,14 @@ class Stage3JointTrainer:
             param.requires_grad = self.vc_trainable
         for param in self.ot_model.parameters():
             param.requires_grad = True
+        if self.lb_prior_model is not None:
+            self.lb_prior_model.eval()
+            for param in self.lb_prior_model.parameters():
+                param.requires_grad = False
+            print(
+                "冻结 l_b VQ/Diffusion prior: "
+                f"sample_steps={self.lb_prior_model.sample_steps}"
+            )
         if joint_train:
             print("联合训练模式：从epoch 0开始微调VelocityContact + ObjectTrans")
 
@@ -381,6 +422,16 @@ class Stage3JointTrainer:
             human_pose_input = hp_out.get('p_pred')
             root_trans_input = hp_out.get('root_trans_pred')
 
+        lb_prior_quantiles = None
+        if self.lb_prior_model is not None:
+            self.lb_prior_model.eval()
+            with torch.no_grad():
+                lb_prior_quantiles = self.lb_prior_model(
+                    hp_out,
+                    vc_out,
+                    data_dict['obj_imu'],
+                )
+
         ot_out = call_model_inference(
             self.ot_model,
             hand_positions,
@@ -393,6 +444,7 @@ class Stage3JointTrainer:
             has_object_mask=data_dict['has_object'],
             human_pose_input=human_pose_input,
             root_trans_input=root_trans_input,
+            lb_prior_quantiles=lb_prior_quantiles,
             enable_refine=getattr(self.cfg, "enable_ot_refine", False),
             inference_mode="offline",
         )
@@ -490,7 +542,7 @@ class Stage3JointTrainer:
         
         with torch.no_grad():
             test_iter = tqdm(self.test_loader, desc=f'Test {epoch}', leave=False)
-            
+
             for batch in test_iter:
                 data_dict = build_model_input_dict(batch, self.cfg, self.device, add_noise=False)
                 results, vc_out, hp_out, ot_out = self.forward_all(data_dict, batch=batch, epoch=epoch, training=False)
@@ -717,6 +769,7 @@ def _run_auto_joint_train(cfg, trainer, train_loader, test_loader, base_lr):
         train_loader,
         test_loader,
         joint_train=True,
+        lb_prior_model=trainer.lb_prior_model,
     )
     joint_trainer.train()
     return joint_trainer
@@ -739,14 +792,48 @@ def main():
         cfg.object_trans_online_mode = args.object_trans_online_mode
     elif not hasattr(cfg, 'object_trans_online_mode'):
         cfg.object_trans_online_mode = 'window'
+    if args.object_trans_arch is not None:
+        cfg.object_trans_arch = args.object_trans_arch
+    elif not hasattr(cfg, 'object_trans_arch'):
+        cfg.object_trans_arch = 'current'
+    elif str(cfg.object_trans_arch).strip().lower() == 'mergeheads_obs':
+        cfg.object_trans_arch = 'mergeHeads_obs'
+    if cfg.object_trans_arch == 'mergeHeads_obs':
+        # Persist the architecture's resolved fixed dimensions so the run
+        # snapshot describes the actual checkpoint shapes.
+        cfg.interaction_code_dim = MergeHeadsObsObjectTransModule.INTERACTION_CODE_DIM
+        cfg.object_trans_hidden_dim = MergeHeadsObsObjectTransModule.PREDICTOR_HIDDEN_DIM
     auto_joint_train = bool(args.joint_train) or bool(getattr(cfg, "joint_train", False))
     base_train_lr = float(cfg.lr)
     cfg.joint_train = auto_joint_train
+
+    prior_cfg = getattr(cfg, 'lb_vq_prior', None)
+    enable_lb_prior = bool(getattr(cfg, 'enable_ot_lb_prior', False))
+    if cfg.object_trans_arch == 'mergeHeads_obs' and enable_lb_prior:
+        print("mergeHeads_obs使用内置ObsEncoder；已关闭外部l_b VQ/Diffusion prior。")
+        enable_lb_prior = False
+        cfg.enable_ot_lb_prior = False
+    if enable_lb_prior and cfg.object_trans_arch != 'current':
+        raise ValueError("l_b VQ/Diffusion prior supports object_trans_arch=current only")
+    if enable_lb_prior:
+        if prior_cfg is None:
+            raise ValueError("enable_ot_lb_prior=true requires an lb_vq_prior config block")
+        if args.lb_vq_ckpt:
+            prior_cfg.vq_checkpoint = args.lb_vq_ckpt
+        if args.lb_diffusion_ckpt:
+            prior_cfg.diffusion_checkpoint = args.lb_diffusion_ckpt
 		    
     setup_seed(cfg.seed)
     cfg = setup_device(cfg)
 	    
-    module_name = 'object_trans'
+    if cfg.object_trans_arch == 'legacy':
+        module_name = 'object_trans_legacy'
+    elif cfg.object_trans_arch == 'legacy_mesh':
+        module_name = 'object_trans_legacy_mesh'
+    elif cfg.object_trans_arch == 'mergeHeads_obs':
+        module_name = 'object_trans_mergeHeads_obs'
+    else:
+        module_name = 'object_trans'
     ablation_suffix = ""
     if cfg.ablate_vc_boundary:
         ablation_suffix += "_vc_boundary_zero"
@@ -759,6 +846,7 @@ def main():
     
     print("=" * 50)
     print(f"{mode_str}: ObjectTransModule训练 ({trans_str}模式)")
+    print(f"ObjectTrans架构: {cfg.object_trans_arch}")
     print(f"设备: {cfg.device}")
     print(f"批次大小: {cfg.batch_size}")
     print(f"训练轮数: {cfg.epochs}")
@@ -825,19 +913,34 @@ def main():
     elif hp_ckpt:
         print(f"警告: HumanPose权重不存在: {hp_ckpt}")
     
-    ot_model = ObjectTransModule(cfg)
+    if cfg.object_trans_arch == 'legacy':
+        ot_model_cls = LegacyObjectTransModule
+    elif cfg.object_trans_arch == 'legacy_mesh':
+        ot_model_cls = LegacyMeshObjectTransModule
+    elif cfg.object_trans_arch == 'mergeHeads_obs':
+        ot_model_cls = MergeHeadsObsObjectTransModule
+    else:
+        ot_model_cls = ObjectTransModule
+    ot_model = ot_model_cls(cfg)
+    lb_prior_model = FrozenLBPriorPredictor(cfg) if enable_lb_prior else None
     if getattr(cfg, "resume_dir", None):
         print("检测到 --resume_dir，ObjectTrans权重将由训练器从断点恢复。")
     
     print(f"VelocityContact参数量: {sum(p.numel() for p in vc_model.parameters())}")
     print(f"HumanPose参数量: {sum(p.numel() for p in hp_model.parameters())}")
     print(f"ObjectTrans参数量: {sum(p.numel() for p in ot_model.parameters())}")
+    if lb_prior_model is not None:
+        print(
+            "冻结 l_b prior 参数量: "
+            f"{sum(p.numel() for p in lb_prior_model.parameters())}"
+        )
     
     # 创建训练器
     trainer = Stage3JointTrainer(
         cfg, vc_model, hp_model, ot_model,
         train_loader, test_loader,
-        joint_train=False
+        joint_train=False,
+        lb_prior_model=lb_prior_model,
     )
     
     # 开始训练

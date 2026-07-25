@@ -28,6 +28,8 @@ class VelocityContactModule(nn.Module):
     Output: hand/object velocity, contact probabilities, interaction boundary.
     """
 
+    _REMOVED_MERGED_CONTACT_PREFIXES = ("contact_rnn.", "obj_move_head.", "hand_contact_head.")
+
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
@@ -42,6 +44,7 @@ class VelocityContactModule(nn.Module):
         self.fps = float(getattr(cfg, "frame_rate", FRAME_RATE))
         self.use_contact_geom_features = bool(getattr(cfg, "velocity_contact_use_geom_features", True))
         self.detach_contact_geom_obj_vel = bool(getattr(cfg, "velocity_contact_geom_detach_obj_vel", True))
+        self.boundary_bidirectional = bool(getattr(cfg, "boundary_bidirectional", True))
         self.adapt_checkpoint_hand_contact_input = bool(
             getattr(cfg, "velocity_contact_adapt_checkpoint_input", False)
         )
@@ -74,6 +77,13 @@ class VelocityContactModule(nn.Module):
             hidden_size=boundary_hidden,
             num_layers=1,
             batch_first=True,
+            bidirectional=self.boundary_bidirectional,
+        )
+        boundary_rnn_output_dim = boundary_hidden * (2 if self.boundary_bidirectional else 1)
+        self.boundary_fusion = (
+            nn.Linear(boundary_rnn_output_dim, boundary_hidden)
+            if boundary_rnn_output_dim != boundary_hidden
+            else nn.Identity()
         )
         self.boundary_head = nn.Linear(boundary_hidden, 2)
         self.boundary_input_norm = nn.LayerNorm(boundary_input_dim)
@@ -158,6 +168,25 @@ class VelocityContactModule(nn.Module):
             dropout=dropout,
         ).to(device=device, dtype=dtype)
         return self
+
+    def validate_checkpoint_state_dict(self, state_dict) -> None:
+        """Reject checkpoints from the abandoned merged-contact experiment."""
+        if not isinstance(state_dict, dict):
+            raise ValueError("VelocityContact checkpoint does not contain a state_dict.")
+        keys = {
+            str(key[7:] if str(key).startswith("module.") else key)
+            for key in state_dict
+        }
+        removed_prefixes = [
+            prefix for prefix in self._REMOVED_MERGED_CONTACT_PREFIXES
+            if any(key.startswith(prefix) for key in keys)
+        ]
+        if removed_prefixes:
+            raise ValueError(
+                "VelocityContact checkpoint uses the abandoned merged-contact architecture "
+                f"({', '.join(removed_prefixes)}). Use a checkpoint with separate obj_move_net "
+                "and hand_contact_net."
+            )
 
     def _denormalize_imu(self, human_imu: torch.Tensor):
         """Convert IMU data back to world frame."""
@@ -324,6 +353,7 @@ class VelocityContactModule(nn.Module):
         boundary_input = torch.cat(boundary_features, dim=-1)
         boundary_input = self.boundary_input_norm(boundary_input)
         boundary_out, _ = self.boundary_rnn(boundary_input)
+        boundary_out = self.boundary_fusion(boundary_out)
         boundary_out_norm = self.boundary_hidden_norm(boundary_out)
         boundary_logits = self.boundary_head(boundary_out_norm)
         boundary_prob = torch.sigmoid(boundary_logits)

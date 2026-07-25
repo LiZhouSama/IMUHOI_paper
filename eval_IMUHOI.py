@@ -194,10 +194,10 @@ def _apply_cli_module_overrides(module_paths, args):
         out["human_pose"] = args.hp_ckpt
     if getattr(args, "interaction_ckpt", None):
         out["interaction"] = args.interaction_ckpt
-    if getattr(args, "velocity_contact_ckpt", None):
-        out["velocity_contact"] = args.velocity_contact_ckpt
-    if getattr(args, "object_trans_ckpt", None):
-        out["object_trans"] = args.object_trans_ckpt
+    if getattr(args, "vc_ckpt", None):
+        out["velocity_contact"] = args.vc_ckpt
+    if getattr(args, "ot_ckpt", None):
+        out["object_trans"] = args.ot_ckpt
     return out if out else None
 
 
@@ -789,8 +789,8 @@ def main():
     parser.add_argument("--model_arch", type=str, choices=["rnn", "dit", "mamba", "mamba_simple"], default=None, help="选择模型架构")
     parser.add_argument("--hp_ckpt", type=str, default=None, help="覆盖 HumanPose checkpoint")
     parser.add_argument("--interaction_ckpt", type=str, default=None, help="覆盖 Interaction/Object checkpoint")
-    parser.add_argument("--velocity_contact_ckpt", type=str, default=None, help="覆盖 VelocityContact checkpoint")
-    parser.add_argument("--object_trans_ckpt", type=str, default=None, help="覆盖 ObjectTrans checkpoint")
+    parser.add_argument("--vc_ckpt", type=str, default=None, help="覆盖 VelocityContact checkpoint")
+    parser.add_argument("--ot_ckpt", type=str, default=None, help="覆盖 ObjectTrans checkpoint")
     parser.add_argument("--hand_contact_threshold", type=float, default=None, help="左右手接触评估阈值")
     parser.add_argument("--object_contact_threshold", type=float, default=None, help="物体接触评估阈值")
     parser.add_argument("--inference_mode", "--inference-mode", choices=["online", "offline"], default="online", help="RNN inference mode")

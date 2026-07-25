@@ -1,11 +1,30 @@
 """Focused regression tests for batched stateful ObjectTrans online evaluation."""
+import os
+import sys
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 import eval_batch_online as batch_eval
 from model.rnn.object_trans import ObjectTransModule
+
+
+def test_batch_online_simulate_imu_noise_defaults_to_disabled():
+    args = batch_eval._make_parser().parse_args([])
+
+    assert args.simulate_imu_noise is False
+    assert args.eval_imu_noise is False
+
+
+def test_batch_online_noise_modes_are_mutually_exclusive():
+    with pytest.raises(SystemExit):
+        batch_eval._make_parser().parse_args(["--simulate_imu_noise", "--eval_imu_noise"])
 
 
 def _stateful_cfg():
@@ -119,6 +138,60 @@ class _StatefulPipeline:
         return output
 
 
+class _RecordingObjectTrans(ObjectTransModule):
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.received_priors = []
+
+    def forward(self, *args, **kwargs):
+        self.received_priors.append(kwargs.get("lb_prior_quantiles"))
+        return super().forward(*args, **kwargs)
+
+
+class _PriorPipeline(_StatefulPipeline):
+    def __init__(self, online_mode="window"):
+        self.human_pose_module = _DummyHumanPose()
+        self.velocity_contact_module = _DummyVelocityContact()
+        cfg = _stateful_cfg()
+        cfg.object_trans_online_mode = online_mode
+        self.object_trans_module = _RecordingObjectTrans(cfg).eval()
+        self.prior_calls = 0
+
+    def _predict_lb_prior(self, hp_out, vc_out, obj_imu):
+        self.prior_calls += 1
+        batch_size = obj_imu.shape[0]
+        return torch.full(
+            (batch_size, 2, 3),
+            float(self.prior_calls),
+            device=obj_imu.device,
+            dtype=obj_imu.dtype,
+        )
+
+    def forward(self, data, use_object_data=True, compute_fk=False, refine_human=False):
+        hp_out = self.human_pose_module.forward(self._build_hp_input_dict(data))
+        vc_out = self.velocity_contact_module.forward({**data, "hp_out": hp_out}, hp_out=hp_out)
+        output = {**hp_out, **vc_out}
+        if use_object_data:
+            lb_prior_quantiles = self._predict_lb_prior(hp_out, vc_out, data["obj_imu"])
+            output.update(
+                self.object_trans_module(
+                    self._resolve_hoi_hand_positions(hp_out),
+                    vc_out["pred_hand_contact_prob"],
+                    data["obj_trans_init"],
+                    obj_imu=data["obj_imu"],
+                    human_imu=data["human_imu"],
+                    obj_vel_input=vc_out["pred_obj_vel"],
+                    contact_init=data.get("contact_init"),
+                    has_object_mask=data.get("has_object"),
+                    lb_prior_quantiles=lb_prior_quantiles,
+                    enable_refine=False,
+                    compute_refine=False,
+                )
+            )
+        output["has_object"] = data.get("has_object")
+        return output
+
+
 def _sample(seq_len):
     obj_imu = torch.randn(seq_len, 9)
     obj_imu[:, 3:9] = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
@@ -169,3 +242,44 @@ def test_batched_stateful_ot_matches_full_causal_scan_for_reordered_active_batch
             atol=1e-5,
             rtol=1e-5,
         )
+
+
+def test_batched_window_ot_passes_prior_to_every_reset_window(monkeypatch):
+    torch.manual_seed(19)
+    model = _PriorPipeline(online_mode="window")
+    monkeypatch.setattr(
+        batch_eval,
+        "build_model_input_dict",
+        lambda raw, config, device, add_noise=False: raw,
+    )
+
+    batch_eval._run_batched_online_group(
+        model,
+        config=None,
+        device=torch.device("cpu"),
+        samples=[_sample(seq_len=5)],
+        online_window=3,
+        use_object_data=True,
+        compute_fk=False,
+        refine_human=False,
+        desc="window-prior-test",
+    )
+
+    received = model.object_trans_module.received_priors
+    assert len(received) == 3
+    assert all(isinstance(prior, torch.Tensor) for prior in received)
+    assert [float(prior[0, 0, 0]) for prior in received] == [1.0, 2.0, 3.0]
+
+
+def test_stateful_warmup_replay_passes_prior_to_initial_state():
+    torch.manual_seed(23)
+    model = _PriorPipeline(online_mode="stateful")
+    warmup_data = batch_eval._collate_sample_slices([_sample(seq_len=3)], [0], [3])
+
+    states = batch_eval._initialize_stateful_ot_states(model, warmup_data, batch_size=1)
+
+    assert len(states) == 1
+    assert len(model.object_trans_module.received_priors) == 1
+    prior = model.object_trans_module.received_priors[0]
+    assert isinstance(prior, torch.Tensor)
+    assert torch.equal(prior, torch.ones(1, 2, 3))

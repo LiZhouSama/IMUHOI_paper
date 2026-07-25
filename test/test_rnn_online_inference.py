@@ -108,6 +108,45 @@ def test_object_trans_offline_inference_matches_forward():
     assert torch.allclose(inference_out["gating_weights"], forward_out["gating_weights"])
 
 
+def test_object_trans_predicts_absolute_length_with_prior_only_in_initial_state():
+    torch.manual_seed(71)
+    model = ObjectTransModule(_small_cfg()).eval()
+    expected_bias = torch.log(torch.expm1(torch.tensor(0.4 - model.LENGTH_EPS)))
+    assert torch.allclose(
+        model.object_trans_head.linear2.bias[[3, 7]],
+        expected_bias.expand(2),
+    )
+    data = _object_inputs(batch_size=2, seq_len=3)
+    prior = torch.tensor(
+        [
+            [[0.20, 0.30, 0.50], [0.40, 0.60, 0.90]],
+            [[0.25, 0.35, 0.55], [0.45, 0.65, 0.95]],
+        ]
+    )
+    nn.init.zeros_(model.object_trans_head.linear2.weight)
+    nn.init.zeros_(model.object_trans_head.linear2.bias)
+
+    with torch.no_grad():
+        out = model(
+            data["hand_pos"],
+            data["contact"],
+            data["obj_trans_init"],
+            obj_imu=data["obj_imu"],
+            human_imu=data["human_imu"],
+            obj_vel_input=data["obj_vel"],
+            human_pose_input=data["pose"],
+            root_trans_input=data["root"],
+            lb_prior_quantiles=prior,
+            enable_refine=False,
+        )
+
+    assert model.object_trans_head.init_net[0].in_features == 17
+    expected_length = torch.full((2, 3), float(torch.log(torch.tensor(2.0))) + 1e-4)
+    assert torch.allclose(out["pred_lhand_lb"], expected_length)
+    assert torch.allclose(out["pred_rhand_lb"], expected_length)
+    assert torch.allclose(out["lb_prior_quantiles"], prior)
+
+
 def test_object_trans_online_shapes_for_short_equal_long_windows():
     torch.manual_seed(8)
     model = ObjectTransModule(_small_cfg()).eval()

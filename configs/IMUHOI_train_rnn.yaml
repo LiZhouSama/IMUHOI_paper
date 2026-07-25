@@ -20,30 +20,91 @@ velocity_num_layers: 2
 velocity_dropout: 0.2
 boundary_group_hidden: 64
 boundary_hidden_dim: 128
+boundary_bidirectional: true
 
 hidden_dim_multiplier: 1
 object_trans_hidden_dim: 192
 object_trans_num_layers: 2
 object_trans_dropout: 0.2
+object_trans_length_init: 0.4
 object_trans_state_feedback: false
 object_trans_feedback_hidden_dim: 64
 object_trans_online_mode: "window"  # window | stateful
 mesh_downsample_points: 256
 enable_ot_refine: true
+enable_ot_lb_prior: true
+
+# ============ 独立 l_b VQ + latent diffusion（暂不接入OT）============
+lb_vq_prior:
+  batch_size: 200
+  num_workers: 4
+  quantiles: [0.1, 0.5, 0.9]
+  min_contact_frames: 10
+  max_seq_len: 256
+  deterministic_test_windows: true
+
+  # canonical mesh points -> one BPS descriptor per window
+  bps_num_basis: 128
+  bps_radius: 1.0
+  bps_seed: 2027
+  mesh_hidden_dim: 128
+  mesh_feature_dim: 64
+
+  # privileged temporal VQ bottleneck
+  temporal_downsample: 8
+  latent_dim: 32
+  num_codes: 64
+  vq_model_dim: 128
+  vq_nhead: 4
+  vq_encoder_layers: 3
+  vq_decoder_layers: 2
+  vq_dropout: 0.1
+  commitment_beta: 0.25
+  soft_assignment_temperature: 0.1
+  vq_epochs: 300
+  vq_lr: 0.0001
+  vq_weight_decay: 0.0001
+  vq_recon_weight: 10.0
+  vq_usage_weight: 0.01
+  vq_smooth_weight: 0.01
+
+  # observation-conditioned diffusion over the frozen VQ latent sequence
+  observation_encoder_layers: 2
+  diffusion_cond_dim: 128
+  diffusion_model_dim: 128
+  diffusion_nhead: 4
+  diffusion_layers: 4
+  diffusion_dropout: 0.1
+  diffusion_cond_dropout: 0.0
+  diffusion_timesteps: 1000
+  diffusion_prediction_type: "x0"
+  diffusion_epochs: 300
+  diffusion_lr: 0.0002
+  diffusion_weight_decay: 0.0001
+  diffusion_latent_weight: 1.0
+  diffusion_decode_weight: 5.0
+  diffusion_codebook_weight: 0.1
+  diffusion_sample_steps: 50
+  eval_sample_batches: 10
+  gradient_clip: 1.0
+  # Frozen prior used by ObjectTrans. 100 DDIM steps matches prior validation.
+  vq_checkpoint:        "outputs/IMUHOI_RNN_2/lb_vq_diffusion_all_07241411/vq_best.pt"
+  diffusion_checkpoint: "outputs/IMUHOI_RNN_2/lb_vq_diffusion_all_07241411/diffusion_best_sample.pt"
+  ot_sample_steps: 50
 
 # ============ 训练超参数 ============
 epochs: 300
 joint_train_epochs: 100
 input_mix_start_epoch: 0
 input_mix_end_epoch: 30  # 0 means use predicted HP/VC inputs from epoch 0
-batch_size: 100 # ot:40
+batch_size: 200
 lr: 0.002 # jt:0.0002
 weight_decay: 0.0001
 milestones: [100, 200, 300, 350, 400, 450, 500]
 joint_train_milestones: [10,20,30,40,50,60,70,80,90,100] 
 gamma: 0.2
 seed: 42
-num_workers: 12
+num_workers: 4
 
 # ============ 特征维度 ============
 num_human_imus: 6
@@ -52,6 +113,7 @@ obj_imu_dim: 9
 num_joints: 24
 
 # ============ 噪声配置 ============
+simulate_imu_noise: true
 imu_acc_noise_std: 0.2
 imu_rot_noise_std: 0.005
 obj_imu_acc_noise_std: 0.2
@@ -143,10 +205,6 @@ test:
 
 # ============ 预训练模块路径（可选）============
 pretrained_modules:
-  human_pose: "outputs/IMUHOI_RNN_2/human_pose_06301344_seq_20260630_134410/best.pt"
-  velocity_contact: "outputs/IMUHOI_RNN_2/velocity_contact_06301534_seq_20260630_134410/best.pt"
-  # ObjectTrans v2 uses a shared prediction head and must be trained from scratch.
-  object_trans: null
-
-  # human_pose: "outputs/IMUHOI_rnn/joint_train_01112057/best_human_pose.pt"
-  # velocity_contact: "outputs/IMUHOI_rnn/joint_train_01112057/best_velocity_contact.pt"
+  human_pose:       "outputs/IMUHOI_RNN_2/rnn_sequential_seq_20260720_173347/human_pose_07201733_seq_20260720_173347/best.pt"
+  velocity_contact: "outputs/IMUHOI_RNN_2/object_trans_07222103/best_velocity_contact.pt"
+  object_trans:     "outputs/IMUHOI_RNN_2/object_trans_07222103/best_object_trans.pt"

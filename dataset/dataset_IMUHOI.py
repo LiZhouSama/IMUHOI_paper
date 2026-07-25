@@ -226,6 +226,7 @@ class IMUDataset(Dataset):
         sequence_paths=None,
         obj_points_sample_count=256,
         resolve_bimanual_contact_conflicts=False,
+        random_window=True,
     ):
         """
         IMU数据集 - 每个epoch为每个序列随机采样一个窗口
@@ -238,6 +239,7 @@ class IMUDataset(Dataset):
             imu_noise_cfg: 可选，IMU 噪声配置（None 使用 Noitom 风格默认值）
             simulate_imu_noise: 是否对合成 IMU 施加真实感噪声模型
             resolve_bimanual_contact_conflicts: 是否后处理双手同时接触段，清掉骨长变化更大的手部接触标签
+            random_window: 窗口模式下是否随机选起点；验证集可关闭以获得可重复曲线
         """
         # 支持单个目录或多个目录
         if isinstance(data_dir, str):
@@ -255,6 +257,7 @@ class IMUDataset(Dataset):
         self.imu_noise_cfg = merge_noise_cfg(imu_noise_cfg)
         self.obj_points_sample_count = int(max(1, obj_points_sample_count))
         self.resolve_bimanual_contact_conflicts = bool(resolve_bimanual_contact_conflicts)
+        self.random_window = bool(random_window)
 
         # 查找所有目录中的序列文件，或使用显式传入的序列文件列表
         self.sequence_files = []
@@ -437,7 +440,10 @@ class IMUDataset(Dataset):
             # 随机生成 start_idx（窗口模式）
             # 有效 start_idx 范围：[1, seq_len - window_size] (包含两端)
             max_start_idx = seq_len - self.window_size
-            start_idx = torch.randint(1, max_start_idx + 1, (1,)).item()
+            if self.random_window:
+                start_idx = torch.randint(1, max_start_idx + 1, (1,)).item()
+            else:
+                start_idx = 1 + (max_start_idx - 1) // 2
             # start_idx = 1
             end_idx = start_idx + self.window_size # 切片时使用 end_idx
 

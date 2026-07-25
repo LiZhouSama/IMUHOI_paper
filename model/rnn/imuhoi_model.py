@@ -11,6 +11,12 @@ from pytorch3d.transforms import matrix_to_rotation_6d, rotation_6d_to_matrix
 from .velocity_contact import VelocityContactModule
 from .human_pose import HumanPoseModule
 from .object_trans import ObjectTransModule
+from .object_trans_legacy import LegacyObjectTransModule
+from .object_trans_legacy_mesh import LegacyMeshObjectTransModule
+from .object_trans_mergeHeads_obsEncoder import (
+    ObjectTransModule as MergeHeadsObsObjectTransModule,
+)
+from .lb_vq_diffusion import FrozenLBPriorPredictor
 from .online import (
     append_stream_data,
     concat_time_dicts,
@@ -140,7 +146,7 @@ class IMUHOIModel(nn.Module):
 
         return computed_obj_trans
 
-    def __init__(self, cfg, device, no_trans: bool = False):
+    def __init__(self, cfg, device, no_trans: bool = False, object_trans_arch: Optional[str] = None):
         """
         Args:
             cfg: 配置对象
@@ -151,11 +157,39 @@ class IMUHOIModel(nn.Module):
         self.cfg = cfg
         self.device = device
         self.no_trans = no_trans
+        self.object_trans_arch = str(
+            object_trans_arch or getattr(cfg, "object_trans_arch", "current")
+        ).strip().lower()
         
         # 创建三个模块
         self.velocity_contact_module = VelocityContactModule(cfg)
         self.human_pose_module = HumanPoseModule(cfg, device, no_trans=no_trans)
-        self.object_trans_module = ObjectTransModule(cfg)
+        if self.object_trans_arch == "legacy":
+            self.object_trans_module = LegacyObjectTransModule(cfg)
+        elif self.object_trans_arch == "legacy_mesh":
+            self.object_trans_module = LegacyMeshObjectTransModule(cfg)
+        elif self.object_trans_arch == "mergeheads_obs":
+            self.object_trans_module = MergeHeadsObsObjectTransModule(cfg)
+        elif self.object_trans_arch == "current":
+            self.object_trans_module = ObjectTransModule(cfg)
+        else:
+            raise ValueError(
+                "object_trans_arch must be 'current', 'legacy', 'legacy_mesh', "
+                "or 'mergeHeads_obs', "
+                f"got {self.object_trans_arch!r}"
+            )
+        self.lb_prior_predictor = None
+        if bool(getattr(cfg, "enable_ot_lb_prior", False)):
+            if self.object_trans_arch == "current":
+                self.lb_prior_predictor = FrozenLBPriorPredictor(cfg)
+            elif self.object_trans_arch != "mergeheads_obs":
+                raise ValueError("l_b VQ/Diffusion prior supports object_trans_arch=current only")
+
+    def _predict_lb_prior(self, hp_out, vc_out, obj_imu):
+        predictor = getattr(self, "lb_prior_predictor", None)
+        if predictor is None:
+            return None
+        return predictor(hp_out, vc_out, obj_imu)
 
     @staticmethod
     def _resolve_hoi_hand_positions(hp_out: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -355,6 +389,9 @@ class IMUHOIModel(nn.Module):
         # Stage 3: ObjectTrans - 预测物体位置
         has_object = data_dict.get("has_object")
         if use_object_data and (has_object is None or has_object.any()):
+            lb_prior_quantiles = self._predict_lb_prior(
+                hp_out, vc_out, data_dict["obj_imu"]
+            )
             ot_out = self.object_trans_module(
                 hoi_hand_positions,
                 vc_out["pred_hand_contact_prob"],
@@ -366,6 +403,7 @@ class IMUHOIModel(nn.Module):
                 has_object_mask=has_object,
                 human_pose_input=hp_out.get("p_pred"),
                 root_trans_input=hp_out.get("root_trans_pred"),
+                lb_prior_quantiles=lb_prior_quantiles,
                 enable_refine=refine_human,
             )
             results.update(ot_out)
@@ -550,6 +588,9 @@ class IMUHOIModel(nn.Module):
 
             has_object = window_data.get("has_object")
             if use_object_data and (has_object is None or has_object.any()):
+                lb_prior_quantiles = self._predict_lb_prior(
+                    hp_context, vc_context, window_data["obj_imu"]
+                )
                 obj_prefix = prefix.get("pred_obj_trans")
                 gate_prefix = prefix.get("gating_weights")
                 if isinstance(obj_prefix, torch.Tensor) and obj_prefix.shape[1] > 0:
@@ -567,6 +608,7 @@ class IMUHOIModel(nn.Module):
                     has_object_mask=has_object,
                     human_pose_input=hp_context.get("p_pred"),
                     root_trans_input=hp_context.get("root_trans_pred"),
+                    lb_prior_quantiles=lb_prior_quantiles,
                     enable_refine=refine_human,
                     known_obj_trans_prefix=obj_prefix,
                     known_gating_weights_prefix=gate_prefix,
@@ -600,6 +642,11 @@ class IMUHOIModel(nn.Module):
         its learned LSTM state and fused OT state across calls, which isolates
         the experimental variable without silently changing upstream models.
         """
+        if getattr(self, "lb_prior_predictor", None) is not None:
+            raise ValueError(
+                "The window-level l_b diffusion prior cannot initialize strict stateful OT "
+                "without future observations; use object_trans_online_mode=window."
+            )
         refine_human = self._resolve_refine_human(refine_human)
         batch_size, chunk_len = infer_batch_seq(data_dict)
         if chunk_len < 1:
@@ -691,6 +738,8 @@ class IMUHOIModel(nn.Module):
                     obj_vel_input=vc_latest["pred_obj_vel"],
                     contact_init=window_data.get("contact_init"),
                     has_object_mask=has_object,
+                    human_pose_input=hp_latest.get("p_pred"),
+                    root_trans_input=hp_latest.get("root_trans_pred"),
                     enable_refine=False,
                     compute_refine=False,
                     prediction_state=prediction_state,
@@ -819,6 +868,7 @@ def load_model(
     device: torch.device,
     no_trans: bool = False,
     module_paths: Optional[Dict[str, str]] = None,
+    object_trans_arch: Optional[str] = None,
 ) -> IMUHOIModel:
     """
     加载IMUHOI模型
@@ -834,7 +884,12 @@ def load_model(
     """
     from utils.utils import flatten_lstm_parameters
     
-    model = IMUHOIModel(config, device, no_trans=no_trans)
+    model = IMUHOIModel(
+        config,
+        device,
+        no_trans=no_trans,
+        object_trans_arch=object_trans_arch,
+    )
     model = model.to(device)
     
     # 确定预训练模块路径

@@ -293,6 +293,12 @@ def _initialize_stateful_ot_states(
         "hp_out": hp_out,
     }
     vc_out = model.velocity_contact_module.forward(vc_input_dict, hp_out=hp_out)
+    lb_prior_quantiles = _predict_lb_prior_if_available(
+        model,
+        hp_out,
+        vc_out,
+        warmup_data["obj_imu"],
+    )
     _, prediction_state = model.object_trans_module.forward(
         model._resolve_hoi_hand_positions(hp_out),
         vc_out["pred_hand_contact_prob"],
@@ -302,11 +308,24 @@ def _initialize_stateful_ot_states(
         obj_vel_input=vc_out["pred_obj_vel"],
         contact_init=warmup_data.get("contact_init"),
         has_object_mask=warmup_data.get("has_object"),
+        lb_prior_quantiles=lb_prior_quantiles,
         enable_refine=False,
         compute_refine=False,
         return_prediction_state=True,
     )
     return _split_ot_prediction_state(prediction_state, batch_size)
+
+
+def _predict_lb_prior_if_available(
+    model,
+    hp_out: Dict[str, Any],
+    vc_out: Dict[str, Any],
+    obj_imu: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    predict = getattr(model, "_predict_lb_prior", None)
+    if not callable(predict):
+        return None
+    return predict(hp_out, vc_out, obj_imu)
 
 
 def _sample_seq_len(sample: Dict[str, Any]) -> int:
@@ -558,6 +577,12 @@ def _run_batched_online_group(
                         )
                     )
                 else:
+                    lb_prior_quantiles = _predict_lb_prior_if_available(
+                        model,
+                        hp_context,
+                        vc_context,
+                        window_data["obj_imu"],
+                    )
                     obj_prefix = prefix.get("pred_obj_trans")
                     gate_prefix = prefix.get("gating_weights")
                     if isinstance(obj_prefix, torch.Tensor) and obj_prefix.shape[1] > 0:
@@ -575,6 +600,7 @@ def _run_batched_online_group(
                         has_object_mask=has_object,
                         human_pose_input=hp_context.get("p_pred"),
                         root_trans_input=hp_context.get("root_trans_pred"),
+                        lb_prior_quantiles=lb_prior_quantiles,
                         enable_refine=refine_human,
                         known_obj_trans_prefix=obj_prefix,
                         known_gating_weights_prefix=gate_prefix,
@@ -689,8 +715,18 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compare_3", action="store_true")
     parser.add_argument("--hp_ckpt", type=str, default=None)
     parser.add_argument("--interaction_ckpt", type=str, default=None)
-    parser.add_argument("--velocity_contact_ckpt", type=str, default=None)
-    parser.add_argument("--object_trans_ckpt", type=str, default=None)
+    parser.add_argument("--vc_ckpt", type=str, default=None)
+    parser.add_argument("--ot_ckpt", type=str, default=None)
+    parser.add_argument(
+        "--object_trans_arch",
+        "--object-trans-arch",
+        choices=("current", "legacy", "legacy_mesh", "mergeHeads_obs"),
+        default=None,
+        help=(
+            "ObjectTrans架构；legacy为无prior多head，legacy_mesh为ObsEncoder多head，"
+            "mergeHeads_obs为共享head+ObsEncoder。"
+        ),
+    )
     parser.add_argument(
         "--object_trans_state_feedback",
         choices=("none", "fused"),
@@ -708,7 +744,17 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ablate_vc_boundary", action="store_true")
     parser.add_argument("--output_json", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
+    noise_group = parser.add_mutually_exclusive_group()
+    noise_group.add_argument(
+        "--simulate_imu_noise",
+        "--simulate-imu-noise",
+        action="store_true",
+        help=(
+            "Enable Dataset.simulate_imu_noise for full-sequence evaluation. "
+            "Default: disabled."
+        ),
+    )
+    noise_group.add_argument(
         "--eval_imu_noise",
         "--eval-imu-noise",
         action="store_true",
@@ -749,6 +795,11 @@ def main() -> int:
         f"{'enabled' if args.eval_imu_noise else 'disabled'}"
         + (f" | base_seed={args.eval_imu_noise_seed}" if args.eval_imu_noise else "")
     )
+    print(
+        "simulate_imu_noise: "
+        f"{'enabled' if args.simulate_imu_noise else 'disabled'}"
+        " (sequence-level)"
+    )
 
     try:
         config_for_dataset_lookup = load_config(args.config)
@@ -765,6 +816,8 @@ def main() -> int:
         print(f"\n=== Batch-online evaluating dataset: {dataset_name} ===")
         config = load_config(args.config)
         config.model_arch = "rnn"
+        if args.object_trans_arch is not None:
+            config.object_trans_arch = args.object_trans_arch
         config.ablate_vc_boundary = bool(args.ablate_vc_boundary)
         if args.object_trans_state_feedback is not None:
             config.object_trans_state_feedback = args.object_trans_state_feedback == "fused"
@@ -834,7 +887,9 @@ def main() -> int:
             data_dir=str(data_path),
             window_size=test_window,
             debug=config.get("debug", False),
-            simulate_imu_noise=False,
+            # full_sequence=True makes simulate_imu_noise operate once per sequence,
+            # before the online evaluator creates its rolling windows.
+            simulate_imu_noise=bool(args.simulate_imu_noise),
             min_obj_contact_frames=0,
             full_sequence=True,
             resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", False),
@@ -843,7 +898,13 @@ def main() -> int:
             print(f"[BatchEval] Skipping '{dataset_name}' (dataset is empty).")
             continue
 
-        model = load_model(config, device, no_trans=args.no_trans, module_paths=module_paths)
+        model = load_model(
+            config,
+            device,
+            no_trans=args.no_trans,
+            module_paths=module_paths,
+            object_trans_arch=args.object_trans_arch,
+        )
         model = _unwrap_model(model)
         model.eval()
 
@@ -957,8 +1018,10 @@ def main() -> int:
             "online_batch_size": args.online_batch_size,
             "object_trans_state_feedback": resolved_ot_state_feedback,
             "object_trans_online_mode": resolved_ot_online_mode,
+            "object_trans_arch": args.object_trans_arch or getattr(load_config(args.config), "object_trans_arch", "current"),
             "ablate_vc_boundary": bool(args.ablate_vc_boundary),
             "seed": seed,
+            "simulate_imu_noise": bool(args.simulate_imu_noise),
             "eval_imu_noise": bool(args.eval_imu_noise),
             "eval_imu_noise_seed": args.eval_imu_noise_seed if args.eval_imu_noise else None,
             "results": all_results,

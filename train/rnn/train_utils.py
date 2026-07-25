@@ -63,8 +63,27 @@ def get_base_args():
     parser.add_argument('--lr', type=float, default=None, help='学习率（优先于配置文件）')
     parser.add_argument('--pretrained_ckpt', type=str, default=None, help='预训练权重路径')
     parser.add_argument('--resume_dir', type=str, default=None, help='从已有训练输出目录恢复训练')
+    parser.add_argument(
+        '--save_dir',
+        type=str,
+        default=None,
+        help='本次训练的输出父目录；模块子目录会在此目录下创建。',
+    )
     parser.add_argument('--debug', action='store_true', help='调试模式')
     parser.add_argument('--no_trans', action='store_true', help='禁用根节点位移预测')
+    parser.add_argument(
+        '--simulate_imu_noise',
+        dest='simulate_imu_noise',
+        action='store_true',
+        default=None,
+        help='在训练数据加载阶段启用 simulate_imu_noise。',
+    )
+    parser.add_argument(
+        '--no_simulate_imu_noise',
+        dest='simulate_imu_noise',
+        action='store_false',
+        help='在训练数据加载阶段关闭 simulate_imu_noise。',
+    )
     parser.add_argument('--model_arch', type=str, choices=['rnn', 'dit', 'mamba_simple'], default=None, help='选择模型架构(rnn/dit/mamba_simple)')
     parser.add_argument('--run_suffix', type=str, default=None, help='追加到本次训练输出目录名的后缀')
     parser.add_argument(
@@ -131,11 +150,17 @@ def merge_config(args):
         cfg.lr = args.lr
     if args.pretrained_ckpt is not None or not hasattr(cfg, 'pretrained_ckpt'):
         cfg.pretrained_ckpt = args.pretrained_ckpt or getattr(cfg, 'pretrained_ckpt', None)
+    if args.save_dir is not None:
+        cfg.save_dir = args.save_dir
 
     cfg.resume_dir = os.path.normpath(resume_dir) if resume_dir else None
     cfg.resume_config_missing = resume_config_missing
     cfg.debug = bool(args.debug) if (not is_resume or _cli_has_option("debug")) else bool(getattr(cfg, 'debug', False))
     cfg.no_trans = bool(args.no_trans) if (not is_resume or _cli_has_option("no_trans")) else bool(getattr(cfg, 'no_trans', False))
+    if args.simulate_imu_noise is not None:
+        cfg.simulate_imu_noise = bool(args.simulate_imu_noise)
+    else:
+        cfg.simulate_imu_noise = bool(getattr(cfg, 'simulate_imu_noise', False))
     cfg.run_suffix = getattr(args, "run_suffix", None) or getattr(cfg, "run_suffix", None)
     cfg.cfg_file = config_path
     cfg.model_arch = args.model_arch or getattr(cfg, 'model_arch', 'rnn')
@@ -250,8 +275,9 @@ def create_dataloaders(cfg, project_root=None):
         window_size=cfg.train.window,
         debug=cfg.debug,
         obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
-        simulate_imu_noise=False,
+        simulate_imu_noise=bool(getattr(cfg, 'simulate_imu_noise', False)),
         resolve_bimanual_contact_conflicts=resolve_bimanual_contact_conflicts,
+        random_window=True,
     )
     
     train_loader = DataLoader(
@@ -272,8 +298,10 @@ def create_dataloaders(cfg, project_root=None):
             window_size=cfg.test.window,
             debug=cfg.debug,
             obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
+            # Keep validation deterministic; noise is enabled for the training split only.
             simulate_imu_noise=False,
             resolve_bimanual_contact_conflicts=resolve_bimanual_contact_conflicts,
+            random_window=not bool(getattr(cfg, "deterministic_test_windows", False)),
         )
         if len(test_dataset) > 0:
             test_loader = DataLoader(

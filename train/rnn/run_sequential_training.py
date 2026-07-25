@@ -4,9 +4,13 @@ Run the RNN training stages in order and wire each best checkpoint forward.
 Stages:
 1. train_human_pose.py --epochs 300
 2. train_velocity_contact.py --epochs 200 --hp_ckpt <stage1 best>
-3. train_object_trans.py --epochs 400 --batch_size 40 --hp_ckpt <stage1 best> --vc_ckpt <stage2 best>
-4. train_object_trans.py --joint_train --lr 0.0002 --epochs 100 --batch_size 30
-   --hp_ckpt <stage1 best> --vc_ckpt <stage2 best> --ot_ckpt <stage3 best>
+3. train_object_trans.py --joint_train --epochs 300 --hp_ckpt <stage1 best>
+   --vc_ckpt <stage2 best>
+
+The OT script automatically performs its joint-training phase in the same OT
+output directory. All three stage directories are created below one new
+pipeline parent directory. Training data uses the dataset-level
+simulate_imu_noise path by default.
 """
 from __future__ import annotations
 
@@ -63,7 +67,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Stable suffix appended to all stage output dirs. Defaults to seq_<timestamp>.",
     )
-    parser.add_argument("--seed", type=int, default=None, help="Forward a seed to every stage.")
+    parser.add_argument("--seed", type=int, default=42, help="Forward a seed to every stage.")
     parser.add_argument("--debug", action="store_true", help="Forward --debug to every stage.")
     parser.add_argument("--no_trans", action="store_true", help="Forward --no_trans to every stage.")
     parser.add_argument(
@@ -85,6 +89,11 @@ def parse_args() -> argparse.Namespace:
         "--dry_run",
         action="store_true",
         help="Print/write the planned commands without launching training.",
+    )
+    parser.add_argument(
+        "--no_simulate_imu_noise",
+        action="store_true",
+        help="Disable simulate_imu_noise for this pipeline (enabled by default).",
     )
     return parser.parse_args()
 
@@ -125,36 +134,26 @@ def stage_specs() -> list[StageSpec]:
             name="object_trans",
             script="train/rnn/train_object_trans.py",
             module_name="object_trans",
-            fixed_args=["--epochs", "400", "--batch_size", "40"],
+            fixed_args=["--epochs", "300", "--joint_train"],
             dependency_args=["--hp_ckpt", "{hp_ckpt}", "--vc_ckpt", "{vc_ckpt}"],
-        ),
-        StageSpec(
-            name="joint_train",
-            script="train/rnn/train_object_trans.py",
-            module_name="joint_train",
-            fixed_args=[
-                "--joint_train",
-                "--lr",
-                "0.0002",
-                "--epochs",
-                "100",
-                "--batch_size",
-                "30",
-            ],
-            dependency_args=[
-                "--hp_ckpt",
-                "{hp_ckpt}",
-                "--vc_ckpt",
-                "{vc_ckpt}",
-                "--ot_ckpt",
-                "{ot_ckpt}",
-            ],
         ),
     ]
 
 
-def common_args(args: argparse.Namespace, cfg_path: Path, run_suffix: str) -> list[str]:
-    values = ["--cfg", str(cfg_path), "--run_suffix", run_suffix]
+def common_args(
+    args: argparse.Namespace,
+    cfg_path: Path,
+    run_suffix: str,
+    pipeline_dir: Path,
+) -> list[str]:
+    values = [
+        "--cfg",
+        str(cfg_path),
+        "--run_suffix",
+        run_suffix,
+        "--save_dir",
+        str(pipeline_dir),
+    ]
     if args.seed is not None:
         values.extend(["--seed", str(args.seed)])
     if args.debug:
@@ -165,6 +164,9 @@ def common_args(args: argparse.Namespace, cfg_path: Path, run_suffix: str) -> li
         values.extend(["--model_arch", args.model_arch])
     if args.train_datasets:
         values.extend(["--train_datasets", *args.train_datasets])
+    values.append(
+        "--no_simulate_imu_noise" if args.no_simulate_imu_noise else "--simulate_imu_noise"
+    )
     return values
 
 
@@ -196,6 +198,55 @@ def find_stage_best(base_save_dir: Path, module_name: str, run_suffix: str) -> t
         raise FileNotFoundError(f"No best.pt found for {module_name} with pattern: {pattern}")
     best_ckpt = max(matches, key=lambda path: path.stat().st_mtime)
     return best_ckpt.parent, best_ckpt
+
+
+def build_eval_command(
+    args: argparse.Namespace,
+    cfg_path: Path,
+    pipeline_dir: Path,
+    results: Sequence[StageResult],
+    ckpts: dict[str, str],
+) -> tuple[list[str], Path, Path]:
+    """Build the final batch-online eval command from this pipeline's outputs."""
+    object_result = next((item for item in results if item.name == "object_trans"), None)
+    if object_result is None or object_result.save_dir is None:
+        raise RuntimeError("The ObjectTrans stage result is required before evaluation.")
+
+    object_save_dir = Path(object_result.save_dir)
+    joint_vc_ckpt = object_save_dir / "best_velocity_contact.pt"
+    joint_ot_ckpt = object_save_dir / "best_object_trans.pt"
+    if not args.dry_run:
+        missing = [path for path in (joint_vc_ckpt, joint_ot_ckpt) if not path.is_file()]
+        if missing:
+            missing_text = ", ".join(str(path) for path in missing)
+            raise FileNotFoundError(
+                "OT --joint_train completed without the expected joint checkpoints: "
+                f"{missing_text}"
+            )
+
+    output_json = pipeline_dir / "eval_batch_online.json"
+    log_path = pipeline_dir / "eval_batch_online.log"
+    command = [
+        sys.executable,
+        str(PROJECT_ROOT / "eval_batch_online.py"),
+        "--config",
+        str(cfg_path),
+        "--hp_ckpt",
+        ckpts["hp_ckpt"],
+        "--vc_ckpt",
+        str(joint_vc_ckpt),
+        "--ot_ckpt",
+        str(joint_ot_ckpt),
+        "--output_json",
+        str(output_json),
+    ]
+    if args.seed is not None:
+        command.extend(["--seed", str(args.seed)])
+    if args.no_trans:
+        command.append("--no_trans")
+    if not args.no_simulate_imu_noise:
+        command.append("--simulate_imu_noise")
+    return command, log_path, output_json
 
 
 def write_manifest(path: Path, payload: dict) -> None:
@@ -299,7 +350,7 @@ def main() -> None:
     pipeline_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = pipeline_dir / "manifest.json"
 
-    shared_args = common_args(args, cfg_path, run_suffix)
+    shared_args = common_args(args, cfg_path, run_suffix, pipeline_dir)
     ckpts: dict[str, str] = {}
     results: list[StageResult] = []
 
@@ -312,13 +363,19 @@ def main() -> None:
         "stages": [],
     }
 
-    for spec in stage_specs():
+    specs = stage_specs()
+    for spec in specs:
+        planning_ckpts = (
+            {"hp_ckpt": "<human_pose_best.pt>", "vc_ckpt": "<velocity_contact_best.pt>"}
+            if args.dry_run
+            else ckpts
+        )
         command = [
             sys.executable,
             str(PROJECT_ROOT / spec.script),
             *shared_args,
             *spec.fixed_args,
-            *expand_dependency_args(spec.dependency_args, ckpts),
+            *expand_dependency_args(spec.dependency_args, planning_ckpts),
         ]
         log_path = pipeline_dir / f"{spec.name}.log"
         result = StageResult(
@@ -332,7 +389,7 @@ def main() -> None:
         write_manifest(manifest_path, manifest)
 
         print("\n" + "=" * 80)
-        print(f"[{len(results)}/4] {spec.name}")
+        print(f"[{len(results)}/{len(specs)}] {spec.name}")
         print(" ".join(command))
         print("=" * 80)
 
@@ -346,8 +403,6 @@ def main() -> None:
                 ckpts["hp_ckpt"] = placeholder
             elif spec.name == "velocity_contact":
                 ckpts["vc_ckpt"] = placeholder
-            elif spec.name == "object_trans":
-                ckpts["ot_ckpt"] = placeholder
             manifest["stages"] = [asdict(item) for item in results]
             manifest["checkpoints"] = dict(ckpts)
             write_manifest(manifest_path, manifest)
@@ -361,7 +416,7 @@ def main() -> None:
             write_manifest(manifest_path, manifest)
             raise SystemExit(f"{spec.name} failed with exit code {result.returncode}. See {log_path}")
 
-        save_dir, best_ckpt = find_stage_best(base_save_dir, spec.module_name, run_suffix)
+        save_dir, best_ckpt = find_stage_best(pipeline_dir, spec.module_name, run_suffix)
         result.save_dir = str(save_dir)
         result.best_ckpt = str(best_ckpt)
         if spec.name == "human_pose":
@@ -378,6 +433,38 @@ def main() -> None:
 
     manifest["stages"] = [asdict(item) for item in results]
     manifest["checkpoints"] = dict(ckpts)
+
+    eval_command, eval_log_path, eval_output_path = build_eval_command(
+        args,
+        cfg_path,
+        pipeline_dir,
+        results,
+        ckpts,
+    )
+    manifest["evaluation"] = {
+        "name": "batch_online",
+        "command": eval_command,
+        "log_path": str(eval_log_path),
+        "output_json": str(eval_output_path),
+        "returncode": None,
+    }
+    write_manifest(manifest_path, manifest)
+
+    print("\n" + "=" * 80)
+    print("Final batch-online evaluation")
+    print(" ".join(eval_command))
+    print("=" * 80)
+    if args.dry_run:
+        manifest["evaluation"]["returncode"] = 0
+    else:
+        eval_returncode = run_command(eval_command, eval_log_path)
+        manifest["evaluation"]["returncode"] = eval_returncode
+        if eval_returncode != 0:
+            write_manifest(manifest_path, manifest)
+            raise SystemExit(
+                f"batch_online evaluation failed with exit code {eval_returncode}. "
+                f"See {eval_log_path}"
+            )
     write_manifest(manifest_path, manifest)
     print("\nSequential RNN training finished.")
     print(f"Manifest: {manifest_path}")

@@ -1,0 +1,120 @@
+可用GPU数量: 1
+保存配置: outputs/IMUHOI_RNN_2/object_trans_07211034/config.yaml
+==================================================
+Stage 3 + 自动联合训练: ObjectTransModule训练 (普通模式)
+ObjectTrans架构: current
+设备: cuda:0
+批次大小: 200
+训练轮数: 300
+noTrans模式: False
+VC boundary ablation: disabled
+OT state feedback: disabled
+OT online mode snapshot: window (Stage3/joint training always scans complete training windows)
+保存目录: outputs/IMUHOI_RNN_2/object_trans_07211034
+==================================================
+VelocityContact权重(cli): outputs/IMUHOI_RNN_2/rnn_sequential_seq_20260720_173347/velocity_contact_07201834_seq_20260720_173347/best.pt
+HumanPose权重(cli): outputs/IMUHOI_RNN_2/rnn_sequential_seq_20260720_173347/human_pose_07201733_seq_20260720_173347/best.pt
+ObjectTrans权重配置(config.pretrained_modules.object_trans)已记录但不会作为自动joint起点: outputs/IMUHOI_RNN_2/legacy_ot_seq_20260720/object_trans_legacy_07202237_legacy_seq_20260720/best_object_trans.pt
+保存配置: outputs/IMUHOI_RNN_2/object_trans_07211034/config.yaml
+训练数据路径: ['/mnt/d/a_WORK/Projects/PhD/tasks/IMUHOI/process/processed_split_data_OMOMO_bps/train']
+从目录 /mnt/d/a_WORK/Projects/PhD/tasks/IMUHOI/process/processed_split_data_OMOMO_bps/train 找到 4705 个序列文件
+总共找到 4705 个序列文件
+开始预加载、共享内存处理和序列信息收集...
+共享内存策略: disabled（只读预加载，避免fd/shm耗尽）
+真实IMU使用情况：人体=生成，物体=生成
+预加载并收集信息完成，共找到4115个有效序列
+过滤条件：序列长度 >= 121，手部接触帧数(左右手任一) >= 0
+训练数据集大小: 4115
+从目录 /mnt/d/a_WORK/Projects/PhD/tasks/IMUHOI/process/processed_split_data_OMOMO_bps/test 找到 1177 个序列文件
+总共找到 1177 个序列文件
+开始预加载、共享内存处理和序列信息收集...
+共享内存策略: disabled（只读预加载，避免fd/shm耗尽）
+真实IMU使用情况：人体=生成，物体=生成
+预加载并收集信息完成，共找到1016个有效序列
+过滤条件：序列长度 >= 121，手部接触帧数(左右手任一) >= 0
+测试数据集大小: 1016
+加载检查点: outputs/IMUHOI_RNN_2/rnn_sequential_seq_20260720_173347/velocity_contact_07201834_seq_20260720_173347/best.pt
+加载检查点: outputs/IMUHOI_RNN_2/rnn_sequential_seq_20260720_173347/human_pose_07201733_seq_20260720_173347/best.pt
+VelocityContact参数量: 1037606
+HumanPose参数量: 6794355
+ObjectTrans参数量: 2977487
+Stage3模式：冻结HumanPose，训练ObjectTrans
+ObjectTrans可训练参数数量: 2977487, lr=0.002
+Epoch 0, Train Loss: 4.1065, Test Loss: 3.8614
+保存模型: best
+新的最佳测试损失: 3.8614
+保存模型: last
+Epoch 1, Train Loss: 2.9805
+保存模型: last
+Epoch 2, Train Loss: 1.9419
+保存模型: last
+Epoch 3, Train Loss: 1.5379
+保存模型: last
+Epoch 4, Train Loss: 1.3498
+保存模型: last
+Epoch 5, Train Loss: 1.2597
+保存模型: last
+Epoch 6, Train Loss: 1.1880
+保存模型: last
+Epoch 7, Train Loss: 1.1260
+保存模型: last
+Epoch 8, Train Loss: 1.0835
+保存模型: last
+Epoch 9, Train Loss: 1.0526
+保存模型: last
+Epoch 10, Train Loss: 1.0053, Test Loss: 1.1940
+保存模型: best
+新的最佳测试损失: 1.1940
+保存模型: last
+Epoch 11, Train Loss: 0.9453
+保存模型: last
+Epoch 12, Train Loss: 0.9175
+保存模型: last
+Epoch 13, Train Loss: 0.8770
+保存模型: last
+Epoch 14, Train Loss: 0.8341
+保存模型: last
+Epoch 15, Train Loss: 0.7993
+保存模型: last
+Epoch 16, Train Loss: 0.7800
+保存模型: last
+Epoch 17, Train Loss: 0.7458
+保存模型: last
+Epoch 18, Train Loss: 0.7380
+保存模型: last
+Epoch 19, Train Loss: 0.7326
+保存模型: last
+Epoch 20, Train Loss: 0.7187, Test Loss: 0.9773
+保存模型: best
+新的最佳测试损失: 0.9773
+保存模型: last
+Epoch 21, Train Loss: 0.6917
+保存模型: last
+Epoch 22, Train Loss: 0.6835
+保存模型: last
+Epoch 23, Train Loss: 0.6744
+保存模型: last
+Epoch 24, Train Loss: 0.6617
+保存模型: last
+Epoch 25, Train Loss: 0.6626
+保存模型: last
+Epoch 26, Train Loss: 0.6424
+保存模型: last
+Epoch 27, Train Loss: 0.6403
+保存模型: last
+Epoch 28, Train Loss: 0.6327
+保存模型: last
+Epoch 29, Train Loss: 0.6226
+保存模型: last
+Epoch 30, Train Loss: 0.6140, Test Loss: 0.9048
+保存模型: best
+新的最佳测试损失: 0.9048
+保存模型: last
+Epoch 31, Train Loss: 0.5948
+保存模型: last
+Epoch 32, Train Loss: 0.5987
+保存模型: last
+Epoch 33, Train Loss: 0.5923
+保存模型: last
+Epoch 34, Train Loss: 0.5809
+保存模型: last

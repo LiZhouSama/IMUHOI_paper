@@ -5,27 +5,31 @@ import torch
 from utils.rotation_conversions import axis_angle_to_matrix, matrix_to_rotation_6d, rotation_6d_to_matrix
 
 
-# Default noise profile approximating a mid-tier Noitom IMU (consumer-grade MEMS).
+# Default feature-space noise profile for a mid-tier Noitom-like IMU.
+#
+# This module is applied after acceleration smoothing and root-frame feature
+# construction, not to raw accelerometer / gyroscope signals.  The values below
+# are therefore effective feature-space perturbations rather than MEMS specs.
 NOITOM_IMU_NOISE_CFG: Dict[str, float] = {
-    "acc_bias_std": 0.08,                 # m/s^2 initial bias
-    "acc_bias_rw_std": 0.02,              # m/s^2 * sqrt(s) random walk
-    "acc_noise_std": 0.12,                # m/s^2 white noise density proxy
-    "acc_scale_std": 0.01,                # dimensionless scale factor error
-    "acc_misalignment_std": math.radians(0.8),  # rad, static axis misalignment
-    "acc_spike_prob": 0.002,              # probability of an accel spike per sample
-    "acc_spike_std": 0.8,                 # m/s^2 spike magnitude
-    "acc_clip": 16.0,                     # m/s^2 clipping to emulate sensor range
-    "acc_drift_per_s": 0.01,              # m/s^2/sec low-frequency drift
+    "acc_bias_std": 0.04,                 # m/s^2 initial bias
+    "acc_bias_rw_std": 0.005,             # m/s^2 * sqrt(s) random walk
+    "acc_noise_std": 0.06,                # m/s^2 white-noise proxy after smoothing
+    "acc_scale_std": 0.005,               # dimensionless scale factor error
+    "acc_misalignment_std": math.radians(0.3),  # rad, static axis misalignment
+    "acc_spike_prob": 0.0,                # enable only after measuring real glitches
+    "acc_spike_std": 0.0,                 # m/s^2 spike magnitude
+    "acc_clip": 0.0,                      # feature-space acceleration is not raw sensor range
+    "acc_drift_per_s": 0.0,               # avoid duplicating random-walk drift
 
-    "ori_bias_std": math.radians(0.4),    # rad, static attitude bias
-    "ori_rw_std": math.radians(0.03),     # rad * sqrt(s) attitude random walk
-    "ori_noise_std": math.radians(0.15),  # rad white noise
-    "ori_misalignment_std": math.radians(0.25),  # rad static misalignment
-    "ori_spike_prob": 0.001,              # probability of an attitude glitch
-    "ori_spike_std": math.radians(1.2),   # rad attitude glitch magnitude
+    "ori_bias_std": math.radians(1.0),    # rad, static attitude / calibration residual
+    "ori_rw_std": math.radians(0.01),     # rad * sqrt(s) attitude random walk
+    "ori_noise_std": math.radians(0.10),  # rad, fused-attitude white noise
+    "ori_misalignment_std": 0.0,          # avoid double-counting static orientation error
+    "ori_spike_prob": 0.0,                # enable only after measuring real glitches
+    "ori_spike_std": 0.0,                 # rad attitude glitch magnitude
 
-    "sample_drop_prob": 0.003,            # probability of dropping/holding a sample
-    "sample_hold_prob": 0.004,            # probability of repeating previous sample
+    "sample_drop_prob": 0.0,              # model packet loss separately when needed
+    "sample_hold_prob": 0.0,              # model packet loss separately when needed
 }
 
 
