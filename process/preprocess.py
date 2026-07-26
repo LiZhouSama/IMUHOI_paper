@@ -602,6 +602,124 @@ def _load_mesh_arrays(obj_mesh_path):
     return vertices, faces
 
 
+def _boolean_runs(mask):
+    """Return ``(value, start, end)`` runs for a one-dimensional boolean tensor."""
+    if not isinstance(mask, torch.Tensor):
+        raise TypeError("contact labels must be a torch.Tensor")
+    if mask.ndim != 1:
+        raise ValueError("contact labels must have shape [T]")
+    if mask.numel() == 0:
+        return []
+
+    values = mask.detach().bool().cpu().tolist()
+    runs = []
+    start = 0
+    current = values[0]
+    for index, value in enumerate(values[1:], start=1):
+        if value != current:
+            runs.append((current, start, index - 1))
+            start = index
+            current = value
+    runs.append((current, start, len(values) - 1))
+    return runs
+
+
+def postprocess_contact_labels(
+    contact_labels,
+    max_hole_frames=30,
+    min_contact_frames=30,
+):
+    """Fill short internal holes, then remove short contact episodes.
+
+    Hole filling is performed first so contact fragments separated only by a
+    short threshold dropout are treated as one interaction.  Leading/trailing
+    non-contact regions are never filled.  A contact segment of exactly
+    ``min_contact_frames`` is retained.
+    """
+    max_hole_frames = int(max_hole_frames)
+    min_contact_frames = int(min_contact_frames)
+    if max_hole_frames < 0:
+        raise ValueError("max_hole_frames must be non-negative")
+    if min_contact_frames < 1:
+        raise ValueError("min_contact_frames must be at least 1")
+
+    filled = contact_labels.bool().clone()
+    sequence_length = int(filled.numel())
+    if sequence_length == 0:
+        return filled
+
+    for is_contact, start, end in _boolean_runs(filled):
+        run_length = end - start + 1
+        is_internal_hole = not is_contact and start > 0 and end < sequence_length - 1
+        if is_internal_hole and run_length <= max_hole_frames:
+            filled[start:end + 1] = True
+
+    filtered = torch.zeros_like(filled)
+    for is_contact, start, end in _boolean_runs(filled):
+        if is_contact and end - start + 1 >= min_contact_frames:
+            filtered[start:end + 1] = True
+    return filtered
+
+
+def find_unheld_object_displacement_interval(
+    obj_trans,
+    lhand_contact,
+    rhand_contact,
+    min_displacement_m=0.10,
+):
+    """Find a no-hand-contact interval whose object displacement is too large.
+
+    Hand contact splits the sequence into independent intervals.  Within each
+    interval where neither hand is in contact, the maximum pairwise Euclidean
+    distance between object positions is measured.  This detects throws and
+    motion caused by other body parts even if hand contact exists elsewhere in
+    the same sequence.
+    """
+    if not isinstance(obj_trans, torch.Tensor) or obj_trans.ndim != 2 or obj_trans.shape[1] != 3:
+        raise ValueError("obj_trans must be a torch.Tensor with shape [T, 3]")
+    if not isinstance(lhand_contact, torch.Tensor) or not isinstance(rhand_contact, torch.Tensor):
+        raise TypeError("hand contact labels must be torch.Tensor instances")
+    if lhand_contact.ndim != 1 or rhand_contact.ndim != 1:
+        raise ValueError("hand contact labels must have shape [T]")
+    if obj_trans.shape[0] != lhand_contact.shape[0] or obj_trans.shape[0] != rhand_contact.shape[0]:
+        raise ValueError("object translation and hand contact sequence lengths must match")
+
+    min_displacement_m = float(min_displacement_m)
+    if min_displacement_m <= 0:
+        raise ValueError("min_displacement_m must be positive")
+    if not bool(torch.isfinite(obj_trans).all()):
+        raise ValueError("obj_trans contains non-finite values")
+
+    no_hand_contact = ~(lhand_contact.bool() | rhand_contact.bool())
+    for is_unheld, interval_start, interval_end in _boolean_runs(no_hand_contact):
+        interval_frames = interval_end - interval_start + 1
+        if not is_unheld or interval_frames < 2:
+            continue
+
+        positions = obj_trans[interval_start:interval_end + 1]
+        pairwise_distance = torch.cdist(positions, positions)
+        max_distance, flat_index = pairwise_distance.reshape(-1).max(dim=0)
+        max_distance_m = float(max_distance.item())
+        if max_distance_m < min_displacement_m:
+            continue
+
+        local_start = int(flat_index.item()) // interval_frames
+        local_end = int(flat_index.item()) % interval_frames
+        motion_start = interval_start + min(local_start, local_end)
+        motion_end = interval_start + max(local_start, local_end)
+        return {
+            "interval_start_frame": int(interval_start),
+            "interval_end_frame": int(interval_end),
+            "interval_frames": int(interval_frames),
+            "motion_start_frame": int(motion_start),
+            "motion_end_frame": int(motion_end),
+            "max_displacement_m": max_distance_m,
+            "displacement_threshold_m": min_displacement_m,
+        }
+
+    return None
+
+
 def compute_improved_contact_labels(obj_trans, obj_rot, obj_scale, position_global_full_gt_world,
                                   obj_mesh_dir, obj_name, device, T):
     """
@@ -748,42 +866,6 @@ def compute_improved_contact_labels(obj_trans, obj_rot, obj_scale, position_glob
             # 根据置信度判断接触
             lhand_contact[t] = lhand_contact_confidence > min_contact_confidence
             rhand_contact[t] = rhand_contact_confidence > min_contact_confidence
-
-        # 6. 后处理：平滑接触标签，去除孤立的接触点
-        def smooth_contact_labels(contact_labels, min_duration=3):
-            """平滑接触标签，去除过短的接触段"""
-            contact_smooth = contact_labels.clone()
-            contact_indices = torch.where(contact_labels)[0]
-
-            if len(contact_indices) == 0:
-                return contact_smooth
-
-            # 找到连续的接触段
-            contact_segments = []
-            start_idx = contact_indices[0].item()
-            end_idx = start_idx
-
-            for i in range(1, len(contact_indices)):
-                if contact_indices[i] == contact_indices[i-1] + 1:
-                    end_idx = contact_indices[i].item()
-                else:
-                    contact_segments.append((start_idx, end_idx))
-                    start_idx = contact_indices[i].item()
-                    end_idx = start_idx
-            contact_segments.append((start_idx, end_idx))
-
-            # 去除过短的接触段
-            contact_smooth.fill_(False)
-            for start, end in contact_segments:
-                if end - start + 1 >= min_duration:
-                    contact_smooth[start:end+1] = True
-
-            return contact_smooth
-
-        lhand_contact = smooth_contact_labels(lhand_contact)
-        rhand_contact = smooth_contact_labels(rhand_contact)
-        # obj_contact 已经基于物体运动设置，也进行平滑处理
-        obj_contact = smooth_contact_labels(obj_contact)
 
     except Exception as e:
         print(f"警告: 计算改进接触标签时出错: {e}")
@@ -1081,6 +1163,12 @@ def process_sequence(
     obj_mesh_dir=None,
     obj_points_count: int = 256,
     resolve_bimanual_contact_conflicts: bool = False,
+    contact_max_hole_frames: int = 30,
+    contact_min_duration_frames: int = 30,
+    skip_object_displacement_without_hand_contact: bool = False,
+    unheld_object_displacement_threshold_m: float = 0.10,
+    skipped_sequences=None,
+    skip_record_context=None,
     output_name=None,
 ):
     import pytorch3d.transforms as transforms
@@ -1098,6 +1186,11 @@ def process_sequence(
 
     seq_name = str(seq_name_raw)
     subject_gender = str(subject_gender_raw)
+    if output_name is None:
+        output_name = f"{seq_key}.pt"
+    output_name = str(output_name)
+    if not output_name.endswith(".pt"):
+        output_name += ".pt"
 
     seq_key_str = str(seq_key)
     dataset_name_str = str(seq_data.get('dataset', ''))
@@ -1207,12 +1300,25 @@ def process_sequence(
         has_object = bool(seq_data.get("has_object", True))
 
         # --- 改进的接触检测算法 ---
-        lhand_contact, rhand_contact, obj_contact = compute_improved_contact_labels(
+        lhand_contact_raw, rhand_contact_raw, obj_contact_raw = compute_improved_contact_labels(
             obj_trans, obj_rot, obj_scale, position_global_full_gt_world,
             obj_mesh_dir, object_name, device, T
         )
-        lhand_contact_raw = lhand_contact.clone()
-        rhand_contact_raw = rhand_contact.clone()
+        lhand_contact = postprocess_contact_labels(
+            lhand_contact_raw,
+            max_hole_frames=contact_max_hole_frames,
+            min_contact_frames=contact_min_duration_frames,
+        )
+        rhand_contact = postprocess_contact_labels(
+            rhand_contact_raw,
+            max_hole_frames=contact_max_hole_frames,
+            min_contact_frames=contact_min_duration_frames,
+        )
+        obj_contact = postprocess_contact_labels(
+            obj_contact_raw,
+            max_hole_frames=contact_max_hole_frames,
+            min_contact_frames=contact_min_duration_frames,
+        )
         if resolve_bimanual_contact_conflicts:
             lhand_contact, rhand_contact = resolve_bimanual_contact_labels_sequence(
                 lhand_contact,
@@ -1221,6 +1327,35 @@ def process_sequence(
                 position_global_full_gt_world,
             )
         # --- 接触检测结束 ---
+
+        unheld_motion_interval = None
+        if has_object and skip_object_displacement_without_hand_contact:
+            unheld_motion_interval = find_unheld_object_displacement_interval(
+                obj_trans,
+                lhand_contact,
+                rhand_contact,
+                min_displacement_m=unheld_object_displacement_threshold_m,
+            )
+        if unheld_motion_interval is not None:
+            skip_record = {
+                "output_file": output_name,
+                "seq_key": str(seq_key),
+                "seq_name": seq_name,
+                "obj_name": object_name,
+                "reason": "object_displacement_without_hand_contact",
+                "sequence_frames": int(T),
+                "obj_motion_frames": int(obj_contact.sum().item()),
+                "lhand_contact_frames": int(lhand_contact.sum().item()),
+                "rhand_contact_frames": int(rhand_contact.sum().item()),
+                "lhand_contact_raw_frames": int(lhand_contact_raw.sum().item()),
+                "rhand_contact_raw_frames": int(rhand_contact_raw.sum().item()),
+            }
+            skip_record.update(unheld_motion_interval)
+            if skip_record_context:
+                skip_record.update(dict(skip_record_context))
+            if skipped_sequences is not None:
+                skipped_sequences.append(skip_record)
+            return 0
 
         # 预存canonical点云（可选）
         canonical_points = None
@@ -1244,7 +1379,13 @@ def process_sequence(
             "rhand_contact": rhand_contact.cpu(), # 基于距离
             "lhand_contact_raw": lhand_contact_raw.cpu(),
             "rhand_contact_raw": rhand_contact_raw.cpu(),
-            "obj_contact": obj_contact.cpu()      # 基于运动
+            "obj_contact": obj_contact.cpu(),      # 基于运动
+            "obj_contact_raw": obj_contact_raw.cpu(),
+            "contact_max_hole_frames": int(contact_max_hole_frames),
+            "contact_min_duration_frames": int(contact_min_duration_frames),
+            "unheld_object_displacement_threshold_m": float(
+                unheld_object_displacement_threshold_m
+            ),
         }
         if isinstance(canonical_points, torch.Tensor) and canonical_points.dim() == 2 and canonical_points.shape[-1] == 3:
             obj_data["obj_points_canonical"] = canonical_points.half().cpu()
@@ -1268,11 +1409,6 @@ def process_sequence(
         data.update(obj_data)
 
     # 保存处理后的数据
-    if output_name is None:
-        output_name = f"{seq_key}.pt"
-    output_name = str(output_name)
-    if not output_name.endswith(".pt"):
-        output_name += ".pt"
     torch.save(data, os.path.join(save_dir, output_name))
     return 1
 
@@ -1285,6 +1421,10 @@ def _process_unified_omomo(
     obj_mesh_dir,
     obj_points_count,
     resolve_bimanual_contact_conflicts,
+    contact_max_hole_frames,
+    contact_min_duration_frames,
+    skip_object_displacement_without_hand_contact,
+    unheld_object_displacement_threshold_m,
 ):
     """Process train then test into one numerically ordered directory.
 
@@ -1295,8 +1435,10 @@ def _process_unified_omomo(
     """
     os.makedirs(save_dir, exist_ok=True)
     total = 0
+    saved_count = 0
+    skipped_sequences = []
     for seq_key in tqdm(data_dict_train, desc="处理统一训练序列"):
-        process_sequence(
+        saved_count += process_sequence(
             data_dict_train[seq_key],
             seq_key,
             save_dir,
@@ -1305,13 +1447,19 @@ def _process_unified_omomo(
             obj_mesh_dir=obj_mesh_dir,
             obj_points_count=obj_points_count,
             resolve_bimanual_contact_conflicts=resolve_bimanual_contact_conflicts,
+            contact_max_hole_frames=contact_max_hole_frames,
+            contact_min_duration_frames=contact_min_duration_frames,
+            skip_object_displacement_without_hand_contact=skip_object_displacement_without_hand_contact,
+            unheld_object_displacement_threshold_m=unheld_object_displacement_threshold_m,
+            skipped_sequences=skipped_sequences,
+            skip_record_context={"source_split": "train", "unified_index": total},
             output_name=f"{total}.pt",
         )
         total += 1
 
-    train_count = total
+    train_source_count = total
     for seq_key in tqdm(data_dict_test, desc="处理统一测试序列"):
-        process_sequence(
+        saved_count += process_sequence(
             data_dict_test[seq_key],
             seq_key,
             save_dir,
@@ -1320,13 +1468,55 @@ def _process_unified_omomo(
             obj_mesh_dir=obj_mesh_dir,
             obj_points_count=obj_points_count,
             resolve_bimanual_contact_conflicts=resolve_bimanual_contact_conflicts,
+            contact_max_hole_frames=contact_max_hole_frames,
+            contact_min_duration_frames=contact_min_duration_frames,
+            skip_object_displacement_without_hand_contact=skip_object_displacement_without_hand_contact,
+            unheld_object_displacement_threshold_m=unheld_object_displacement_threshold_m,
+            skipped_sequences=skipped_sequences,
+            skip_record_context={"source_split": "test", "unified_index": total},
             output_name=f"{total}.pt",
         )
         total += 1
-    return train_count, total
+
+    skip_manifest = {
+        "source_train_sequences": int(train_source_count),
+        "source_test_sequences": int(total - train_source_count),
+        "source_total_sequences": int(total),
+        "saved_sequences": int(saved_count),
+        "skipped_sequences_count": int(len(skipped_sequences)),
+        "contact_max_hole_frames": int(contact_max_hole_frames),
+        "contact_min_duration_frames": int(contact_min_duration_frames),
+        "unheld_object_displacement_threshold_m": float(
+            unheld_object_displacement_threshold_m
+        ),
+        "skip_object_displacement_without_hand_contact": bool(
+            skip_object_displacement_without_hand_contact
+        ),
+        "resolve_bimanual_contact_conflicts": bool(resolve_bimanual_contact_conflicts),
+        "sequences": skipped_sequences,
+    }
+    skip_manifest_path = os.path.join(save_dir, "skipped_sequences.json")
+    with open(skip_manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(skip_manifest, handle, ensure_ascii=False, indent=2)
+
+    return {
+        "train_source_count": int(train_source_count),
+        "source_total_count": int(total),
+        "saved_count": int(saved_count),
+        "skipped_sequences": skipped_sequences,
+        "skip_manifest_path": skip_manifest_path,
+    }
 
 
-def split_unified_by_json(input_dir, split_info_path, train_dir, test_dir, copy_files=True):
+def split_unified_by_json(
+    input_dir,
+    split_info_path,
+    train_dir,
+    test_dir,
+    copy_files=True,
+    allowed_missing_files=None,
+    output_split_info_path=None,
+):
     """Split numerically named unified files according to an existing JSON."""
     with open(split_info_path, "r", encoding="utf-8") as handle:
         split_info = json.load(handle)
@@ -1340,20 +1530,64 @@ def split_unified_by_json(input_dir, split_info_path, train_dir, test_dir, copy_
     if set(all_names) != expected_names:
         raise ValueError("split_info.json 文件名必须覆盖统一目录的 0.pt..N.pt")
 
+    present_names = {
+        name for name in os.listdir(input_dir)
+        if name.endswith(".pt") and os.path.isfile(os.path.join(input_dir, name))
+    }
+    unexpected_names = present_names - expected_names
+    if unexpected_names:
+        raise ValueError(f"统一目录包含 split_info.json 未定义的文件: {sorted(unexpected_names)}")
+
+    missing_names = expected_names - present_names
+    allowed_missing_files = set(allowed_missing_files or [])
+    if missing_names != allowed_missing_files:
+        unexpected_missing = sorted(missing_names - allowed_missing_files)
+        unexpectedly_present = sorted(allowed_missing_files - missing_names)
+        raise ValueError(
+            "统一目录缺失文件与已标记跳过列表不一致: "
+            f"未授权缺失={unexpected_missing}, 标记但仍存在={unexpectedly_present}"
+        )
+
     os.makedirs(train_dir, exist_ok=True)
     os.makedirs(test_dir, exist_ok=True)
     operation = shutil.copy2 if copy_files else shutil.move
+    kept_train_files = []
+    kept_test_files = []
     for file_name, target_dir in ((name, train_dir) for name in train_files):
         source = os.path.join(input_dir, file_name)
         if not os.path.isfile(source):
-            raise FileNotFoundError(source)
+            continue
         operation(source, os.path.join(target_dir, file_name))
+        kept_train_files.append(file_name)
     for file_name, target_dir in ((name, test_dir) for name in test_files):
         source = os.path.join(input_dir, file_name)
         if not os.path.isfile(source):
-            raise FileNotFoundError(source)
+            continue
         operation(source, os.path.join(target_dir, file_name))
-    print(f"按 {split_info_path} 完成分割：训练 {len(train_files)}，测试 {len(test_files)}")
+        kept_test_files.append(file_name)
+
+    kept_total = len(kept_train_files) + len(kept_test_files)
+    filtered_split_info = {
+        "train_ratio": len(kept_train_files) / kept_total if kept_total else 0.0,
+        "test_ratio": len(kept_test_files) / kept_total if kept_total else 0.0,
+        "total_files": kept_total,
+        "source_total_files": expected_total,
+        "skipped_files": sorted(missing_names, key=lambda name: int(os.path.splitext(name)[0])),
+        "train_files": kept_train_files,
+        "test_files": kept_test_files,
+        "source_split_info": os.path.abspath(split_info_path),
+    }
+    if output_split_info_path:
+        output_split_dir = os.path.dirname(os.path.abspath(output_split_info_path))
+        os.makedirs(output_split_dir, exist_ok=True)
+        with open(output_split_info_path, "w", encoding="utf-8") as handle:
+            json.dump(filtered_split_info, handle, ensure_ascii=False, indent=2)
+
+    print(
+        f"按 {split_info_path} 完成分割：训练 {len(kept_train_files)}，"
+        f"测试 {len(kept_test_files)}，跳过 {len(missing_names)}"
+    )
+    return filtered_split_info
 
 
 # def preprocess_amass(args, bm):
@@ -1615,7 +1849,7 @@ def main(args):
     # separate directories would make the numeric IDs incompatible with the
     # checked-in split_info.json.
     if args.save_dir_unified:
-        train_count, total_count = _process_unified_omomo(
+        process_summary = _process_unified_omomo(
             data_dict_train,
             data_dict_test,
             args.save_dir_unified,
@@ -1624,15 +1858,41 @@ def main(args):
             args.obj_mesh_dir,
             args.obj_points_count,
             args.resolve_bimanual_contact_conflicts,
+            args.contact_max_hole_frames,
+            args.contact_min_duration_frames,
+            args.skip_object_displacement_without_hand_contact,
+            args.unheld_object_displacement_threshold_m,
         )
-        print(f"统一序列处理完成：训练 {train_count}，总计 {total_count}，目录：{args.save_dir_unified}")
+        print(
+            "统一序列处理完成："
+            f"源训练 {process_summary['train_source_count']}，"
+            f"源总计 {process_summary['source_total_count']}，"
+            f"保存 {process_summary['saved_count']}，"
+            f"跳过 {len(process_summary['skipped_sequences'])}，"
+            f"目录：{args.save_dir_unified}"
+        )
         if args.split_info:
+            output_split_info_path = args.output_split_info
+            if output_split_info_path is None:
+                output_root = os.path.commonpath(
+                    [os.path.abspath(args.save_dir_train), os.path.abspath(args.save_dir_test)]
+                )
+                output_split_info_path = os.path.join(output_root, "split_info.json")
             split_unified_by_json(
                 args.save_dir_unified,
                 args.split_info,
                 args.save_dir_train,
                 args.save_dir_test,
                 copy_files=not args.move_after_split,
+                allowed_missing_files={
+                    record["output_file"] for record in process_summary["skipped_sequences"]
+                },
+                output_split_info_path=output_split_info_path,
+            )
+            output_root = os.path.dirname(os.path.abspath(output_split_info_path))
+            shutil.copy2(
+                process_summary["skip_manifest_path"],
+                os.path.join(output_root, "skipped_sequences.json"),
             )
         print("所有数据处理完成!")
         return
@@ -1654,6 +1914,14 @@ def main(args):
             obj_mesh_dir=args.obj_mesh_dir,
             obj_points_count=args.obj_points_count,
             resolve_bimanual_contact_conflicts=args.resolve_bimanual_contact_conflicts,
+            contact_max_hole_frames=args.contact_max_hole_frames,
+            contact_min_duration_frames=args.contact_min_duration_frames,
+            skip_object_displacement_without_hand_contact=(
+                args.skip_object_displacement_without_hand_contact
+            ),
+            unheld_object_displacement_threshold_m=(
+                args.unheld_object_displacement_threshold_m
+            ),
         )
 
     print(f"训练序列处理完成，结果保存在：{args.save_dir_train}")
@@ -1669,6 +1937,14 @@ def main(args):
             obj_mesh_dir=args.obj_mesh_dir,
             obj_points_count=args.obj_points_count,
             resolve_bimanual_contact_conflicts=args.resolve_bimanual_contact_conflicts,
+            contact_max_hole_frames=args.contact_max_hole_frames,
+            contact_min_duration_frames=args.contact_min_duration_frames,
+            skip_object_displacement_without_hand_contact=(
+                args.skip_object_displacement_without_hand_contact
+            ),
+            unheld_object_displacement_threshold_m=(
+                args.unheld_object_displacement_threshold_m
+            ),
         )
 
     print(f"测试序列处理完成，结果保存在：{args.save_dir_test}")
@@ -1708,6 +1984,44 @@ if __name__ == "__main__":
                         help="物体网格目录")
     parser.add_argument("--obj_points_count", type=int, default=256,
                         help="canonical物体点云点数（保存到pt）")
+    parser.add_argument(
+        "--contact-max-hole-frames",
+        type=int,
+        default=30,
+        help="填补两侧均为接触的内部无接触孔洞的最大帧数（默认：30）。",
+    )
+    parser.add_argument(
+        "--contact-min-duration-frames",
+        type=int,
+        default=30,
+        help="保留接触段所需的最小连续帧数（默认：30，恰好30帧会保留）。",
+    )
+    skip_motion_group = parser.add_mutually_exclusive_group()
+    skip_motion_group.add_argument(
+        "--skip-object-displacement-without-hand-contact",
+        dest="skip_object_displacement_without_hand_contact",
+        action="store_true",
+        help="跳过任一无手接触区间内物体位移达到阈值的序列。",
+    )
+    skip_motion_group.add_argument(
+        "--keep-object-displacement-without-hand-contact",
+        dest="skip_object_displacement_without_hand_contact",
+        action="store_false",
+        help="保留无手接触区间内物体发生大位移的序列。",
+    )
+    parser.set_defaults(skip_object_displacement_without_hand_contact=True)
+    parser.add_argument(
+        "--unheld-object-displacement-threshold-m",
+        type=float,
+        default=0.10,
+        help="无手接触连续区间内触发整序列排除的物体最大位移，单位米（默认：0.10）。",
+    )
+    parser.add_argument(
+        "--output-split-info",
+        type=str,
+        default=None,
+        help="过滤后 split_info.json 的输出路径；默认写入 train/test 的共同父目录。",
+    )
     resolve_group = parser.add_mutually_exclusive_group()
     resolve_group.add_argument(
         "--resolve-bimanual-contact-conflicts",

@@ -39,6 +39,10 @@ except Exception:
 
 from dataset.dataset_IMUHOI import IMUDataset
 from model import IMUHOIModel, load_model
+from model.rnn.velocity_contact import (
+    VELOCITY_CONTACT_ARCH_CHOICES,
+    normalize_velocity_contact_arch,
+)
 from utils.dataset_config import get_dataset_configs, resolve_dataset_path
 from utils.utils import (
     load_config,
@@ -790,6 +794,13 @@ def main():
     parser.add_argument("--hp_ckpt", type=str, default=None, help="覆盖 HumanPose checkpoint")
     parser.add_argument("--interaction_ckpt", type=str, default=None, help="覆盖 Interaction/Object checkpoint")
     parser.add_argument("--vc_ckpt", type=str, default=None, help="覆盖 VelocityContact checkpoint")
+    parser.add_argument(
+        "--velocity_contact_arch", "--velocity-contact-arch",
+        dest="velocity_contact_arch",
+        choices=VELOCITY_CONTACT_ARCH_CHOICES,
+        default=None,
+        help="VelocityContact架构；legacy不包含interaction boundary模块",
+    )
     parser.add_argument("--ot_ckpt", type=str, default=None, help="覆盖 ObjectTrans checkpoint")
     parser.add_argument("--hand_contact_threshold", type=float, default=None, help="左右手接触评估阈值")
     parser.add_argument("--object_contact_threshold", type=float, default=None, help="物体接触评估阈值")
@@ -811,7 +822,6 @@ def main():
         default=None,
         help="覆盖 ObjectTrans online 运行方式",
     )
-    parser.add_argument("--ablate_vc_boundary", action="store_true", help="将RNN VC boundary输出置零，用于消融人体pose先验")
     parser.add_argument("--output_json", type=str, default=None, help="可选：保存评估结果JSON")
     parser.add_argument("--seed", type=int, default=None, help="可选：固定评估随机种子，用于可复现实验")
     parser.add_argument(
@@ -847,10 +857,7 @@ def main():
         f"state_feedback={args.object_trans_state_feedback or 'config'} | "
         f"online_mode={args.object_trans_online_mode or 'config'}"
     )
-    print(
-        "Ablations: "
-        f"vc_boundary={'zero' if args.ablate_vc_boundary else 'normal'}"
-    )
+    print(f"VelocityContact architecture: {args.velocity_contact_arch or 'config/default'}")
     seed = _set_eval_seed(args.seed)
     print(f"Eval seed: {seed if seed is not None else 'unset'}")
 
@@ -880,7 +887,11 @@ def main():
             config.object_trans_online_mode = "window"
         effective_ot_state_feedback = bool(getattr(config, "object_trans_state_feedback", False))
         effective_ot_online_mode = str(getattr(config, "object_trans_online_mode", "window"))
-        config.ablate_vc_boundary = bool(args.ablate_vc_boundary)
+        if args.velocity_contact_arch is not None:
+            config.velocity_contact_arch = args.velocity_contact_arch
+        config.velocity_contact_arch = normalize_velocity_contact_arch(
+            getattr(config, "velocity_contact_arch", "current")
+        )
         ot_refine = (
             bool(args.ot_refine)
             if args.ot_refine is not None
@@ -925,7 +936,13 @@ def main():
             print(f"[Eval] Skipping '{dataset_name}': {exc}")
             continue
 
-        model = load_model(config, device, no_trans=args.no_trans, module_paths=module_paths)
+        model = load_model(
+            config,
+            device,
+            no_trans=args.no_trans,
+            module_paths=module_paths,
+            velocity_contact_arch=args.velocity_contact_arch,
+        )
         model_kind = _infer_model_kind(model)
         evaluate_contacts = (not args.no_eval_objects) and has_velocity_contact_ckpt
         evaluate_objects = (not args.no_eval_objects) and has_velocity_contact_ckpt
@@ -1083,7 +1100,7 @@ def main():
             "object_trans_online_mode": effective_ot_online_mode,
             "object_trans_state_feedback_override": args.object_trans_state_feedback,
             "object_trans_online_mode_override": args.object_trans_online_mode,
-            "ablate_vc_boundary": bool(args.ablate_vc_boundary),
+            "velocity_contact_arch": args.velocity_contact_arch or getattr(load_config(args.config), "velocity_contact_arch", "current"),
             "seed": seed,
             "results": all_results,
         }

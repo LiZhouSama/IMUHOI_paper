@@ -163,3 +163,11 @@ def test_batch_eval_parser_accepts_mergeheads_obs():
     )
 
     assert args.object_trans_arch == "mergeHeads_obs"
+
+
+def test_batch_eval_parser_accepts_legacy_velocity_contact_arch():
+    args = eval_batch_online._make_parser().parse_args(
+        ["--velocity_contact_arch", "legacy"]
+    )
+
+    assert args.velocity_contact_arch == "legacy"

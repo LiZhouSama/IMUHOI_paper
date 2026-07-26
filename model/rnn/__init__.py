@@ -2,7 +2,13 @@
 IMUHOI模块化网络组件
 """
 from .base import RNN, RNNWithInit, SubPoser
-from .velocity_contact import VelocityContactModule
+from .velocity_contact import (
+    VELOCITY_CONTACT_ARCH_CHOICES,
+    VelocityContactModule,
+    build_velocity_contact_module,
+    normalize_velocity_contact_arch,
+)
+from .velocity_contact_legacy import LegacyVelocityContactModule
 from .human_pose import HumanPoseModule
 from .object_trans import ObjectTransModule
 from .object_trans_mergeHeads_obsEncoder import (
@@ -16,6 +22,10 @@ __all__ = [
     'RNNWithInit', 
     'SubPoser',
     'VelocityContactModule',
+    'LegacyVelocityContactModule',
+    'VELOCITY_CONTACT_ARCH_CHOICES',
+    'build_velocity_contact_module',
+    'normalize_velocity_contact_arch',
     'HumanPoseModule',
     'ObjectTransModule',
     'MergeHeadsObsObjectTransModule',

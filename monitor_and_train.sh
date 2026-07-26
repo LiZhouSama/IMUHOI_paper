@@ -24,9 +24,9 @@ else
     echo "Current directory: $(pwd)"
 
     python train/rnn/train_object_trans.py \
-        --vc_ckpt outputs/IMUHOI_RNN_2/velocity_contact_vc_boundary_zero_06211816 \
+        --vc_ckpt outputs/IMUHOI_RNN_2/velocity_contact_legacy_06211816 \
         --joint_train \
-        --ablate_vc_boundary \
+        --velocity_contact_arch legacy \
         --batch_size 40 \
         --epochs 100 \
         --lr 0.0002

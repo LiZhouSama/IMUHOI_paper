@@ -31,6 +31,10 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from model import HumanPoseModule, VelocityContactModule
+from model.rnn.velocity_contact import (
+    VELOCITY_CONTACT_ARCH_CHOICES,
+    normalize_velocity_contact_arch,
+)
 from model.rnn.lb_vq_diffusion import (
     DEFAULT_LB_QUANTILES,
     LBLatentDiffusion,
@@ -67,6 +71,13 @@ def get_args():
     parser.add_argument("--stage", choices=("vq", "diffusion", "all"), default="all")
     parser.add_argument("--hp_ckpt", type=str, default=None, help="Frozen HumanPose checkpoint")
     parser.add_argument("--vc_ckpt", type=str, default=None, help="Frozen VelocityContact checkpoint")
+    parser.add_argument(
+        "--velocity_contact_arch", "--velocity-contact-arch",
+        dest="velocity_contact_arch",
+        choices=VELOCITY_CONTACT_ARCH_CHOICES,
+        default=None,
+        help="VelocityContact架构；legacy不包含interaction boundary模块",
+    )
     parser.add_argument("--vq_ckpt", type=str, default=None, help="VQ checkpoint required by diffusion-only stage")
     parser.add_argument("--vq_epochs", type=int, default=None)
     parser.add_argument("--diffusion_epochs", type=int, default=None)
@@ -621,6 +632,11 @@ def _log_epoch(stage, epoch, train_metrics, eval_metrics, writer, save_dir):
 def main():
     args = get_args()
     cfg = merge_config(args)
+    cfg.velocity_contact_arch = normalize_velocity_contact_arch(
+        args.velocity_contact_arch
+        if args.velocity_contact_arch is not None
+        else getattr(cfg, "velocity_contact_arch", "current")
+    )
     if not hasattr(cfg, "lb_vq_prior"):
         raise ValueError("Config must define an lb_vq_prior block")
 
@@ -667,6 +683,7 @@ def main():
     print(f"batch size: {cfg.batch_size}")
     print(f"HP checkpoint: {hp_ckpt}")
     print(f"VC checkpoint: {vc_ckpt}")
+    print(f"VelocityContact architecture: {cfg.velocity_contact_arch}")
     print(f"save dir: {save_dir}")
     print("ObjectTransModule is not instantiated by this script.")
     print("=" * 72)

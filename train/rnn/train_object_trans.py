@@ -20,7 +20,12 @@ from tqdm import tqdm
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
 
-from model import VelocityContactModule, HumanPoseModule, ObjectTransModule
+from model import HumanPoseModule, ObjectTransModule
+from model.rnn.velocity_contact import (
+    VELOCITY_CONTACT_ARCH_CHOICES,
+    build_velocity_contact_module,
+    normalize_velocity_contact_arch,
+)
 from model.rnn.object_trans_legacy import LegacyObjectTransModule
 from model.rnn.object_trans_legacy_mesh import LegacyMeshObjectTransModule
 from model.rnn.object_trans_mergeHeads_obsEncoder import (
@@ -89,8 +94,13 @@ def get_args():
             'mergeHeads_obs为共享head+ObsEncoder'
         ),
     )
-    parser.add_argument('--ablate_vc_boundary', action='store_true', default=None,
-                        help='训练时将VelocityContact boundary输出置零')
+    parser.add_argument(
+        '--velocity_contact_arch', '--velocity-contact-arch',
+        dest='velocity_contact_arch',
+        choices=VELOCITY_CONTACT_ARCH_CHOICES,
+        default=None,
+        help='VelocityContact架构；legacy不包含interaction boundary模块',
+    )
     parser.add_argument(
         '--object_trans_state_feedback', '--object-trans-state-feedback',
         dest='object_trans_state_feedback',
@@ -779,10 +789,10 @@ def main():
     """主函数"""
     args = get_args()
     cfg = merge_config(args)
-    cfg.ablate_vc_boundary = (
-        bool(args.ablate_vc_boundary)
-        if args.ablate_vc_boundary is not None
-        else bool(getattr(cfg, "ablate_vc_boundary", False))
+    cfg.velocity_contact_arch = normalize_velocity_contact_arch(
+        args.velocity_contact_arch
+        if args.velocity_contact_arch is not None
+        else getattr(cfg, "velocity_contact_arch", "current")
     )
     if args.object_trans_state_feedback is not None:
         cfg.object_trans_state_feedback = args.object_trans_state_feedback == 'fused'
@@ -834,10 +844,8 @@ def main():
         module_name = 'object_trans_mergeHeads_obs'
     else:
         module_name = 'object_trans'
-    ablation_suffix = ""
-    if cfg.ablate_vc_boundary:
-        ablation_suffix += "_vc_boundary_zero"
-    module_name = f"{module_name}{ablation_suffix}"
+    if cfg.velocity_contact_arch == "legacy":
+        module_name = f"{module_name}_vc_legacy"
     save_dir = create_save_dir(cfg, module_name)
     save_config_snapshot(cfg)
     
@@ -851,7 +859,7 @@ def main():
     print(f"批次大小: {cfg.batch_size}")
     print(f"训练轮数: {cfg.epochs}")
     print(f"noTrans模式: {cfg.no_trans}")
-    print(f"VC boundary ablation: {'enabled' if cfg.ablate_vc_boundary else 'disabled'}")
+    print(f"VelocityContact架构: {cfg.velocity_contact_arch}")
     print(
         "OT state feedback: "
         f"{'enabled' if bool(getattr(cfg, 'object_trans_state_feedback', False)) else 'disabled'}"
@@ -901,7 +909,7 @@ def main():
     # 创建模型
     device = torch.device(cfg.device)
     
-    vc_model = VelocityContactModule(cfg)
+    vc_model = build_velocity_contact_module(cfg)
     if vc_ckpt and os.path.exists(vc_ckpt):
         load_checkpoint(vc_model, vc_ckpt, device, strict=False)
     elif vc_ckpt:

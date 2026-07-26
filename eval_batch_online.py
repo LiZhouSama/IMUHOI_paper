@@ -29,6 +29,10 @@ from eval_IMUHOI import (
     get_default_dataset_config,
 )
 from model.rnn.imuhoi_model import load_model
+from model.rnn.velocity_contact import (
+    VELOCITY_CONTACT_ARCH_CHOICES,
+    normalize_velocity_contact_arch,
+)
 from model.rnn.online import (
     TimeDictAccumulator,
     infer_batch_seq,
@@ -728,6 +732,13 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--velocity_contact_arch",
+        "--velocity-contact-arch",
+        choices=VELOCITY_CONTACT_ARCH_CHOICES,
+        default=None,
+        help="VelocityContact架构；legacy不包含interaction boundary模块。",
+    )
+    parser.add_argument(
         "--object_trans_state_feedback",
         choices=("none", "fused"),
         default=None,
@@ -741,7 +752,6 @@ def _make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--hand_contact_threshold", type=float, default=None)
     parser.add_argument("--object_contact_threshold", type=float, default=None)
-    parser.add_argument("--ablate_vc_boundary", action="store_true")
     parser.add_argument("--output_json", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     noise_group = parser.add_mutually_exclusive_group()
@@ -785,10 +795,7 @@ def main() -> int:
     print("Model arch: rnn")
     print(f"Mode: {'noTrans' if args.no_trans else 'Normal'}")
     print(f"Batch online size: {args.online_batch_size}")
-    print(
-        "Ablations: "
-        f"vc_boundary={'zero' if args.ablate_vc_boundary else 'normal'}"
-    )
+    print(f"VelocityContact architecture: {args.velocity_contact_arch or 'config/default'}")
     print(f"Eval seed: {seed if seed is not None else 'unset'}")
     print(
         "Eval IMU noise: "
@@ -818,7 +825,12 @@ def main() -> int:
         config.model_arch = "rnn"
         if args.object_trans_arch is not None:
             config.object_trans_arch = args.object_trans_arch
-        config.ablate_vc_boundary = bool(args.ablate_vc_boundary)
+        if args.velocity_contact_arch is not None:
+            config.velocity_contact_arch = args.velocity_contact_arch
+        resolved_vc_arch = normalize_velocity_contact_arch(
+            getattr(config, "velocity_contact_arch", "current")
+        )
+        config.velocity_contact_arch = resolved_vc_arch
         if args.object_trans_state_feedback is not None:
             config.object_trans_state_feedback = args.object_trans_state_feedback == "fused"
         if args.object_trans_online_mode is not None:
@@ -904,6 +916,7 @@ def main() -> int:
             no_trans=args.no_trans,
             module_paths=module_paths,
             object_trans_arch=args.object_trans_arch,
+            velocity_contact_arch=args.velocity_contact_arch,
         )
         model = _unwrap_model(model)
         model.eval()
@@ -926,6 +939,7 @@ def main() -> int:
             f"feedback={'fused' if bool(getattr(config, 'object_trans_state_feedback', False)) else 'none'} | "
             f"online_mode={getattr(config, 'object_trans_online_mode', 'window')}"
         )
+        print(f"VC architecture: {resolved_vc_arch}")
         print(f"OT human refine: {'enabled' if ot_refine else 'disabled'}")
 
         eval_start = time.time()
@@ -1019,7 +1033,7 @@ def main() -> int:
             "object_trans_state_feedback": resolved_ot_state_feedback,
             "object_trans_online_mode": resolved_ot_online_mode,
             "object_trans_arch": args.object_trans_arch or getattr(load_config(args.config), "object_trans_arch", "current"),
-            "ablate_vc_boundary": bool(args.ablate_vc_boundary),
+            "velocity_contact_arch": args.velocity_contact_arch or getattr(load_config(args.config), "velocity_contact_arch", "current"),
             "seed": seed,
             "simulate_imu_noise": bool(args.simulate_imu_noise),
             "eval_imu_noise": bool(args.eval_imu_noise),

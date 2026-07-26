@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 CASES = (
     "baseline",
-    "vc_boundary_zero",
+    "vc_legacy",
 )
 
 LOG_PROGRESS_RE = re.compile(
@@ -181,10 +181,10 @@ def _case_flags(args: argparse.Namespace, case_name: str) -> List[str]:
             flags.extend(["--object_trans_ckpt", args.baseline_ot_ckpt])
         return flags
 
-    if case_name == "vc_boundary_zero":
-        flags.append("--ablate_vc_boundary")
-        if args.vc_boundary_zero_vc_ckpt:
-            flags.extend(["--velocity_contact_ckpt", args.vc_boundary_zero_vc_ckpt])
+    if case_name == "vc_legacy":
+        flags.extend(["--velocity_contact_arch", "legacy"])
+        if args.vc_legacy_vc_ckpt:
+            flags.extend(["--velocity_contact_ckpt", args.vc_legacy_vc_ckpt])
         if args.baseline_ot_ckpt:
             flags.extend(["--object_trans_ckpt", args.baseline_ot_ckpt])
         return flags
@@ -194,8 +194,8 @@ def _case_flags(args: argparse.Namespace, case_name: str) -> List[str]:
 
 def _validate_case_ckpts(args: argparse.Namespace) -> None:
     missing = []
-    if not args.vc_boundary_zero_vc_ckpt:
-        missing.append("--vc_boundary_zero_vc_ckpt")
+    if not args.vc_legacy_vc_ckpt:
+        missing.append("--vc_legacy_vc_ckpt")
     if missing and not args.allow_missing_case_ckpts:
         joined = ", ".join(missing)
         raise SystemExit(
@@ -220,7 +220,7 @@ def main() -> int:
     parser.add_argument("--hp_ckpt", default=None, help="Common HumanPose checkpoint override for all cases.")
     parser.add_argument("--baseline_vc_ckpt", default=None, help="Optional baseline VelocityContact checkpoint.")
     parser.add_argument("--baseline_ot_ckpt", default=None, help="Optional baseline ObjectTrans checkpoint.")
-    parser.add_argument("--vc_boundary_zero_vc_ckpt", default="outputs/IMUHOI_RNN_2/velocity_contact_vc_boundary_zero_06211816/best.pt", help="VelocityContact checkpoint for vc_boundary_zero.")
+    parser.add_argument("--vc_legacy_vc_ckpt", default="outputs/IMUHOI_RNN_2/velocity_contact_legacy_06211816/best.pt", help="VelocityContact checkpoint for vc_legacy.")
     parser.add_argument("--allow_missing_case_ckpts", action="store_true")
     refine_group = parser.add_mutually_exclusive_group()
     refine_group.add_argument("--enable_ot_refine", dest="ot_refine", action="store_true", default=None)

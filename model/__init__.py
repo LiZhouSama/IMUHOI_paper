@@ -71,6 +71,8 @@ def VelocityContactModule(cfg, *args, **kwargs):
         raise RuntimeError("VelocityContactModule is not implemented for model_arch='mamba' yet.")
     if arch == "mamba_simple":
         return _arch_module(arch).VelocityContactModule(cfg, *args, **kwargs)
+    if arch == "rnn":
+        return _arch_module(arch).build_velocity_contact_module(cfg, *args, **kwargs)
     return _arch_module(arch).VelocityContactModule(cfg, *args, **kwargs)
 
 
@@ -101,8 +103,17 @@ def load_model(
     device,
     no_trans: bool = False,
     module_paths: Optional[dict] = None,
+    velocity_contact_arch: Optional[str] = None,
 ):
     arch = _resolve_arch(config)
+    if arch == "rnn":
+        return _arch_module(arch).load_model(
+            config,
+            device,
+            no_trans=no_trans,
+            module_paths=module_paths,
+            velocity_contact_arch=velocity_contact_arch,
+        )
     return _arch_module(arch).load_model(config, device, no_trans=no_trans, module_paths=module_paths)
 
 

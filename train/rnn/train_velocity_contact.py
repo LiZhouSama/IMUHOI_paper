@@ -12,7 +12,12 @@ from tqdm import tqdm
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
 
-from model import VelocityContactModule, HumanPoseModule
+from model import HumanPoseModule
+from model.rnn.velocity_contact import (
+    VELOCITY_CONTACT_ARCH_CHOICES,
+    build_velocity_contact_module,
+    normalize_velocity_contact_arch,
+)
 from train.rnn.loss.velocity_contact_loss import VelocityContactLoss
 from torch.nn.utils import clip_grad_norm_
 from train.rnn.train_utils import (
@@ -62,10 +67,11 @@ def get_args():
         help='Path to pretrained HumanPoseModule (frozen to provide hp_out).',
     )
     parser.add_argument(
-        '--ablate_vc_boundary',
-        action='store_true',
+        '--velocity_contact_arch', '--velocity-contact-arch',
+        dest='velocity_contact_arch',
+        choices=VELOCITY_CONTACT_ARCH_CHOICES,
         default=None,
-        help='Train VelocityContact with boundary logits/prob/hidden states forced to zero.',
+        help='VelocityContact架构；legacy不包含interaction boundary模块。',
     )
     return parser.parse_args()
 
@@ -179,15 +185,19 @@ def main():
     args = get_args()
     cfg = merge_config(args)
     cfg.hp_ckpt = _resolve_hp_ckpt(cfg, getattr(args, "hp_ckpt", None))
-    cfg.ablate_vc_boundary = (
-        bool(args.ablate_vc_boundary)
-        if args.ablate_vc_boundary is not None
-        else bool(getattr(cfg, "ablate_vc_boundary", False))
+    cfg.velocity_contact_arch = normalize_velocity_contact_arch(
+        args.velocity_contact_arch
+        if args.velocity_contact_arch is not None
+        else getattr(cfg, "velocity_contact_arch", "current")
     )
 
     setup_seed(cfg.seed)
     cfg = setup_device(cfg)
-    module_name = 'velocity_contact_vc_boundary_zero' if cfg.ablate_vc_boundary else 'velocity_contact'
+    module_name = (
+        'velocity_contact'
+        if cfg.velocity_contact_arch == 'current'
+        else 'velocity_contact_legacy'
+    )
     save_dir = create_save_dir(cfg, module_name)
     save_config_snapshot(cfg)
 
@@ -201,7 +211,7 @@ def main():
         print(f"Pretrained: {cfg.pretrained_ckpt}")
     if getattr(cfg, "hp_ckpt", None):
         print(f"HumanPose checkpoint: {cfg.hp_ckpt}")
-    print(f"VC boundary ablation: {'enabled' if cfg.ablate_vc_boundary else 'disabled'}")
+    print(f"VelocityContact架构: {cfg.velocity_contact_arch}")
     print(f"Save dir: {save_dir}")
     print("=" * 50)
 
@@ -212,7 +222,7 @@ def main():
         return
 
     # VC model
-    model = VelocityContactModule(cfg)
+    model = build_velocity_contact_module(cfg)
     model = model.to(cfg.device)
     print(f"Model params: {sum(p.numel() for p in model.parameters())}")
 

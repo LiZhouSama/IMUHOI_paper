@@ -18,6 +18,7 @@ human_pose_dropout: 0.2
 velocity_hidden_dim: 128
 velocity_num_layers: 2
 velocity_dropout: 0.2
+velocity_contact_arch: "current"  # current | legacy (without interaction boundary)
 boundary_group_hidden: 64
 boundary_hidden_dim: 128
 boundary_bidirectional: true
@@ -32,7 +33,7 @@ object_trans_feedback_hidden_dim: 64
 object_trans_online_mode: "window"  # window | stateful
 mesh_downsample_points: 256
 enable_ot_refine: true
-enable_ot_lb_prior: true
+enable_ot_lb_prior: false
 
 # ============ 独立 l_b VQ + latent diffusion（暂不接入OT）============
 lb_vq_prior:
@@ -51,7 +52,7 @@ lb_vq_prior:
   mesh_feature_dim: 64
 
   # privileged temporal VQ bottleneck
-  temporal_downsample: 8
+  temporal_downsample: 8  
   latent_dim: 32
   num_codes: 64
   vq_model_dim: 128
@@ -132,28 +133,28 @@ train_datasets: ["omomo"]  # 可选: behave, imhd, omomo, pahoi, hodome
 # ============ 数据集路径 ============
 datasets:
   omomo:
-    train_path: "process/processed_split_data_OMOMO_bps/train"
-    test_path: "process/processed_split_data_OMOMO_bps/test"
-    debug_path: "process/processed_split_data_OMOMO_bps/debug"
+    train_path: "process/processed_split_data_OMOMO_bps_fixed/train"
+    test_path:  "process/processed_split_data_OMOMO_bps_fixed/test"
+    debug_path: "process/processed_split_data_OMOMO_bps_fixed/debug"
     object_geo_root: "datasets/OMOMO/captured_objects"
   imhd:
     train_path: "process/processed_seg_data_IMHD_bps/train"
-    test_path: "process/processed_seg_data_IMHD_bps/test"
+    test_path:  "process/processed_seg_data_IMHD_bps/test"
     debug_path: "process/processed_seg_data_IMHD_bps/debug"
     object_geo_root: "datasets/IMHD/IMHD Dataset/object_templates"
   behave:
     train_path: "process/processed_seg_data_BEHAVE_bps/train"
-    test_path: "process/processed_seg_data_BEHAVE_bps/test"
+    test_path:  "process/processed_seg_data_BEHAVE_bps/test"
     debug_path: "process/processed_seg_data_BEHAVE_bps/debug"
     object_geo_root: "datasets/BEHAVE/objects"
   pahoi:
     train_path: "process/processed_seg_data_PAHOI_bps/train"
-    test_path: "process/processed_seg_data_PAHOI_bps/test"
+    test_path:  "process/processed_seg_data_PAHOI_bps/test"
     debug_path: "process/processed_seg_data_PAHOI_bps/debug"
     object_geo_root: "datasets/PAHOI/Object_mesh"
   hodome:
     train_path: "process/processed_seg_data_HODOME_bps/train"
-    test_path: "process/processed_seg_data_HODOME_bps/test"
+    test_path:  "process/processed_seg_data_HODOME_bps/test"
     debug_path: "process/processed_seg_data_HODOME_bps/debug"
     object_geo_root: "datasets/HODome/scaned_object"
 

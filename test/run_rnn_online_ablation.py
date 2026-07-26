@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 CASES = (
     ("baseline", ()),
-    ("vc_boundary_zero", ("--ablate_vc_boundary",)),
+    ("vc_legacy", ("--velocity_contact_arch", "legacy")),
 )
 
 LOG_PROGRESS_RE = re.compile(r"(Evaluating|预加载和收集信息):\s*(\d+)%\|.*?\|\s*([0-9]+)/([0-9]+)")

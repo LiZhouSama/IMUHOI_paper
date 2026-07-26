@@ -34,7 +34,8 @@ except Exception:
 from configs import _REDUCED_POSE_NAMES
 from model.rnn.imuhoi_model import IMUHOIModel
 from model.rnn.object_trans import ObjectTransModule
-from model.rnn.velocity_contact import VelocityContactModule
+from model.rnn.velocity_contact import VelocityContactModule, build_velocity_contact_module
+from model.rnn.velocity_contact_legacy import LegacyVelocityContactModule
 from train.rnn.loss.object_trans_loss import ObjectTransLoss
 from train.rnn.loss.velocity_contact_loss import VelocityContactLoss
 from train.rnn.scheduled_inputs import prediction_mix_probability, sample_mix_tensor
@@ -262,6 +263,25 @@ def test_velocity_contact_legacy_hand_contact_input_mode_forward():
     assert model.hand_contact_net.linear1.in_features == 27
     assert out["pred_hand_contact_prob"].shape == (batch_size, seq_len, 3)
     assert out["pred_obj_vel"].shape == (batch_size, seq_len, 3)
+
+
+def test_velocity_contact_arch_legacy_has_no_boundary_branch():
+    cfg = SimpleNamespace(
+        num_human_imus=6,
+        imu_dim=9,
+        obj_imu_dim=9,
+        velocity_hidden_dim=16,
+        velocity_num_layers=1,
+        velocity_dropout=0.0,
+        boundary_group_hidden=8,
+        boundary_hidden_dim=8,
+        velocity_contact_arch="legacy",
+    )
+    model = build_velocity_contact_module(cfg)
+
+    assert isinstance(model, LegacyVelocityContactModule)
+    assert not hasattr(model, "boundary_rnn")
+    assert not any(key.startswith(("group_encoders.", "boundary_")) for key in model.state_dict())
 
 
 def test_velocity_contact_hp_ckpt_resolves_from_config_pretrained_modules():

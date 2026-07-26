@@ -8,7 +8,11 @@ import torch
 import torch.nn as nn
 from pytorch3d.transforms import matrix_to_rotation_6d, rotation_6d_to_matrix
 
-from .velocity_contact import VelocityContactModule
+from .velocity_contact import (
+    VelocityContactModule,
+    build_velocity_contact_module,
+    normalize_velocity_contact_arch,
+)
 from .human_pose import HumanPoseModule
 from .object_trans import ObjectTransModule
 from .object_trans_legacy import LegacyObjectTransModule
@@ -146,7 +150,14 @@ class IMUHOIModel(nn.Module):
 
         return computed_obj_trans
 
-    def __init__(self, cfg, device, no_trans: bool = False, object_trans_arch: Optional[str] = None):
+    def __init__(
+        self,
+        cfg,
+        device,
+        no_trans: bool = False,
+        object_trans_arch: Optional[str] = None,
+        velocity_contact_arch: Optional[str] = None,
+    ):
         """
         Args:
             cfg: 配置对象
@@ -157,12 +168,19 @@ class IMUHOIModel(nn.Module):
         self.cfg = cfg
         self.device = device
         self.no_trans = no_trans
+        self.velocity_contact_arch = normalize_velocity_contact_arch(
+            velocity_contact_arch or getattr(cfg, "velocity_contact_arch", "current")
+        )
         self.object_trans_arch = str(
             object_trans_arch or getattr(cfg, "object_trans_arch", "current")
         ).strip().lower()
         
         # 创建三个模块
-        self.velocity_contact_module = VelocityContactModule(cfg)
+        self.velocity_contact_module = (
+            VelocityContactModule(cfg)
+            if self.velocity_contact_arch == "current"
+            else build_velocity_contact_module(cfg, velocity_contact_arch=self.velocity_contact_arch)
+        )
         self.human_pose_module = HumanPoseModule(cfg, device, no_trans=no_trans)
         if self.object_trans_arch == "legacy":
             self.object_trans_module = LegacyObjectTransModule(cfg)
@@ -869,6 +887,7 @@ def load_model(
     no_trans: bool = False,
     module_paths: Optional[Dict[str, str]] = None,
     object_trans_arch: Optional[str] = None,
+    velocity_contact_arch: Optional[str] = None,
 ) -> IMUHOIModel:
     """
     加载IMUHOI模型
@@ -878,6 +897,7 @@ def load_model(
         device: 计算设备
         no_trans: 是否使用noTrans模式
         module_paths: 可选的模块权重路径覆盖
+        velocity_contact_arch: VC架构；current包含boundary分支，legacy不包含
     
     Returns:
         加载好的IMUHOIModel实例
@@ -889,6 +909,7 @@ def load_model(
         device,
         no_trans=no_trans,
         object_trans_arch=object_trans_arch,
+        velocity_contact_arch=velocity_contact_arch,
     )
     model = model.to(device)
     

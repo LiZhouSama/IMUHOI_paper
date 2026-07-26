@@ -21,6 +21,30 @@ from utils.human_pose import select_hand_anchor_positions
 from utils.utils import _central_diff, _smooth_acceleration
 
 
+VELOCITY_CONTACT_ARCH_CHOICES = ("current", "legacy")
+
+
+def normalize_velocity_contact_arch(arch):
+    """Normalize and validate the RNN velocity-contact architecture name."""
+    normalized = str(arch or "current").strip().lower()
+    if normalized not in VELOCITY_CONTACT_ARCH_CHOICES:
+        choices = ", ".join(VELOCITY_CONTACT_ARCH_CHOICES)
+        raise ValueError(f"velocity_contact_arch must be one of: {choices}; got {arch!r}")
+    return normalized
+
+
+def build_velocity_contact_module(cfg, velocity_contact_arch=None):
+    """Build the configured RNN velocity-contact implementation."""
+    arch = normalize_velocity_contact_arch(
+        velocity_contact_arch or getattr(cfg, "velocity_contact_arch", "current")
+    )
+    if arch == "legacy":
+        from .velocity_contact_legacy import LegacyVelocityContactModule
+
+        return LegacyVelocityContactModule(cfg)
+    return VelocityContactModule(cfg)
+
+
 class VelocityContactModule(nn.Module):
     """
     Speed and contact prediction.
@@ -441,10 +465,6 @@ class VelocityContactModule(nn.Module):
         # Boundary prediction from HPE outputs
         pose_streams = self._prepare_pose_streams(hp_out or data_dict.get("hp_out"), device, dtype, batch_size, seq_len)
         boundary_logits, boundary_prob, boundary_out = self._encode_body_groups(pose_streams)
-        if bool(getattr(self.cfg, "ablate_vc_boundary", False)):
-            boundary_logits = torch.zeros_like(boundary_logits)
-            boundary_prob = torch.zeros_like(boundary_prob)
-            boundary_out = torch.zeros_like(boundary_out)
 
         # Hand contact using HPE-derived velocity/acc plus boundary hidden states
         if getattr(self, "hand_contact_input_mode", "current") == "legacy":
