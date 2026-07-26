@@ -108,9 +108,11 @@ def test_object_trans_offline_inference_matches_forward():
     assert torch.allclose(inference_out["gating_weights"], forward_out["gating_weights"])
 
 
-def test_object_trans_predicts_absolute_length_with_prior_only_in_initial_state():
+def test_object_trans_prior_quantiles_condition_init_and_per_frame_inputs():
+    """v6: the prior enters both the init vector and every frame's input."""
     torch.manual_seed(71)
     model = ObjectTransModule(_small_cfg()).eval()
+    assert model.n_prediction_input == 9 + 3 + 3 + 3 + 2 * (3 + 9) + model.LB_QUANTILE_DIM
     expected_bias = torch.log(torch.expm1(torch.tensor(0.4 - model.LENGTH_EPS)))
     assert torch.allclose(
         model.object_trans_head.linear2.bias[[3, 7]],

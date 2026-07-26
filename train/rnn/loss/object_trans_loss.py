@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from utils.rotation_conversions import matrix_to_rotation_6d
 from utils.human_pose import select_hand_anchor_positions
-from configs import _REDUCED_POSE_NAMES
+from configs import FRAME_RATE, _REDUCED_POSE_NAMES
 
 
 def _masked_mse(pred, target, mask, zero):
@@ -38,26 +38,44 @@ class ObjectTransLoss:
         'rhand_obj_direction',
         'lhand_lb',
         'rhand_lb',
+        'lhand_lb_cons',
+        'rhand_lb_cons',
         'hoi_error_l',
         'hoi_error_r',
         'obj_vel_cons',
-        'obj_acc_cons',
         'refine_pose',
         'refine_root_trans',
         'gate_weak',
     }
-    
-    # 测试阶段用于模型选择的损失键
+
+    # 测试阶段记录/上报的损失键
     TEST_LOSS_KEYS = {
         'obj_trans',
         'lhand_obj_direction',
         'rhand_obj_direction',
         'lhand_lb',
         'rhand_lb',
+        'lhand_lb_cons',
+        'rhand_lb_cons',
         'hoi_error_l',
         'hoi_error_r',
         'refine_pose',
         'refine_root_trans',
+    }
+
+    # 模型选择（best.pt）只累加 OT 核心项：refine_pose/refine_root_trans 的
+    # 训练权重很大（服务人体微调头），计入选择总分会主导 checkpoint 的选取，
+    # 而在线部署关心的是 OT 本身的质量。refine 项仍在 TEST_LOSS_KEYS 中记录。
+    MODEL_SELECTION_KEYS = {
+        'obj_trans',
+        'lhand_obj_direction',
+        'rhand_obj_direction',
+        'lhand_lb',
+        'rhand_lb',
+        'lhand_lb_cons',
+        'rhand_lb_cons',
+        'hoi_error_l',
+        'hoi_error_r',
     }
     
     def __init__(self, weights=None):
@@ -107,12 +125,6 @@ class ObjectTransLoss:
             obj_vel_gt = obj_vel_gt.to(device)
         else:
             obj_vel_gt = torch.zeros(bs, seq, 3, device=device, dtype=dtype)
-        
-        obj_imu_gt = batch.get('obj_imu')
-        if isinstance(obj_imu_gt, torch.Tensor):
-            obj_imu_gt = obj_imu_gt.to(device)
-        else:
-            obj_imu_gt = None
         
         obj_trans_gt = batch.get('obj_trans')
         if isinstance(obj_trans_gt, torch.Tensor):
@@ -210,19 +222,40 @@ class ObjectTransLoss:
         
         if 'pred_obj_vel_from_posdiff' in pred_dict:
             losses['obj_vel_cons'] = _masked_mse(pred_dict['pred_obj_vel_from_posdiff'], obj_vel_gt, obj_mask, zero)
-        
-        if 'pred_obj_acc_from_posdiff' in pred_dict and obj_imu_gt is not None:
-            losses['obj_acc_cons'] = _masked_mse(pred_dict['pred_obj_acc_from_posdiff'], obj_imu_gt[:, :, :3], obj_mask, zero)
 
         gate_logits = pred_dict.get('gate_logits') if isinstance(pred_dict, dict) else None
         gating_weights = pred_dict.get('gating_weights') if isinstance(pred_dict, dict) else None
         gating_contact_prob = pred_dict.get('gating_contact_prob') if isinstance(pred_dict, dict) else None
+        # 训练时优先用 GT 接触构建 gate 弱监督目标：若目标来自输入的（预测）
+        # 接触概率，gate 只会被回归成"VC 说什么就信什么"，VC 出错时被一并强化；
+        # 用 GT 目标才能让 gate 借助其他信号纠正错误的接触估计。
+        gate_contact_source = None
+        obj_contact_gt = batch.get('obj_contact')
         if (
+            isinstance(batch.get('lhand_contact'), torch.Tensor)
+            and isinstance(batch.get('rhand_contact'), torch.Tensor)
+            and isinstance(obj_contact_gt, torch.Tensor)
+            and lhand_contact_gt.shape == (bs, seq)
+            and rhand_contact_gt.shape == (bs, seq)
+        ):
+            obj_contact_bool = obj_contact_gt.to(device).bool()
+            if obj_contact_bool.shape == (bs, seq):
+                gate_contact_source = torch.stack(
+                    (
+                        lhand_contact_gt.to(dtype=dtype),
+                        rhand_contact_gt.to(dtype=dtype),
+                        obj_contact_bool.to(dtype=dtype),
+                    ),
+                    dim=-1,
+                )
+        if gate_contact_source is None and (
             isinstance(gating_contact_prob, torch.Tensor)
             and gating_contact_prob.shape[:2] == (bs, seq)
             and gating_contact_prob.shape[-1] >= 3
         ):
-            target = self._build_gate_weak_target(gating_contact_prob[..., :3].to(device=device, dtype=dtype)).detach()
+            gate_contact_source = gating_contact_prob[..., :3].to(device=device, dtype=dtype)
+        if gate_contact_source is not None:
+            target = self._build_gate_weak_target(gate_contact_source).detach()
             smooth = float(self.weights.get('gate_weak_target_smoothing', 0.1))
             if smooth > 0.0:
                 smooth = min(max(smooth, 0.0), 1.0)
@@ -267,9 +300,26 @@ class ObjectTransLoss:
             
             if 'pred_lhand_lb' in pred_dict:
                 losses['lhand_lb'] = _masked_mse(pred_dict['pred_lhand_lb'], lb_l_gt, mask_l, zero)
-            
+
             if 'pred_rhand_lb' in pred_dict:
                 losses['rhand_lb'] = _masked_mse(pred_dict['pred_rhand_lb'], lb_r_gt, mask_r, zero)
+
+            # 接触段内的骨长时序一致性：对齐 GT 的帧间差分而不是惩罚 |Δlb| 本身。
+            # 刚性抓握时 GT 差分≈0（等价于恒定先验）；手在物体上滑动时 GT 差分
+            # 非零，预测被引导跟随滑动而不是被错误地压平。差分乘 FRAME_RATE
+            # 换算成 m/s，与 obj_vel_cons 同量纲。
+            if seq > 1:
+                if 'pred_lhand_lb' in pred_dict:
+                    pred_delta_l = (pred_dict['pred_lhand_lb'][:, 1:] - pred_dict['pred_lhand_lb'][:, :-1]) * FRAME_RATE
+                    gt_delta_l = (lb_l_gt[:, 1:] - lb_l_gt[:, :-1]) * FRAME_RATE
+                    cons_mask_l = mask_l[:, 1:] & mask_l[:, :-1]
+                    losses['lhand_lb_cons'] = _masked_mse(pred_delta_l, gt_delta_l, cons_mask_l, zero)
+
+                if 'pred_rhand_lb' in pred_dict:
+                    pred_delta_r = (pred_dict['pred_rhand_lb'][:, 1:] - pred_dict['pred_rhand_lb'][:, :-1]) * FRAME_RATE
+                    gt_delta_r = (lb_r_gt[:, 1:] - lb_r_gt[:, :-1]) * FRAME_RATE
+                    cons_mask_r = mask_r[:, 1:] & mask_r[:, :-1]
+                    losses['rhand_lb_cons'] = _masked_mse(pred_delta_r, gt_delta_r, cons_mask_r, zero)
             
             if 'pred_lhand_obj_direction' in pred_dict and lhand_dir_gt is not None:
                 losses['lhand_obj_direction'] = _masked_mse(pred_dict['pred_lhand_obj_direction'], lhand_dir_gt, mask_l, zero)
@@ -304,15 +354,20 @@ class ObjectTransLoss:
         return total_loss, losses, weighted_losses
     
     def compute_test_loss(self, pred_dict, batch, device):
-        """计算测试损失（用于模型选择）"""
+        """计算测试损失：上报 TEST_LOSS_KEYS，模型选择只累加 MODEL_SELECTION_KEYS。"""
         total_loss, losses, weighted_losses = self.compute_loss(pred_dict, batch, device)
-        
-        # 只选择测试损失键
+
+        # 上报的测试分量
         test_losses = {k: v for k, v in weighted_losses.items() if k in self.TEST_LOSS_KEYS}
-        
-        # 重新计算测试总损失
-        test_total = sum(test_losses.values())
-        
+
+        # 模型选择总分只看 OT 核心项，避免 refine 大权重主导 best.pt
+        selection_values = [v for k, v in test_losses.items() if k in self.MODEL_SELECTION_KEYS]
+        if selection_values:
+            test_total = sum(selection_values)
+        else:
+            human_imu = batch['human_imu'].to(device)
+            test_total = human_imu.new_tensor(0.0)
+
         return test_total, test_losses
     
     @classmethod

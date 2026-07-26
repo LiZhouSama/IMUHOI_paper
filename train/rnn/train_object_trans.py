@@ -37,6 +37,7 @@ from train.rnn.scheduled_inputs import (
     build_gt_human_pose_outputs,
     build_gt_velocity_contact_outputs,
     prediction_mix_probability,
+    sample_gt_lb_prior_stats,
     sample_mix_dict,
     sample_mix_tensor,
 )
@@ -59,7 +60,7 @@ from train.rnn.train_utils import (
     _restore_rng_state,
     _torch_load_checkpoint,
 )
-from torch.cuda.amp.grad_scaler import GradScaler
+from torch.nn.utils import clip_grad_norm_
 try:
     from torch.utils.tensorboard.writer import SummaryWriter
 except Exception:
@@ -70,7 +71,7 @@ def get_args():
     """获取命令行参数"""
     parser = get_base_args()
     parser.description = 'ObjectTransModule训练 (Stage 3) + 联合训练'
-    
+
     # Stage3特有参数
     parser.add_argument('--vc_ckpt', type=str, default=None, 
                         help='VelocityContactModule权重路径')
@@ -115,7 +116,7 @@ def get_args():
         default=None,
         help='记录到本次配置快照的 OT online 评测模式；训练本身始终使用完整序列扫描',
     )
-	    
+
     return parser.parse_args()
 
 
@@ -126,14 +127,14 @@ def find_latest_checkpoint(base_dir, module_name):
         # os.path.join(base_dir, f'{module_name}*', 'final.pt'),
         # os.path.join(base_dir, 'modules', f'{module_name}_best.pt'),
     ]
-    
+
     all_files = []
     for pattern in patterns:
         all_files.extend(glob.glob(pattern))
-    
+
     if not all_files:
         return None
-    
+
     # 按修改时间排序，返回最新的
     all_files.sort(key=os.path.getmtime, reverse=True)
     return all_files[0]
@@ -162,7 +163,7 @@ def _resolve_pretrained_ckpt(cfg, cli_path, module_key, fallback_attr=None):
 
 class Stage3JointTrainer:
     """Stage3和联合训练器"""
-    
+
     def __init__(
         self,
         cfg,
@@ -183,7 +184,7 @@ class Stage3JointTrainer:
         self.lb_prior_model = (
             lb_prior_model.to(self.device) if lb_prior_model is not None else None
         )
-        
+
         self.train_loader = train_loader
         self.test_loader = test_loader
         self.resume_path = resolve_resume_checkpoint(getattr(cfg, "resume_dir", None))
@@ -191,7 +192,7 @@ class Stage3JointTrainer:
         self.start_epoch = 0
         self.best_loss = float('inf')
         self.n_iter = 0
-	        
+
         self.vc_trainable = bool(joint_train)
 
         # 设置训练/冻结状态：HP始终冻结；VC仅在joint阶段参与训练
@@ -210,6 +211,24 @@ class Stage3JointTrainer:
                 "冻结 l_b VQ/Diffusion prior: "
                 f"sample_steps={self.lb_prior_model.sample_steps}"
             )
+
+        # 在线接触段 l_b 统计先验（diffusion prior 未启用时的默认来源）：
+        # 训练时从 GT 序列的随机因果前缀模拟"已观测历史"的分位数统计。
+        self.lb_stats_enabled = (
+            self.lb_prior_model is None
+            and bool(getattr(cfg, "object_trans_lb_stats", True))
+            and str(getattr(cfg, "object_trans_arch", "current")).strip().lower() == "current"
+        )
+        self.lb_stats_min_frames = int(getattr(cfg, "lb_stats_min_frames", 10))
+        self.lb_stats_noise_std = float(getattr(cfg, "lb_stats_noise_std", 0.02))
+        self.lb_stats_drop_prob = float(getattr(cfg, "lb_stats_drop_prob", 0.3))
+        if self.lb_stats_enabled:
+            print(
+                "启用在线 l_b 统计先验模拟: "
+                f"min_frames={self.lb_stats_min_frames}, "
+                f"noise_std={self.lb_stats_noise_std}, "
+                f"drop_prob={self.lb_stats_drop_prob}"
+            )
         if joint_train:
             print("联合训练模式：从epoch 0开始微调VelocityContact + ObjectTrans")
 
@@ -217,18 +236,18 @@ class Stage3JointTrainer:
             print(f"Resume checkpoint: {self.resume_path}")
             self.resume_checkpoint = _torch_load_checkpoint(self.resume_path, map_location=self.device)
             self._restore_model_weights(self.resume_checkpoint)
-	        
+
         # 多GPU包装
         if cfg.use_multi_gpu:
             print(f'多GPU训练: {cfg.gpus}')
             self.vc_model = torch.nn.DataParallel(self.vc_model, device_ids=cfg.gpus)
             self.hp_model = torch.nn.DataParallel(self.hp_model, device_ids=cfg.gpus)
             self.ot_model = torch.nn.DataParallel(self.ot_model, device_ids=cfg.gpus)
-        
+
         flatten_lstm_parameters(self.vc_model)
         flatten_lstm_parameters(self.hp_model)
         flatten_lstm_parameters(self.ot_model)
-        
+
         # 优化器
         base_lr = cfg.lr
         if cfg.use_multi_gpu:
@@ -254,7 +273,9 @@ class Stage3JointTrainer:
         self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
             self.optimizer, milestones=cfg.milestones, gamma=cfg.gamma
         )
-        self.scaler = GradScaler(enabled=self.device.type == "cuda")
+        # Stage3/joint 训练是纯 fp32：此前挂着的 GradScaler 没有配套 autocast，
+        # 只是误导性的空转，已移除；换成与其它 stage 一致的梯度裁剪。
+        self.gradient_clip = float(getattr(cfg, "gradient_clip", 1.0))
         if self.resume_checkpoint is not None:
             self._restore_training_state(self.resume_checkpoint)
 
@@ -263,12 +284,12 @@ class Stage3JointTrainer:
         print(f"ObjectTrans可训练参数数量: {ot_trainable}, lr={base_lr}")
         if joint_train:
             print(f"VelocityContact可训练参数数量: {vc_params}, lr={base_lr}")
-        
+
         # 损失函数
         loss_weights = getattr(cfg, 'loss_weights', {})
         self.vc_loss_fn = VelocityContactLoss(weights=loss_weights) if joint_train else None
         self.ot_loss_fn = ObjectTransLoss(weights=loss_weights)
-        
+
         # TensorBoard
         self.writer = None
         if cfg.use_tensorboard and not cfg.debug and SummaryWriter is not None:
@@ -276,7 +297,7 @@ class Stage3JointTrainer:
             self.writer = SummaryWriter(log_dir=log_dir)
         elif cfg.use_tensorboard and not cfg.debug:
             print('TensorBoard is unavailable; continue without SummaryWriter.')
-        
+
     def _restore_model_weights(self, checkpoint):
         if not isinstance(checkpoint, dict):
             raise ValueError(f"Resume checkpoint must be a dict: {self.resume_path}")
@@ -320,13 +341,6 @@ class Stage3JointTrainer:
         else:
             print("警告：resume checkpoint 缺少 scheduler_state_dict，学习率调度器将从当前配置重新开始。")
 
-        scaler_state = checkpoint.get("scaler_state_dict")
-        if scaler_state is not None:
-            try:
-                self.scaler.load_state_dict(scaler_state)
-            except Exception as exc:
-                print(f"警告：恢复 scaler_state_dict 失败: {exc}")
-
         completed_epoch = int(checkpoint.get("epoch", -1))
         self.start_epoch = completed_epoch + 1
         self.n_iter = int(checkpoint.get("n_iter", self.start_epoch * max(len(self.train_loader), 1)))
@@ -365,10 +379,14 @@ class Stage3JointTrainer:
             hp_out = call_model_inference(self.hp_model, data_dict, inference_mode="offline")
 
         gt_hp = None
+        mix_mask = None
         if training and batch is not None:
             pred_prob = prediction_mix_probability(epoch, self.cfg)
             gt_hp = build_gt_human_pose_outputs(batch, self.device, dtype=hp_out['pred_hand_glb_pos'].dtype)
-            hp_for_vc = sample_mix_dict(
+            # 整条 VC->OT 输入链共用同一个 per-sample mask：否则会出现
+            # "VC 吃预测 HP 算出的 contact + OT 吃 GT 手位置" 这类部署时
+            # 不存在的自相矛盾组合。
+            hp_for_vc, mix_mask = sample_mix_dict(
                 gt_hp,
                 hp_out,
                 (
@@ -382,6 +400,7 @@ class Stage3JointTrainer:
                     "root_trans_pred",
                 ),
                 pred_prob,
+                return_mask=True,
             )
         else:
             hp_for_vc = hp_out
@@ -395,35 +414,43 @@ class Stage3JointTrainer:
             if gt_hp is None:
                 gt_hp = build_gt_human_pose_outputs(batch, self.device, dtype=hp_out['pred_hand_glb_pos'].dtype)
             gt_vc = build_gt_velocity_contact_outputs(batch, self.device, dtype=vc_out['pred_obj_vel'].dtype)
-            hand_positions, ot_mask = sample_mix_tensor(
-                gt_hp.get('pred_palm_glb_pos', gt_hp['pred_hand_glb_pos']),
-                hp_out.get('pred_palm_glb_pos', hp_out['pred_hand_glb_pos']),
-                pred_prob,
-                return_mask=True,
-            )
+            if mix_mask is None:
+                hand_positions, mix_mask = sample_mix_tensor(
+                    gt_hp.get('pred_palm_glb_pos', gt_hp['pred_hand_glb_pos']),
+                    hp_out.get('pred_palm_glb_pos', hp_out['pred_hand_glb_pos']),
+                    pred_prob,
+                    return_mask=True,
+                )
+            else:
+                hand_positions = sample_mix_tensor(
+                    gt_hp.get('pred_palm_glb_pos', gt_hp['pred_hand_glb_pos']),
+                    hp_out.get('pred_palm_glb_pos', hp_out['pred_hand_glb_pos']),
+                    pred_prob,
+                    mask=mix_mask,
+                )
             contact_prob = sample_mix_tensor(
                 gt_vc['pred_hand_contact_prob'],
                 vc_out['pred_hand_contact_prob'],
                 pred_prob,
-                mask=ot_mask,
+                mask=mix_mask,
             )
             obj_vel_input = sample_mix_tensor(
                 gt_vc['pred_obj_vel'],
                 vc_out['pred_obj_vel'],
                 pred_prob,
-                mask=ot_mask,
+                mask=mix_mask,
             )
             human_pose_input = sample_mix_tensor(
                 gt_hp['p_pred'],
                 hp_out['p_pred'],
                 pred_prob,
-                mask=ot_mask,
+                mask=mix_mask,
             )
             root_trans_input = sample_mix_tensor(
                 gt_hp['root_trans_pred'],
                 hp_out['root_trans_pred'],
                 pred_prob,
-                mask=ot_mask,
+                mask=mix_mask,
             )
         else:
             hand_positions = hp_out.get('pred_palm_glb_pos', hp_out['pred_hand_glb_pos'])
@@ -441,6 +468,18 @@ class Stage3JointTrainer:
                     vc_out,
                     data_dict['obj_imu'],
                 )
+        elif self.lb_stats_enabled and training and batch is not None:
+            # 用 GT 序列的随机因果前缀模拟在线接触段统计（含噪声/丢弃增广）。
+            # 评估分支保持 None：offline 单趟推理没有历史，等价于冷启动，
+            # 训练中的 drop/短前缀样本已覆盖这一分布。
+            lb_prior_quantiles = sample_gt_lb_prior_stats(
+                batch,
+                self.device,
+                hp_out['pred_hand_glb_pos'].dtype,
+                min_contact_frames=self.lb_stats_min_frames,
+                noise_std=self.lb_stats_noise_std,
+                drop_prob=self.lb_stats_drop_prob,
+            )
 
         ot_out = call_model_inference(
             self.ot_model,
@@ -471,19 +510,19 @@ class Stage3JointTrainer:
             self.vc_model.train() if self.vc_trainable else self.vc_model.eval()
             self.hp_model.eval()
             self.ot_model.train()
-            
+
             total_loss = 0
             loss_components = {}
-            
+
             train_iter = tqdm(self.train_loader, desc=f'Epoch {epoch}', leave=False)
-            
+
             for batch in train_iter:
                 data_dict = build_model_input_dict(batch, self.cfg, self.device, add_noise=True)
-                
+
                 self.optimizer.zero_grad()
-                
+
                 results, vc_out, hp_out, ot_out = self.forward_all(data_dict, batch=batch, epoch=epoch, training=True)
-                
+
                 # 计算损失
                 losses = {}
                 ot_losses = {}
@@ -501,22 +540,30 @@ class Stage3JointTrainer:
 
                 # 总损失
                 batch_loss = vc_loss + ot_loss
-                
-                self.scaler.scale(batch_loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                
+
+                batch_loss.backward()
+                if self.gradient_clip > 0:
+                    clip_grad_norm_(
+                        [
+                            param
+                            for group in self.optimizer.param_groups
+                            for param in group["params"]
+                        ],
+                        max_norm=self.gradient_clip,
+                    )
+                self.optimizer.step()
+
                 total_loss += batch_loss.item()
                 for key, value in losses.items():
                     if isinstance(value, torch.Tensor):
                         loss_components[key] = loss_components.get(key, 0) + value.item()
-                
+
                 # 更新进度条
                 postfix = {'loss': batch_loss.item(), 'ot': ot_loss.item()}
                 if self.joint_train and self.vc_trainable:
                     postfix['vc'] = vc_loss.item()
                 train_iter.set_postfix(postfix)
-                
+
                 if self.writer is not None:
                     self.writer.add_scalar('train/total_loss', batch_loss.item(), self.n_iter)
                     self.writer.add_scalar('train/ot_loss', ot_loss.item(), self.n_iter)
@@ -529,27 +576,27 @@ class Stage3JointTrainer:
                         for key, value in vc_weighted_losses.items():
                             if isinstance(value, torch.Tensor):
                                 self.writer.add_scalar(f'train/vc/{key}', value.item(), self.n_iter)
-                
+
                 self.n_iter += 1
-            
+
             total_loss /= len(self.train_loader)
             for key in loss_components:
                 loss_components[key] /= len(self.train_loader)
-            
+
             return total_loss, loss_components
-    
+
     def evaluate(self, epoch):
         """评估"""
         if self.test_loader is None:
             return None, {}
-        
+
         self.vc_model.eval()
         self.hp_model.eval()
         self.ot_model.eval()
-        
+
         total_loss = 0
         loss_components = {}
-        
+
         with torch.no_grad():
             test_iter = tqdm(self.test_loader, desc=f'Test {epoch}', leave=False)
 
@@ -573,13 +620,13 @@ class Stage3JointTrainer:
                 for key, value in vc_losses.items():
                     if isinstance(value, torch.Tensor):
                         loss_components[f"vc_{key}"] = loss_components.get(f"vc_{key}", 0) + value.item()
-        
+
         total_loss /= len(self.test_loader)
         for key in loss_components:
             loss_components[key] /= len(self.test_loader)
-        
+
         return total_loss, loss_components
-    
+
     def train(self):
         """完整训练循环"""
         max_epoch = self.cfg.epochs
@@ -589,18 +636,18 @@ class Stage3JointTrainer:
             if self.writer is not None:
                 self.writer.close()
             return
-	        
+
         for epoch in range(self.start_epoch, max_epoch):
             train_loss, train_components = self.train_epoch(epoch)
-	            
+
             print(f'\rEpoch {epoch}, Train Loss: {train_loss:.4f}', end='')
-            
+
             if epoch % 10 == 0 and self.test_loader is not None:
                 test_loss, test_components = self.evaluate(epoch)
-                
+
                 if test_loss is not None:
                     print(f', Test Loss: {test_loss:.4f}')
-	                    
+
                     if test_loss < self.best_loss:
                         self.best_loss = test_loss
                         self._save_models(
@@ -614,7 +661,7 @@ class Stage3JointTrainer:
                             },
                         )
                         print(f'新的最佳测试损失: {self.best_loss:.4f}')
-                    
+
                     if self.writer is not None:
                         self.writer.add_scalar('test/total_loss', test_loss, self.n_iter)
                         for key, value in test_components.items():
@@ -639,7 +686,7 @@ class Stage3JointTrainer:
                         },
                     )
                     print(f'新的最佳训练损失: {self.best_loss:.4f}')
-	            
+
             self.scheduler.step()
             self._save_models(
                 epoch,
@@ -651,7 +698,7 @@ class Stage3JointTrainer:
                     'n_iter': self.n_iter,
                 },
             )
-	        
+
         # 保存最终模型
         self._save_models(
             max_epoch - 1,
@@ -662,10 +709,10 @@ class Stage3JointTrainer:
                 'n_iter': self.n_iter,
             },
         )
-	        
+
         if self.writer is not None:
             self.writer.close()
-	    
+
     def _write_checkpoint(self, path, checkpoint):
         tmp_path = f"{path}.tmp"
         torch.save(checkpoint, tmp_path)
@@ -681,7 +728,6 @@ class Stage3JointTrainer:
             'object_trans_state_dict': ot_state,
             'optimizer_state_dict': self.optimizer.state_dict() if self.optimizer else None,
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
-            'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
             'rng_state': _capture_rng_state(),
         }
         if self.joint_train:
@@ -832,10 +878,10 @@ def main():
             prior_cfg.vq_checkpoint = args.lb_vq_ckpt
         if args.lb_diffusion_ckpt:
             prior_cfg.diffusion_checkpoint = args.lb_diffusion_ckpt
-		    
+
     setup_seed(cfg.seed)
     cfg = setup_device(cfg)
-	    
+
     if cfg.object_trans_arch == 'legacy':
         module_name = 'object_trans_legacy'
     elif cfg.object_trans_arch == 'legacy_mesh':
@@ -848,10 +894,10 @@ def main():
         module_name = f"{module_name}_vc_legacy"
     save_dir = create_save_dir(cfg, module_name)
     save_config_snapshot(cfg)
-    
+
     mode_str = "Stage 3 + 自动联合训练" if auto_joint_train else "Stage 3"
     trans_str = "noTrans" if cfg.no_trans else "普通"
-    
+
     print("=" * 50)
     print(f"{mode_str}: ObjectTransModule训练 ({trans_str}模式)")
     print(f"ObjectTrans架构: {cfg.object_trans_arch}")
@@ -871,7 +917,7 @@ def main():
     )
     print(f"保存目录: {save_dir}")
     print("=" * 50)
-    
+
     # 查找/加载预训练权重
     vc_ckpt, vc_source = _resolve_pretrained_ckpt(cfg, args.vc_ckpt, 'velocity_contact', 'vc_ckpt')
     hp_ckpt, hp_source = _resolve_pretrained_ckpt(cfg, args.hp_ckpt, 'human_pose', 'hp_ckpt')
@@ -888,7 +934,7 @@ def main():
     print(f"HumanPose权重({hp_source or 'missing'}): {hp_ckpt}")
     if ot_ckpt:
         print(f"ObjectTrans权重配置({ot_source or 'missing'})已记录但不会作为自动joint起点: {ot_ckpt}")
-	    
+
     cfg.vc_ckpt = vc_ckpt
     cfg.hp_ckpt = hp_ckpt
     cfg.ot_ckpt = ot_ckpt
@@ -898,17 +944,17 @@ def main():
     if vc_ckpt is None or hp_ckpt is None:
         print("警告: 未找到预训练权重，将使用随机初始化")
         print("建议先训练Stage1和Stage2，或使用--auto_find_ckpt自动搜索")
-    
+
     # 创建数据加载器
     train_loader, test_loader = create_dataloaders(cfg)
-    
+
     if train_loader is None or len(train_loader) == 0:
         print("错误: 无法创建训练数据加载器")
         return
-    
+
     # 创建模型
     device = torch.device(cfg.device)
-    
+
     vc_model = build_velocity_contact_module(cfg)
     if vc_ckpt and os.path.exists(vc_ckpt):
         load_checkpoint(vc_model, vc_ckpt, device, strict=False)
@@ -920,7 +966,7 @@ def main():
         load_checkpoint(hp_model, hp_ckpt, device)
     elif hp_ckpt:
         print(f"警告: HumanPose权重不存在: {hp_ckpt}")
-    
+
     if cfg.object_trans_arch == 'legacy':
         ot_model_cls = LegacyObjectTransModule
     elif cfg.object_trans_arch == 'legacy_mesh':
@@ -933,7 +979,7 @@ def main():
     lb_prior_model = FrozenLBPriorPredictor(cfg) if enable_lb_prior else None
     if getattr(cfg, "resume_dir", None):
         print("检测到 --resume_dir，ObjectTrans权重将由训练器从断点恢复。")
-    
+
     print(f"VelocityContact参数量: {sum(p.numel() for p in vc_model.parameters())}")
     print(f"HumanPose参数量: {sum(p.numel() for p in hp_model.parameters())}")
     print(f"ObjectTrans参数量: {sum(p.numel() for p in ot_model.parameters())}")
@@ -942,7 +988,7 @@ def main():
             "冻结 l_b prior 参数量: "
             f"{sum(p.numel() for p in lb_prior_model.parameters())}"
         )
-    
+
     # 创建训练器
     trainer = Stage3JointTrainer(
         cfg, vc_model, hp_model, ot_model,
@@ -950,13 +996,13 @@ def main():
         joint_train=False,
         lb_prior_model=lb_prior_model,
     )
-    
+
     # 开始训练
     trainer.train()
 
     if auto_joint_train:
         _run_auto_joint_train(cfg, trainer, train_loader, test_loader, base_train_lr)
-    
+
     print(f"\n训练完成！模型保存到: {save_dir}")
 
 

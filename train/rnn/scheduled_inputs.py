@@ -1,11 +1,12 @@
 """Scheduled input mixing helpers for RNN staged training."""
 from __future__ import annotations
 
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import torch
 
 from configs import _REDUCED_POSE_NAMES
+from model.rnn.lb_vq_diffusion import DEFAULT_LB_QUANTILES, compute_lb_quantile_targets
 from utils.human_pose import (
     append_virtual_palm_joints,
     append_virtual_palm_rotations,
@@ -70,10 +71,16 @@ def sample_mix_dict(
     pred: Dict[str, torch.Tensor],
     keys: Iterable[str],
     pred_prob: float,
-) -> Dict[str, torch.Tensor]:
-    """Mix matching tensor values from two dicts with one sample-level mask."""
+    mask: Optional[torch.Tensor] = None,
+    return_mask: bool = False,
+) -> Dict[str, torch.Tensor] | Tuple[Dict[str, torch.Tensor], Optional[torch.Tensor]]:
+    """Mix matching tensor values from two dicts with one sample-level mask.
+
+    Pass ``mask`` (or use ``return_mask=True`` and reuse the result) to keep an
+    entire input chain per-sample consistent instead of drawing a fresh mask
+    for each stage.
+    """
     out: Dict[str, torch.Tensor] = dict(pred)
-    mask = None
     for key in keys:
         gt_value = gt.get(key)
         pred_value = pred.get(key)
@@ -86,6 +93,8 @@ def sample_mix_dict(
         else:
             mixed = sample_mix_tensor(gt_value, pred_value, pred_prob, mask=mask)
         out[key] = mixed
+    if return_mask:
+        return out, mask
     return out
 
 
@@ -192,6 +201,79 @@ def build_gt_human_pose_outputs(batch, device, dtype=None, num_joints: int = 24)
         "root_vel_pred": root_vel,
         "root_trans_pred": trans,
     }
+
+
+def sample_gt_lb_prior_stats(
+    batch,
+    device,
+    dtype,
+    *,
+    min_contact_frames: int = 10,
+    noise_std: float = 0.02,
+    drop_prob: float = 0.3,
+    quantiles: Sequence[float] = DEFAULT_LB_QUANTILES,
+) -> Optional[torch.Tensor]:
+    """Simulate the online contact-segment l_b statistics from GT streams.
+
+    Draws one random causal prefix per sample ("history observed so far"),
+    computes per-hand contact-frame length quantiles inside it, then applies
+    Gaussian noise and per-hand dropout.  Hands without usable statistics are
+    returned as NaN so ObjectTrans falls back to its init geometry — the model
+    therefore learns both to exploit the statistics and to survive cold starts
+    (first contact segment, offline single-pass inference).
+    """
+    lhand_lb = batch.get("lhand_lb")
+    rhand_lb = batch.get("rhand_lb")
+    lhand_contact = batch.get("lhand_contact")
+    rhand_contact = batch.get("rhand_contact")
+    if not all(
+        isinstance(value, torch.Tensor)
+        for value in (lhand_lb, rhand_lb, lhand_contact, rhand_contact)
+    ):
+        return None
+
+    lhand_lb = lhand_lb.to(device=device, dtype=dtype)
+    rhand_lb = rhand_lb.to(device=device, dtype=dtype)
+    if lhand_lb.dim() == 1:
+        lhand_lb = lhand_lb.unsqueeze(0)
+    if rhand_lb.dim() == 1:
+        rhand_lb = rhand_lb.unsqueeze(0)
+    if lhand_lb.shape != rhand_lb.shape or lhand_lb.dim() != 2:
+        return None
+    batch_size, seq_len = lhand_lb.shape
+    if seq_len < 2:
+        return None
+
+    lhand_contact = lhand_contact.to(device=device).bool()
+    rhand_contact = rhand_contact.to(device=device).bool()
+    if lhand_contact.dim() == 1:
+        lhand_contact = lhand_contact.unsqueeze(0)
+    if rhand_contact.dim() == 1:
+        rhand_contact = rhand_contact.unsqueeze(0)
+    if lhand_contact.shape != (batch_size, seq_len) or rhand_contact.shape != (batch_size, seq_len):
+        return None
+
+    prefix_len = torch.randint(0, seq_len + 1, (batch_size,), device=device)
+    prefix_mask = torch.arange(seq_len, device=device).unsqueeze(0) < prefix_len.unsqueeze(1)
+    targets, valid_hands, _ = compute_lb_quantile_targets(
+        lhand_lb,
+        rhand_lb,
+        lhand_contact & prefix_mask,
+        rhand_contact & prefix_mask,
+        has_object=batch.get("has_object"),
+        quantiles=quantiles,
+        min_contact_frames=min_contact_frames,
+    )
+    if noise_std > 0.0:
+        targets = targets + torch.randn_like(targets) * float(noise_std)
+    if drop_prob > 0.0:
+        drop = torch.rand(batch_size, 2, device=device) < float(drop_prob)
+        valid_hands = valid_hands & ~drop
+    return torch.where(
+        valid_hands.unsqueeze(-1),
+        targets.clamp_min(0.0),
+        torch.full_like(targets, float("nan")),
+    )
 
 
 def build_gt_velocity_contact_outputs(batch, device, dtype=None) -> Dict[str, torch.Tensor]:

@@ -22,6 +22,30 @@ _SEQUENCE_LENGTH_KEYS = (
     "pred_obj_trans",
 )
 
+# Keys whose tensors are per-sequence metadata with a small fixed second
+# dimension (2, 3, N points, ...).  The shape-based temporal heuristic
+# misclassifies them whenever the window length happens to coincide with that
+# dimension, silently slicing init vectors and priors, so list them explicitly.
+NON_TEMPORAL_KEYS = frozenset(
+    {
+        "v_init",
+        "p_init",
+        "trans_init",
+        "hand_vel_glb_init",
+        "obj_vel_init",
+        "obj_trans_init",
+        "contact_init",
+        "has_object",
+        "obj_points_canonical",
+        "lb_prior_quantiles",
+        "init_lhand_oe_ho",
+        "init_rhand_oe_ho",
+        "init_lhand_lb",
+        "init_rhand_lb",
+        "gating_smoothing_applied",
+    }
+)
+
 
 def normalize_inference_mode(inference_mode: str) -> str:
     mode = str(inference_mode or "offline").lower()
@@ -71,7 +95,10 @@ def slice_time_value(value: Any, start: int, end: int, batch_size: int, seq_len:
 
 
 def slice_time_dict(data: Dict[str, Any], start: int, end: int, batch_size: int, seq_len: int) -> Dict[str, Any]:
-    return {key: slice_time_value(value, start, end, batch_size, seq_len) for key, value in data.items()}
+    return {
+        key: value if key in NON_TEMPORAL_KEYS else slice_time_value(value, start, end, batch_size, seq_len)
+        for key, value in data.items()
+    }
 
 
 def append_stream_data(
@@ -154,6 +181,9 @@ def concat_time_dicts(chunks: Iterable[InferenceOutput]) -> InferenceOutput:
         values = [value for value, _ in values_with_seq]
         if not values:
             continue
+        if key in NON_TEMPORAL_KEYS:
+            result[key] = values[-1]
+            continue
         if all(isinstance(value, dict) for value in values):
             result[key] = concat_time_dicts(values)  # type: ignore[arg-type]
             continue
@@ -221,11 +251,13 @@ class TimeDictAccumulator:
         self.seq_len = int(seq_len)
         self.total_seq_len = int(total_seq_len)
         self._values: Dict[str, Any] = {
-            key: self._init_value(value, self.seq_len)
+            key: self._init_value(key, value, self.seq_len)
             for key, value in initial.items()
         }
 
-    def _init_value(self, value: Any, seq_len: int) -> Any:
+    def _init_value(self, key: str, value: Any, seq_len: int) -> Any:
+        if key in NON_TEMPORAL_KEYS:
+            return value
         if is_temporal_tensor(value, self.batch_size, seq_len):
             return _TemporalBuffer(value, self.total_seq_len, seq_len)
         if isinstance(value, dict):
@@ -258,6 +290,12 @@ class TimeDictAccumulator:
                 if current_value.can_append(value):
                     current_value.append(value)
                 else:
+                    # Replacing the buffer silently truncates accumulated
+                    # history; make the (unexpected) shape/dtype drift visible.
+                    print(
+                        f"Warning: TimeDictAccumulator dropped buffered history for '{key}' "
+                        "(incoming value is incompatible with the temporal buffer)."
+                    )
                     self._values[key] = value
                 continue
 

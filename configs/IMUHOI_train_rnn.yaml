@@ -21,19 +21,35 @@ velocity_dropout: 0.2
 velocity_contact_arch: "current"  # current | legacy (without interaction boundary)
 boundary_group_hidden: 64
 boundary_hidden_dim: 128
-boundary_bidirectional: true
+# 在线滑窗只保留窗口末帧，而双向 boundary GRU 在末帧没有反向信息，离线训练
+# 与在线部署分布不一致；改为因果单向。注意：修改后必须重训 VelocityContact，
+# 旧的双向 checkpoint 会在加载时被 validate_checkpoint_state_dict 拒绝。
+boundary_bidirectional: false
 
 hidden_dim_multiplier: 1
 object_trans_hidden_dim: 192
 object_trans_num_layers: 2
 object_trans_dropout: 0.2
 object_trans_length_init: 0.4
-object_trans_state_feedback: false
+# 打开 OT 状态反馈：预测器每帧看到自己上一帧的物体位置（物体系下相对双手的
+# 向量），接触开始时才能几何推导锚定骨长，而不是从 IMU 历史里猜。
+object_trans_state_feedback: true
 object_trans_feedback_hidden_dim: 64
 object_trans_online_mode: "window"  # window | stateful
 mesh_downsample_points: 256
 enable_ot_refine: true
 enable_ot_lb_prior: false
+
+# ============ 在线接触段 l_b 统计先验（OT arch v6，替代 VQ/Diffusion prior）============
+# 在线：从已累计的预测历史中统计接触帧 ||pred_obj_trans - hand|| 的 [q10,q50,q90]，
+# 逐帧 broadcast 进 OT 预测器输入；训练：从 GT 序列的随机因果前缀模拟同一统计
+# （带噪声与按手丢弃增广，无统计的手回退到 init 几何长度）。
+# 注意：OT arch 升级到 v6（预测器输入 +6 维），旧的 v5 checkpoint 需要重训。
+object_trans_lb_stats: true
+lb_stats_contact_threshold: 0.5
+lb_stats_min_frames: 10
+lb_stats_noise_std: 0.02
+lb_stats_drop_prob: 0.3
 
 # ============ 独立 l_b VQ + latent diffusion（暂不接入OT）============
 lb_vq_prior:
@@ -101,6 +117,7 @@ input_mix_end_epoch: 30  # 0 means use predicted HP/VC inputs from epoch 0
 batch_size: 200
 lr: 0.002 # jt:0.0002
 weight_decay: 0.0001
+gradient_clip: 1.0
 milestones: [100, 200, 300, 350, 400, 450, 500]
 joint_train_milestones: [10,20,30,40,50,60,70,80,90,100] 
 gamma: 0.2
@@ -188,11 +205,15 @@ loss_weights:
   rhand_obj_direction: 1
   lhand_lb: 10
   rhand_lb: 10
+  # 接触段内骨长时序一致性：对齐 GT 帧间差分（m/s 量纲）。刚性抓握时等价于
+  # 恒定先验；手在物体上滑动时跟随 GT 的变化，不会误判滑动。
+  lhand_lb_cons: 1.0
+  rhand_lb_cons: 1.0
   hoi_error_l: 1
   hoi_error_r: 1
   obj_vel_cons: 0.01
-  obj_acc_cons: 0.00001
-  gate_weak: 0.05
+  # gate 弱监督目标改由 GT 接触构建后适当加大权重
+  gate_weak: 0.1
   gate_weak_target_smoothing: 0.1
   refine_pose: 100
   refine_root_trans: 10
@@ -205,6 +226,9 @@ test:
   window: 120
 
 # ============ 预训练模块路径（可选）============
+# 注意：boundary_bidirectional=false 与 OT arch v6 之后，下面的 velocity_contact
+# 与 object_trans checkpoint 均为旧架构，加载会被显式拒绝——需先重训 Stage2/Stage3
+# 并把路径替换为新产物（human_pose 不受影响）。
 pretrained_modules:
   human_pose:       "outputs/IMUHOI_RNN_2/rnn_sequential_seq_20260720_173347/human_pose_07201733_seq_20260720_173347/best.pt"
   velocity_contact: "outputs/IMUHOI_RNN_2/object_trans_07222103/best_velocity_contact.pt"

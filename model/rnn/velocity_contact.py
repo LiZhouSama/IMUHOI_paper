@@ -211,6 +211,24 @@ class VelocityContactModule(nn.Module):
                 f"({', '.join(removed_prefixes)}). Use a checkpoint with separate obj_move_net "
                 "and hand_contact_net."
             )
+        # A direction mismatch would otherwise be dropped silently by
+        # non-strict loading, leaving boundary_rnn randomly initialized while
+        # its features still feed hand_contact_net.  The legacy architecture
+        # shares this validator but has no boundary branch at all — it ignores
+        # boundary weights, so the check must not touch boundary attributes.
+        module_bidirectional = getattr(self, "boundary_bidirectional", None)
+        has_boundary_weights = any(key.startswith("boundary_rnn.") for key in keys)
+        if has_boundary_weights and module_bidirectional is not None:
+            checkpoint_bidirectional = any(
+                key.startswith("boundary_rnn.") and "_reverse" in key for key in keys
+            )
+            if checkpoint_bidirectional != bool(module_bidirectional):
+                raise ValueError(
+                    "VelocityContact checkpoint boundary_rnn direction (bidirectional="
+                    f"{checkpoint_bidirectional}) does not match this configuration "
+                    f"(boundary_bidirectional={bool(module_bidirectional)}); "
+                    "retrain VelocityContact with the current boundary_bidirectional setting."
+                )
 
     def _denormalize_imu(self, human_imu: torch.Tensor):
         """Convert IMU data back to world frame."""

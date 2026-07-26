@@ -209,6 +209,41 @@ class IMUHOIModel(nn.Module):
             return None
         return predictor(hp_out, vc_out, obj_imu)
 
+    def _online_lb_stats_enabled(self) -> bool:
+        """Contact-segment l_b statistics measured from the causal history.
+
+        Enabled by default for the current ObjectTrans architecture whenever
+        the frozen VQ/diffusion prior is not in use.  Offline single-pass
+        inference intentionally stays cold (no history -> init-geometry
+        fallback inside ObjectTrans), matching the training-time drop/short
+        prefix augmentation.
+        """
+        if getattr(self, "lb_prior_predictor", None) is not None:
+            return False
+        if not isinstance(self.object_trans_module, ObjectTransModule):
+            return False
+        return bool(getattr(self.cfg, "object_trans_lb_stats", True))
+
+    def _compute_online_lb_stats(self, history) -> Optional[torch.Tensor]:
+        """Per-hand [q10, q50, q90] of ||pred_obj_trans - hand|| on contact frames."""
+        if not isinstance(history, dict) or not history:
+            return None
+        pred_obj_trans = history.get("pred_obj_trans")
+        contact_prob = history.get("pred_hand_contact_prob")
+        if not isinstance(pred_obj_trans, torch.Tensor) or not isinstance(contact_prob, torch.Tensor):
+            return None
+        try:
+            hand_positions = self._resolve_stage1_hoi_hand_positions(history)
+        except KeyError:
+            return None
+        return ObjectTransModule.compute_online_lb_quantiles(
+            pred_obj_trans,
+            hand_positions,
+            contact_prob,
+            contact_threshold=float(getattr(self.cfg, "lb_stats_contact_threshold", 0.5)),
+            min_contact_frames=int(getattr(self.cfg, "lb_stats_min_frames", 10)),
+        )
+
     @staticmethod
     def _resolve_hoi_hand_positions(hp_out: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Return the palm anchor positions used by VC/OT geometry."""
@@ -609,6 +644,10 @@ class IMUHOIModel(nn.Module):
                 lb_prior_quantiles = self._predict_lb_prior(
                     hp_context, vc_context, window_data["obj_imu"]
                 )
+                if lb_prior_quantiles is None and self._online_lb_stats_enabled():
+                    # Cross-segment statistics use the full accumulated
+                    # history, not just the current window prefix.
+                    lb_prior_quantiles = self._compute_online_lb_stats(history)
                 obj_prefix = prefix.get("pred_obj_trans")
                 gate_prefix = prefix.get("gating_weights")
                 if isinstance(obj_prefix, torch.Tensor) and obj_prefix.shape[1] > 0:
@@ -747,6 +786,18 @@ class IMUHOIModel(nn.Module):
             results.update(vc_context)
             has_object = window_data.get("has_object")
             if use_object_data and (has_object is None or has_object.any()):
+                # In stateful mode the statistics window is bounded by
+                # output_window; the per-frame broadcast injection is what
+                # carries them (the persistent LSTM state ignores new inits).
+                # Like the init updates above, statistics only engage once a
+                # full window of history exists — warmup then behaves exactly
+                # like one cold full-window scan, which keeps the batched
+                # evaluator's warmup replay and this stream interchangeable.
+                lb_prior_quantiles = (
+                    self._compute_online_lb_stats(history)
+                    if self._online_lb_stats_enabled() and history_len >= online_window
+                    else None
+                )
                 ot_latest, prediction_state = self.object_trans_module.forward(
                     self._resolve_hoi_hand_positions(hp_latest),
                     vc_latest["pred_hand_contact_prob"],
@@ -758,6 +809,7 @@ class IMUHOIModel(nn.Module):
                     has_object_mask=has_object,
                     human_pose_input=hp_latest.get("p_pred"),
                     root_trans_input=hp_latest.get("root_trans_pred"),
+                    lb_prior_quantiles=lb_prior_quantiles,
                     enable_refine=False,
                     compute_refine=False,
                     prediction_state=prediction_state,
