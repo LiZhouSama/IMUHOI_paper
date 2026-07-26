@@ -149,6 +149,69 @@ def gaussian_label_from_indices(indices, length, sigma=2.0, device=None, dtype=N
         labels = torch.maximum(labels, torch.exp(-0.5 * ((t - float(idx)) / sigma) ** 2))
     return labels
 
+
+# 接触段端点通道顺序: (lhand_start, lhand_end, rhand_start, rhand_end, obj_start, obj_end)
+CONTACT_ENDPOINT_CHANNEL_NAMES = ("lhand", "rhand", "obj")
+
+
+def build_contact_endpoint_labels(
+    lhand_contact,
+    rhand_contact,
+    obj_contact,
+    prev_contact=(False, False, False),
+    next_contact=(False, False, False),
+    sigma=2.0,
+    device=None,
+    dtype=None,
+):
+    """构建接触段端点标签，6通道: (l_start, l_end, r_start, r_end, obj_start, obj_end)。
+
+    窗口切片会截断跨窗口的接触段：若某段起点落在窗口首帧且窗口前一帧仍在接触
+    （prev_contact 为 True），说明真实起点在窗口外，此时不打 start 标签；
+    段终点落在窗口末帧且窗口后一帧仍在接触（next_contact 为 True）时同理不打
+    end 标签，避免网络把窗口边界学成端点。
+
+    Args:
+        lhand_contact / rhand_contact / obj_contact: [T] 接触标签
+        prev_contact: 三通道在窗口前一帧（原始序列 start_idx-1）的接触状态
+        next_contact: 三通道在窗口后一帧（原始序列 end_idx）的接触状态
+    Returns:
+        hard: [T, 6] 端点脉冲标签
+        gauss: [T, 6] 高斯平滑标签
+    """
+    if device is None:
+        device = torch.device("cpu")
+    if dtype is None:
+        dtype = torch.float32
+    channels = (lhand_contact, rhand_contact, obj_contact)
+    length = int(channels[0].shape[0])
+    hard = torch.zeros(length, 6, device=device, dtype=dtype)
+    gauss = torch.zeros(length, 6, device=device, dtype=dtype)
+    for channel_index, contact in enumerate(channels):
+        contact = contact.bool()
+        if int(contact.shape[0]) != length:
+            raise ValueError("contact label channels must share the same length")
+        start_indices = []
+        end_indices = []
+        for seg_start, seg_end in find_contact_segments(contact):
+            if not (seg_start == 0 and bool(prev_contact[channel_index])):
+                start_indices.append(seg_start)
+            if not (seg_end == length - 1 and bool(next_contact[channel_index])):
+                end_indices.append(seg_end)
+        start_channel = 2 * channel_index
+        end_channel = start_channel + 1
+        for index in start_indices:
+            hard[index, start_channel] = 1.0
+        for index in end_indices:
+            hard[index, end_channel] = 1.0
+        gauss[:, start_channel] = gaussian_label_from_indices(
+            start_indices, length, sigma=sigma, device=device, dtype=dtype
+        )
+        gauss[:, end_channel] = gaussian_label_from_indices(
+            end_indices, length, sigma=sigma, device=device, dtype=dtype
+        )
+    return hard, gauss
+
 def compute_obj_direction_supervision(position_global, obj_trans, obj_rot, 
                                     lhand_contact, rhand_contact):
     """
@@ -638,19 +701,40 @@ class IMUDataset(Dataset):
                     lhand_lb = torch.zeros(actual_seq_len, device=device, dtype=dtype)
                     rhand_lb = torch.zeros(actual_seq_len, device=device, dtype=dtype)
 
-            # --- 交互起止帧标签 ---
-            contact_mask_for_boundary = obj_contact_window.bool()
-            start_label = torch.zeros(actual_seq_len, device=device, dtype=dtype)
-            end_label = torch.zeros(actual_seq_len, device=device, dtype=dtype)
-            start_indices = []
-            end_indices = []
-            for seg_start, seg_end in find_contact_segments(contact_mask_for_boundary):
-                start_label[seg_start] = 1.0
-                end_label[seg_end] = 1.0
-                start_indices.append(seg_start)
-                end_indices.append(seg_end)
-            start_gauss = gaussian_label_from_indices(start_indices, actual_seq_len, sigma=2.0, device=device, dtype=dtype)
-            end_gauss = gaussian_label_from_indices(end_indices, actual_seq_len, sigma=2.0, device=device, dtype=dtype)
+            # --- 交互起止帧标签（接触段端点，含窗口截断mask）---
+            def _full_contact_state(key, index):
+                """原始（未切窗）序列在 index 帧的接触状态，越界视为无接触。"""
+                value = seq_data.get(key)
+                if value is None or index < 0:
+                    return False
+                if not isinstance(value, torch.Tensor):
+                    value = torch.from_numpy(np.asarray(value))
+                if index >= int(value.shape[0]):
+                    return False
+                return bool(value[index])
+
+            contact_keys = ("lhand_contact", "rhand_contact", "obj_contact")
+            if has_object:
+                prev_contact = tuple(_full_contact_state(key, start_idx - 1) for key in contact_keys)
+                next_contact = tuple(_full_contact_state(key, end_idx) for key in contact_keys)
+            else:
+                prev_contact = (False, False, False)
+                next_contact = (False, False, False)
+
+            contact_endpoint, contact_endpoint_gauss = build_contact_endpoint_labels(
+                lhand_contact_window,
+                rhand_contact_window,
+                obj_contact_window,
+                prev_contact=prev_contact,
+                next_contact=next_contact,
+                sigma=2.0,
+                device=device,
+                dtype=dtype,
+            )
+            start_label = contact_endpoint[:, 4]
+            end_label = contact_endpoint[:, 5]
+            start_gauss = contact_endpoint_gauss[:, 4]
+            end_gauss = contact_endpoint_gauss[:, 5]
 
             result = {
                 "human_imu": human_imu.float(),  # [seq, num_imus, 9]
@@ -683,6 +767,8 @@ class IMUDataset(Dataset):
                 "interaction_end": end_label.float(),
                 "interaction_start_gauss": start_gauss.float(),
                 "interaction_end_gauss": end_gauss.float(),
+                "contact_endpoint": contact_endpoint.float(),
+                "contact_endpoint_gauss": contact_endpoint_gauss.float(),
                 "lfoot_contact": lfoot_contact_window.float(),
                 "rfoot_contact": rfoot_contact_window.float(),
                 "lhand_obj_direction": lhand_obj_direction.float(),

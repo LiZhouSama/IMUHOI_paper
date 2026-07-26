@@ -17,12 +17,15 @@ class VelocityContactLoss:
         'hand_contact_cond',
         'interaction_boundary',
         'interaction_order',
+        'contact_endpoint',
+        'contact_endpoint_order',
     }
 
     TEST_LOSS_KEYS = {
         'obj_vel',
         'obj_move',
         'hand_contact_cond',
+        'contact_endpoint',
     }
 
     def __init__(self, weights=None):
@@ -55,6 +58,26 @@ class VelocityContactLoss:
             denom = mask.sum().clamp_min(eps)
             return loss.sum() / denom
         return loss.mean()
+
+    @staticmethod
+    def _soft_order_penalty(start_prob, end_prob, has_object_mask, zero):
+        """Penalize the soft-expected start time exceeding the end time."""
+        bs, seq = start_prob.shape[:2]
+        t = torch.arange(seq, device=start_prob.device, dtype=start_prob.dtype).view(1, seq)
+        start_mass = start_prob.sum(dim=1)
+        end_mass = end_prob.sum(dim=1)
+        valid_mask = (start_mass > 1e-3) & (end_mass > 1e-3)
+        if not valid_mask.any():
+            return zero.clone()
+        start_time = (start_prob[valid_mask] * t).sum(dim=1) / start_mass[valid_mask]
+        end_time = (end_prob[valid_mask] * t).sum(dim=1) / end_mass[valid_mask]
+        order_loss = F.relu(start_time - end_time)
+        if has_object_mask is not None:
+            mask_flat = has_object_mask.view(bs)[valid_mask]
+            if mask_flat.numel() > 0 and mask_flat.sum() > 0:
+                return (order_loss * mask_flat).sum() / mask_flat.sum()
+            return zero.clone()
+        return order_loss.mean()
 
     def compute_loss(self, pred_dict, batch, device):
         human_imu = batch['human_imu'].to(device)
@@ -224,27 +247,43 @@ class VelocityContactLoss:
             losses['interaction_boundary'] = self._focal_binary(boundary_pred, boundary_gt, alpha=alpha, gamma=gamma, mask=mask)
 
             # order penalty: start should be before end (soft expectation)
-            t = torch.arange(seq, device=device, dtype=dtype).view(1, seq)
-            start_prob = boundary_pred[..., 0]
-            end_prob = boundary_pred[..., 1]
-            start_mass = start_prob.sum(dim=1)
-            end_mass = end_prob.sum(dim=1)
-            valid_mask = (start_mass > 1e-3) & (end_mass > 1e-3)
-            if valid_mask.any():
-                start_time = (start_prob[valid_mask] * t).sum(dim=1) / start_mass[valid_mask]
-                end_time = (end_prob[valid_mask] * t).sum(dim=1) / end_mass[valid_mask]
-                order_loss = F.relu(start_time - end_time)
-                if has_object_mask is not None:
-                    mask_flat = has_object_mask.view(bs)[valid_mask]
-                    if mask_flat.numel() > 0 and mask_flat.sum() > 0:
-                        order_loss = (order_loss * mask_flat).sum() / mask_flat.sum()
-                    else:
-                        order_loss = zero.clone()
-                else:
-                    order_loss = order_loss.mean()
-                losses['interaction_order'] = order_loss
+            losses['interaction_order'] = self._soft_order_penalty(
+                boundary_pred[..., 0], boundary_pred[..., 1], has_object_mask, zero
+            )
+
+        # contact segment endpoint heatmaps
+        # 6 channels: (l_start, l_end, r_start, r_end, obj_start, obj_end)
+        endpoint_logits = pred_dict.get('pred_contact_endpoint_logits')
+        if endpoint_logits is not None:
+            endpoint_gt = batch.get('contact_endpoint_gauss')
+            if isinstance(endpoint_gt, torch.Tensor):
+                endpoint_gt = endpoint_gt.to(device=device, dtype=dtype)
             else:
-                losses['interaction_order'] = zero.clone()
+                endpoint_gt = torch.zeros(
+                    bs, seq, endpoint_logits.shape[-1], device=device, dtype=dtype
+                )
+            endpoint_prob = torch.sigmoid(endpoint_logits)
+            alpha = float(self.weights.get(
+                'endpoint_focal_alpha', self.weights.get('boundary_focal_alpha', 0.25)
+            ))
+            gamma = float(self.weights.get(
+                'endpoint_focal_gamma', self.weights.get('boundary_focal_gamma', 2.0)
+            ))
+            losses['contact_endpoint'] = self._focal_binary(
+                endpoint_prob, endpoint_gt, alpha=alpha, gamma=gamma, mask=has_object_mask
+            )
+
+            num_pairs = endpoint_prob.shape[-1] // 2
+            order_terms = []
+            for pair in range(num_pairs):
+                order_terms.append(self._soft_order_penalty(
+                    endpoint_prob[..., 2 * pair],
+                    endpoint_prob[..., 2 * pair + 1],
+                    has_object_mask,
+                    zero,
+                ))
+            if order_terms:
+                losses['contact_endpoint_order'] = sum(order_terms) / len(order_terms)
 
         # weighted sum
         total_loss = zero.clone()
@@ -261,8 +300,10 @@ class VelocityContactLoss:
 
         Stage3 consumes ``pred_obj_vel`` and ``pred_hand_contact_prob``.  The
         latter is built from conditional hand-contact logits plus object-move
-        probability, so test loss keeps those contact terms and excludes
-        auxiliary hand-velocity/boundary objectives.
+        probability (or, with ``contact_from_segments``, rasterized from the
+        decoded endpoint heatmaps), so test loss keeps those contact terms and
+        the endpoint heatmap term, excluding auxiliary hand-velocity/boundary
+        objectives.
         """
         _, _, weighted_losses = self.compute_loss(pred_dict, batch, device)
         test_losses = {

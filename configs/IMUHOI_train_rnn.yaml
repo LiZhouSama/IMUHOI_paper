@@ -127,6 +127,12 @@ resolve_bimanual_contact_conflicts: false
 hand_contact_threshold: 0.15
 object_contact_threshold: 0.5
 
+# ============ 接触段端点检测 ============
+contact_from_segments: false              # 推理时用解码接触段的栅格化结果替换逐帧接触概率
+contact_endpoint_peak_threshold: 0.3      # 端点热图峰值阈值
+contact_endpoint_segment_threshold: 0.25  # 段置信度阈值（起点/终点峰值与段内逐帧概率的几何平均）
+contact_endpoint_peak_radius: 5           # 峰值NMS半径（帧）
+
 # ============ 要使用的数据集 ============
 train_datasets: ["omomo"]  # 可选: behave, imhd, omomo, pahoi, hodome
 
@@ -181,6 +187,10 @@ loss_weights:
   interaction_order: 1.0
   boundary_focal_alpha: 0.25
   boundary_focal_gamma: 2.0
+  contact_endpoint: 1.0
+  contact_endpoint_order: 0.5
+  endpoint_focal_alpha: 0.25
+  endpoint_focal_gamma: 2.0
 
   # Stage 3: ObjectTransModule
   obj_trans: 10

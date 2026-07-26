@@ -1,6 +1,8 @@
 """
 VelocityContactModule: predict hand/object velocity and contact cues.
 """
+import math
+
 import torch
 import torch.nn as nn
 from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_rotation_6d
@@ -43,6 +45,158 @@ def build_velocity_contact_module(cfg, velocity_contact_arch=None):
 
         return LegacyVelocityContactModule(cfg)
     return VelocityContactModule(cfg)
+
+
+# Contact-segment endpoint channels are ordered as
+# (lhand_start, lhand_end, rhand_start, rhand_end, obj_start, obj_end);
+# rasterized/interior channels follow (lhand, rhand, obj).
+CONTACT_SEGMENT_CHANNEL_NAMES = ("lhand", "rhand", "obj")
+
+
+def find_heatmap_peaks(prob, threshold=0.3, radius=5):
+    """Find local maxima of a 1D endpoint heatmap with greedy NMS.
+
+    Args:
+        prob: [T] probability tensor.
+        threshold: minimum peak height.
+        radius: NMS radius in frames; lower peaks within it are suppressed.
+    Returns:
+        list of (index, value) sorted by index.
+    """
+    length = int(prob.shape[0])
+    if length == 0:
+        return []
+    left = torch.cat((prob.new_full((1,), -1.0), prob[:-1]))
+    right = torch.cat((prob[1:], prob.new_full((1,), -1.0)))
+    is_peak = (prob >= left) & (prob > right) & (prob >= threshold)
+    candidates = torch.nonzero(is_peak).flatten().tolist()
+    candidates.sort(key=lambda index: float(prob[index]), reverse=True)
+    kept = []
+    for index in candidates:
+        if any(abs(index - kept_index) <= radius for kept_index, _ in kept):
+            continue
+        kept.append((index, float(prob[index])))
+    kept.sort(key=lambda item: item[0])
+    return kept
+
+
+def _pair_endpoint_peaks(start_peaks, end_peaks, seq_len, allow_open_segments=True):
+    """Greedily pair start peaks with the next end peak in time order.
+
+    An end peak with no active start opens a segment from the previous
+    segment's end + 1 (the stream entered the window mid-contact); a trailing
+    start with no end opens a segment running to the last frame (contact
+    still ongoing). Open sides carry a None confidence.
+
+    Returns:
+        list of (start, end, start_confidence_or_None, end_confidence_or_None).
+    """
+    events = [(index, 0, value) for index, value in start_peaks]
+    events += [(index, 1, value) for index, value in end_peaks]
+    events.sort(key=lambda item: (item[0], item[1]))
+
+    segments = []
+    active = None
+    for index, kind, value in events:
+        if kind == 0:
+            if active is None:
+                active = (index, value)
+        else:
+            if active is not None:
+                segments.append((active[0], index, active[1], value))
+                active = None
+            elif allow_open_segments:
+                open_start = segments[-1][1] + 1 if segments else 0
+                if open_start <= index:
+                    segments.append((open_start, index, None, value))
+    if active is not None and allow_open_segments:
+        segments.append((active[0], seq_len - 1, active[1], None))
+    return segments
+
+
+def _segment_confidence(start_confidence, end_confidence, interior_confidence, eps=1e-6):
+    """Geometric mean of the available confidence terms."""
+    terms = [
+        term
+        for term in (start_confidence, end_confidence, interior_confidence)
+        if term is not None
+    ]
+    if not terms:
+        return 0.0
+    log_sum = sum(math.log(max(float(term), eps)) for term in terms)
+    return float(math.exp(log_sum / len(terms)))
+
+
+def decode_contact_segments(
+    endpoint_prob,
+    interior_prob=None,
+    peak_threshold=0.3,
+    segment_threshold=0.25,
+    peak_radius=5,
+    allow_open_segments=True,
+):
+    """Decode start/end endpoint heatmaps into contact segments with confidence.
+
+    Args:
+        endpoint_prob: [B, T, 6] heatmaps ordered as
+            (lhand_start, lhand_end, rhand_start, rhand_end, obj_start, obj_end).
+        interior_prob: optional [B, T, 3] per-frame contact probabilities
+            (lhand, rhand, obj) used as interior actionness in the confidence.
+        peak_threshold: minimum endpoint peak height.
+        segment_threshold: minimum segment confidence (geometric mean of
+            start peak, end peak and mean interior probability).
+        peak_radius: NMS radius for peak extraction, in frames.
+        allow_open_segments: emit segments whose start/end lies outside the
+            observed range (needed for streaming/ongoing contact).
+    Returns:
+        segments: per-batch list of dicts with keys
+            channel, channel_name, start, end, confidence,
+            start_confidence, end_confidence (open sides are None).
+        raster: [B, T, 3] per-frame probabilities rasterized from segments;
+            frames inside a segment take its confidence, overlaps take max.
+    """
+    if endpoint_prob.dim() != 3 or endpoint_prob.shape[-1] % 2 != 0:
+        raise ValueError(f"endpoint_prob must be [B, T, 2*C], got {tuple(endpoint_prob.shape)}")
+    batch_size, seq_len, twice_channels = endpoint_prob.shape
+    num_channels = twice_channels // 2
+    raster = endpoint_prob.new_zeros(batch_size, seq_len, num_channels)
+    segments = []
+    for b in range(batch_size):
+        batch_segments = []
+        for channel in range(num_channels):
+            start_peaks = find_heatmap_peaks(
+                endpoint_prob[b, :, 2 * channel], threshold=peak_threshold, radius=peak_radius
+            )
+            end_peaks = find_heatmap_peaks(
+                endpoint_prob[b, :, 2 * channel + 1], threshold=peak_threshold, radius=peak_radius
+            )
+            paired = _pair_endpoint_peaks(start_peaks, end_peaks, seq_len, allow_open_segments)
+            for seg_start, seg_end, start_conf, end_conf in paired:
+                interior_conf = None
+                if interior_prob is not None:
+                    interior_conf = float(interior_prob[b, seg_start:seg_end + 1, channel].mean())
+                confidence = _segment_confidence(start_conf, end_conf, interior_conf)
+                if confidence < segment_threshold:
+                    continue
+                batch_segments.append({
+                    "channel": channel,
+                    "channel_name": (
+                        CONTACT_SEGMENT_CHANNEL_NAMES[channel]
+                        if channel < len(CONTACT_SEGMENT_CHANNEL_NAMES)
+                        else str(channel)
+                    ),
+                    "start": int(seg_start),
+                    "end": int(seg_end),
+                    "confidence": confidence,
+                    "start_confidence": start_conf,
+                    "end_confidence": end_conf,
+                })
+                raster[b, seg_start:seg_end + 1, channel] = raster[
+                    b, seg_start:seg_end + 1, channel
+                ].clamp(min=confidence)
+        batch_segments.sort(key=lambda seg: (seg["start"], seg["channel"]))
+        segments.append(batch_segments)
+    return segments, raster
 
 
 class VelocityContactModule(nn.Module):
@@ -155,6 +309,23 @@ class VelocityContactModule(nn.Module):
             bidirectional=False,
             dropout=dropout,
         )
+
+        # Contact segment endpoint heatmaps, 6 channels:
+        # (lhand_start, lhand_end, rhand_start, rhand_end, obj_start, obj_end).
+        # Fed by the same current-mode features as the geom hand-contact path,
+        # independent of any checkpoint-compat hand-contact input mode.
+        self.contact_endpoint_channels = 6
+        self.contact_endpoint_input_dim = self.base_hand_contact_input_dim + (
+            self.contact_geom_dim if self.use_contact_geom_features else 0
+        )
+        self.contact_endpoint_input_norm = nn.LayerNorm(self.contact_endpoint_input_dim)
+        self.contact_endpoint_rnn = nn.GRU(
+            input_size=self.contact_endpoint_input_dim,
+            hidden_size=contact_hidden,
+            num_layers=1,
+            batch_first=True,
+        )
+        self.contact_endpoint_head = nn.Linear(contact_hidden, self.contact_endpoint_channels)
 
         self.left_hand_sensor = _SENSOR_NAMES.index("LeftForeArm")
         self.right_hand_sensor = _SENSOR_NAMES.index("RightForeArm")
@@ -466,28 +637,29 @@ class VelocityContactModule(nn.Module):
         pose_streams = self._prepare_pose_streams(hp_out or data_dict.get("hp_out"), device, dtype, batch_size, seq_len)
         boundary_logits, boundary_prob, boundary_out = self._encode_body_groups(pose_streams)
 
+        # Shared per-frame features for hand contact and endpoint detection
+        hand_dyn_feat = torch.cat(
+            (
+                pose_streams["hand_vel"].reshape(batch_size, seq_len, -1),
+                pose_streams["hand_acc"].reshape(batch_size, seq_len, -1),
+            ),
+            dim=-1,
+        )
+        root_vel_feat = pose_streams["root_vel"]
+        base_contact_input = torch.cat((hand_dyn_feat, root_vel_feat, obj_imu, boundary_out), dim=-1)
+        geom_feat = None
+        obj_trans_rough = None
+        if self.use_contact_geom_features:
+            geom_feat, obj_trans_rough = self._build_contact_geom_features(
+                pose_streams, obj_vel, obj_trans_init_vec
+            )
+
         # Hand contact using HPE-derived velocity/acc plus boundary hidden states
         if getattr(self, "hand_contact_input_mode", "current") == "legacy":
             hand_contact_input = contact_input_imu
-            obj_trans_rough = None
         else:
-            hand_dyn_feat = torch.cat(
-                (
-                    pose_streams["hand_vel"].reshape(batch_size, seq_len, -1),
-                    pose_streams["hand_acc"].reshape(batch_size, seq_len, -1),
-                ),
-                dim=-1,
-            )
-            root_vel_feat = pose_streams["root_vel"]
-            base_contact_input = torch.cat((hand_dyn_feat, root_vel_feat, obj_imu, boundary_out), dim=-1)
             expected_contact_dim = int(self.hand_contact_net.linear1.in_features)
-            obj_trans_rough = None
-            if expected_contact_dim == self.base_hand_contact_input_dim:
-                hand_contact_input = base_contact_input
-            elif expected_contact_dim == self.geom_hand_contact_input_dim:
-                geom_feat, obj_trans_rough = self._build_contact_geom_features(
-                    pose_streams, obj_vel, obj_trans_init_vec
-                )
+            if expected_contact_dim == self.geom_hand_contact_input_dim and geom_feat is not None:
                 hand_contact_input = torch.cat((base_contact_input, geom_feat), dim=-1)
             else:
                 hand_contact_input = base_contact_input
@@ -504,6 +676,15 @@ class VelocityContactModule(nn.Module):
         # Unconditional hand contact = object move prob * conditional
         hand_contact_prob = obj_move_prob * hand_contact_prob_cond
 
+        # Contact segment endpoint heatmaps
+        endpoint_input = base_contact_input
+        if geom_feat is not None:
+            endpoint_input = torch.cat((endpoint_input, geom_feat), dim=-1)
+        endpoint_input = self.contact_endpoint_input_norm(endpoint_input)
+        endpoint_hidden, _ = self.contact_endpoint_rnn(endpoint_input)
+        contact_endpoint_logits = self.contact_endpoint_head(endpoint_hidden)
+        contact_endpoint_prob = torch.sigmoid(contact_endpoint_logits)
+
         # Concatenated outputs for compatibility
         contact_logits = torch.cat((hand_contact_logits, obj_move_logits), dim=-1)
         contact_prob = torch.cat((hand_contact_prob, obj_move_prob), dim=-1)
@@ -518,10 +699,43 @@ class VelocityContactModule(nn.Module):
             "pred_hand_contact_logits_cond": hand_contact_logits,
             "pred_interaction_boundary_logits": boundary_logits,
             "pred_interaction_boundary_prob": boundary_prob,
+            "pred_contact_endpoint_logits": contact_endpoint_logits,
+            "pred_contact_endpoint_prob": contact_endpoint_prob,
         }
         if obj_trans_rough is not None:
             out["pred_obj_trans_rough"] = obj_trans_rough
         return out
+
+    @torch.no_grad()
+    def decode_contact_segments(self, endpoint_prob, interior_prob=None, **overrides):
+        """Decode endpoint heatmaps into segments using cfg thresholds."""
+        kwargs = dict(
+            peak_threshold=float(getattr(self.cfg, "contact_endpoint_peak_threshold", 0.3)),
+            segment_threshold=float(getattr(self.cfg, "contact_endpoint_segment_threshold", 0.25)),
+            peak_radius=int(getattr(self.cfg, "contact_endpoint_peak_radius", 5)),
+        )
+        kwargs.update(overrides)
+        return decode_contact_segments(endpoint_prob, interior_prob, **kwargs)
+
+    def _apply_segment_contact(self, output):
+        """Replace per-frame contact prob with rasterized decoded segments.
+
+        The per-frame prediction is kept under ``pred_hand_contact_prob_frame``.
+        Segment frame indices refer to the sequence passed in (in online mode:
+        the full accumulated stream).
+        """
+        endpoint_prob = output.get("pred_contact_endpoint_prob")
+        if endpoint_prob is None:
+            return output
+        frame_prob = output.get("pred_hand_contact_prob")
+        segments, raster = self.decode_contact_segments(endpoint_prob, frame_prob)
+        output = dict(output)
+        output["pred_contact_segments"] = segments
+        if frame_prob is not None:
+            output["pred_hand_contact_prob_frame"] = frame_prob
+            raster = raster.to(dtype=frame_prob.dtype)
+        output["pred_hand_contact_prob"] = raster
+        return output
 
     def _slice_hp_out(self, hp_out, start: int, end: int, batch_size: int, seq_len: int):
         if not isinstance(hp_out, dict):
@@ -562,8 +776,11 @@ class VelocityContactModule(nn.Module):
         **_,
     ):
         mode = normalize_inference_mode(inference_mode)
+        contact_from_segments = bool(getattr(self.cfg, "contact_from_segments", False))
         if mode == "offline":
             output = self.forward(data_dict, hp_out=hp_out)
+            if contact_from_segments:
+                output = self._apply_segment_contact(output)
             if return_online_state:
                 return output, online_state or {}
             return output
@@ -574,6 +791,8 @@ class VelocityContactModule(nn.Module):
             data_dict,
         )
         output = self._inference_online_sequence(run_data, hp_out=hp_out, online_window=window)
+        if contact_from_segments:
+            output = self._apply_segment_contact(output)
         state = {"data_dict": run_data, "hp_out": hp_out, "outputs": output}
         if return_online_state:
             if previous_len > 0:
@@ -595,4 +814,6 @@ class VelocityContactModule(nn.Module):
             "pred_hand_contact_logits_cond": torch.zeros(batch_size, seq_len, 2, device=device),
             "pred_interaction_boundary_logits": torch.zeros(batch_size, seq_len, 2, device=device),
             "pred_interaction_boundary_prob": torch.zeros(batch_size, seq_len, 2, device=device),
+            "pred_contact_endpoint_logits": torch.zeros(batch_size, seq_len, 6, device=device),
+            "pred_contact_endpoint_prob": torch.zeros(batch_size, seq_len, 6, device=device),
         }
