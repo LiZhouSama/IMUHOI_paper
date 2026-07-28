@@ -579,6 +579,7 @@ class IMUHOIModel(nn.Module):
                 window_data,
                 self._stage1_history_for_inits(history),
                 index=start - 1,
+                contact_index=start,
             )
             window_len = end - start
             prefix = select_time_context(history, start, end - 1)
@@ -720,6 +721,7 @@ class IMUHOIModel(nn.Module):
                     window_data,
                     self._stage1_history_for_inits(history),
                     index=0,
+                    contact_index=1 if history_len > 1 else 0,
                 )
                 prefix = select_time_context(history, 1, history_len)
             else:

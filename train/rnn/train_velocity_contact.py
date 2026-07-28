@@ -28,6 +28,9 @@ from train.rnn.train_utils import (
     create_save_dir,
     create_dataloaders,
     build_model_input_dict,
+    build_optimizer_and_scheduler,
+    load_model_state_from_checkpoint,
+    save_checkpoint,
     save_config_snapshot,
     BaseTrainer,
     load_checkpoint,
@@ -57,6 +60,179 @@ def _resolve_hp_ckpt(cfg, cli_hp_ckpt=None):
     return _cfg_get(pretrained_modules, "human_pose")
 
 
+def _milestone_lr_lambda(milestones, gamma):
+    milestones = tuple(sorted(int(value) for value in milestones))
+    gamma = float(gamma)
+
+    def lr_lambda(epoch):
+        return gamma ** sum(int(epoch) >= milestone for milestone in milestones)
+
+    return lr_lambda
+
+
+def _vc_parameter_group(name):
+    if name.startswith("vel_net."):
+        return "velocity"
+    if name.startswith("contact_endpoint_"):
+        return "endpoint"
+    return "contact"
+
+
+def _staged_lr_lambda(group_name, cfg):
+    velocity_epochs = int(getattr(cfg, "vc_velocity_stage_epochs", 120))
+    joint_epochs = int(getattr(cfg, "vc_joint_stage_epochs", 60))
+    endpoint_start = velocity_epochs + joint_epochs
+    gamma = float(getattr(cfg, "vc_group_lr_gamma", getattr(cfg, "gamma", 0.2)))
+
+    velocity_milestones = tuple(
+        sorted(int(value) for value in getattr(
+            cfg,
+            "vc_velocity_lr_milestones",
+            [60, 100],
+        ))
+    )
+    contact_milestones = tuple(
+        sorted(int(value) for value in getattr(
+            cfg,
+            "vc_contact_lr_milestones",
+            [20, 35, 50],
+        ))
+    )
+    endpoint_joint_milestones = tuple(
+        sorted(int(value) for value in getattr(
+            cfg,
+            "vc_endpoint_joint_lr_milestones",
+            [30, 50],
+        ))
+    )
+    endpoint_finetune_milestones = tuple(
+        sorted(int(value) for value in getattr(
+            cfg,
+            "vc_endpoint_finetune_lr_milestones",
+            [50, 90],
+        ))
+    )
+    endpoint_finetune_scale = float(
+        getattr(cfg, "vc_endpoint_finetune_lr_scale", 0.2)
+    )
+
+    def decay(relative_epoch, milestones):
+        return gamma ** sum(relative_epoch >= milestone for milestone in milestones)
+
+    def lr_lambda(epoch):
+        epoch = int(epoch)
+        if epoch < velocity_epochs:
+            if group_name != "velocity":
+                return 0.0
+            return decay(epoch, velocity_milestones)
+        if epoch < endpoint_start:
+            relative_epoch = epoch - velocity_epochs
+            if group_name == "contact":
+                return decay(relative_epoch, contact_milestones)
+            if group_name == "endpoint":
+                return decay(relative_epoch, endpoint_joint_milestones)
+            return 0.0
+        if group_name != "endpoint":
+            return 0.0
+        relative_epoch = epoch - endpoint_start
+        return endpoint_finetune_scale * decay(
+            relative_epoch,
+            endpoint_finetune_milestones,
+        )
+
+    return lr_lambda
+
+
+def build_velocity_contact_optimizer_and_scheduler(model, cfg):
+    """Use one optimizer/checkpoint with task-specific VC learning-rate decay."""
+    target = model.module if isinstance(model, torch.nn.DataParallel) else model
+    staged_training = (
+        bool(getattr(cfg, "vc_staged_training", False))
+        and hasattr(target, "contact_endpoint_head")
+    )
+    if not staged_training and not bool(getattr(cfg, "vc_grouped_lr", False)):
+        return build_optimizer_and_scheduler(model, cfg)
+
+    base_lr = float(cfg.lr)
+    if bool(getattr(cfg, "use_multi_gpu", False)):
+        base_lr *= len(getattr(cfg, "gpus", []))
+    weight_decay = float(cfg.weight_decay)
+
+    grouped = {"contact": [], "velocity": [], "endpoint": []}
+    for name, parameter in target.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        group_name = _vc_parameter_group(name)
+        grouped[group_name].append(parameter)
+
+    parameter_groups = []
+    active_names = []
+    for group_name in ("contact", "velocity", "endpoint"):
+        parameters = grouped[group_name]
+        if not parameters:
+            continue
+        parameter_groups.append({
+            "params": parameters,
+            "lr": base_lr,
+            "group_name": group_name,
+        })
+        active_names.append(group_name)
+
+    optimizer = torch.optim.AdamW(
+        parameter_groups,
+        lr=base_lr,
+        weight_decay=weight_decay,
+    )
+    gamma = float(getattr(cfg, "vc_group_lr_gamma", getattr(cfg, "gamma", 0.2)))
+    if staged_training:
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=[
+                _staged_lr_lambda(group_name, cfg)
+                for group_name in active_names
+            ],
+        )
+    else:
+        default_milestones = list(getattr(cfg, "milestones", []))
+        milestone_map = {
+            "contact": list(getattr(cfg, "vc_contact_lr_milestones", [20, 30, 40])),
+            "velocity": list(getattr(cfg, "vc_velocity_lr_milestones", default_milestones)),
+            "endpoint": list(getattr(cfg, "vc_endpoint_lr_milestones", default_milestones)),
+        }
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=[
+                _milestone_lr_lambda(milestone_map[group_name], gamma)
+                for group_name in active_names
+            ],
+        )
+
+    counts = {
+        group_name: sum(parameter.numel() for parameter in grouped[group_name])
+        for group_name in active_names
+    }
+    print(f"VC参数组: {counts}")
+    if staged_training:
+        velocity_epochs = int(getattr(cfg, "vc_velocity_stage_epochs", 120))
+        joint_epochs = int(getattr(cfg, "vc_joint_stage_epochs", 60))
+        print(
+            "VC三阶段学习: "
+            f"velocity=[0,{velocity_epochs}), "
+            f"joint=[{velocity_epochs},{velocity_epochs + joint_epochs}), "
+            f"endpoint=[{velocity_epochs + joint_epochs},{int(cfg.epochs)})"
+        )
+    else:
+        print(
+            "VC分组学习率里程碑: "
+            + ", ".join(
+                f"{group_name}={milestone_map[group_name]}"
+                for group_name in active_names
+            )
+            + f", gamma={gamma}"
+        )
+    return optimizer, scheduler
+
+
 def get_args():
     parser = get_base_args()
     parser.description = 'VelocityContactModule training (Stage 2)'
@@ -79,14 +255,185 @@ def get_args():
 class VelocityContactTrainer(BaseTrainer):
     """Trainer for VelocityContactModule."""
 
+    STAGE_LOSS_KEYS = {
+        "velocity": {"obj_vel", "hand_vel"},
+        "joint": {
+            "obj_move",
+            "hand_contact_cond",
+            "contact_endpoint",
+            "contact_endpoint_order",
+            "endpoint_contact_consistency",
+        },
+        "endpoint": {
+            "contact_endpoint",
+            "contact_endpoint_order",
+            "endpoint_contact_consistency",
+        },
+        "all": set(VelocityContactLoss.LOSS_KEYS),
+    }
+
+    GROUP_MODULE_NAMES = {
+        "velocity": ("vel_net",),
+        "contact": (
+            "group_encoders",
+            "group_norms",
+            "boundary_rnn",
+            "boundary_fusion",
+            "boundary_input_norm",
+            "boundary_hidden_norm",
+            "obj_move_net",
+            "hand_contact_net",
+        ),
+        "endpoint": (
+            "contact_endpoint_input_norm",
+            "contact_endpoint_rnn",
+            "contact_endpoint_head",
+        ),
+    }
+
     def __init__(self, cfg, model, loss_fn, train_loader, test_loader=None, hp_model=None):
+        target = model.module if isinstance(model, torch.nn.DataParallel) else model
+        self.staged_training = (
+            bool(getattr(cfg, "vc_staged_training", False))
+            and hasattr(target, "contact_endpoint_head")
+        )
         super().__init__(cfg, model, loss_fn, train_loader, test_loader)
         self.hp_model = hp_model
         self.current_epoch = 0
+        self.current_stage = None
+        self.velocity_stage_best_loss = float("inf")
+        self.velocity_stage_best_state = None
+        if self.staged_training and self.endpoint_stage_start >= int(cfg.epochs):
+            raise ValueError(
+                "VC staged training leaves no endpoint-only epochs: "
+                f"velocity={self.velocity_stage_epochs}, "
+                f"joint={self.joint_stage_epochs}, total={int(cfg.epochs)}"
+            )
+        if isinstance(self.resume_checkpoint, dict):
+            self.velocity_stage_best_loss = float(
+                self.resume_checkpoint.get(
+                    "velocity_stage_best_loss",
+                    self.velocity_stage_best_loss,
+                )
+            )
+            self.velocity_stage_best_state = self.resume_checkpoint.get(
+                "velocity_stage_best_state",
+            )
         if self.hp_model is not None:
             self.hp_model.eval()
             for p in self.hp_model.parameters():
                 p.requires_grad_(False)
+
+    def build_optimizer_and_scheduler(self):
+        return build_velocity_contact_optimizer_and_scheduler(self.model, self.cfg)
+
+    @property
+    def velocity_stage_epochs(self):
+        return int(getattr(self.cfg, "vc_velocity_stage_epochs", 120))
+
+    @property
+    def joint_stage_epochs(self):
+        return int(getattr(self.cfg, "vc_joint_stage_epochs", 60))
+
+    @property
+    def endpoint_stage_start(self):
+        return self.velocity_stage_epochs + self.joint_stage_epochs
+
+    def stage_for_epoch(self, epoch):
+        if not self.staged_training:
+            return "all"
+        if int(epoch) < self.velocity_stage_epochs:
+            return "velocity"
+        if int(epoch) < self.endpoint_stage_start:
+            return "joint"
+        return "endpoint"
+
+    def _target_model(self):
+        return self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+
+    def _configure_stage(self, stage):
+        active_groups = {
+            "velocity": {"velocity"},
+            "joint": {"contact", "endpoint"},
+            "endpoint": {"endpoint"},
+            "all": {"velocity", "contact", "endpoint"},
+        }[stage]
+        target = self._target_model()
+        for name, parameter in target.named_parameters():
+            parameter.requires_grad_(_vc_parameter_group(name) in active_groups)
+
+        self.model.train()
+        for group_name, module_names in self.GROUP_MODULE_NAMES.items():
+            train_group = group_name in active_groups
+            for module_name in module_names:
+                module = getattr(target, module_name, None)
+                if module is not None:
+                    module.train(train_group)
+
+        if stage != self.current_stage:
+            trainable = sum(
+                parameter.numel()
+                for parameter in target.parameters()
+                if parameter.requires_grad
+            )
+            print(f"VC训练阶段切换: {stage}, 可训练参数={trainable}")
+            self.current_stage = stage
+
+    def _contact_schedule_epoch(self, epoch):
+        if not self.staged_training:
+            return int(epoch)
+        return max(0, int(epoch) - self.velocity_stage_epochs)
+
+    def _capture_parameter_group(self, group_name):
+        return {
+            name: parameter.detach().cpu().clone()
+            for name, parameter in self._target_model().named_parameters()
+            if _vc_parameter_group(name) == group_name
+        }
+
+    def _restore_parameter_group(self, state):
+        if not isinstance(state, dict):
+            return False
+        restored = 0
+        with torch.no_grad():
+            for name, parameter in self._target_model().named_parameters():
+                value = state.get(name)
+                if isinstance(value, torch.Tensor) and value.shape == parameter.shape:
+                    parameter.copy_(value.to(device=parameter.device, dtype=parameter.dtype))
+                    restored += 1
+        return restored > 0
+
+    def _restore_joint_best_for_endpoint_finetune(self):
+        best_path = os.path.join(self.cfg.save_dir, "best.pt")
+        if not os.path.isfile(best_path):
+            print("VC endpoint微调前未找到joint best.pt，使用联合阶段末尾权重。")
+            return
+        try:
+            try:
+                checkpoint = torch.load(
+                    best_path,
+                    map_location=self.device,
+                    weights_only=False,
+                )
+            except TypeError:
+                checkpoint = torch.load(best_path, map_location=self.device)
+            if checkpoint.get("vc_stage") != "joint":
+                print("VC best.pt并非联合阶段检查点，不覆盖当前模型。")
+                return
+            load_model_state_from_checkpoint(
+                self.model,
+                checkpoint,
+                strict=False,
+                name="VelocityContact endpoint finetune init",
+            )
+            for parameter_group in self.optimizer.param_groups:
+                if parameter_group.get("group_name") != "endpoint":
+                    continue
+                for parameter in parameter_group["params"]:
+                    self.optimizer.state.pop(parameter, None)
+            print("VC endpoint微调从联合阶段的统一best.pt恢复，并重置endpoint优化器状态。")
+        except Exception as exc:
+            print(f"警告：恢复联合阶段best.pt失败，使用当前权重: {exc}")
 
     def model_forward(
         self,
@@ -98,6 +445,17 @@ class VelocityContactTrainer(BaseTrainer):
         """Use frozen HP/GT scheduled hp_out, then forward VC."""
         training = self.model.training if training is None else bool(training)
         epoch = self.current_epoch if epoch is None else int(epoch)
+        velocity_only = (
+            self.staged_training
+            and self.stage_for_epoch(epoch) == "velocity"
+        )
+        if velocity_only:
+            return self.model(
+                data_dict,
+                hp_out=None,
+                velocity_only=True,
+            )
+
         pred_hp_out = None
         if self.hp_model is not None:
             with torch.no_grad():
@@ -126,16 +484,39 @@ class VelocityContactTrainer(BaseTrainer):
                         "root_vel_pred",
                         "root_trans_pred",
                     ),
-                    prediction_mix_probability(epoch, self.cfg),
+                    prediction_mix_probability(
+                        self._contact_schedule_epoch(epoch),
+                        self.cfg,
+                    ),
                 )
-        return call_model_inference(self.model, data_dict, hp_out=hp_out, inference_mode="offline")
+        if training:
+            # Keep training on differentiable frame-level outputs. Segment
+            # decoding is an inference-only, non-differentiable operation.
+            return self.model(data_dict, hp_out=hp_out)
+        return call_model_inference(
+            self.model,
+            data_dict,
+            hp_out=hp_out,
+            inference_mode="offline",
+        )
 
     def train_epoch(self, epoch):
         """Override to add gradient clipping for stability."""
         self.current_epoch = epoch
-        self.model.train()
+        stage = self.stage_for_epoch(epoch)
+        self._configure_stage(stage)
+        active_loss_keys = self.STAGE_LOSS_KEYS[stage]
         total_loss = 0
         loss_components = {}
+
+        if self.writer is not None:
+            for parameter_group in self.optimizer.param_groups:
+                group_name = parameter_group.get("group_name", "all")
+                self.writer.add_scalar(
+                    f"lr/{group_name}",
+                    float(parameter_group["lr"]),
+                    epoch,
+                )
 
         train_iter = tqdm(self.train_loader, desc=f'Epoch {epoch}', leave=False)
 
@@ -145,12 +526,24 @@ class VelocityContactTrainer(BaseTrainer):
             self.optimizer.zero_grad()
             pred_dict = self.model_forward(data_dict, batch=batch, epoch=epoch, training=True)
 
-            total_loss_tensor, losses, weighted_losses = self.loss_fn(pred_dict, batch, self.device)
+            total_loss_tensor, losses, weighted_losses = self.loss_fn(
+                pred_dict,
+                batch,
+                self.device,
+                active_loss_keys=active_loss_keys,
+            )
 
             self.scaler.scale(total_loss_tensor).backward()
             # gradient clipping
             self.scaler.unscale_(self.optimizer)
-            clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            clip_grad_norm_(
+                (
+                    parameter
+                    for parameter in self.model.parameters()
+                    if parameter.requires_grad
+                ),
+                max_norm=float(getattr(self.cfg, "gradient_clip", 1.0)),
+            )
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
@@ -179,6 +572,205 @@ class VelocityContactTrainer(BaseTrainer):
             loss_components[key] /= len(self.train_loader)
 
         return total_loss, loss_components
+
+    def evaluate_all_losses(self, epoch):
+        """Evaluate once and derive both stage and unified checkpoint metrics."""
+        if self.test_loader is None:
+            return None, None, {}
+
+        self.model.eval()
+        weighted_sums = {}
+        with torch.no_grad():
+            test_iter = tqdm(self.test_loader, desc=f"Test {epoch}", leave=False)
+            for batch in test_iter:
+                data_dict = build_model_input_dict(
+                    batch,
+                    self.cfg,
+                    self.device,
+                    add_noise=False,
+                )
+                pred_dict = self.model_forward(
+                    data_dict,
+                    batch=batch,
+                    epoch=epoch,
+                    training=False,
+                )
+                _, _, weighted_losses = self.loss_fn(
+                    pred_dict,
+                    batch,
+                    self.device,
+                )
+                for key, value in weighted_losses.items():
+                    if isinstance(value, torch.Tensor):
+                        weighted_sums[key] = (
+                            weighted_sums.get(key, 0.0) + float(value.item())
+                        )
+
+        num_batches = len(self.test_loader)
+        components = {
+            key: value / num_batches
+            for key, value in weighted_sums.items()
+        }
+        stage = self.stage_for_epoch(epoch)
+        stage_loss = sum(
+            components.get(key, 0.0)
+            for key in self.STAGE_LOSS_KEYS[stage]
+        )
+        unified_loss = None
+        if stage != "velocity":
+            unified_loss = sum(
+                components.get(key, 0.0)
+                for key in self.loss_fn.TEST_LOSS_KEYS
+            )
+        return unified_loss, stage_loss, components
+
+    def train(self):
+        """Train velocity, joint contact, then endpoint in one checkpoint."""
+        max_epoch = int(self.cfg.epochs)
+        train_loss = 0.0
+        if self.start_epoch >= max_epoch:
+            print(
+                f"Resume checkpoint already reached epoch {self.start_epoch - 1}; "
+                f"target epochs={max_epoch}."
+            )
+            if self.writer is not None:
+                self.writer.close()
+            return self.model
+
+        for epoch in range(self.start_epoch, max_epoch):
+            stage = self.stage_for_epoch(epoch)
+            if (
+                self.staged_training
+                and stage == "joint"
+                and epoch == self.velocity_stage_epochs
+            ):
+                if self._restore_parameter_group(self.velocity_stage_best_state):
+                    print(
+                        "VC联合阶段从验证集最优velocity参数开始，随后冻结velocity。"
+                    )
+                else:
+                    print(
+                        "VC联合阶段未找到velocity验证快照，冻结当前velocity参数。"
+                    )
+                self.velocity_stage_best_state = None
+            if (
+                self.staged_training
+                and stage == "endpoint"
+                and epoch == self.endpoint_stage_start
+            ):
+                self._restore_joint_best_for_endpoint_finetune()
+
+            train_loss, train_components = self.train_epoch(epoch)
+            print(
+                f"\rEpoch {epoch} [{stage}], Train Loss: {train_loss:.4f}",
+                end="",
+            )
+
+            eval_interval = max(1, int(getattr(self.cfg, "eval_interval", 10)))
+            if epoch % eval_interval == 0 and self.test_loader is not None:
+                test_loss, stage_test_loss, test_components = (
+                    self.evaluate_all_losses(epoch)
+                )
+                if test_loss is None:
+                    print(f", Stage Loss: {stage_test_loss:.4f}")
+                else:
+                    print(
+                        f", Test Loss: {test_loss:.4f}, "
+                        f"Stage Loss: {stage_test_loss:.4f}"
+                    )
+
+                if stage == "velocity":
+                    if stage_test_loss < self.velocity_stage_best_loss:
+                        self.velocity_stage_best_loss = stage_test_loss
+                        self.velocity_stage_best_state = (
+                            self._capture_parameter_group("velocity")
+                        )
+                        print(
+                            "新的最佳velocity阶段损失: "
+                            f"{self.velocity_stage_best_loss:.4f}"
+                        )
+                elif test_loss is not None and test_loss < self.best_loss:
+                    self.best_loss = test_loss
+                    save_path = os.path.join(self.cfg.save_dir, "best.pt")
+                    save_checkpoint(
+                        self.model,
+                        self.optimizer,
+                        epoch,
+                        save_path,
+                        test_loss,
+                        {
+                            "test_components": test_components,
+                            "best_loss": self.best_loss,
+                            "n_iter": self.n_iter,
+                            "vc_stage": stage,
+                        },
+                        scheduler=self.scheduler,
+                        scaler=self.scaler,
+                    )
+                    print(f"新的统一最佳测试损失: {self.best_loss:.4f}")
+
+                if self.writer is not None:
+                    if test_loss is not None:
+                        self.writer.add_scalar(
+                            "test/total_loss",
+                            test_loss,
+                            self.n_iter,
+                        )
+                    self.writer.add_scalar(
+                        "test/stage_loss",
+                        stage_test_loss,
+                        self.n_iter,
+                    )
+                    for key, value in test_components.items():
+                        self.writer.add_scalar(
+                            f"test/{key}",
+                            value,
+                            self.n_iter,
+                        )
+            else:
+                print()
+
+            self.scheduler.step()
+            last_info = {
+                "train_components": train_components,
+                "best_loss": self.best_loss,
+                "n_iter": self.n_iter,
+                "vc_stage": stage,
+            }
+            if stage == "velocity":
+                last_info.update({
+                    "velocity_stage_best_loss": self.velocity_stage_best_loss,
+                    "velocity_stage_best_state": self.velocity_stage_best_state,
+                })
+            save_checkpoint(
+                self.model,
+                self.optimizer,
+                epoch,
+                os.path.join(self.cfg.save_dir, "last.pt"),
+                train_loss,
+                last_info,
+                scheduler=self.scheduler,
+                scaler=self.scaler,
+            )
+
+        save_checkpoint(
+            self.model,
+            self.optimizer,
+            max_epoch - 1,
+            os.path.join(self.cfg.save_dir, "final.pt"),
+            train_loss,
+            {
+                "best_loss": self.best_loss,
+                "n_iter": self.n_iter,
+                "vc_stage": self.stage_for_epoch(max_epoch - 1),
+            },
+            scheduler=self.scheduler,
+            scaler=self.scaler,
+        )
+
+        if self.writer is not None:
+            self.writer.close()
+        return self.model
 
 
 def main():

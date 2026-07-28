@@ -98,12 +98,24 @@ epochs: 300
 joint_train_epochs: 100
 input_mix_start_epoch: 0
 input_mix_end_epoch: 30  # 0 means use predicted HP/VC inputs from epoch 0
+deterministic_test_windows: true
+eval_interval: 1
 batch_size: 200
 lr: 0.002 # jt:0.0002
 weight_decay: 0.0001
 milestones: [100, 200, 300, 350, 400, 450, 500]
 joint_train_milestones: [10,20,30,40,50,60,70,80,90,100] 
 gamma: 0.2
+# VC使用一个模型、optimizer和best.pt，按依赖顺序分三阶段训练。
+vc_staged_training: true
+vc_velocity_stage_epochs: 120
+vc_joint_stage_epochs: 60
+vc_velocity_lr_milestones: [60, 100]       # 相对velocity阶段
+vc_contact_lr_milestones: [20, 35, 50]     # 相对joint阶段
+vc_endpoint_joint_lr_milestones: [30, 50]  # 相对joint阶段
+vc_endpoint_finetune_lr_scale: 0.2
+vc_endpoint_finetune_lr_milestones: [50, 90]  # 相对endpoint微调阶段
+vc_group_lr_gamma: 0.2
 seed: 42
 num_workers: 4
 
@@ -130,8 +142,9 @@ object_contact_threshold: 0.5
 # ============ 接触段端点检测 ============
 contact_from_segments: false              # 推理时用解码接触段的栅格化结果替换逐帧接触概率
 contact_endpoint_peak_threshold: 0.3      # 端点热图峰值阈值
-contact_endpoint_segment_threshold: 0.25  # 段置信度阈值（起点/终点峰值与段内逐帧概率的几何平均）
+contact_endpoint_segment_threshold: 0.25  # 段置信度阈值（初始状态/端点峰值/段内逐帧概率的几何平均）
 contact_endpoint_peak_radius: 5           # 峰值NMS半径（帧）
+contact_endpoint_init_thresholds: [0.15, 0.15, 0.5]  # 第0帧左手/右手/物体状态阈值
 
 # ============ 要使用的数据集 ============
 train_datasets: ["omomo"]  # 可选: behave, imhd, omomo, pahoi, hodome
@@ -180,15 +193,12 @@ loss_weights:
   hand_vel: 1.0
   obj_move: 1.0
   hand_contact_cond: 1.0
-  hand_contact_pos_weight: 0.7
-  hand_contact_neg_weight: 4.0
-  hand_contact_hard_neg_weight: 8.0
-  interaction_boundary: 0.1
-  interaction_order: 1.0
-  boundary_focal_alpha: 0.25
-  boundary_focal_gamma: 2.0
+  hand_contact_pos_weight: 1.0
+  hand_contact_neg_weight: 2.0
+  hand_contact_hard_neg_weight: 4.0
   contact_endpoint: 1.0
   contact_endpoint_order: 0.5
+  endpoint_contact_consistency: 0.5
   endpoint_focal_alpha: 0.25
   endpoint_focal_gamma: 2.0
 

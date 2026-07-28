@@ -15,8 +15,15 @@ from model.rnn.velocity_contact import (
     VelocityContactModule,
     decode_contact_segments,
     find_heatmap_peaks,
+    recover_contact_state_from_endpoints,
 )
+from model.rnn.online import update_data_inits_from_history
 from train.rnn.loss.velocity_contact_loss import VelocityContactLoss
+from train.rnn.train_velocity_contact import (
+    VelocityContactTrainer,
+    _vc_parameter_group,
+    build_velocity_contact_optimizer_and_scheduler,
+)
 
 
 def _contact_mask(length, *runs):
@@ -121,8 +128,8 @@ def test_decode_pairs_peaks_with_geometric_mean_confidence():
     assert segment["start"] == 10 and segment["end"] == 40
     expected_conf = math.exp((math.log(0.9) + math.log(0.8) + math.log(0.9)) / 3)
     assert abs(segment["confidence"] - expected_conf) < 1e-5
-    assert segment["start_confidence"] == 0.9
-    assert segment["end_confidence"] == 0.8
+    assert abs(segment["start_confidence"] - 0.9) < 1e-6
+    assert abs(segment["end_confidence"] - 0.8) < 1e-6
     # 栅格化：段内为置信度，段外为0
     assert torch.allclose(raster[0, 10:41, 2], torch.full((31,), expected_conf), atol=1e-5)
     assert raster[0, 9, 2] == 0.0 and raster[0, 41, 2] == 0.0
@@ -154,6 +161,53 @@ def test_decode_emits_open_segments_at_stream_borders():
     assert raster[0, 0:6, 2].min() > 0.0
     assert raster[0, 50:, 2].min() > 0.0
     assert raster[0, 6:50, 2].sum() == 0.0
+
+
+def test_decode_uses_initial_contact_for_fully_open_segments():
+    seq_len = 60
+    endpoint_prob = torch.zeros(1, seq_len, 6)
+    interior_prob = torch.full((1, seq_len, 3), 0.05)
+    initial_contact = torch.tensor([[1.0, 0.0, 0.8]])
+
+    segments, raster = decode_contact_segments(
+        endpoint_prob,
+        interior_prob,
+        initial_contact=initial_contact,
+        peak_threshold=0.3,
+        segment_threshold=0.25,
+        peak_radius=5,
+    )
+
+    assert [segment["channel_name"] for segment in segments[0]] == ["lhand", "obj"]
+    for segment in segments[0]:
+        assert segment["start"] == 0 and segment["end"] == seq_len - 1
+        assert segment["start_confidence"] is None
+        assert segment["end_confidence"] is None
+        assert abs(
+            segment["initial_confidence"]
+            - float(initial_contact[0, segment["channel"]])
+        ) < 1e-6
+    assert torch.allclose(raster[0, :, 0], torch.ones(seq_len))
+    assert raster[0, :, 1].sum() == 0.0
+    assert torch.allclose(raster[0, :, 2], torch.full((seq_len,), 0.8))
+
+
+def test_online_contact_init_uses_window_first_frame_raw_prediction():
+    decoded = torch.zeros(1, 5, 3)
+    raw = torch.arange(15, dtype=torch.float32).reshape(1, 5, 3) / 15.0
+    history = {
+        "pred_hand_contact_prob": decoded,
+        "pred_hand_contact_prob_frame": raw,
+    }
+
+    updated = update_data_inits_from_history(
+        {"contact_init": torch.zeros(1, 3)},
+        history,
+        index=1,
+        contact_index=2,
+    )
+
+    assert torch.equal(updated["contact_init"], raw[:, 2])
 
 
 def test_decode_filters_low_confidence_segments():
@@ -232,8 +286,55 @@ def test_velocity_contact_forward_outputs_endpoint_heatmaps():
     assert out["pred_contact_endpoint_prob"].shape == (batch_size, seq_len, 6)
     assert out["pred_contact_endpoint_prob"].min() >= 0.0
     assert out["pred_contact_endpoint_prob"].max() <= 1.0
+    assert out["pred_contact_from_endpoints_prob"].shape == (
+        batch_size,
+        seq_len,
+        3,
+    )
     # 逐帧接触概率保持原接口
     assert out["pred_hand_contact_prob"].shape == (batch_size, seq_len, 3)
+    assert not hasattr(model, "boundary_head")
+    assert "pred_interaction_boundary_logits" not in out
+    assert "pred_interaction_boundary_prob" not in out
+
+
+def test_velocity_only_forward_skips_contact_branches():
+    model = VelocityContactModule(_vc_cfg()).eval()
+
+    with torch.no_grad():
+        out = model(_vc_inputs(), velocity_only=True)
+
+    assert set(out) == {"pred_hand_glb_vel", "pred_obj_vel"}
+
+
+def test_endpoint_state_recovery_uses_last_active_frame_end_semantics():
+    endpoint_prob = torch.zeros(1, 7, 6)
+    endpoint_prob[0, 2, 4] = 1.0  # object start
+    endpoint_prob[0, 4, 5] = 1.0  # object end (frame 4 remains active)
+
+    recovered = recover_contact_state_from_endpoints(
+        endpoint_prob,
+        torch.zeros(1, 3),
+    )
+
+    assert torch.equal(
+        recovered[0, :, 2],
+        torch.tensor([0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0]),
+    )
+
+
+def test_endpoint_state_recovery_keeps_fully_open_initial_contact():
+    endpoint_prob = torch.zeros(1, 8, 6)
+    initial_contact = torch.tensor([[1.0, 0.0, 0.8]])
+
+    recovered = recover_contact_state_from_endpoints(
+        endpoint_prob,
+        initial_contact,
+    )
+
+    assert torch.allclose(recovered[:, :, 0], torch.ones(1, 8))
+    assert torch.allclose(recovered[:, :, 1], torch.zeros(1, 8))
+    assert torch.allclose(recovered[:, :, 2], torch.full((1, 8), 0.8))
 
 
 def test_velocity_contact_inference_contact_from_segments():
@@ -250,6 +351,30 @@ def test_velocity_contact_inference_contact_from_segments():
     # 逐帧概率被段栅格化结果替换，原逐帧输出保留在 _frame
     assert out["pred_hand_contact_prob"].shape == (batch_size, seq_len, 3)
     assert out["pred_hand_contact_prob_frame"].shape == (batch_size, seq_len, 3)
+
+
+def test_velocity_contact_inference_passes_frame_zero_contact_to_decoder(monkeypatch):
+    cfg = _vc_cfg(contact_from_segments=True)
+    model = VelocityContactModule(cfg).eval()
+    inputs = _vc_inputs(batch_size=1, seq_len=8)
+    inputs["contact_init"] = torch.tensor([[1.0, 0.0, 0.8]])
+
+    def _fake_forward(data_dict, hp_out=None):
+        del data_dict, hp_out
+        return {
+            "pred_contact_endpoint_prob": torch.zeros(1, 8, 6),
+            "pred_hand_contact_prob": torch.full((1, 8, 3), 0.05),
+        }
+
+    monkeypatch.setattr(model, "forward", _fake_forward)
+    out = model.inference(inputs, inference_mode="offline")
+
+    assert torch.allclose(out["pred_hand_contact_prob"][0, :, 0], torch.ones(8))
+    assert out["pred_hand_contact_prob"][0, :, 1].sum() == 0.0
+    assert torch.allclose(
+        out["pred_hand_contact_prob"][0, :, 2],
+        torch.full((8,), 0.8),
+    )
 
 
 def test_velocity_contact_loss_includes_endpoint_terms():
@@ -273,3 +398,140 @@ def test_velocity_contact_loss_includes_endpoint_terms():
     assert losses["contact_endpoint"] > 0.0
     assert torch.isfinite(losses["contact_endpoint_order"])
     assert "contact_endpoint" in weighted
+    assert "interaction_boundary" not in losses
+
+
+def test_endpoint_contact_consistency_backpropagates_only_to_endpoint_state():
+    batch_size, seq_len = 2, 8
+    endpoint_logits = torch.zeros(
+        batch_size,
+        seq_len,
+        6,
+        requires_grad=True,
+    )
+    endpoint_prob = torch.sigmoid(endpoint_logits)
+    endpoint_state = recover_contact_state_from_endpoints(
+        endpoint_prob,
+        torch.zeros(batch_size, 3),
+    )
+    frame_contact = torch.full(
+        (batch_size, seq_len, 3),
+        0.1,
+        requires_grad=True,
+    )
+    loss_fn = VelocityContactLoss(
+        weights={"endpoint_contact_consistency": 1.0}
+    )
+    batch = {
+        "human_imu": torch.randn(batch_size, seq_len, 6, 9),
+        "has_object": torch.ones(batch_size, dtype=torch.bool),
+    }
+    pred_dict = {
+        "pred_contact_from_endpoints_prob": endpoint_state,
+        "pred_hand_contact_prob": frame_contact,
+    }
+
+    total, _, weighted = loss_fn(
+        pred_dict,
+        batch,
+        torch.device("cpu"),
+        active_loss_keys={"endpoint_contact_consistency"},
+    )
+    total.backward()
+
+    assert set(weighted) == {"endpoint_contact_consistency"}
+    assert endpoint_logits.grad is not None
+    assert torch.isfinite(endpoint_logits.grad).all()
+    assert endpoint_logits.grad.abs().sum() > 0
+    assert frame_contact.grad is None
+
+
+def test_velocity_contact_stages_keep_one_optimizer_with_task_schedules():
+    cfg = _vc_cfg(
+        lr=0.002,
+        weight_decay=1e-4,
+        use_multi_gpu=False,
+        gpus=[0],
+        epochs=6,
+        milestones=[],
+        gamma=0.2,
+        vc_staged_training=True,
+        vc_velocity_stage_epochs=2,
+        vc_joint_stage_epochs=2,
+        vc_contact_lr_milestones=[],
+        vc_velocity_lr_milestones=[],
+        vc_endpoint_joint_lr_milestones=[],
+        vc_endpoint_finetune_lr_scale=0.2,
+        vc_endpoint_finetune_lr_milestones=[],
+        vc_group_lr_gamma=0.2,
+    )
+    model = VelocityContactModule(cfg)
+    optimizer, scheduler = build_velocity_contact_optimizer_and_scheduler(model, cfg)
+
+    groups = {
+        group["group_name"]: group
+        for group in optimizer.param_groups
+    }
+    assert set(groups) == {"contact", "velocity", "endpoint"}
+    optimized_ids = [
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    trainable_ids = [
+        id(parameter)
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    ]
+    assert len(optimized_ids) == len(set(optimized_ids))
+    assert set(optimized_ids) == set(trainable_ids)
+    assert math.isclose(groups["velocity"]["lr"], 0.002)
+    assert math.isclose(groups["contact"]["lr"], 0.0)
+    assert math.isclose(groups["endpoint"]["lr"], 0.0)
+
+    optimizer.step()
+    scheduler.step()
+    assert math.isclose(groups["velocity"]["lr"], 0.002)
+    assert math.isclose(groups["contact"]["lr"], 0.0)
+    assert math.isclose(groups["endpoint"]["lr"], 0.0)
+
+    optimizer.step()
+    scheduler.step()
+    assert math.isclose(groups["velocity"]["lr"], 0.0)
+    assert math.isclose(groups["contact"]["lr"], 0.002)
+    assert math.isclose(groups["endpoint"]["lr"], 0.002)
+
+    optimizer.step()
+    scheduler.step()
+    optimizer.step()
+    scheduler.step()
+    assert math.isclose(groups["velocity"]["lr"], 0.0)
+    assert math.isclose(groups["contact"]["lr"], 0.0)
+    assert math.isclose(groups["endpoint"]["lr"], 0.0004)
+
+
+def test_velocity_contact_stage_freezing_matches_dependency_order():
+    model = VelocityContactModule(_vc_cfg())
+    trainer = object.__new__(VelocityContactTrainer)
+    trainer.model = model
+    trainer.current_stage = None
+
+    expected_active_groups = {
+        "velocity": {"velocity"},
+        "joint": {"contact", "endpoint"},
+        "endpoint": {"endpoint"},
+    }
+    for stage, expected_groups in expected_active_groups.items():
+        trainer._configure_stage(stage)
+        active_groups = {
+            _vc_parameter_group(name)
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+        assert active_groups == expected_groups
+
+    trainer._configure_stage("endpoint")
+    assert not model.vel_net.training
+    assert not model.boundary_rnn.training
+    assert not model.hand_contact_net.training
+    assert model.contact_endpoint_rnn.training

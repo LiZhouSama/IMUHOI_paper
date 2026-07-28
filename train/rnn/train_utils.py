@@ -535,7 +535,7 @@ class BaseTrainer:
         
         flatten_lstm_parameters(self.model)
         
-        self.optimizer, self.scheduler = build_optimizer_and_scheduler(self.model, cfg)
+        self.optimizer, self.scheduler = self.build_optimizer_and_scheduler()
         self.scaler = GradScaler(enabled=self.device.type == "cuda")
         if self.resume_checkpoint is not None:
             self._restore_training_state(self.resume_checkpoint)
@@ -548,6 +548,10 @@ class BaseTrainer:
             print(f'TensorBoard logs: {log_dir}')
         elif cfg.use_tensorboard and not cfg.debug:
             print('TensorBoard is unavailable; continue without SummaryWriter.')
+
+    def build_optimizer_and_scheduler(self):
+        """Build the trainer optimizer; subclasses may provide parameter groups."""
+        return build_optimizer_and_scheduler(self.model, self.cfg)
         
     def _restore_training_state(self, checkpoint):
         if not isinstance(checkpoint, dict):
@@ -708,8 +712,8 @@ class BaseTrainer:
             
             print(f'\rEpoch {epoch}, Train Loss: {train_loss:.4f}', end='')
             
-            # 每10个epoch评估一次
-            if epoch % 10 == 0 and self.test_loader is not None:
+            eval_interval = max(1, int(getattr(self.cfg, "eval_interval", 10)))
+            if epoch % eval_interval == 0 and self.test_loader is not None:
                 test_loss, test_components = self.evaluate(epoch)
                 
                 if test_loss is not None:

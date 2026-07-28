@@ -508,7 +508,12 @@ def _run_batched_online_group(
             history = _stack_dicts(histories)
             stage1_history_fn = getattr(model, "_stage1_history_for_inits", None)
             history_for_inits = stage1_history_fn(history) if callable(stage1_history_fn) else history
-            window_data = update_data_inits_from_history(window_data, history_for_inits, index=start - 1)
+            window_data = update_data_inits_from_history(
+                window_data,
+                history_for_inits,
+                index=start - 1,
+                contact_index=start,
+            )
             active_batch, window_len = infer_batch_seq(window_data)
             prefix = select_time_context(history, start, end - 1)
 

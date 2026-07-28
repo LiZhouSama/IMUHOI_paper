@@ -80,45 +80,118 @@ def find_heatmap_peaks(prob, threshold=0.3, radius=5):
     return kept
 
 
-def _pair_endpoint_peaks(start_peaks, end_peaks, seq_len, allow_open_segments=True):
+def recover_contact_state_from_endpoints(
+    endpoint_prob: torch.Tensor,
+    initial_contact: torch.Tensor,
+) -> torch.Tensor:
+    """Differentiably recover dense contact state from start/end probabilities.
+
+    Endpoint channels are ordered as ``(start, end)`` for each contact
+    channel. ``initial_contact`` is the state at frame 0. A start at frame
+    ``t`` activates frame ``t``; an end at frame ``t`` deactivates frame
+    ``t + 1``, because the endpoint label marks the last active frame.
+    """
+    if endpoint_prob.dim() != 3 or endpoint_prob.shape[-1] % 2 != 0:
+        raise ValueError(
+            "endpoint_prob must be [B, T, 2*C], "
+            f"got {tuple(endpoint_prob.shape)}"
+        )
+    batch_size, seq_len, twice_channels = endpoint_prob.shape
+    num_channels = twice_channels // 2
+    initial_contact = torch.as_tensor(
+        initial_contact,
+        device=endpoint_prob.device,
+        dtype=endpoint_prob.dtype,
+    )
+    if initial_contact.dim() == 1:
+        initial_contact = initial_contact.unsqueeze(0)
+    if initial_contact.shape[0] == 1 and batch_size > 1:
+        initial_contact = initial_contact.expand(batch_size, -1)
+    if initial_contact.shape != (batch_size, num_channels):
+        raise ValueError(
+            "initial_contact must be [B, C] matching endpoint channels, "
+            f"got {tuple(initial_contact.shape)} for B={batch_size}, C={num_channels}"
+        )
+    if seq_len == 0:
+        return endpoint_prob.new_zeros(batch_size, 0, num_channels)
+
+    endpoint_pairs = endpoint_prob.reshape(batch_size, seq_len, num_channels, 2)
+    state = initial_contact.clamp(0.0, 1.0)
+    states = [state]
+    for frame in range(1, seq_len):
+        start_prob = endpoint_pairs[:, frame, :, 0]
+        previous_end_prob = endpoint_pairs[:, frame - 1, :, 1]
+        state = (
+            state * (1.0 - previous_end_prob)
+            + (1.0 - state) * start_prob
+        ).clamp(0.0, 1.0)
+        states.append(state)
+    return torch.stack(states, dim=1)
+
+
+def _pair_endpoint_peaks(
+    start_peaks,
+    end_peaks,
+    seq_len,
+    allow_open_segments=True,
+    initial_active=False,
+    initial_confidence=None,
+):
     """Greedily pair start peaks with the next end peak in time order.
 
     An end peak with no active start opens a segment from the previous
     segment's end + 1 (the stream entered the window mid-contact); a trailing
     start with no end opens a segment running to the last frame (contact
-    still ongoing). Open sides carry a None confidence.
+    still ongoing). ``initial_active`` explicitly represents contact already
+    active at frame 0, including the endpoint-free case where the same segment
+    spans the whole window. Open sides carry a None endpoint confidence.
 
     Returns:
-        list of (start, end, start_confidence_or_None, end_confidence_or_None).
+        list of (start, end, start_confidence_or_None,
+        end_confidence_or_None, initial_confidence_or_None).
     """
     events = [(index, 0, value) for index, value in start_peaks]
     events += [(index, 1, value) for index, value in end_peaks]
     events.sort(key=lambda item: (item[0], item[1]))
 
     segments = []
-    active = None
+    active = (0, None, initial_confidence) if initial_active else None
     for index, kind, value in events:
         if kind == 0:
             if active is None:
-                active = (index, value)
+                active = (index, value, None)
+            elif active[0] == 0 and active[1] is None and index == 0:
+                # Frame 0 can be both active and a genuine in-window start.
+                active = (0, value, active[2])
         else:
             if active is not None:
-                segments.append((active[0], index, active[1], value))
+                segments.append((active[0], index, active[1], value, active[2]))
                 active = None
             elif allow_open_segments:
                 open_start = segments[-1][1] + 1 if segments else 0
                 if open_start <= index:
-                    segments.append((open_start, index, None, value))
+                    segments.append((open_start, index, None, value, None))
     if active is not None and allow_open_segments:
-        segments.append((active[0], seq_len - 1, active[1], None))
+        segments.append((active[0], seq_len - 1, active[1], None, active[2]))
     return segments
 
 
-def _segment_confidence(start_confidence, end_confidence, interior_confidence, eps=1e-6):
+def _segment_confidence(
+    start_confidence,
+    end_confidence,
+    interior_confidence,
+    initial_confidence=None,
+    eps=1e-6,
+):
     """Geometric mean of the available confidence terms."""
     terms = [
         term
-        for term in (start_confidence, end_confidence, interior_confidence)
+        for term in (
+            start_confidence,
+            end_confidence,
+            interior_confidence,
+            initial_confidence,
+        )
         if term is not None
     ]
     if not terms:
@@ -134,6 +207,8 @@ def decode_contact_segments(
     segment_threshold=0.25,
     peak_radius=5,
     allow_open_segments=True,
+    initial_contact=None,
+    initial_contact_threshold=0.5,
 ):
     """Decode start/end endpoint heatmaps into contact segments with confidence.
 
@@ -144,10 +219,15 @@ def decode_contact_segments(
             (lhand, rhand, obj) used as interior actionness in the confidence.
         peak_threshold: minimum endpoint peak height.
         segment_threshold: minimum segment confidence (geometric mean of
-            start peak, end peak and mean interior probability).
+            available initial state, endpoint peaks and mean interior probability).
         peak_radius: NMS radius for peak extraction, in frames.
         allow_open_segments: emit segments whose start/end lies outside the
             observed range (needed for streaming/ongoing contact).
+        initial_contact: optional [B, 3] frame-0 contact state/probability.
+            An active channel seeds an open segment at frame 0, so a segment
+            spanning the whole window can be decoded without endpoint peaks.
+        initial_contact_threshold: scalar or [3] per-channel thresholds for
+            treating initial_contact as active.
     Returns:
         segments: per-batch list of dicts with keys
             channel, channel_name, start, end, confidence,
@@ -159,6 +239,34 @@ def decode_contact_segments(
         raise ValueError(f"endpoint_prob must be [B, T, 2*C], got {tuple(endpoint_prob.shape)}")
     batch_size, seq_len, twice_channels = endpoint_prob.shape
     num_channels = twice_channels // 2
+    initial_thresholds = torch.as_tensor(
+        initial_contact_threshold,
+        device=endpoint_prob.device,
+        dtype=endpoint_prob.dtype,
+    )
+    if initial_thresholds.dim() == 0:
+        initial_thresholds = initial_thresholds.expand(num_channels)
+    if initial_thresholds.shape != (num_channels,):
+        raise ValueError(
+            "initial_contact_threshold must be scalar or [C], "
+            f"got {tuple(initial_thresholds.shape)} for C={num_channels}"
+        )
+    if initial_contact is not None:
+        initial_contact = torch.as_tensor(
+            initial_contact,
+            device=endpoint_prob.device,
+            dtype=endpoint_prob.dtype,
+        )
+        if initial_contact.dim() == 1:
+            initial_contact = initial_contact.unsqueeze(0)
+        if initial_contact.shape[0] == 1 and batch_size > 1:
+            initial_contact = initial_contact.expand(batch_size, -1)
+        if initial_contact.shape != (batch_size, num_channels):
+            raise ValueError(
+                "initial_contact must be [B, C] matching endpoint channels, "
+                f"got {tuple(initial_contact.shape)} for B={batch_size}, C={num_channels}"
+            )
+        initial_contact = initial_contact.clamp(0.0, 1.0)
     raster = endpoint_prob.new_zeros(batch_size, seq_len, num_channels)
     segments = []
     for b in range(batch_size):
@@ -170,12 +278,39 @@ def decode_contact_segments(
             end_peaks = find_heatmap_peaks(
                 endpoint_prob[b, :, 2 * channel + 1], threshold=peak_threshold, radius=peak_radius
             )
-            paired = _pair_endpoint_peaks(start_peaks, end_peaks, seq_len, allow_open_segments)
-            for seg_start, seg_end, start_conf, end_conf in paired:
+            initial_conf = (
+                float(initial_contact[b, channel])
+                if initial_contact is not None
+                else None
+            )
+            paired = _pair_endpoint_peaks(
+                start_peaks,
+                end_peaks,
+                seq_len,
+                allow_open_segments,
+                initial_active=(
+                    initial_conf is not None
+                    and initial_conf >= float(initial_thresholds[channel])
+                ),
+                initial_confidence=initial_conf,
+            )
+            for seg_start, seg_end, start_conf, end_conf, init_conf in paired:
                 interior_conf = None
-                if interior_prob is not None:
+                is_fully_open_initial_segment = (
+                    init_conf is not None
+                    and start_conf is None
+                    and end_conf is None
+                    and seg_start == 0
+                    and seg_end == seq_len - 1
+                )
+                if interior_prob is not None and not is_fully_open_initial_segment:
                     interior_conf = float(interior_prob[b, seg_start:seg_end + 1, channel].mean())
-                confidence = _segment_confidence(start_conf, end_conf, interior_conf)
+                confidence = _segment_confidence(
+                    start_conf,
+                    end_conf,
+                    interior_conf,
+                    initial_confidence=init_conf,
+                )
                 if confidence < segment_threshold:
                     continue
                 batch_segments.append({
@@ -190,6 +325,7 @@ def decode_contact_segments(
                     "confidence": confidence,
                     "start_confidence": start_conf,
                     "end_confidence": end_conf,
+                    "initial_confidence": init_conf,
                 })
                 raster[b, seg_start:seg_end + 1, channel] = raster[
                     b, seg_start:seg_end + 1, channel
@@ -203,7 +339,7 @@ class VelocityContactModule(nn.Module):
     """
     Speed and contact prediction.
     Input: human_imu, obj_imu, hp_out (optional human-pose outputs).
-    Output: hand/object velocity, contact probabilities, interaction boundary.
+    Output: hand/object velocity, per-frame contact and contact endpoints.
     """
 
     _REMOVED_MERGED_CONTACT_PREFIXES = ("contact_rnn.", "obj_move_head.", "hand_contact_head.")
@@ -227,7 +363,7 @@ class VelocityContactModule(nn.Module):
             getattr(cfg, "velocity_contact_adapt_checkpoint_input", False)
         )
 
-        # Body-part grouped encoders for interaction boundary prediction
+        # Shared body-part interaction encoder used by contact and endpoint heads.
         self.body_group_indices = {
             "left_arm": [13, 16, 18, 20, 22],
             "right_arm": [14, 17, 19, 21, 23],
@@ -263,7 +399,6 @@ class VelocityContactModule(nn.Module):
             if boundary_rnn_output_dim != boundary_hidden
             else nn.Identity()
         )
-        self.boundary_head = nn.Linear(boundary_hidden, 2)
         self.boundary_input_norm = nn.LayerNorm(boundary_input_dim)
         self.boundary_hidden_norm = nn.LayerNorm(boundary_hidden)
 
@@ -550,16 +685,20 @@ class VelocityContactModule(nn.Module):
         boundary_out, _ = self.boundary_rnn(boundary_input)
         boundary_out = self.boundary_fusion(boundary_out)
         boundary_out_norm = self.boundary_hidden_norm(boundary_out)
-        boundary_logits = self.boundary_head(boundary_out_norm)
-        boundary_prob = torch.sigmoid(boundary_logits)
-        return boundary_logits, boundary_prob, boundary_out_norm
+        return boundary_out_norm
 
-    def forward(self, data_dict: dict, hp_out: dict = None):
+    def forward(
+        self,
+        data_dict: dict,
+        hp_out: dict = None,
+        velocity_only: bool = False,
+    ):
         """
         Forward pass.
         Args:
             data_dict: contains human_imu, obj_imu, hand_vel_glb_init, obj_vel_init, contact_init.
-            hp_out: optional human pose outputs (pose/vel/acc) for boundary/contact prediction.
+            hp_out: optional human pose outputs (pose/vel/acc) for contact prediction.
+            velocity_only: return after the shared hand/object velocity path.
         """
         human_imu = data_dict['human_imu']
         obj_imu = data_dict.get('obj_imu')
@@ -609,6 +748,11 @@ class VelocityContactModule(nn.Module):
 
         # Object velocity
         obj_vel = self.vel_net((obj_imu, obj_vel_init_vec))
+        if velocity_only:
+            return {
+                "pred_hand_glb_vel": hand_vel,
+                "pred_obj_vel": obj_vel,
+            }
 
         # Contact input (IMU-based)
         hand_imu_feat = human_imu_denorm[:, :, [self.left_hand_sensor, self.right_hand_sensor], :].reshape(
@@ -633,9 +777,9 @@ class VelocityContactModule(nn.Module):
         obj_move_logits = self.obj_move_net((contact_input_imu, contact_init_vec))
         obj_move_prob = torch.sigmoid(obj_move_logits)
 
-        # Boundary prediction from HPE outputs
+        # Shared interaction features from HPE outputs
         pose_streams = self._prepare_pose_streams(hp_out or data_dict.get("hp_out"), device, dtype, batch_size, seq_len)
-        boundary_logits, boundary_prob, boundary_out = self._encode_body_groups(pose_streams)
+        boundary_out = self._encode_body_groups(pose_streams)
 
         # Shared per-frame features for hand contact and endpoint detection
         hand_dyn_feat = torch.cat(
@@ -684,6 +828,10 @@ class VelocityContactModule(nn.Module):
         endpoint_hidden, _ = self.contact_endpoint_rnn(endpoint_input)
         contact_endpoint_logits = self.contact_endpoint_head(endpoint_hidden)
         contact_endpoint_prob = torch.sigmoid(contact_endpoint_logits)
+        contact_from_endpoints_prob = recover_contact_state_from_endpoints(
+            contact_endpoint_prob,
+            contact_init_vec,
+        )
 
         # Concatenated outputs for compatibility
         contact_logits = torch.cat((hand_contact_logits, obj_move_logits), dim=-1)
@@ -697,10 +845,9 @@ class VelocityContactModule(nn.Module):
             "pred_obj_move_prob": obj_move_prob,
             "pred_hand_contact_prob_cond": hand_contact_prob_cond,
             "pred_hand_contact_logits_cond": hand_contact_logits,
-            "pred_interaction_boundary_logits": boundary_logits,
-            "pred_interaction_boundary_prob": boundary_prob,
             "pred_contact_endpoint_logits": contact_endpoint_logits,
             "pred_contact_endpoint_prob": contact_endpoint_prob,
+            "pred_contact_from_endpoints_prob": contact_from_endpoints_prob,
         }
         if obj_trans_rough is not None:
             out["pred_obj_trans_rough"] = obj_trans_rough
@@ -709,18 +856,31 @@ class VelocityContactModule(nn.Module):
     @torch.no_grad()
     def decode_contact_segments(self, endpoint_prob, interior_prob=None, **overrides):
         """Decode endpoint heatmaps into segments using cfg thresholds."""
+        initial_thresholds = getattr(self.cfg, "contact_endpoint_init_thresholds", None)
+        if initial_thresholds is None:
+            initial_thresholds = getattr(
+                self.cfg,
+                "contact_endpoint_init_threshold",
+                (
+                    float(getattr(self.cfg, "hand_contact_threshold", 0.15)),
+                    float(getattr(self.cfg, "hand_contact_threshold", 0.15)),
+                    float(getattr(self.cfg, "object_contact_threshold", 0.5)),
+                ),
+            )
         kwargs = dict(
             peak_threshold=float(getattr(self.cfg, "contact_endpoint_peak_threshold", 0.3)),
             segment_threshold=float(getattr(self.cfg, "contact_endpoint_segment_threshold", 0.25)),
             peak_radius=int(getattr(self.cfg, "contact_endpoint_peak_radius", 5)),
+            initial_contact_threshold=initial_thresholds,
         )
         kwargs.update(overrides)
         return decode_contact_segments(endpoint_prob, interior_prob, **kwargs)
 
-    def _apply_segment_contact(self, output):
+    def _apply_segment_contact(self, output, contact_init=None):
         """Replace per-frame contact prob with rasterized decoded segments.
 
         The per-frame prediction is kept under ``pred_hand_contact_prob_frame``.
+        ``contact_init`` is the three-channel contact state at frame 0.
         Segment frame indices refer to the sequence passed in (in online mode:
         the full accumulated stream).
         """
@@ -728,7 +888,11 @@ class VelocityContactModule(nn.Module):
         if endpoint_prob is None:
             return output
         frame_prob = output.get("pred_hand_contact_prob")
-        segments, raster = self.decode_contact_segments(endpoint_prob, frame_prob)
+        segments, raster = self.decode_contact_segments(
+            endpoint_prob,
+            frame_prob,
+            initial_contact=contact_init,
+        )
         output = dict(output)
         output["pred_contact_segments"] = segments
         if frame_prob is not None:
@@ -757,7 +921,12 @@ class VelocityContactModule(nn.Module):
         for end in range(warmup_len + 1, seq_len + 1):
             start = end - warmup_len
             window_data = slice_time_dict(data_dict, start, end, batch_size, seq_len)
-            window_data = update_data_inits_from_history(window_data, history, index=start - 1)
+            window_data = update_data_inits_from_history(
+                window_data,
+                history,
+                index=start - 1,
+                contact_index=start,
+            )
             window_hp = self._slice_hp_out(hp_out, start, end, batch_size, seq_len)
             window_out = self.forward(window_data, hp_out=window_hp)
             latest = take_latest_frame(window_out, batch_size, end - start)
@@ -780,7 +949,10 @@ class VelocityContactModule(nn.Module):
         if mode == "offline":
             output = self.forward(data_dict, hp_out=hp_out)
             if contact_from_segments:
-                output = self._apply_segment_contact(output)
+                output = self._apply_segment_contact(
+                    output,
+                    contact_init=data_dict.get("contact_init"),
+                )
             if return_online_state:
                 return output, online_state or {}
             return output
@@ -792,7 +964,10 @@ class VelocityContactModule(nn.Module):
         )
         output = self._inference_online_sequence(run_data, hp_out=hp_out, online_window=window)
         if contact_from_segments:
-            output = self._apply_segment_contact(output)
+            output = self._apply_segment_contact(
+                output,
+                contact_init=run_data.get("contact_init"),
+            )
         state = {"data_dict": run_data, "hp_out": hp_out, "outputs": output}
         if return_online_state:
             if previous_len > 0:
@@ -812,8 +987,7 @@ class VelocityContactModule(nn.Module):
             "pred_obj_move_prob": torch.zeros(batch_size, seq_len, 1, device=device),
             "pred_hand_contact_prob_cond": torch.zeros(batch_size, seq_len, 2, device=device),
             "pred_hand_contact_logits_cond": torch.zeros(batch_size, seq_len, 2, device=device),
-            "pred_interaction_boundary_logits": torch.zeros(batch_size, seq_len, 2, device=device),
-            "pred_interaction_boundary_prob": torch.zeros(batch_size, seq_len, 2, device=device),
             "pred_contact_endpoint_logits": torch.zeros(batch_size, seq_len, 6, device=device),
             "pred_contact_endpoint_prob": torch.zeros(batch_size, seq_len, 6, device=device),
+            "pred_contact_from_endpoints_prob": torch.zeros(batch_size, seq_len, 3, device=device),
         }

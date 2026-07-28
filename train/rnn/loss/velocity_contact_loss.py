@@ -8,17 +8,16 @@ from configs import _SENSOR_POS_INDICES
 
 
 class VelocityContactLoss:
-    """Loss computation for velocity/contact and interaction boundary."""
+    """Loss computation for velocity, dense contact and contact endpoints."""
 
     LOSS_KEYS = {
         'obj_vel',
         'hand_vel',
         'obj_move',
         'hand_contact_cond',
-        'interaction_boundary',
-        'interaction_order',
         'contact_endpoint',
         'contact_endpoint_order',
+        'endpoint_contact_consistency',
     }
 
     TEST_LOSS_KEYS = {
@@ -26,6 +25,7 @@ class VelocityContactLoss:
         'obj_move',
         'hand_contact_cond',
         'contact_endpoint',
+        'endpoint_contact_consistency',
     }
 
     def __init__(self, weights=None):
@@ -33,14 +33,18 @@ class VelocityContactLoss:
         Args:
             weights: dict of loss weights (defaults to 1.0 if missing).
                 - hand_contact: weight for hand_contact_cond
-                - interaction_boundary: weight for boundary focal loss
-                - interaction_order: weight for start-before-end penalty (default 0)
-                - boundary_focal_alpha / boundary_focal_gamma: focal params
+                - contact_endpoint: endpoint heatmap focal loss
+                - endpoint_contact_consistency: dense endpoint/contact agreement
         """
         self.weights = weights or {}
 
-    def __call__(self, pred_dict, batch, device):
-        return self.compute_loss(pred_dict, batch, device)
+    def __call__(self, pred_dict, batch, device, active_loss_keys=None):
+        return self.compute_loss(
+            pred_dict,
+            batch,
+            device,
+            active_loss_keys=active_loss_keys,
+        )
 
     @staticmethod
     def _focal_binary(pred, target, alpha=0.25, gamma=2.0, eps=1e-6, mask=None):
@@ -79,7 +83,7 @@ class VelocityContactLoss:
             return zero.clone()
         return order_loss.mean()
 
-    def compute_loss(self, pred_dict, batch, device):
+    def compute_loss(self, pred_dict, batch, device, active_loss_keys=None):
         human_imu = batch['human_imu'].to(device)
         dtype = human_imu.dtype
         bs, seq = human_imu.shape[:2]
@@ -223,34 +227,6 @@ class VelocityContactLoss:
                 else zero.clone()
             )
 
-        # interaction boundary focal loss
-        boundary_pred = pred_dict.get('pred_interaction_boundary_prob')
-        if boundary_pred is not None:
-            start_gt = batch.get('interaction_start_gauss', batch.get('interaction_start'))
-            end_gt = batch.get('interaction_end_gauss', batch.get('interaction_end'))
-            if isinstance(start_gt, torch.Tensor):
-                start_gt = start_gt.to(device=device, dtype=dtype)
-            else:
-                start_gt = torch.zeros(bs, seq, device=device, dtype=dtype)
-            if isinstance(end_gt, torch.Tensor):
-                end_gt = end_gt.to(device=device, dtype=dtype)
-            else:
-                end_gt = torch.zeros(bs, seq, device=device, dtype=dtype)
-            if start_gt.dim() == 2:
-                start_gt = start_gt
-            if end_gt.dim() == 2:
-                end_gt = end_gt
-            boundary_gt = torch.stack([start_gt, end_gt], dim=-1)
-            alpha = float(self.weights.get('boundary_focal_alpha', 0.25))
-            gamma = float(self.weights.get('boundary_focal_gamma', 2.0))
-            mask = has_object_mask if has_object_mask is not None else None
-            losses['interaction_boundary'] = self._focal_binary(boundary_pred, boundary_gt, alpha=alpha, gamma=gamma, mask=mask)
-
-            # order penalty: start should be before end (soft expectation)
-            losses['interaction_order'] = self._soft_order_penalty(
-                boundary_pred[..., 0], boundary_pred[..., 1], has_object_mask, zero
-            )
-
         # contact segment endpoint heatmaps
         # 6 channels: (l_start, l_end, r_start, r_end, obj_start, obj_end)
         endpoint_logits = pred_dict.get('pred_contact_endpoint_logits')
@@ -263,12 +239,8 @@ class VelocityContactLoss:
                     bs, seq, endpoint_logits.shape[-1], device=device, dtype=dtype
                 )
             endpoint_prob = torch.sigmoid(endpoint_logits)
-            alpha = float(self.weights.get(
-                'endpoint_focal_alpha', self.weights.get('boundary_focal_alpha', 0.25)
-            ))
-            gamma = float(self.weights.get(
-                'endpoint_focal_gamma', self.weights.get('boundary_focal_gamma', 2.0)
-            ))
+            alpha = float(self.weights.get('endpoint_focal_alpha', 0.25))
+            gamma = float(self.weights.get('endpoint_focal_gamma', 2.0))
             losses['contact_endpoint'] = self._focal_binary(
                 endpoint_prob, endpoint_gt, alpha=alpha, gamma=gamma, mask=has_object_mask
             )
@@ -285,10 +257,55 @@ class VelocityContactLoss:
             if order_terms:
                 losses['contact_endpoint_order'] = sum(order_terms) / len(order_terms)
 
+        # Endpoint-recovered dense state should agree with the original
+        # per-frame contact prediction. Detaching the dense prediction makes it
+        # a teacher for this term, avoiding a mutual-collapse shortcut.
+        endpoint_contact = pred_dict.get('pred_contact_from_endpoints_prob')
+        frame_contact = pred_dict.get(
+            'pred_hand_contact_prob_frame',
+            pred_dict.get('pred_hand_contact_prob'),
+        )
+        if (
+            isinstance(endpoint_contact, torch.Tensor)
+            and isinstance(frame_contact, torch.Tensor)
+            and endpoint_contact.shape == frame_contact.shape
+            and seq > 1
+        ):
+            endpoint_contact = endpoint_contact[:, 1:].clamp(1e-6, 1.0 - 1e-6)
+            frame_teacher = frame_contact[:, 1:].detach().clamp(1e-6, 1.0 - 1e-6)
+            consistency = F.binary_cross_entropy(
+                endpoint_contact,
+                frame_teacher,
+                reduction='none',
+            )
+            if has_object_mask is not None:
+                consistency_mask = has_object_mask.expand(
+                    bs,
+                    seq - 1,
+                    endpoint_contact.shape[-1],
+                )
+                losses['endpoint_contact_consistency'] = (
+                    (consistency * consistency_mask).sum()
+                    / consistency_mask.sum().clamp_min(1e-6)
+                )
+            else:
+                losses['endpoint_contact_consistency'] = consistency.mean()
+
         # weighted sum
+        if active_loss_keys is None:
+            active_loss_keys = self.LOSS_KEYS
+        else:
+            active_loss_keys = set(active_loss_keys)
+            unknown_keys = active_loss_keys - self.LOSS_KEYS
+            if unknown_keys:
+                raise ValueError(
+                    f"Unknown VelocityContact loss keys: {sorted(unknown_keys)}"
+                )
         total_loss = zero.clone()
         weighted_losses = {}
         for key, loss in losses.items():
+            if key not in active_loss_keys:
+                continue
             weight = self.weights.get(key, 1.0)
             weighted_losses[key] = loss * weight
             total_loss = total_loss + weighted_losses[key]
@@ -300,10 +317,8 @@ class VelocityContactLoss:
 
         Stage3 consumes ``pred_obj_vel`` and ``pred_hand_contact_prob``.  The
         latter is built from conditional hand-contact logits plus object-move
-        probability (or, with ``contact_from_segments``, rasterized from the
-        decoded endpoint heatmaps), so test loss keeps those contact terms and
-        the endpoint heatmap term, excluding auxiliary hand-velocity/boundary
-        objectives.
+        probability. Test loss keeps those terms together with endpoint
+        heatmaps and endpoint/contact consistency, excluding hand velocity.
         """
         _, _, weighted_losses = self.compute_loss(pred_dict, batch, device)
         test_losses = {
