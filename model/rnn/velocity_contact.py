@@ -561,7 +561,12 @@ class VelocityContactModule(nn.Module):
         for end in range(warmup_len + 1, seq_len + 1):
             start = end - warmup_len
             window_data = slice_time_dict(data_dict, start, end, batch_size, seq_len)
-            window_data = update_data_inits_from_history(window_data, history, index=start - 1)
+            window_data = update_data_inits_from_history(
+                window_data,
+                history,
+                index=start - 1,
+                contact_index=start,
+            )
             window_hp = self._slice_hp_out(hp_out, start, end, batch_size, seq_len)
             window_out = self.forward(window_data, hp_out=window_hp)
             latest = take_latest_frame(window_out, batch_size, end - start)

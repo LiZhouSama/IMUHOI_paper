@@ -297,6 +297,16 @@ def _initialize_stateful_ot_states(
         "hp_out": hp_out,
     }
     vc_out = model.velocity_contact_module.forward(vc_input_dict, hp_out=hp_out)
+    apply_segment_contact = getattr(
+        model,
+        "_apply_vc_segment_contact_if_enabled",
+        None,
+    )
+    if callable(apply_segment_contact):
+        vc_out = apply_segment_contact(
+            vc_out,
+            warmup_data.get("contact_init"),
+        )
     lb_prior_quantiles = _predict_lb_prior_if_available(
         model,
         hp_out,
@@ -525,7 +535,12 @@ def _run_batched_online_group(
             history = _stack_dicts(histories)
             stage1_history_fn = getattr(model, "_stage1_history_for_inits", None)
             history_for_inits = stage1_history_fn(history) if callable(stage1_history_fn) else history
-            window_data = update_data_inits_from_history(window_data, history_for_inits, index=start - 1)
+            window_data = update_data_inits_from_history(
+                window_data,
+                history_for_inits,
+                index=start - 1,
+                contact_index=start,
+            )
             active_batch, window_len = infer_batch_seq(window_data)
             prefix = select_time_context(history, start, end - 1)
 
@@ -548,6 +563,16 @@ def _run_batched_online_group(
                 "hp_out": hp_context,
             }
             vc_out_raw = model.velocity_contact_module.forward(vc_input_dict, hp_out=hp_context)
+            apply_segment_contact = getattr(
+                model,
+                "_apply_vc_segment_contact_if_enabled",
+                None,
+            )
+            if callable(apply_segment_contact):
+                vc_out_raw = apply_segment_contact(
+                    vc_out_raw,
+                    window_data.get("contact_init"),
+                )
             vc_latest = take_latest_frame(vc_out_raw, active_batch, window_len)
             vc_context = _merge_stage_context(prefix, vc_latest)
 

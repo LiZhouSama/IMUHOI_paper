@@ -20,12 +20,12 @@ except Exception:
 try:  # torch>=2.3 unified AMP namespace; torch.cuda.amp.* is deprecated.
     from torch.amp import GradScaler as _AmpGradScaler
 
-    def create_grad_scaler(enabled: bool):
+    def GradScaler(enabled: bool):
         return _AmpGradScaler("cuda", enabled=enabled)
 except ImportError:
     from torch.cuda.amp.grad_scaler import GradScaler as _AmpGradScaler
 
-    def create_grad_scaler(enabled: bool):
+    def GradScaler(enabled: bool):
         return _AmpGradScaler(enabled=enabled)
 from tqdm import tqdm
 
@@ -543,9 +543,9 @@ class BaseTrainer:
             self.model = torch.nn.DataParallel(self.model, device_ids=cfg.gpus)
         
         flatten_lstm_parameters(self.model)
-
-        self.optimizer, self.scheduler = build_optimizer_and_scheduler(self.model, cfg)
-        self.scaler = create_grad_scaler(self.device.type == "cuda")
+        
+        self.optimizer, self.scheduler = self.build_optimizer_and_scheduler()
+        self.scaler = GradScaler(enabled=self.device.type == "cuda")
         if self.resume_checkpoint is not None:
             self._restore_training_state(self.resume_checkpoint)
         
@@ -557,6 +557,10 @@ class BaseTrainer:
             print(f'TensorBoard logs: {log_dir}')
         elif cfg.use_tensorboard and not cfg.debug:
             print('TensorBoard is unavailable; continue without SummaryWriter.')
+
+    def build_optimizer_and_scheduler(self):
+        """Build the trainer optimizer; subclasses may provide parameter groups."""
+        return build_optimizer_and_scheduler(self.model, self.cfg)
         
     def _restore_training_state(self, checkpoint):
         if not isinstance(checkpoint, dict):

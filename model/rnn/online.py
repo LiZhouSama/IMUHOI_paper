@@ -352,8 +352,19 @@ def _history_tensor(output: InferenceOutput, key: str, index: int = -1) -> Optio
     return None
 
 
-def update_data_inits_from_history(data: Dict[str, Any], history: InferenceOutput, index: int = -1) -> Dict[str, Any]:
-    """Refresh init tensors from the latest known predictions."""
+def update_data_inits_from_history(
+    data: Dict[str, Any],
+    history: InferenceOutput,
+    index: int = -1,
+    contact_index: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Refresh init tensors from known predictions.
+
+    ``index`` keeps the existing predecessor-frame semantics for kinematic
+    initializers. ``contact_index`` can independently select the first frame
+    of the current window, because contact_init represents frame-0 state rather
+    than the state immediately before the window.
+    """
     if not history:
         return data
 
@@ -379,9 +390,12 @@ def update_data_inits_from_history(data: Dict[str, Any], history: InferenceOutpu
     if value is not None:
         updated["obj_vel_init"] = value
 
-    value = _history_tensor(history, "pred_hand_contact_prob", index)
-    if value is not None:
-        updated["contact_init"] = value[..., :3]
+    resolved_contact_index = index if contact_index is None else contact_index
+    for contact_key in ("pred_hand_contact_prob_frame", "pred_hand_contact_prob"):
+        value = _history_tensor(history, contact_key, resolved_contact_index)
+        if value is not None:
+            updated["contact_init"] = value[..., :3]
+            break
 
     value = _history_tensor(history, "pred_obj_trans", index)
     if value is not None:

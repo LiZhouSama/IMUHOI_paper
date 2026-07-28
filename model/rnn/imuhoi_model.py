@@ -244,6 +244,29 @@ class IMUHOIModel(nn.Module):
             min_contact_frames=int(getattr(self.cfg, "lb_stats_min_frames", 10)),
         )
 
+    def _apply_vc_segment_contact_if_enabled(
+        self,
+        vc_out: Dict[str, torch.Tensor],
+        contact_init: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Adapt endpoint-aware VC output before OT consumes contact.
+
+        Endpoint segment decoding is inference-only and non-differentiable.
+        Keep training on the frame-level contact head, matching the staged VC
+        loss design, and remain compatible with VC implementations that do not
+        expose the optional decoder.
+        """
+        if self.training or not bool(getattr(self.cfg, "contact_from_segments", False)):
+            return vc_out
+        apply_segment_contact = getattr(
+            self.velocity_contact_module,
+            "_apply_segment_contact",
+            None,
+        )
+        if not callable(apply_segment_contact):
+            return vc_out
+        return apply_segment_contact(vc_out, contact_init=contact_init)
+
     @staticmethod
     def _resolve_hoi_hand_positions(hp_out: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Return the palm anchor positions used by VC/OT geometry."""
@@ -436,6 +459,10 @@ class IMUHOIModel(nn.Module):
             'hp_out': hp_out,
         }
         vc_out = self.velocity_contact_module(vc_input_dict, hp_out=hp_out)
+        vc_out = self._apply_vc_segment_contact_if_enabled(
+            vc_out,
+            data_dict.get("contact_init"),
+        )
         results.update(vc_out)
         hoi_hand_positions = self._resolve_hoi_hand_positions(hp_out)
         
@@ -614,6 +641,7 @@ class IMUHOIModel(nn.Module):
                 window_data,
                 self._stage1_history_for_inits(history),
                 index=start - 1,
+                contact_index=start,
             )
             window_len = end - start
             prefix = select_time_context(history, start, end - 1)
@@ -632,6 +660,10 @@ class IMUHOIModel(nn.Module):
                 "hp_out": hp_context,
             }
             vc_out_raw = self.velocity_contact_module.forward(vc_input_dict, hp_out=hp_context)
+            vc_out_raw = self._apply_vc_segment_contact_if_enabled(
+                vc_out_raw,
+                window_data.get("contact_init"),
+            )
             vc_latest = take_latest_frame(vc_out_raw, batch_size, window_len)
             vc_context = self._merge_stage_context(prefix, vc_latest)
 
@@ -759,6 +791,7 @@ class IMUHOIModel(nn.Module):
                     window_data,
                     self._stage1_history_for_inits(history),
                     index=0,
+                    contact_index=1 if history_len > 1 else 0,
                 )
                 prefix = select_time_context(history, 1, history_len)
             else:
@@ -778,6 +811,10 @@ class IMUHOIModel(nn.Module):
                 "hp_out": hp_context,
             }
             vc_out_raw = self.velocity_contact_module.forward(vc_input_dict, hp_out=hp_context)
+            vc_out_raw = self._apply_vc_segment_contact_if_enabled(
+                vc_out_raw,
+                window_data.get("contact_init"),
+            )
             vc_latest = take_latest_frame(vc_out_raw, batch_size, window_len)
             vc_context = self._merge_stage_context(prefix, vc_latest)
 
