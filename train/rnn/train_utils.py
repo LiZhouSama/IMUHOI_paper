@@ -17,7 +17,16 @@ try:
     from torch.utils.tensorboard.writer import SummaryWriter
 except Exception:
     SummaryWriter = None
-from torch.cuda.amp.grad_scaler import GradScaler
+try:  # torch>=2.3 unified AMP namespace; torch.cuda.amp.* is deprecated.
+    from torch.amp import GradScaler as _AmpGradScaler
+
+    def GradScaler(enabled: bool):
+        return _AmpGradScaler("cuda", enabled=enabled)
+except ImportError:
+    from torch.cuda.amp.grad_scaler import GradScaler as _AmpGradScaler
+
+    def GradScaler(enabled: bool):
+        return _AmpGradScaler(enabled=enabled)
 from tqdm import tqdm
 
 # 从 utils 导入共用函数

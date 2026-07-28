@@ -297,6 +297,16 @@ def _initialize_stateful_ot_states(
         "hp_out": hp_out,
     }
     vc_out = model.velocity_contact_module.forward(vc_input_dict, hp_out=hp_out)
+    apply_segment_contact = getattr(
+        model,
+        "_apply_vc_segment_contact_if_enabled",
+        None,
+    )
+    if callable(apply_segment_contact):
+        vc_out = apply_segment_contact(
+            vc_out,
+            warmup_data.get("contact_init"),
+        )
     lb_prior_quantiles = _predict_lb_prior_if_available(
         model,
         hp_out,
@@ -325,11 +335,28 @@ def _predict_lb_prior_if_available(
     hp_out: Dict[str, Any],
     vc_out: Dict[str, Any],
     obj_imu: torch.Tensor,
+    history: Optional[Dict[str, Any]] = None,
 ) -> Optional[torch.Tensor]:
     predict = getattr(model, "_predict_lb_prior", None)
-    if not callable(predict):
+    if callable(predict):
+        prior = predict(hp_out, vc_out, obj_imu)
+        if prior is not None:
+            return prior
+    return _compute_online_lb_stats_if_available(model, history)
+
+
+def _compute_online_lb_stats_if_available(
+    model,
+    history: Optional[Dict[str, Any]],
+) -> Optional[torch.Tensor]:
+    """Mirror IMUHOIModel's contact-segment l_b statistics for batched eval."""
+    if history is None:
         return None
-    return predict(hp_out, vc_out, obj_imu)
+    stats_enabled = getattr(model, "_online_lb_stats_enabled", None)
+    compute_stats = getattr(model, "_compute_online_lb_stats", None)
+    if not callable(stats_enabled) or not callable(compute_stats) or not stats_enabled():
+        return None
+    return compute_stats(history)
 
 
 def _sample_seq_len(sample: Dict[str, Any]) -> int:
@@ -536,6 +563,16 @@ def _run_batched_online_group(
                 "hp_out": hp_context,
             }
             vc_out_raw = model.velocity_contact_module.forward(vc_input_dict, hp_out=hp_context)
+            apply_segment_contact = getattr(
+                model,
+                "_apply_vc_segment_contact_if_enabled",
+                None,
+            )
+            if callable(apply_segment_contact):
+                vc_out_raw = apply_segment_contact(
+                    vc_out_raw,
+                    window_data.get("contact_init"),
+                )
             vc_latest = take_latest_frame(vc_out_raw, active_batch, window_len)
             vc_context = _merge_stage_context(prefix, vc_latest)
 
@@ -551,6 +588,16 @@ def _run_batched_online_group(
                     active_states = _stack_ot_prediction_states(
                         [ot_prediction_states[local_pos] for local_pos in active_local]
                     )
+                    # IMUHOIModel's stateful stream computes these statistics
+                    # from its bounded output_window; slice the accumulated
+                    # history to the same trailing window for parity.
+                    hist_len = int(end - 1)
+                    lb_history = (
+                        select_time_context(history, hist_len - online_window, hist_len)
+                        if hist_len > online_window
+                        else history
+                    )
+                    lb_prior_quantiles = _compute_online_lb_stats_if_available(model, lb_history)
                     ot_latest, next_active_state = model.object_trans_module.forward(
                         model._resolve_hoi_hand_positions(hp_latest),
                         vc_latest["pred_hand_contact_prob"],
@@ -560,6 +607,7 @@ def _run_batched_online_group(
                         obj_vel_input=vc_latest["pred_obj_vel"],
                         contact_init=window_data.get("contact_init"),
                         has_object_mask=has_object,
+                        lb_prior_quantiles=lb_prior_quantiles,
                         enable_refine=False,
                         compute_refine=False,
                         prediction_state=active_states,
@@ -591,6 +639,7 @@ def _run_batched_online_group(
                         hp_context,
                         vc_context,
                         window_data["obj_imu"],
+                        history=history,
                     )
                     obj_prefix = prefix.get("pred_obj_trans")
                     gate_prefix = prefix.get("gating_weights")

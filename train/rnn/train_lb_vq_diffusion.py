@@ -22,7 +22,16 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+try:  # torch>=2.3 unified AMP namespace; torch.cuda.amp.* is deprecated.
+    from torch.amp import GradScaler as _AmpGradScaler, autocast as _amp_autocast
+
+    def GradScaler(enabled=True):
+        return _AmpGradScaler("cuda", enabled=enabled)
+
+    def autocast(enabled=True):
+        return _amp_autocast("cuda", enabled=enabled)
+except ImportError:
+    from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
 

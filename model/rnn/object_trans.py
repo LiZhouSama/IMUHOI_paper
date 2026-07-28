@@ -14,6 +14,7 @@ from .online import (
     append_stream_data,
     infer_batch_seq,
     normalize_inference_mode,
+    NON_TEMPORAL_KEYS,
     resolve_online_window,
     select_time_context,
     slice_time_dict,
@@ -29,8 +30,13 @@ class ObjectTransModule(nn.Module):
     物体位置预测模块
     基于手部位置、接触概率和物体IMU预测物体位置
     """
-    ARCH_VERSION = 5
+    # v6: the per-window l_b prior quantiles are broadcast to every frame of
+    # the predictor input (init-state-only injection was too weak to constrain
+    # per-frame lengths), and hands without usable statistics fall back to the
+    # init geometry instead of rejecting the prior tensor.
+    ARCH_VERSION = 6
     LENGTH_EPS = 1e-4
+    LB_QUANTILE_DIM = 6  # two hands x (q10, q50, q90)
     _LEGACY_HEAD_PREFIXES = (
         "lhand_fk_head.",
         "rhand_fk_head.",
@@ -51,8 +57,12 @@ class ObjectTransModule(nn.Module):
 
         # The predictor keeps every non-redundant feature formerly consumed by
         # the two FK heads and the gate, but shares one temporal state across
-        # both hands and the fusion decision.
-        n_prediction_input = self.obj_imu_dim + 3 + 3 + 3 + 2 * (3 + self.imu_dim)
+        # both hands and the fusion decision.  The l_b prior quantiles are a
+        # per-window constant broadcast to every frame so the LSTM cannot wash
+        # them out the way an init-state-only injection would.
+        n_prediction_input = (
+            self.obj_imu_dim + 3 + 3 + 3 + 2 * (3 + self.imu_dim) + self.LB_QUANTILE_DIM
+        )
         predictor_hidden = int(getattr(cfg, "object_trans_hidden_dim", 128)) * hidden_dim_multiplier
         predictor_layers = int(getattr(cfg, "object_trans_num_layers", 2))
         predictor_dropout = float(getattr(cfg, "object_trans_dropout", 0.2))
@@ -176,6 +186,7 @@ class ObjectTransModule(nn.Module):
         lhand_imu,
         rhand_position,
         rhand_imu,
+        lb_prior_feature,
     ):
         return torch.cat(
             (
@@ -187,6 +198,7 @@ class ObjectTransModule(nn.Module):
                 lhand_imu,
                 rhand_position,
                 rhand_imu,
+                lb_prior_feature,
             ),
             dim=-1,
         )
@@ -309,14 +321,19 @@ class ObjectTransModule(nn.Module):
         if base_pose is None or base_root is None:
             return {}
 
+        # The refine head is an output-side correction (see the online paths,
+        # which never feed refined poses back upstream).  Detach its dynamic
+        # inputs so the heavily weighted human-refinement losses cannot pull
+        # the shared OT predictor and the upstream VC away from their own
+        # objectives; refine gradients stay inside refine_head.
         refine_input = torch.cat(
             (
-                fused_pos,
-                obj_vel_feature,
-                weights,
-                pred_hand_contact_prob,
-                lhand_position,
-                rhand_position,
+                fused_pos.detach(),
+                obj_vel_feature.detach(),
+                weights.detach(),
+                pred_hand_contact_prob.detach(),
+                lhand_position.detach(),
+                rhand_position.detach(),
                 base_root,
                 base_pose,
             ),
@@ -436,14 +453,28 @@ class ObjectTransModule(nn.Module):
             raise ValueError(f"obj_trans_init must have shape [{batch_size},3], got {tuple(obj_trans_init.shape)}")
         l_oe0, l_lb0 = self._compute_init_dir_len(lhand_position[:, 0], obj_rotm[:, 0], obj_trans_init)
         r_oe0, r_lb0 = self._compute_init_dir_len(rhand_position[:, 0], obj_rotm[:, 0], obj_trans_init)
-        lb_prior_quantiles = self._prepare_lb_prior_quantiles(
-            lb_prior_quantiles,
-            l_lb0,
-            r_lb0,
-            batch_size,
-            device,
-            dtype,
+        stored_lb_quantiles = (
+            prediction_state.get("lb_prior_quantiles") if isinstance(prediction_state, dict) else None
         )
+        if (
+            lb_prior_quantiles is None
+            and isinstance(stored_lb_quantiles, torch.Tensor)
+            and stored_lb_quantiles.shape == (batch_size, 2, 3)
+        ):
+            # Stateful continuation without a fresh prior: keep the constant
+            # stored when the state was created.  Re-deriving the neutral from
+            # the current chunk's init/hand geometry would make the per-frame
+            # broadcast feature drift between streamed and full-sequence runs.
+            lb_prior_quantiles = stored_lb_quantiles.to(device=device, dtype=dtype)
+        else:
+            lb_prior_quantiles = self._prepare_lb_prior_quantiles(
+                lb_prior_quantiles,
+                l_lb0,
+                r_lb0,
+                batch_size,
+                device,
+                dtype,
+            )
         if contact_init is None:
             contact_init_vec = torch.zeros(batch_size, 3, device=device, dtype=dtype)
         else:
@@ -454,6 +485,9 @@ class ObjectTransModule(nn.Module):
             if contact_init_vec.shape != (batch_size, 3):
                 raise ValueError(f"contact_init must have shape [{batch_size},3], got {tuple(contact_init_vec.shape)}")
 
+        lb_prior_feature = (
+            lb_prior_quantiles.flatten(1).unsqueeze(1).expand(batch_size, seq_len, self.LB_QUANTILE_DIM)
+        )
         prediction_input = self._build_prediction_inputs(
             obj_imu,
             obj_rot_delta,
@@ -463,6 +497,7 @@ class ObjectTransModule(nn.Module):
             lhand_imu,
             rhand_position,
             rhand_imu,
+            lb_prior_feature,
         )
         return {
             "batch_size": batch_size,
@@ -508,10 +543,12 @@ class ObjectTransModule(nn.Module):
         device,
         dtype,
     ):
+        centers = torch.cat((l_lb0, r_lb0), dim=-1).clamp_min(0.0)
+        neutral = centers.unsqueeze(-1).expand(-1, -1, 3)
         if value is None:
-            # Neutral fallback for direct module calls and prior ablations.
-            centers = torch.cat((l_lb0, r_lb0), dim=-1).clamp_min(0.0)
-            return centers.unsqueeze(-1).expand(-1, -1, 3)
+            # Neutral fallback for direct module calls, cold starts, and
+            # prior ablations.
+            return neutral
         if not isinstance(value, torch.Tensor):
             value = torch.as_tensor(value, device=device, dtype=dtype)
         value = value.to(device=device, dtype=dtype)
@@ -519,12 +556,81 @@ class ObjectTransModule(nn.Module):
             raise ValueError(
                 f"lb_prior_quantiles must have shape [{batch_size},2,3], got {tuple(value.shape)}"
             )
-        if not bool(torch.isfinite(value).all().item()):
-            raise ValueError("lb_prior_quantiles contains non-finite values")
-        # The decoder is ordered by construction; cummax also makes externally
-        # supplied priors safe without introducing a hard length interval.
-        value = value.clamp_min(0.0)
+        # Hands without usable statistics are marked non-finite (NaN) by the
+        # online/GT estimators; fall back to the init geometry per hand.
+        finite = torch.isfinite(value).all(dim=-1, keepdim=True)
+        value = torch.where(finite, value.clamp_min(0.0), neutral)
+        # The estimators are ordered by construction; cummax also makes
+        # externally supplied priors safe without a hard length interval.
         return torch.cummax(value, dim=-1).values
+
+    @staticmethod
+    @torch.no_grad()
+    def compute_online_lb_quantiles(
+        pred_obj_trans,
+        hand_positions,
+        contact_prob,
+        *,
+        contact_threshold: float = 0.5,
+        min_contact_frames: int = 10,
+        quantiles=(0.1, 0.5, 0.9),
+        max_history_frames: int = 2048,
+    ):
+        """Estimate per-hand l_b quantiles from the causal prediction history.
+
+        Frames whose predicted contact probability exceeds ``contact_threshold``
+        contribute ``||pred_obj_trans - hand||``.  Hands with fewer than
+        ``min_contact_frames`` usable frames are returned as NaN, which
+        ``_prepare_lb_prior_quantiles`` maps back to the init geometry.
+        Returns ``None`` when no hand has usable statistics.
+        """
+        if not isinstance(pred_obj_trans, torch.Tensor) or not isinstance(contact_prob, torch.Tensor):
+            return None
+        if not isinstance(hand_positions, torch.Tensor):
+            return None
+        if hand_positions.dim() == 3 and hand_positions.shape[-1] == 6:
+            hand_positions = hand_positions.reshape(*hand_positions.shape[:2], 2, 3)
+        if (
+            pred_obj_trans.dim() != 3
+            or hand_positions.dim() != 4
+            or contact_prob.dim() != 3
+            or pred_obj_trans.shape[-1] != 3
+            or hand_positions.shape[2:] != (2, 3)
+            or contact_prob.shape[-1] < 2
+            or pred_obj_trans.shape[:2] != hand_positions.shape[:2]
+            or pred_obj_trans.shape[:2] != contact_prob.shape[:2]
+            or pred_obj_trans.shape[1] == 0
+        ):
+            return None
+
+        lengths = (pred_obj_trans.unsqueeze(2) - hand_positions).norm(dim=-1)  # [B,T,2]
+        contact = contact_prob[..., :2] > float(contact_threshold)
+        seq_len = lengths.shape[1]
+        if seq_len > int(max_history_frames):
+            # Uniform stride keeps early contact segments represented while
+            # bounding the per-step quantile cost on long streams.
+            stride = -(-seq_len // int(max_history_frames))
+            lengths = lengths[:, ::stride]
+            contact = contact[:, ::stride]
+
+        batch_size = lengths.shape[0]
+        q_values = torch.as_tensor(tuple(float(q) for q in quantiles), device=lengths.device, dtype=lengths.dtype)
+        output = torch.full(
+            (batch_size, 2, q_values.numel()),
+            float("nan"),
+            device=lengths.device,
+            dtype=lengths.dtype,
+        )
+        min_count = int(max(1, min_contact_frames))
+        for batch_idx in range(batch_size):
+            for hand_idx in range(2):
+                values = lengths[batch_idx, :, hand_idx][contact[batch_idx, :, hand_idx]]
+                values = values[torch.isfinite(values)]
+                if values.numel() >= min_count:
+                    output[batch_idx, hand_idx] = torch.quantile(values, q_values)
+        if not bool(torch.isfinite(output).any().item()):
+            return None
+        return output
 
     def _init_prediction_state(self, context):
         batch_size = context["batch_size"]
@@ -536,6 +642,7 @@ class ObjectTransModule(nn.Module):
             "prev_obj_delta": torch.zeros_like(obj_trans_init),
             "prev_gating_weights": obj_trans_init.new_tensor((0.0, 0.0, 0.0, 1.0)).expand(batch_size, -1).clone(),
             "prev_obj_rotm": None,
+            "lb_prior_quantiles": context["lb_prior_quantiles"],
             "frames_seen": 0,
         }
 
@@ -629,6 +736,9 @@ class ObjectTransModule(nn.Module):
             "prev_obj_delta": fused_pos - previous_pos,
             "prev_gating_weights": effective_weights,
             "prev_obj_rotm": obj_rotm,
+            # Persist the quantiles in effect for this call so stateful
+            # continuation without a fresh prior reuses them verbatim.
+            "lb_prior_quantiles": context["lb_prior_quantiles"],
             "frames_seen": frames_seen + 1,
         }
         return {
@@ -901,7 +1011,11 @@ class ObjectTransModule(nn.Module):
 
         def _slice_kwargs(start: int, end: int):
             return {
-                key: self._slice_optional_time(value, start, end, batch_size, seq_len)
+                key: (
+                    value
+                    if key in NON_TEMPORAL_KEYS
+                    else self._slice_optional_time(value, start, end, batch_size, seq_len)
+                )
                 for key, value in kwargs.items()
                 if key not in {"known_obj_trans_prefix", "known_gating_weights_prefix"}
             }
@@ -990,6 +1104,12 @@ class ObjectTransModule(nn.Module):
             for key in stream_dict.keys():
                 if key not in {"hand_positions", "pred_hand_contact_prob"}:
                     kwargs[key] = run_data.get(key)
+            # The l_b prior describes the caller's *current* statistics;
+            # append_stream_data would otherwise freeze the first chunk's
+            # value (correct for init vectors, wrong for a live prior).
+            if isinstance(stream_dict.get("lb_prior_quantiles"), torch.Tensor):
+                kwargs["lb_prior_quantiles"] = stream_dict["lb_prior_quantiles"]
+                run_data["lb_prior_quantiles"] = stream_dict["lb_prior_quantiles"]
         else:
             previous_len = 0
             run_data = stream_dict
@@ -1037,6 +1157,7 @@ class ObjectTransModule(nn.Module):
             "rhand_fk_out": zeros_fk,
             "gate_logits": zeros_weights,
             "gating_contact_prob": torch.zeros(batch_size, seq_len, 3, device=device),
+            "lb_prior_quantiles": torch.zeros(batch_size, 2, 3, device=device),
             "init_lhand_oe_ho": torch.zeros(batch_size, 3, device=device),
             "init_rhand_oe_ho": torch.zeros(batch_size, 3, device=device),
             "init_lhand_lb": torch.zeros(batch_size, device=device),
