@@ -87,11 +87,13 @@ datasets:
     train_path: "process/processed_seg_data_IMHD/train"
     test_path: "process/processed_seg_data_IMHD/test"
     debug_path: "process/processed_seg_data_IMHD/debug"
+    full_sequence_test_path: "process/processed_split_data_IMHD/test"
     object_geo_root: "datasets/IMHD/IMHD Dataset/object_templates"
   behave:
     train_path: "process/processed_seg_data_BEHAVE/train"
     test_path: "process/processed_seg_data_BEHAVE/test"
     debug_path: "process/processed_seg_data_BEHAVE/debug"
+    full_sequence_test_path: "process/processed_split_data_BEHAVE/test"
     object_geo_root: "datasets/BEHAVE/objects"
 
 # ============ 损失权重 ============

@@ -697,14 +697,26 @@ def find_unheld_object_displacement_interval(
             continue
 
         positions = obj_trans[interval_start:interval_end + 1]
-        pairwise_distance = torch.cdist(positions, positions)
-        max_distance, flat_index = pairwise_distance.reshape(-1).max(dim=0)
+        max_distance = positions.new_tensor(-1.0)
+        local_start = 0
+        local_end = 0
+        distance_block_frames = 1024
+        for block_start in range(0, interval_frames, distance_block_frames):
+            block_end = min(block_start + distance_block_frames, interval_frames)
+            pairwise_block = torch.cdist(
+                positions[block_start:block_end],
+                positions,
+            )
+            block_max, block_flat_index = pairwise_block.reshape(-1).max(dim=0)
+            if block_max > max_distance:
+                max_distance = block_max
+                flat_index = int(block_flat_index.item())
+                local_start = block_start + flat_index // interval_frames
+                local_end = flat_index % interval_frames
         max_distance_m = float(max_distance.item())
         if max_distance_m < min_displacement_m:
             continue
 
-        local_start = int(flat_index.item()) // interval_frames
-        local_end = int(flat_index.item()) % interval_frames
         motion_start = interval_start + min(local_start, local_end)
         motion_end = interval_start + max(local_start, local_end)
         return {
@@ -718,6 +730,208 @@ def find_unheld_object_displacement_interval(
         }
 
     return None
+
+
+CONTACT_POSTPROCESS_VERSION = 1
+
+
+def postprocess_sequence_contact_labels(
+    lhand_contact_raw,
+    rhand_contact_raw,
+    obj_contact_raw,
+    obj_trans,
+    max_hole_frames=30,
+    min_contact_frames=30,
+    skip_object_displacement_without_hand_contact=True,
+    unheld_object_displacement_threshold_m=0.10,
+):
+    """Apply the canonical full-sequence contact cleanup and exclusion test."""
+    labels = (lhand_contact_raw, rhand_contact_raw, obj_contact_raw)
+    if any(not isinstance(label, torch.Tensor) or label.ndim != 1 for label in labels):
+        raise ValueError("raw contact labels must be one-dimensional torch.Tensor values")
+    if not (labels[0].shape == labels[1].shape == labels[2].shape):
+        raise ValueError("left/right/object raw contact labels must have the same shape")
+    if obj_trans.shape[0] != labels[0].shape[0]:
+        raise ValueError("object translation and contact labels must have the same length")
+
+    lhand_contact = postprocess_contact_labels(
+        lhand_contact_raw,
+        max_hole_frames=max_hole_frames,
+        min_contact_frames=min_contact_frames,
+    )
+    rhand_contact = postprocess_contact_labels(
+        rhand_contact_raw,
+        max_hole_frames=max_hole_frames,
+        min_contact_frames=min_contact_frames,
+    )
+    obj_contact = postprocess_contact_labels(
+        obj_contact_raw,
+        max_hole_frames=max_hole_frames,
+        min_contact_frames=min_contact_frames,
+    )
+
+    unheld_motion_interval = None
+    if skip_object_displacement_without_hand_contact:
+        unheld_motion_interval = find_unheld_object_displacement_interval(
+            obj_trans,
+            lhand_contact,
+            rhand_contact,
+            min_displacement_m=unheld_object_displacement_threshold_m,
+        )
+    return (
+        lhand_contact,
+        rhand_contact,
+        obj_contact,
+        unheld_motion_interval,
+    )
+
+
+def build_unheld_object_motion_skip_record(
+    *,
+    dataset,
+    seq_name,
+    output_file,
+    obj_name,
+    obj_trans,
+    lhand_contact_raw,
+    rhand_contact_raw,
+    obj_contact_raw,
+    lhand_contact,
+    rhand_contact,
+    obj_contact,
+    unheld_motion_interval,
+    extra=None,
+):
+    """Build a consistent manifest record for a sequence-level exclusion."""
+    if unheld_motion_interval is None:
+        raise ValueError("unheld_motion_interval is required for a skip record")
+    record = {
+        "dataset": str(dataset),
+        "seq_name": str(seq_name),
+        "output_file": str(output_file),
+        "obj_name": str(obj_name),
+        "reason": "object_displacement_without_hand_contact",
+        "sequence_frames": int(obj_trans.shape[0]),
+        "obj_motion_frames": int(obj_contact.sum().item()),
+        "lhand_contact_frames": int(lhand_contact.sum().item()),
+        "rhand_contact_frames": int(rhand_contact.sum().item()),
+        "obj_motion_raw_frames": int(obj_contact_raw.sum().item()),
+        "lhand_contact_raw_frames": int(lhand_contact_raw.sum().item()),
+        "rhand_contact_raw_frames": int(rhand_contact_raw.sum().item()),
+    }
+    record.update(dict(unheld_motion_interval))
+    if extra:
+        record.update(dict(extra))
+    return record
+
+
+def contact_postprocess_metadata(
+    *,
+    max_hole_frames,
+    min_contact_frames,
+    skip_object_displacement_without_hand_contact,
+    unheld_object_displacement_threshold_m,
+):
+    return {
+        "contact_postprocess_version": int(CONTACT_POSTPROCESS_VERSION),
+        "contact_max_hole_frames": int(max_hole_frames),
+        "contact_min_duration_frames": int(min_contact_frames),
+        "skip_object_displacement_without_hand_contact": bool(
+            skip_object_displacement_without_hand_contact
+        ),
+        "unheld_object_displacement_threshold_m": float(
+            unheld_object_displacement_threshold_m
+        ),
+    }
+
+
+def saved_contact_postprocess_matches(path, **expected_kwargs):
+    """Return whether an existing pt file was produced with this configuration."""
+    if not os.path.isfile(path):
+        return False
+    try:
+        try:
+            saved = torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            saved = torch.load(path, map_location="cpu")
+    except Exception:
+        return False
+    if not isinstance(saved, dict):
+        return False
+    expected = contact_postprocess_metadata(**expected_kwargs)
+    return all(saved.get(key) == value for key, value in expected.items())
+
+
+def add_contact_postprocess_arguments(parser):
+    """Add the shared sequence-contact cleanup CLI arguments."""
+    parser.add_argument(
+        "--contact-max-hole-frames",
+        type=int,
+        default=30,
+        help="Fill internal no-contact holes up to this many frames.",
+    )
+    parser.add_argument(
+        "--contact-min-duration-frames",
+        type=int,
+        default=30,
+        help="Remove contact segments shorter than this many frames.",
+    )
+    skip_group = parser.add_mutually_exclusive_group()
+    skip_group.add_argument(
+        "--skip-object-displacement-without-hand-contact",
+        dest="skip_object_displacement_without_hand_contact",
+        action="store_true",
+    )
+    skip_group.add_argument(
+        "--keep-object-displacement-without-hand-contact",
+        dest="skip_object_displacement_without_hand_contact",
+        action="store_false",
+    )
+    parser.set_defaults(skip_object_displacement_without_hand_contact=True)
+    parser.add_argument(
+        "--unheld-object-displacement-threshold-m",
+        type=float,
+        default=0.10,
+        help="Exclude a sequence when an unheld interval spans this displacement.",
+    )
+    return parser
+
+
+def write_contact_skip_manifest(
+    output_dir,
+    *,
+    dataset,
+    source_sequences,
+    saved_sequences,
+    skipped_sequences,
+    max_hole_frames,
+    min_contact_frames,
+    skip_object_displacement_without_hand_contact,
+    unheld_object_displacement_threshold_m,
+):
+    """Write the contact-cleanup/exclusion summary used by all preprocessors."""
+    os.makedirs(output_dir, exist_ok=True)
+    manifest = {
+        "dataset": str(dataset),
+        "source_sequences": int(source_sequences),
+        "saved_sequences": int(saved_sequences),
+        "skipped_sequences_count": int(len(skipped_sequences)),
+        **contact_postprocess_metadata(
+            max_hole_frames=max_hole_frames,
+            min_contact_frames=min_contact_frames,
+            skip_object_displacement_without_hand_contact=(
+                skip_object_displacement_without_hand_contact
+            ),
+            unheld_object_displacement_threshold_m=(
+                unheld_object_displacement_threshold_m
+            ),
+        ),
+        "sequences": list(skipped_sequences),
+    }
+    manifest_path = os.path.join(output_dir, "skipped_sequences.json")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, ensure_ascii=False, indent=2)
+    return manifest_path
 
 
 def compute_improved_contact_labels(obj_trans, obj_rot, obj_scale, position_global_full_gt_world,
@@ -1821,11 +2035,11 @@ def main(args):
     ).to(device)
 
     # 处理AMASS数据集
-    if args.process_amass:
-        print("开始处理AMASS数据集...")
-        preprocess_amass(args, bm_male)
-        print("AMASS数据集处理完成!")
-        return
+    # if args.process_amass:
+    #     print("开始处理AMASS数据集...")
+    #     preprocess_amass(args, bm_male)
+    #     print("AMASS数据集处理完成!")
+    #     return
 
 
     # # 创建BPS目录

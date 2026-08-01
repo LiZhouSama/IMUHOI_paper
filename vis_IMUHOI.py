@@ -37,7 +37,15 @@ except Exception:
 from dataset.dataset_IMUHOI import IMUDataset
 from process.preprocess import load_object_geometry
 from model import IMUHOIModel, load_model
-from utils.dataset_config import get_dataset_configs, resolve_dataset_path
+from model.rnn.velocity_contact import (
+    VELOCITY_CONTACT_ARCH_CHOICES,
+    normalize_velocity_contact_arch,
+)
+from utils.dataset_config import (
+    get_dataset_configs,
+    get_full_sequence_test_path,
+    resolve_dataset_path,
+)
 from utils.utils import (
     apply_eval_imu_noise_to_sequence,
     load_config,
@@ -938,14 +946,54 @@ class InteractiveViewer(Viewer):
                     self.scene.current_frame_id = 0
 
 
-def main():
+OBJECT_TRANS_ARCH_CHOICES = (
+    "current",
+    "legacy",
+    "legacy_mesh",
+    "mergeHeads_obs",
+    "imuhoi",
+)
+
+
+def _normalize_object_trans_arch(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized == "mergeheads_obs":
+        return "mergeHeads_obs"
+    return normalized
+
+
+def _make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Interactive IMUHOI Visualization Tool')
     parser.add_argument('--config', type=str, default='configs/IMUHOI_train_rnn.yaml', help='Path to config file')
     parser.add_argument('--model_arch', type=str, choices=['rnn', 'dit', 'mamba'], default=None, help='Override model architecture in config')
     parser.add_argument('--hp_ckpt', type=str, default=None, help='Override HumanPose checkpoint')
+    parser.add_argument('--vc_ckpt', type=str, default=None, help='Override VelocityContact checkpoint')
+    parser.add_argument('--ot_ckpt', type=str, default=None, help='Override ObjectTrans checkpoint')
     parser.add_argument('--interaction_ckpt', type=str, default=None, help='Override Interaction/Object checkpoint')
+    parser.add_argument(
+        '--object_trans_arch',
+        '--object-trans-arch',
+        type=_normalize_object_trans_arch,
+        choices=OBJECT_TRANS_ARCH_CHOICES,
+        default=None,
+        help=(
+            'ObjectTrans architecture (case-insensitive); imuhoi selects the '
+            'EgoIMU three-branch fusion model.'
+        ),
+    )
+    parser.add_argument(
+        '--velocity_contact_arch',
+        '--velocity-contact-arch',
+        type=normalize_velocity_contact_arch,
+        choices=VELOCITY_CONTACT_ARCH_CHOICES,
+        default=None,
+        help=(
+            'VelocityContact architecture (case-insensitive); imuhoi selects '
+            'the EgoIMU VC model.'
+        ),
+    )
     parser.add_argument('--smpl_model_path', type=str, default=None, help='Path to SMPL model file')
-    parser.add_argument('--dataset', type=str, default='imhd', help='Dataset key under config.datasets')
+    parser.add_argument('--dataset', type=str, default='omomo', help='Dataset key under config.datasets')
     parser.add_argument('--num_workers', type=int, default=0, help='DataLoader workers')
     parser.add_argument('--no_objects', action='store_true', help='Disable object mesh rendering')
     parser.add_argument('--vis_gt_only', action='store_true', help='Render GT only')
@@ -960,11 +1008,25 @@ def main():
     parser.add_argument('--no_trans', action='store_true', help='Enable noTrans mode')
     parser.add_argument('--inference_mode', '--inference-mode', choices=['online', 'offline'], default='offline', help='RNN inference mode')
     parser.add_argument('--online_window', '--online-window', type=int, default=None, help='RNN online sliding window size')
-    parser.add_argument(
+    noise_group = parser.add_mutually_exclusive_group()
+    noise_group.add_argument(
+        '--simulate_imu_noise',
+        '--simulate-imu-noise',
+        action='store_true',
+        help='Enable Dataset IMU noise simulation once per full sequence.',
+    )
+    noise_group.add_argument(
         '--eval_imu_noise',
         '--eval-imu-noise',
         action='store_true',
         help='Apply one fixed split-Gaussian IMU noise draw per full sequence before visualization.',
+    )
+    parser.add_argument(
+        '--simulate_imu_noise_seed',
+        '--simulate-imu-noise-seed',
+        type=int,
+        default=42,
+        help='Base seed for deterministic Dataset IMU noise; sequence path is mixed in.',
     )
     parser.add_argument(
         '--eval_imu_noise_seed',
@@ -987,7 +1049,11 @@ def main():
         action='store_false',
         help='Disable ObjectTrans human refine and keep HumanPose output',
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = _make_parser().parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -997,6 +1063,12 @@ def main():
         "Eval IMU noise: "
         f"{'enabled' if args.eval_imu_noise else 'disabled'}"
         + (f" | base_seed={args.eval_imu_noise_seed}" if args.eval_imu_noise else "")
+    )
+    print(
+        "simulate_imu_noise: "
+        f"{'enabled' if args.simulate_imu_noise else 'disabled'}"
+        + (f" | base_seed={args.simulate_imu_noise_seed}" if args.simulate_imu_noise else "")
+        + " (sequence-level)"
     )
 
     print(f"Loading config from: {args.config}")
@@ -1008,7 +1080,7 @@ def main():
             raise ValueError(f"Unknown dataset '{args.dataset}'. Valid datasets: {valid}")
         dataset_config = dataset_configs[args.dataset]
         test_data_input = str(resolve_dataset_path(
-            dataset_config.get('test_path') or dataset_config.get('data_dir'),
+            get_full_sequence_test_path(dataset_config),
             PROJECT_ROOT,
         ))
         obj_geo_setting = dataset_config.get('object_geo_root')
@@ -1029,10 +1101,26 @@ def main():
 
     if args.model_arch is not None:
         config.model_arch = args.model_arch
+    if args.object_trans_arch is not None:
+        config.object_trans_arch = args.object_trans_arch
+    config.object_trans_arch = _normalize_object_trans_arch(
+        getattr(config, 'object_trans_arch', 'current')
+    )
+    if args.velocity_contact_arch is not None:
+        config.velocity_contact_arch = args.velocity_contact_arch
+    config.velocity_contact_arch = normalize_velocity_contact_arch(
+        getattr(config, 'velocity_contact_arch', 'current')
+    )
+    print(f"ObjectTrans architecture: {config.object_trans_arch}")
+    print(f"VelocityContact architecture: {config.velocity_contact_arch}")
     ot_refine = (
-        bool(args.ot_refine)
-        if args.ot_refine is not None
-        else bool(getattr(config, 'enable_ot_refine', False))
+        False
+        if str(config.object_trans_arch).lower() == 'imuhoi'
+        else (
+            bool(args.ot_refine)
+            if args.ot_refine is not None
+            else bool(getattr(config, 'enable_ot_refine', False))
+        )
     )
     config.enable_ot_refine = ot_refine
     print(f"OT human refine: {'enabled' if ot_refine else 'disabled'}")
@@ -1042,6 +1130,12 @@ def main():
     if args.hp_ckpt:
         module_paths = dict(module_paths) if isinstance(module_paths, dict) else {}
         module_paths["human_pose"] = args.hp_ckpt
+    if args.vc_ckpt:
+        module_paths = dict(module_paths) if isinstance(module_paths, dict) else {}
+        module_paths["velocity_contact"] = args.vc_ckpt
+    if args.ot_ckpt:
+        module_paths = dict(module_paths) if isinstance(module_paths, dict) else {}
+        module_paths["object_trans"] = args.ot_ckpt
     if args.interaction_ckpt:
         module_paths = dict(module_paths) if isinstance(module_paths, dict) else {}
         module_paths["interaction"] = args.interaction_ckpt
@@ -1079,7 +1173,8 @@ def main():
             window_size=test_window_size,
             debug=dataset_debug,
             full_sequence=True,
-            simulate_imu_noise=False,
+            simulate_imu_noise=bool(args.simulate_imu_noise),
+            simulate_imu_noise_seed=args.simulate_imu_noise_seed,
             resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", False),
         )
     elif os.path.isfile(test_data_input) and test_data_input.lower().endswith(".pt"):
@@ -1093,7 +1188,8 @@ def main():
             debug=dataset_debug,
             full_sequence=True,
             sequence_paths=[target_pt],
-            simulate_imu_noise=False,
+            simulate_imu_noise=bool(args.simulate_imu_noise),
+            simulate_imu_noise_seed=args.simulate_imu_noise_seed,
             resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", False),
         )
         if len(test_dataset.sequence_info) != 1:

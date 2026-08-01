@@ -43,7 +43,11 @@ from model.rnn.velocity_contact import (
     VELOCITY_CONTACT_ARCH_CHOICES,
     normalize_velocity_contact_arch,
 )
-from utils.dataset_config import get_dataset_configs, resolve_dataset_path
+from utils.dataset_config import (
+    get_dataset_configs,
+    get_full_sequence_test_path,
+    resolve_dataset_path,
+)
 from utils.utils import (
     load_config,
     load_smpl_model,
@@ -797,9 +801,13 @@ def main():
     parser.add_argument(
         "--velocity_contact_arch", "--velocity-contact-arch",
         dest="velocity_contact_arch",
+        type=str.lower,
         choices=VELOCITY_CONTACT_ARCH_CHOICES,
         default=None,
-        help="VelocityContact架构；legacy不包含interaction boundary模块",
+        help=(
+            "VelocityContact架构；legacy不包含interaction boundary模块，"
+            "imuhoi恢复EgoIMU VC"
+        ),
     )
     parser.add_argument("--ot_ckpt", type=str, default=None, help="覆盖 ObjectTrans checkpoint")
     parser.add_argument("--hand_contact_threshold", type=float, default=None, help="左右手接触评估阈值")
@@ -824,6 +832,19 @@ def main():
     )
     parser.add_argument("--output_json", type=str, default=None, help="可选：保存评估结果JSON")
     parser.add_argument("--seed", type=int, default=None, help="可选：固定评估随机种子，用于可复现实验")
+    parser.add_argument(
+        "--simulate_imu_noise",
+        "--simulate-imu-noise",
+        action="store_true",
+        help="在完整评估序列上启用确定性的 Dataset IMU 噪声。",
+    )
+    parser.add_argument(
+        "--simulate_imu_noise_seed",
+        "--simulate-imu-noise-seed",
+        type=int,
+        default=42,
+        help="Dataset IMU 噪声基础种子；与序列路径混合以消除访问顺序影响。",
+    )
     parser.add_argument(
         "--interaction_human_source",
         type=str,
@@ -860,6 +881,11 @@ def main():
     print(f"VelocityContact architecture: {args.velocity_contact_arch or 'config/default'}")
     seed = _set_eval_seed(args.seed)
     print(f"Eval seed: {seed if seed is not None else 'unset'}")
+    print(
+        "simulate_imu_noise: "
+        f"{'enabled' if args.simulate_imu_noise else 'disabled'}"
+        + (f" | base_seed={args.simulate_imu_noise_seed}" if args.simulate_imu_noise else "")
+    )
 
     try:
         config_for_dataset_lookup = load_config(args.config)
@@ -964,7 +990,7 @@ def main():
                     "仅评估 VC 产生的 contact 和 obj_vel/IMU object baseline。"
                 )
 
-        data_dir_default = dataset_cfg.get("test_path") or dataset_cfg.get("data_dir")
+        data_dir_default = get_full_sequence_test_path(dataset_cfg)
         if data_dir_default is None:
             print(f"[Eval] Skipping '{dataset_name}' (no dataset directory configured).")
             continue
@@ -986,7 +1012,8 @@ def main():
             data_dir=str(data_path),
             window_size=test_window,
             debug=config.get("debug", False),
-            simulate_imu_noise=False,
+            simulate_imu_noise=bool(args.simulate_imu_noise),
+            simulate_imu_noise_seed=args.simulate_imu_noise_seed,
             min_obj_contact_frames=0,
             full_sequence=True,
             resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", False),

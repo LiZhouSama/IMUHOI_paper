@@ -34,6 +34,12 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CFG = "configs/IMUHOI_train_rnn.yaml"
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+TQDM_PROGRESS_RE = re.compile(
+    r"^(?P<head>(?:Epoch|Test)\s+\d+:\s+.*?\|\s*\d+/\d+)\s+"
+    r"\[(?P<time>[^,\]]+),\s*(?P<rate>[?<\d.]+(?:it/s|s/it))"
+    r"(?:,\s*(?P<postfix>.*))?\]$"
+)
 
 
 @dataclass
@@ -257,8 +263,83 @@ def write_manifest(path: Path, payload: dict) -> None:
     os.replace(tmp_path, path)
 
 
+def compact_tqdm_progress(line: str) -> str | None:
+    """Keep tqdm progress/timing plus total loss, dropping component losses."""
+    clean_line = ANSI_ESCAPE_RE.sub("", line).strip()
+    match = TQDM_PROGRESS_RE.match(clean_line)
+    if match is None:
+        return None
+
+    compact = (
+        f"{match.group('head')} "
+        f"[{match.group('time')}, {match.group('rate')}]"
+    )
+    postfix = match.group("postfix") or ""
+    loss_match = re.search(r"(?:^|,\s*)loss=([^,\]]+)", postfix)
+    if loss_match is not None:
+        compact += f" loss={loss_match.group(1).strip()}"
+    return compact
+
+
+class CompactConsoleRenderer:
+    """Render child tqdm updates in place while preserving ordinary messages."""
+
+    def __init__(self) -> None:
+        self.buffer = ""
+        self.progress_active = False
+
+    def _finish_progress(self) -> None:
+        if self.progress_active:
+            sys.stdout.write("\n")
+            self.progress_active = False
+
+    def _render_record(self, record: str) -> None:
+        compact = compact_tqdm_progress(record)
+        if compact is not None:
+            sys.stdout.write(f"\r\x1b[2K{compact}")
+            sys.stdout.flush()
+            self.progress_active = True
+            return
+
+        clean_record = ANSI_ESCAPE_RE.sub("", record).strip()
+        if not clean_record:
+            return
+
+        self._finish_progress()
+        sys.stdout.write(clean_record + "\n")
+        sys.stdout.flush()
+
+    def feed(self, text: str) -> None:
+        self.buffer += text
+        while True:
+            carriage_index = self.buffer.find("\r")
+            newline_index = self.buffer.find("\n")
+            delimiter_indices = [
+                index
+                for index in (carriage_index, newline_index)
+                if index >= 0
+            ]
+            if not delimiter_indices:
+                break
+            delimiter_index = min(delimiter_indices)
+            record = self.buffer[:delimiter_index]
+            delimiter = self.buffer[delimiter_index]
+            self.buffer = self.buffer[delimiter_index + 1:]
+            if delimiter == "\r" and self.buffer.startswith("\n"):
+                self.buffer = self.buffer[1:]
+            self._render_record(record)
+
+    def close(self) -> None:
+        if self.buffer:
+            self._render_record(self.buffer)
+            self.buffer = ""
+        self._finish_progress()
+        sys.stdout.flush()
+
+
 def _run_command_pipe(command: list[str], log_path: Path, env: dict[str, str]) -> int:
     """Fallback for non-POSIX systems."""
+    renderer = CompactConsoleRenderer()
     with log_path.open("w") as log_file:
         process = subprocess.Popen(
             command,
@@ -271,8 +352,10 @@ def _run_command_pipe(command: list[str], log_path: Path, env: dict[str, str]) -
         )
         assert process.stdout is not None
         for line in process.stdout:
-            print(line, end="")
             log_file.write(line)
+            log_file.flush()
+            renderer.feed(line)
+        renderer.close()
         return process.wait()
 
 
@@ -283,6 +366,7 @@ def run_command(command: list[str], log_path: Path) -> int:
         return _run_command_pipe(command, log_path, env)
 
     master_fd, slave_fd = pty.openpty()
+    renderer = CompactConsoleRenderer()
     with log_path.open("w") as log_file:
         process = subprocess.Popen(
             command,
@@ -310,10 +394,9 @@ def run_command(command: list[str], log_path: Path) -> int:
                 if not chunk:
                     break
                 text = chunk.decode(errors="replace")
-                sys.stdout.write(text)
-                sys.stdout.flush()
                 log_file.write(text)
                 log_file.flush()
+                renderer.feed(text)
 
             while True:
                 try:
@@ -325,12 +408,12 @@ def run_command(command: list[str], log_path: Path) -> int:
                 if not chunk:
                     break
                 text = chunk.decode(errors="replace")
-                sys.stdout.write(text)
-                sys.stdout.flush()
                 log_file.write(text)
                 log_file.flush()
+                renderer.feed(text)
         finally:
             os.close(master_fd)
+            renderer.close()
         return process.wait()
 
 

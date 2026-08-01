@@ -18,17 +18,29 @@ import pytorch3d.transforms as transforms
 
 try:
     from preprocess import (
+        add_contact_postprocess_arguments,
+        build_unheld_object_motion_skip_record,
+        contact_postprocess_metadata,
         compute_foot_contact_labels,
         compute_improved_contact_labels,
         load_object_canonical_points,
+        postprocess_sequence_contact_labels,
         resolve_object_mesh_path,
+        saved_contact_postprocess_matches,
+        write_contact_skip_manifest,
     )
 except ModuleNotFoundError:
     from process.preprocess import (
+        add_contact_postprocess_arguments,
+        build_unheld_object_motion_skip_record,
+        contact_postprocess_metadata,
         compute_foot_contact_labels,
         compute_improved_contact_labels,
         load_object_canonical_points,
+        postprocess_sequence_contact_labels,
         resolve_object_mesh_path,
+        saved_contact_postprocess_matches,
+        write_contact_skip_manifest,
     )
 
 
@@ -573,9 +585,30 @@ def process_pahoi_sequence(
     max_frames: Optional[int] = None,
     floor_align: bool = True,
     skip_existing: bool = False,
-) -> Path:
+    contact_max_hole_frames: int = 30,
+    contact_min_duration_frames: int = 30,
+    skip_object_displacement_without_hand_contact: bool = True,
+    unheld_object_displacement_threshold_m: float = 0.10,
+    skipped_sequences=None,
+) -> Optional[Path]:
     out_path = output_dir / f"{seq.seq_name}.pt"
-    if skip_existing and out_path.exists():
+    contact_metadata_kwargs = {
+        "max_hole_frames": contact_max_hole_frames,
+        "min_contact_frames": contact_min_duration_frames,
+        "skip_object_displacement_without_hand_contact": (
+            skip_object_displacement_without_hand_contact
+        ),
+        "unheld_object_displacement_threshold_m": (
+            unheld_object_displacement_threshold_m
+        ),
+    }
+    if (
+        skip_existing
+        and saved_contact_postprocess_matches(
+            str(out_path),
+            **contact_metadata_kwargs,
+        )
+    ):
         return out_path
 
     human = load_pahoi_human_sequence(seq, num_betas=bm_loader.num_betas)
@@ -636,7 +669,7 @@ def process_pahoi_sequence(
     obj_rot_t = torch.tensor(obj_rot, dtype=torch.float32, device=device)
     obj_trans_t = torch.tensor(obj_trans, dtype=torch.float32, device=device)
     obj_scale_t = torch.ones(T, dtype=torch.float32, device=device)
-    lhand_contact, rhand_contact, obj_contact = compute_improved_contact_labels(
+    lhand_contact_raw, rhand_contact_raw, obj_contact_raw = compute_improved_contact_labels(
         obj_trans_t,
         obj_rot_t,
         obj_scale_t,
@@ -646,6 +679,43 @@ def process_pahoi_sequence(
         device,
         T,
     )
+    (
+        lhand_contact,
+        rhand_contact,
+        obj_contact,
+        unheld_motion_interval,
+    ) = postprocess_sequence_contact_labels(
+        lhand_contact_raw,
+        rhand_contact_raw,
+        obj_contact_raw,
+        obj_trans_t,
+        **contact_metadata_kwargs,
+    )
+    if unheld_motion_interval is not None:
+        if skipped_sequences is not None:
+            skipped_sequences.append(build_unheld_object_motion_skip_record(
+                dataset="PAHOI",
+                seq_name=seq.seq_name,
+                output_file=out_path.name,
+                obj_name=object_label,
+                obj_trans=obj_trans_t,
+                lhand_contact_raw=lhand_contact_raw,
+                rhand_contact_raw=rhand_contact_raw,
+                obj_contact_raw=obj_contact_raw,
+                lhand_contact=lhand_contact,
+                rhand_contact=rhand_contact,
+                obj_contact=obj_contact,
+                unheld_motion_interval=unheld_motion_interval,
+                extra={
+                    "subject_id": seq.subject_id,
+                    "action": str(metadata["action"]),
+                },
+            ))
+        if out_path.exists():
+            out_path.unlink()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return None
 
     canonical_points = load_object_canonical_points(
         object_label,
@@ -695,6 +765,9 @@ def process_pahoi_sequence(
         "lhand_contact": lhand_contact.cpu().bool(),
         "rhand_contact": rhand_contact.cpu().bool(),
         "obj_contact": obj_contact.cpu().bool(),
+        "lhand_contact_raw": lhand_contact_raw.cpu().bool(),
+        "rhand_contact_raw": rhand_contact_raw.cpu().bool(),
+        "obj_contact_raw": obj_contact_raw.cpu().bool(),
         "source_files": [
             str(path)
             for path in (
@@ -709,6 +782,7 @@ def process_pahoi_sequence(
         "fbx_rotation_order": str(fbx_rotation_order),
         "fbx_key_times": torch.from_numpy(fbx_key_times[:T]).long(),
         "fbx_seconds": torch.from_numpy((fbx_key_times[:T].astype(np.float64) / FBX_TICKS_PER_SECOND).astype(np.float32)),
+        **contact_postprocess_metadata(**contact_metadata_kwargs),
     }
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -737,6 +811,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_floor_align", action="store_true")
     parser.add_argument("--fail_fast", dest="fail_fast", action="store_true", default=True)
     parser.add_argument("--no_fail_fast", dest="fail_fast", action="store_false")
+    add_contact_postprocess_arguments(parser)
+    parser.set_defaults(skip_object_displacement_without_hand_contact=False)
     return parser.parse_args()
 
 
@@ -763,10 +839,11 @@ def main() -> None:
     bm_loader = BodyModelLoader(args.support_dir, device, num_betas=args.num_betas)
 
     processed_count = 0
+    skipped_sequences = []
     errors: List[Tuple[str, Exception]] = []
     for seq in tqdm(sequences, desc="Processing PAHOI sequences"):
         try:
-            process_pahoi_sequence(
+            output_path = process_pahoi_sequence(
                 seq=seq,
                 metadata=metadata[seq.seq_name],
                 bm_loader=bm_loader,
@@ -779,16 +856,43 @@ def main() -> None:
                 max_frames=args.max_frames,
                 floor_align=not args.no_floor_align,
                 skip_existing=args.skip_existing,
+                contact_max_hole_frames=args.contact_max_hole_frames,
+                contact_min_duration_frames=args.contact_min_duration_frames,
+                skip_object_displacement_without_hand_contact=(
+                    args.skip_object_displacement_without_hand_contact
+                ),
+                unheld_object_displacement_threshold_m=(
+                    args.unheld_object_displacement_threshold_m
+                ),
+                skipped_sequences=skipped_sequences,
             )
-            processed_count += 1
+            processed_count += int(output_path is not None)
         except Exception as exc:
             if args.fail_fast:
                 raise
             errors.append((seq.seq_name, exc))
             print(f"Warning: skipped {seq.seq_name}: {exc}")
 
+    manifest_path = write_contact_skip_manifest(
+        str(output_root),
+        dataset="PAHOI",
+        source_sequences=len(sequences),
+        saved_sequences=processed_count,
+        skipped_sequences=skipped_sequences,
+        max_hole_frames=args.contact_max_hole_frames,
+        min_contact_frames=args.contact_min_duration_frames,
+        skip_object_displacement_without_hand_contact=(
+            args.skip_object_displacement_without_hand_contact
+        ),
+        unheld_object_displacement_threshold_m=(
+            args.unheld_object_displacement_threshold_m
+        ),
+    )
+
     print("PAHOI preprocessing finished")
     print(f"  processed: {processed_count} sequences -> {output_root}")
+    print(f"  contact-skipped: {len(skipped_sequences)} sequences")
+    print(f"  skip manifest: {manifest_path}")
     print("  output layout: flat top-level .pt files, ready for process/split_dataset.py")
     if errors:
         print(f"  skipped: {len(errors)} sequences")

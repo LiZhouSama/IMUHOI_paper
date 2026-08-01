@@ -23,7 +23,7 @@ from utils.human_pose import select_hand_anchor_positions
 from utils.utils import _central_diff, _smooth_acceleration
 
 
-VELOCITY_CONTACT_ARCH_CHOICES = ("current", "legacy")
+VELOCITY_CONTACT_ARCH_CHOICES = ("current", "legacy", "imuhoi")
 
 
 def normalize_velocity_contact_arch(arch):
@@ -44,6 +44,10 @@ def build_velocity_contact_module(cfg, velocity_contact_arch=None):
         from .velocity_contact_legacy import LegacyVelocityContactModule
 
         return LegacyVelocityContactModule(cfg)
+    if arch == "imuhoi":
+        from .velocity_contact_IMUHOI import IMUHOIVelocityContactModule
+
+        return IMUHOIVelocityContactModule(cfg)
     return VelocityContactModule(cfg)
 
 

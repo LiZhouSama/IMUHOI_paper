@@ -6,7 +6,8 @@ ObjectTransModule训练脚本 (Stage 3) + 可选自动联合训练
     # 仅训练Stage3 (Object Trans)
     python train_object_trans.py --cfg config.yaml --vc_ckpt path/to/vc.pt --hp_ckpt path/to/hp.pt
 
-    # 先训练Stage3，结束后在同一输出目录自动联合微调ObjectTrans + VelocityContact
+    # 先训练Stage3，结束后自动联合微调；IMUHOI为HumanPose + ObjectTrans，
+    # 其他架构为VelocityContact + ObjectTrans
     python train_object_trans.py --cfg config.yaml --vc_ckpt path/to/vc.pt --hp_ckpt path/to/hp.pt --joint_train
 """
 import copy
@@ -27,12 +28,18 @@ from model.rnn.velocity_contact import (
     normalize_velocity_contact_arch,
 )
 from model.rnn.object_trans_legacy import LegacyObjectTransModule
+from model.rnn.object_trans_IMUHOI import IMUHOIObjectTransModule
 from model.rnn.object_trans_legacy_mesh import LegacyMeshObjectTransModule
 from model.rnn.object_trans_mergeHeads_obsEncoder import (
     ObjectTransModule as MergeHeadsObsObjectTransModule,
 )
 from model.rnn.lb_vq_diffusion import FrozenLBPriorPredictor
-from train.rnn.loss import VelocityContactLoss, ObjectTransLoss
+from train.rnn.loss import (
+    HumanPoseLoss,
+    VelocityContactLoss,
+    ObjectTransLoss,
+    IMUHOIObjectTransLoss,
+)
 from train.rnn.scheduled_inputs import (
     build_gt_human_pose_outputs,
     build_gt_velocity_contact_outputs,
@@ -84,20 +91,33 @@ def get_args():
     parser.add_argument('--lb_diffusion_ckpt', type=str, default=None,
                         help='冻结的 l_b diffusion checkpoint；默认读取 lb_vq_prior.diffusion_checkpoint')
     parser.add_argument('--joint_train', action='store_true', 
-                        help='Stage3训练完成后，自动在同一输出目录进行ObjectTrans + VelocityContact联合训练')
+                        help=(
+                            'Stage3训练完成后自动联合训练；IMUHOI解冻'
+                            'HumanPose + ObjectTrans并冻结VelocityContact，'
+                            '其他架构保持VelocityContact + ObjectTrans'
+                        ))
     parser.add_argument(
         '--object_trans_arch', '--object-trans-arch',
         dest='object_trans_arch',
-        choices=['current', 'legacy', 'legacy_mesh', 'mergeHeads_obs'],
+        choices=[
+            'current',
+            'legacy',
+            'legacy_mesh',
+            'mergeHeads_obs',
+            'IMUHOI',
+            'imuhoi',
+        ],
         default=None,
         help=(
-            'ObjectTrans架构；legacy为无prior多head，legacy_mesh为ObsEncoder多head，'
+            'ObjectTrans架构；legacy为四路无prior多head，IMUHOI为EgoIMU'
+            '三路接触先验融合，legacy_mesh为ObsEncoder多head，'
             'mergeHeads_obs为共享head+ObsEncoder'
         ),
     )
     parser.add_argument(
         '--velocity_contact_arch', '--velocity-contact-arch',
         dest='velocity_contact_arch',
+        type=str.lower,
         choices=VELOCITY_CONTACT_ARCH_CHOICES,
         default=None,
         help='VelocityContact架构；legacy不包含interaction boundary模块',
@@ -161,6 +181,15 @@ def _resolve_pretrained_ckpt(cfg, cli_path, module_key, fallback_attr=None):
     return None, None
 
 
+def _joint_trainable_modules(object_trans_arch, joint_train):
+    """Return (hp_trainable, vc_trainable) for the requested joint stage."""
+    if not joint_train:
+        return False, False
+    if str(object_trans_arch).strip().lower() == "imuhoi":
+        return True, False
+    return False, True
+
+
 class Stage3JointTrainer:
     """Stage3和联合训练器"""
 
@@ -178,6 +207,10 @@ class Stage3JointTrainer:
         self.cfg = cfg
         self.device = torch.device(cfg.device)
         self.joint_train = joint_train
+        self.imuhoi_arch = (
+            str(getattr(cfg, "object_trans_arch", "current")).strip().lower()
+            == "imuhoi"
+        )
         self.vc_model = vc_model.to(self.device)
         self.hp_model = hp_model.to(self.device)
         self.ot_model = ot_model.to(self.device)
@@ -193,12 +226,18 @@ class Stage3JointTrainer:
         self.best_loss = float('inf')
         self.n_iter = 0
 
-        self.vc_trainable = bool(joint_train)
+        # The original IMUHOI joint stage fine-tunes HumanPose + ObjectTrans.
+        # Other architectures retain the repository's existing VC + OT joint
+        # training behavior.
+        self.hp_trainable, self.vc_trainable = _joint_trainable_modules(
+            getattr(cfg, "object_trans_arch", "current"),
+            joint_train,
+        )
 
-        # 设置训练/冻结状态：HP始终冻结；VC仅在joint阶段参与训练
-        print("Stage3模式：冻结HumanPose，训练ObjectTrans")
+        # 设置训练/冻结状态
+        print("Stage3模式：训练ObjectTrans")
         for param in self.hp_model.parameters():
-            param.requires_grad = False
+            param.requires_grad = self.hp_trainable
         for param in self.vc_model.parameters():
             param.requires_grad = self.vc_trainable
         for param in self.ot_model.parameters():
@@ -230,7 +269,16 @@ class Stage3JointTrainer:
                 f"drop_prob={self.lb_stats_drop_prob}"
             )
         if joint_train:
-            print("联合训练模式：从epoch 0开始微调VelocityContact + ObjectTrans")
+            if self.imuhoi_arch:
+                print(
+                    "IMUHOI联合训练模式：冻结VelocityContact，"
+                    "从epoch 0开始微调HumanPose + ObjectTrans"
+                )
+            else:
+                print(
+                    "联合训练模式：冻结HumanPose，"
+                    "从epoch 0开始微调VelocityContact + ObjectTrans"
+                )
 
         if self.resume_path:
             print(f"Resume checkpoint: {self.resume_path}")
@@ -260,12 +308,23 @@ class Stage3JointTrainer:
                 "name": "object_trans",
             }
         ]
-        if joint_train:
+        if self.vc_trainable:
             param_groups.append(
                 {
                     "params": [p for p in self.vc_model.parameters() if p.requires_grad],
                     "lr": base_lr,
                     "name": "velocity_contact",
+                }
+            )
+        if self.hp_trainable:
+            param_groups.append(
+                {
+                    "params": [
+                        p for p in self.hp_model.parameters()
+                        if p.requires_grad
+                    ],
+                    "lr": base_lr,
+                    "name": "human_pose",
                 }
             )
 
@@ -283,12 +342,50 @@ class Stage3JointTrainer:
         vc_params = sum(p.numel() for p in self.vc_model.parameters())
         print(f"ObjectTrans可训练参数数量: {ot_trainable}, lr={base_lr}")
         if joint_train:
-            print(f"VelocityContact可训练参数数量: {vc_params}, lr={base_lr}")
+            if self.hp_trainable:
+                hp_params = sum(
+                    p.numel()
+                    for p in self.hp_model.parameters()
+                    if p.requires_grad
+                )
+                print(f"HumanPose可训练参数数量: {hp_params}, lr={base_lr}")
+                print("VelocityContact冻结")
+            else:
+                print(f"VelocityContact可训练参数数量: {vc_params}, lr={base_lr}")
 
         # 损失函数
         loss_weights = getattr(cfg, 'loss_weights', {})
-        self.vc_loss_fn = VelocityContactLoss(weights=loss_weights) if joint_train else None
-        self.ot_loss_fn = ObjectTransLoss(weights=loss_weights)
+        if self.imuhoi_arch:
+            imuhoi_weights = getattr(
+                cfg,
+                "imuhoi_loss_weights",
+                IMUHOIObjectTransLoss.DEFAULT_WEIGHTS,
+            )
+            self.vc_loss_fn = None
+            self.hp_loss_fn = (
+                HumanPoseLoss(
+                    weights={
+                        **dict(loss_weights),
+                        # EgoIMU IMUHOI does not supervise the auxiliary
+                        # HumanPose foot-contact head in its joint stage.
+                        "contact": 0.0,
+                    },
+                    no_trans=bool(getattr(cfg, "no_trans", False)),
+                )
+                if self.hp_trainable
+                else None
+            )
+            self.ot_loss_fn = IMUHOIObjectTransLoss(
+                weights=imuhoi_weights
+            )
+        else:
+            self.vc_loss_fn = (
+                VelocityContactLoss(weights=loss_weights)
+                if joint_train
+                else None
+            )
+            self.hp_loss_fn = None
+            self.ot_loss_fn = ObjectTransLoss(weights=loss_weights)
 
         # TensorBoard
         self.writer = None
@@ -321,6 +418,15 @@ class Stage3JointTrainer:
                 name="VelocityContact",
             )
             print(f"恢复VelocityContact权重: {self.resume_path}")
+        if checkpoint.get("human_pose_state_dict") is not None:
+            load_model_state_from_checkpoint(
+                self.hp_model,
+                checkpoint,
+                strict=False,
+                state_key="human_pose_state_dict",
+                name="HumanPose",
+            )
+            print(f"恢复HumanPose权重: {self.resume_path}")
 
     def _restore_training_state(self, checkpoint):
         optimizer_state = checkpoint.get("optimizer_state_dict")
@@ -369,18 +475,21 @@ class Stage3JointTrainer:
 
     def forward_all(self, data_dict, batch=None, epoch: int = 0, training: bool = True):
         """完整的前向传播"""
-        self.hp_model.eval()
+        if self.hp_trainable and training:
+            self.hp_model.train()
+        else:
+            self.hp_model.eval()
         if self.vc_trainable and training:
             self.vc_model.train()
         else:
             self.vc_model.eval()
 
-        with torch.no_grad():
+        with torch.set_grad_enabled(self.hp_trainable and training):
             hp_out = call_model_inference(self.hp_model, data_dict, inference_mode="offline")
 
         gt_hp = None
         mix_mask = None
-        if training and batch is not None:
+        if training and batch is not None and not self.imuhoi_arch:
             pred_prob = prediction_mix_probability(epoch, self.cfg)
             gt_hp = build_gt_human_pose_outputs(batch, self.device, dtype=hp_out['pred_hand_glb_pos'].dtype)
             # 整条 VC->OT 输入链共用同一个 per-sample mask：否则会出现
@@ -409,22 +518,54 @@ class Stage3JointTrainer:
         with torch.set_grad_enabled(vc_grad_enabled):
             vc_out = call_model_inference(self.vc_model, data_dict, hp_out=hp_for_vc, inference_mode="offline")
 
-        if training and batch is not None:
+        if training and batch is not None and not self.imuhoi_arch:
             pred_prob = prediction_mix_probability(epoch, self.cfg)
             if gt_hp is None:
                 gt_hp = build_gt_human_pose_outputs(batch, self.device, dtype=hp_out['pred_hand_glb_pos'].dtype)
             gt_vc = build_gt_velocity_contact_outputs(batch, self.device, dtype=vc_out['pred_obj_vel'].dtype)
             if mix_mask is None:
+                gt_hand_positions = (
+                    gt_hp["pred_hand_glb_pos"]
+                    if self.imuhoi_arch
+                    else gt_hp.get(
+                        "pred_palm_glb_pos",
+                        gt_hp["pred_hand_glb_pos"],
+                    )
+                )
+                pred_hand_positions = (
+                    hp_out["pred_hand_glb_pos"]
+                    if self.imuhoi_arch
+                    else hp_out.get(
+                        "pred_palm_glb_pos",
+                        hp_out["pred_hand_glb_pos"],
+                    )
+                )
                 hand_positions, mix_mask = sample_mix_tensor(
-                    gt_hp.get('pred_palm_glb_pos', gt_hp['pred_hand_glb_pos']),
-                    hp_out.get('pred_palm_glb_pos', hp_out['pred_hand_glb_pos']),
+                    gt_hand_positions,
+                    pred_hand_positions,
                     pred_prob,
                     return_mask=True,
                 )
             else:
+                gt_hand_positions = (
+                    gt_hp["pred_hand_glb_pos"]
+                    if self.imuhoi_arch
+                    else gt_hp.get(
+                        "pred_palm_glb_pos",
+                        gt_hp["pred_hand_glb_pos"],
+                    )
+                )
+                pred_hand_positions = (
+                    hp_out["pred_hand_glb_pos"]
+                    if self.imuhoi_arch
+                    else hp_out.get(
+                        "pred_palm_glb_pos",
+                        hp_out["pred_hand_glb_pos"],
+                    )
+                )
                 hand_positions = sample_mix_tensor(
-                    gt_hp.get('pred_palm_glb_pos', gt_hp['pred_hand_glb_pos']),
-                    hp_out.get('pred_palm_glb_pos', hp_out['pred_hand_glb_pos']),
+                    gt_hand_positions,
+                    pred_hand_positions,
                     pred_prob,
                     mask=mix_mask,
                 )
@@ -453,7 +594,14 @@ class Stage3JointTrainer:
                 mask=mix_mask,
             )
         else:
-            hand_positions = hp_out.get('pred_palm_glb_pos', hp_out['pred_hand_glb_pos'])
+            hand_positions = (
+                hp_out["pred_hand_glb_pos"]
+                if self.imuhoi_arch
+                else hp_out.get(
+                    "pred_palm_glb_pos",
+                    hp_out["pred_hand_glb_pos"],
+                )
+            )
             contact_prob = vc_out['pred_hand_contact_prob']
             obj_vel_input = vc_out['pred_obj_vel']
             human_pose_input = hp_out.get('p_pred')
@@ -494,7 +642,11 @@ class Stage3JointTrainer:
             human_pose_input=human_pose_input,
             root_trans_input=root_trans_input,
             lb_prior_quantiles=lb_prior_quantiles,
-            enable_refine=getattr(self.cfg, "enable_ot_refine", False),
+            enable_refine=(
+                False
+                if self.imuhoi_arch
+                else getattr(self.cfg, "enable_ot_refine", False)
+            ),
             inference_mode="offline",
         )
 
@@ -508,7 +660,7 @@ class Stage3JointTrainer:
     def train_epoch(self, epoch):
             """训练一个epoch"""
             self.vc_model.train() if self.vc_trainable else self.vc_model.eval()
-            self.hp_model.eval()
+            self.hp_model.train() if self.hp_trainable else self.hp_model.eval()
             self.ot_model.train()
 
             total_loss = 0
@@ -527,6 +679,7 @@ class Stage3JointTrainer:
                 losses = {}
                 ot_losses = {}
                 vc_losses = {}
+                hp_losses = {}
 
                 if self.joint_train and self.vc_trainable and self.vc_loss_fn:
                     vc_loss, vc_losses, vc_weighted_losses = self.vc_loss_fn(vc_out, batch, self.device)
@@ -535,11 +688,27 @@ class Stage3JointTrainer:
                     vc_loss = torch.tensor(0.0, device=self.device)
                     vc_weighted_losses = {}
 
+                if self.hp_trainable and self.hp_loss_fn:
+                    hp_loss, hp_losses, hp_weighted_losses = self.hp_loss_fn(
+                        hp_out,
+                        batch,
+                        self.device,
+                    )
+                    losses.update(
+                        {
+                            f"hp_{key}": value
+                            for key, value in hp_weighted_losses.items()
+                        }
+                    )
+                else:
+                    hp_loss = torch.tensor(0.0, device=self.device)
+                    hp_weighted_losses = {}
+
                 ot_loss, ot_losses, ot_weighted_losses = self.ot_loss_fn(ot_out, batch, self.device)
                 losses.update({f'ot_{k}': v for k, v in ot_weighted_losses.items()})
 
                 # 总损失
-                batch_loss = vc_loss + ot_loss
+                batch_loss = hp_loss + vc_loss + ot_loss
 
                 batch_loss.backward()
                 if self.gradient_clip > 0:
@@ -562,6 +731,8 @@ class Stage3JointTrainer:
                 postfix = {'loss': batch_loss.item(), 'ot': ot_loss.item()}
                 if self.joint_train and self.vc_trainable:
                     postfix['vc'] = vc_loss.item()
+                if self.hp_trainable:
+                    postfix['hp'] = hp_loss.item()
                 train_iter.set_postfix(postfix)
 
                 if self.writer is not None:
@@ -569,6 +740,10 @@ class Stage3JointTrainer:
                     self.writer.add_scalar('train/ot_loss', ot_loss.item(), self.n_iter)
                     if self.joint_train and self.vc_trainable:
                         self.writer.add_scalar('train/vc_loss', vc_loss.item(), self.n_iter)
+                    if self.hp_trainable:
+                        self.writer.add_scalar(
+                            'train/hp_loss', hp_loss.item(), self.n_iter
+                        )
                     for key, value in ot_weighted_losses.items():
                         if isinstance(value, torch.Tensor):
                             self.writer.add_scalar(f'train/ot/{key}', value.item(), self.n_iter)
@@ -576,6 +751,14 @@ class Stage3JointTrainer:
                         for key, value in vc_weighted_losses.items():
                             if isinstance(value, torch.Tensor):
                                 self.writer.add_scalar(f'train/vc/{key}', value.item(), self.n_iter)
+                    if self.hp_trainable:
+                        for key, value in hp_weighted_losses.items():
+                            if isinstance(value, torch.Tensor):
+                                self.writer.add_scalar(
+                                    f'train/hp/{key}',
+                                    value.item(),
+                                    self.n_iter,
+                                )
 
                 self.n_iter += 1
 
@@ -610,9 +793,25 @@ class Stage3JointTrainer:
                 if self.joint_train and self.vc_trainable and self.vc_loss_fn:
                     vc_loss, vc_losses, _ = self.vc_loss_fn(vc_out, batch, self.device)
 
+                hp_loss = torch.tensor(0.0, device=self.device)
+                hp_losses = {}
+                if self.hp_trainable and self.hp_loss_fn:
+                    _, _, hp_weighted = self.hp_loss_fn(
+                        hp_out,
+                        batch,
+                        self.device,
+                    )
+                    hp_losses = {
+                        key: value
+                        for key, value in hp_weighted.items()
+                        if key in self.hp_loss_fn.TEST_LOSS_KEYS
+                    }
+                    if hp_losses:
+                        hp_loss = sum(hp_losses.values())
+
                 ot_loss, ot_losses = self.ot_loss_fn.compute_test_loss(ot_out, batch, self.device)
 
-                combined_loss = ot_loss + vc_loss
+                combined_loss = ot_loss + vc_loss + hp_loss
                 total_loss += combined_loss.item()
                 for key, value in ot_losses.items():
                     if isinstance(value, torch.Tensor):
@@ -620,6 +819,12 @@ class Stage3JointTrainer:
                 for key, value in vc_losses.items():
                     if isinstance(value, torch.Tensor):
                         loss_components[f"vc_{key}"] = loss_components.get(f"vc_{key}", 0) + value.item()
+                for key, value in hp_losses.items():
+                    if isinstance(value, torch.Tensor):
+                        loss_components[f"hp_{key}"] = (
+                            loss_components.get(f"hp_{key}", 0)
+                            + value.item()
+                        )
 
         total_loss /= len(self.test_loader)
         for key in loss_components:
@@ -665,10 +870,12 @@ class Stage3JointTrainer:
                     if self.writer is not None:
                         self.writer.add_scalar('test/total_loss', test_loss, self.n_iter)
                         for key, value in test_components.items():
-                            if key in ObjectTransLoss.TEST_LOSS_KEYS:
+                            if key in self.ot_loss_fn.TEST_LOSS_KEYS:
                                 self.writer.add_scalar(f'test/ot/{key}', value, self.n_iter)
                             elif key.startswith('vc_'):
                                 self.writer.add_scalar(f'test/vc/{key[3:]}', value, self.n_iter)
+                            elif key.startswith('hp_'):
+                                self.writer.add_scalar(f'test/hp/{key[3:]}', value, self.n_iter)
                             else:
                                 self.writer.add_scalar(f'test/{key}', value, self.n_iter)
             else:
@@ -731,7 +938,14 @@ class Stage3JointTrainer:
             'rng_state': _capture_rng_state(),
         }
         if self.joint_train:
-            checkpoint['velocity_contact_state_dict'] = get_model_state_dict(self.vc_model)
+            if self.hp_trainable:
+                checkpoint['human_pose_state_dict'] = get_model_state_dict(
+                    self.hp_model
+                )
+            if self.vc_trainable:
+                checkpoint['velocity_contact_state_dict'] = (
+                    get_model_state_dict(self.vc_model)
+                )
         if extra:
             checkpoint.update(extra)
         return checkpoint
@@ -756,9 +970,29 @@ class Stage3JointTrainer:
         if self.joint_train:
             # joint阶段与OT阶段共用目录，但不覆盖OT的best.pt/last.pt/final.pt。
             ot_path = os.path.join(self.cfg.save_dir, f'{prefix}_object_trans.pt')
-            vc_path = os.path.join(self.cfg.save_dir, f'{prefix}_velocity_contact.pt')
             self._save_module_checkpoint(ot_path, checkpoint['object_trans_state_dict'], epoch, loss)
-            self._save_module_checkpoint(vc_path, checkpoint['velocity_contact_state_dict'], epoch, loss)
+            if self.hp_trainable:
+                hp_path = os.path.join(
+                    self.cfg.save_dir,
+                    f'{prefix}_human_pose.pt',
+                )
+                self._save_module_checkpoint(
+                    hp_path,
+                    checkpoint['human_pose_state_dict'],
+                    epoch,
+                    loss,
+                )
+            if self.vc_trainable:
+                vc_path = os.path.join(
+                    self.cfg.save_dir,
+                    f'{prefix}_velocity_contact.pt',
+                )
+                self._save_module_checkpoint(
+                    vc_path,
+                    checkpoint['velocity_contact_state_dict'],
+                    epoch,
+                    loss,
+                )
         else:
             checkpoint_path = os.path.join(self.cfg.save_dir, f'{prefix}.pt')
             self._write_checkpoint(checkpoint_path, checkpoint)
@@ -810,7 +1044,10 @@ def _run_auto_joint_train(cfg, trainer, train_loader, test_loader, base_lr):
     )
 
     print("=" * 50)
-    print("自动联合训练: ObjectTrans + VelocityContact")
+    if str(getattr(cfg, "object_trans_arch", "")).lower() == "imuhoi":
+        print("自动联合训练: HumanPose + IMUHOI ObjectTrans")
+    else:
+        print("自动联合训练: ObjectTrans + VelocityContact")
     print(f"训练轮数: {joint_cfg.epochs}")
     print(f"学习率: {joint_cfg.lr}")
     print(f"milestones: {joint_cfg.milestones}")
@@ -852,8 +1089,11 @@ def main():
         cfg.object_trans_arch = args.object_trans_arch
     elif not hasattr(cfg, 'object_trans_arch'):
         cfg.object_trans_arch = 'current'
-    elif str(cfg.object_trans_arch).strip().lower() == 'mergeheads_obs':
+    normalized_ot_arch = str(cfg.object_trans_arch).strip().lower()
+    if normalized_ot_arch == 'mergeheads_obs':
         cfg.object_trans_arch = 'mergeHeads_obs'
+    elif normalized_ot_arch == 'imuhoi':
+        cfg.object_trans_arch = 'imuhoi'
     if cfg.object_trans_arch == 'mergeHeads_obs':
         # Persist the architecture's resolved fixed dimensions so the run
         # snapshot describes the actual checkpoint shapes.
@@ -884,6 +1124,8 @@ def main():
 
     if cfg.object_trans_arch == 'legacy':
         module_name = 'object_trans_legacy'
+    elif cfg.object_trans_arch == 'imuhoi':
+        module_name = 'object_trans_IMUHOI'
     elif cfg.object_trans_arch == 'legacy_mesh':
         module_name = 'object_trans_legacy_mesh'
     elif cfg.object_trans_arch == 'mergeHeads_obs':
@@ -892,6 +1134,8 @@ def main():
         module_name = 'object_trans'
     if cfg.velocity_contact_arch == "legacy":
         module_name = f"{module_name}_vc_legacy"
+    elif cfg.velocity_contact_arch == "imuhoi":
+        module_name = f"{module_name}_vc_IMUHOI"
     save_dir = create_save_dir(cfg, module_name)
     save_config_snapshot(cfg)
 
@@ -925,7 +1169,12 @@ def main():
 
     base_save_dir = os.path.dirname(save_dir)
     if vc_ckpt is None:
-        vc_ckpt = find_latest_checkpoint(base_save_dir, 'velocity_contact')
+        vc_search_name = (
+            "velocity_contact_IMUHOI"
+            if cfg.velocity_contact_arch == "imuhoi"
+            else "velocity_contact"
+        )
+        vc_ckpt = find_latest_checkpoint(base_save_dir, vc_search_name)
         vc_source = "auto"
     print(f"VelocityContact权重({vc_source or 'missing'}): {vc_ckpt}")
     if hp_ckpt is None:
@@ -969,6 +1218,8 @@ def main():
 
     if cfg.object_trans_arch == 'legacy':
         ot_model_cls = LegacyObjectTransModule
+    elif cfg.object_trans_arch == 'imuhoi':
+        ot_model_cls = IMUHOIObjectTransModule
     elif cfg.object_trans_arch == 'legacy_mesh':
         ot_model_cls = LegacyMeshObjectTransModule
     elif cfg.object_trans_arch == 'mergeHeads_obs':

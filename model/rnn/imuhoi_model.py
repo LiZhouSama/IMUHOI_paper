@@ -16,6 +16,7 @@ from .velocity_contact import (
 from .human_pose import HumanPoseModule
 from .object_trans import ObjectTransModule
 from .object_trans_legacy import LegacyObjectTransModule
+from .object_trans_IMUHOI import IMUHOIObjectTransModule
 from .object_trans_legacy_mesh import LegacyMeshObjectTransModule
 from .object_trans_mergeHeads_obsEncoder import (
     ObjectTransModule as MergeHeadsObsObjectTransModule,
@@ -184,6 +185,8 @@ class IMUHOIModel(nn.Module):
         self.human_pose_module = HumanPoseModule(cfg, device, no_trans=no_trans)
         if self.object_trans_arch == "legacy":
             self.object_trans_module = LegacyObjectTransModule(cfg)
+        elif self.object_trans_arch == "imuhoi":
+            self.object_trans_module = IMUHOIObjectTransModule(cfg)
         elif self.object_trans_arch == "legacy_mesh":
             self.object_trans_module = LegacyMeshObjectTransModule(cfg)
         elif self.object_trans_arch == "mergeheads_obs":
@@ -192,8 +195,8 @@ class IMUHOIModel(nn.Module):
             self.object_trans_module = ObjectTransModule(cfg)
         else:
             raise ValueError(
-                "object_trans_arch must be 'current', 'legacy', 'legacy_mesh', "
-                "or 'mergeHeads_obs', "
+                "object_trans_arch must be 'current', 'legacy', 'imuhoi', "
+                "'legacy_mesh', or 'mergeHeads_obs', "
                 f"got {self.object_trans_arch!r}"
             )
         self.lb_prior_predictor = None
@@ -278,6 +281,18 @@ class IMUHOIModel(nn.Module):
             if isinstance(hand_pos, torch.Tensor):
                 return hand_pos
         raise KeyError("hp_out must contain pred_palm_glb_pos or pred_hand_glb_pos")
+
+    def _resolve_ot_hand_positions(
+        self,
+        hp_out: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Use wrists for the EgoIMU IMUHOI OT and palms for newer OTs."""
+        if getattr(self, "object_trans_arch", "current") == "imuhoi":
+            wrist_pos = hp_out.get("pred_hand_glb_pos")
+            if isinstance(wrist_pos, torch.Tensor):
+                return wrist_pos
+            raise KeyError("IMUHOI ObjectTrans requires pred_hand_glb_pos")
+        return self._resolve_hoi_hand_positions(hp_out)
 
     @staticmethod
     def _resolve_stage1_hoi_hand_positions(outputs: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -395,6 +410,8 @@ class IMUHOIModel(nn.Module):
             print(f"Warning: failed to recompute refined human outputs: {exc}")
 
     def _resolve_refine_human(self, refine_human: Optional[bool]) -> bool:
+        if getattr(self, "object_trans_arch", "current") == "imuhoi":
+            return False
         if refine_human is None:
             return bool(getattr(self.cfg, "enable_ot_refine", False))
         return bool(refine_human)
@@ -464,7 +481,7 @@ class IMUHOIModel(nn.Module):
             data_dict.get("contact_init"),
         )
         results.update(vc_out)
-        hoi_hand_positions = self._resolve_hoi_hand_positions(hp_out)
+        hoi_hand_positions = self._resolve_ot_hand_positions(hp_out)
         
         # Stage 3: ObjectTrans - 预测物体位置
         has_object = data_dict.get("has_object")
@@ -529,7 +546,7 @@ class IMUHOIModel(nn.Module):
         obj_imu = data_dict["obj_imu"]
         obj_rot6d = obj_imu[..., 3:9]
         obj_rotm = rotation_6d_to_matrix(obj_rot6d.reshape(-1, 6)).reshape(batch_size, seq_len, 3, 3)
-        hand_pos = self._resolve_hoi_hand_positions(results)
+        hand_pos = self._resolve_ot_hand_positions(results)
         results["pred_obj_trans_fk"] = self._fk_obj_trans_baseline_hard(
             vc_out["pred_hand_contact_prob"],
             hand_pos,
@@ -687,7 +704,7 @@ class IMUHOIModel(nn.Module):
                 else:
                     ot_obj_trans_init = window_data["obj_trans_init"]
                 ot_out = self.object_trans_module.forward(
-                    self._resolve_hoi_hand_positions(hp_context),
+                    self._resolve_ot_hand_positions(hp_context),
                     vc_context["pred_hand_contact_prob"],
                     ot_obj_trans_init,
                     obj_imu=window_data["obj_imu"],
@@ -836,7 +853,7 @@ class IMUHOIModel(nn.Module):
                     else None
                 )
                 ot_latest, prediction_state = self.object_trans_module.forward(
-                    self._resolve_hoi_hand_positions(hp_latest),
+                    self._resolve_ot_hand_positions(hp_latest),
                     vc_latest["pred_hand_contact_prob"],
                     window_data["obj_trans_init"],
                     obj_imu=window_data["obj_imu"][:, -1:],
@@ -856,7 +873,7 @@ class IMUHOIModel(nn.Module):
                 ot_context.update(
                     self.object_trans_module.compute_human_refinement_from_prediction(
                         ot_context,
-                        self._resolve_hoi_hand_positions(hp_context),
+                        self._resolve_ot_hand_positions(hp_context),
                         vc_context["pred_hand_contact_prob"],
                         obj_vel_input=vc_context["pred_obj_vel"],
                         human_pose_input=hp_context.get("p_pred"),

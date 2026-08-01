@@ -19,6 +19,7 @@ def test_batch_online_simulate_imu_noise_defaults_to_disabled():
     args = batch_eval._make_parser().parse_args([])
 
     assert args.simulate_imu_noise is False
+    assert args.simulate_imu_noise_seed == 42
     assert args.eval_imu_noise is False
 
 

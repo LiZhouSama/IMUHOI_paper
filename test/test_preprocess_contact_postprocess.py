@@ -6,9 +6,13 @@ from pathlib import Path
 import torch
 
 from process.preprocess import (
+    contact_postprocess_metadata,
     find_unheld_object_displacement_interval,
     postprocess_contact_labels,
+    postprocess_sequence_contact_labels,
+    saved_contact_postprocess_matches,
     split_unified_by_json,
+    write_contact_skip_manifest,
 )
 
 
@@ -121,6 +125,85 @@ class ContactPostprocessTests(unittest.TestCase):
         self.assertEqual(reaches_threshold["motion_start_frame"], 1)
         self.assertEqual(reaches_threshold["motion_end_frame"], 2)
         self.assertIsNone(below_threshold)
+
+    def test_full_sequence_cleanup_runs_before_unheld_motion_exclusion(self):
+        lhand_raw = _mask((True, 10), (False, 30))
+        rhand_raw = _mask((False, 40))
+        obj_raw = _mask((True, 20), (False, 5), (True, 15))
+        obj_trans = torch.zeros(40, 3)
+        obj_trans[-1, 0] = 0.11
+
+        lhand, rhand, obj, interval = postprocess_sequence_contact_labels(
+            lhand_raw,
+            rhand_raw,
+            obj_raw,
+            obj_trans,
+            max_hole_frames=5,
+            min_contact_frames=30,
+            skip_object_displacement_without_hand_contact=True,
+            unheld_object_displacement_threshold_m=0.10,
+        )
+
+        self.assertFalse(bool(lhand.any()))
+        self.assertFalse(bool(rhand.any()))
+        self.assertTrue(bool(obj.all()))
+        self.assertIsNotNone(interval)
+        self.assertEqual(interval["interval_start_frame"], 0)
+        self.assertEqual(interval["interval_end_frame"], 39)
+
+    def test_unheld_displacement_is_exact_across_distance_blocks(self):
+        frame_count = 2050
+        obj_trans = torch.zeros(frame_count, 3)
+        obj_trans[-1, 0] = 0.11
+        no_hand = torch.zeros(frame_count, dtype=torch.bool)
+
+        interval = find_unheld_object_displacement_interval(
+            obj_trans,
+            no_hand,
+            no_hand,
+            min_displacement_m=0.10,
+        )
+
+        self.assertIsNotNone(interval)
+        self.assertEqual(interval["motion_start_frame"], 0)
+        self.assertEqual(interval["motion_end_frame"], frame_count - 1)
+        self.assertAlmostEqual(interval["max_displacement_m"], 0.11, places=6)
+
+    def test_contact_metadata_controls_skip_existing_and_manifest(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = {
+                "max_hole_frames": 30,
+                "min_contact_frames": 30,
+                "skip_object_displacement_without_hand_contact": True,
+                "unheld_object_displacement_threshold_m": 0.10,
+            }
+            output_path = Path(temp_dir) / "1.pt"
+            torch.save(contact_postprocess_metadata(**config), output_path)
+
+            self.assertTrue(
+                saved_contact_postprocess_matches(str(output_path), **config)
+            )
+            self.assertFalse(
+                saved_contact_postprocess_matches(
+                    str(output_path),
+                    **{**config, "max_hole_frames": 29},
+                )
+            )
+
+            manifest_path = write_contact_skip_manifest(
+                temp_dir,
+                dataset="TEST",
+                source_sequences=2,
+                saved_sequences=1,
+                skipped_sequences=[{"output_file": "2.pt"}],
+                **config,
+            )
+            manifest = json.loads(
+                Path(manifest_path).read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["saved_sequences"], 1)
+            self.assertEqual(manifest["skipped_sequences_count"], 1)
+            self.assertEqual(manifest["contact_postprocess_version"], 1)
 
     def test_split_preserves_numeric_hole_and_writes_filtered_json(self):
         with tempfile.TemporaryDirectory() as temp_dir:

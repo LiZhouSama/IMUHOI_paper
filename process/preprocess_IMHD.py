@@ -16,11 +16,28 @@ from human_body_prior.body_model.body_model import BodyModel
 from human_body_prior.tools.rotation_tools import local2global_pose
 import pytorch3d.transforms as transforms
 
-from preprocess import (
-    compute_improved_contact_labels,
-    compute_foot_contact_labels,
-    load_canonical_points_from_mesh_path,
-)
+try:
+    from preprocess import (
+        add_contact_postprocess_arguments,
+        build_unheld_object_motion_skip_record,
+        contact_postprocess_metadata,
+        compute_improved_contact_labels,
+        compute_foot_contact_labels,
+        load_canonical_points_from_mesh_path,
+        postprocess_sequence_contact_labels,
+        write_contact_skip_manifest,
+    )
+except ModuleNotFoundError:
+    from process.preprocess import (
+        add_contact_postprocess_arguments,
+        build_unheld_object_motion_skip_record,
+        contact_postprocess_metadata,
+        compute_improved_contact_labels,
+        compute_foot_contact_labels,
+        load_canonical_points_from_mesh_path,
+        postprocess_sequence_contact_labels,
+        write_contact_skip_manifest,
+    )
 
 DEFAULT_CHUNK_LEN = 4000
 
@@ -519,7 +536,14 @@ def process_imhd_sequence(
     frame_trim: Optional[int] = None,
     smpl_batch: int = 256,
     obj_points_count: int = 256,
-) -> None:
+    contact_max_hole_frames: int = 30,
+    contact_min_duration_frames: int = 30,
+    skip_object_displacement_without_hand_contact: bool = True,
+    unheld_object_displacement_threshold_m: float = 0.10,
+    skipped_sequences=None,
+) -> Optional[str]:
+    output_file = f"{entry.seq_name}.pt"
+    out_path = os.path.join(output_dir, output_file)
 
     data_np, human_imu_real, obj_imu_real = load_imhd_sequence(entry.pkl_files)
     
@@ -706,12 +730,52 @@ def process_imhd_sequence(
     rotation_global = torch.cat(rot_global_chunks, dim=0).float()
     lfoot_contact = torch.cat(lfoot_chunks, dim=0)
     rfoot_contact = torch.cat(rfoot_chunks, dim=0)
-    lhand_contact = torch.cat(lhand_chunks, dim=0)
-    rhand_contact = torch.cat(rhand_chunks, dim=0)
-    obj_contact = torch.cat(obj_contact_chunks, dim=0)
+    lhand_contact_raw = torch.cat(lhand_chunks, dim=0).bool()
+    rhand_contact_raw = torch.cat(rhand_chunks, dim=0).bool()
+    obj_contact_raw = torch.cat(obj_contact_chunks, dim=0).bool()
     obj_trans_cpu = torch.cat(obj_trans_chunks, dim=0)
     obj_rot_cpu = torch.cat(obj_rot_chunks, dim=0)
     obj_scale_cpu = torch.cat(obj_scale_chunks, dim=0)
+    (
+        lhand_contact,
+        rhand_contact,
+        obj_contact,
+        unheld_motion_interval,
+    ) = postprocess_sequence_contact_labels(
+        lhand_contact_raw,
+        rhand_contact_raw,
+        obj_contact_raw,
+        obj_trans_cpu,
+        max_hole_frames=contact_max_hole_frames,
+        min_contact_frames=contact_min_duration_frames,
+        skip_object_displacement_without_hand_contact=(
+            skip_object_displacement_without_hand_contact
+        ),
+        unheld_object_displacement_threshold_m=(
+            unheld_object_displacement_threshold_m
+        ),
+    )
+    if unheld_motion_interval is not None:
+        if skipped_sequences is not None:
+            skipped_sequences.append(build_unheld_object_motion_skip_record(
+                dataset="IMHD",
+                seq_name=entry.seq_name,
+                output_file=output_file,
+                obj_name=object_name,
+                obj_trans=obj_trans_cpu,
+                lhand_contact_raw=lhand_contact_raw,
+                rhand_contact_raw=rhand_contact_raw,
+                obj_contact_raw=obj_contact_raw,
+                lhand_contact=lhand_contact,
+                rhand_contact=rhand_contact,
+                obj_contact=obj_contact,
+                unheld_motion_interval=unheld_motion_interval,
+            ))
+        if os.path.isfile(out_path):
+            os.remove(out_path)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return None
 
     output = {
         "seq_name": entry.seq_name,
@@ -736,19 +800,32 @@ def process_imhd_sequence(
         "lhand_contact": lhand_contact,
         "rhand_contact": rhand_contact,
         "obj_contact": obj_contact,
+        "lhand_contact_raw": lhand_contact_raw,
+        "rhand_contact_raw": rhand_contact_raw,
+        "obj_contact_raw": obj_contact_raw,
         "source_pkls": [os.path.relpath(path, entry.motion_dir) for path in entry.pkl_files],
         "imhd_up_alignment_rotation": torch.from_numpy(up_alignment_rot).float(),
         "imhd_body_up_before_alignment": torch.from_numpy(body_up_before).float(),
         "imhd_aligned_body_up": torch.from_numpy(aligned_body_up).float(),
         "imhd_up_alignment_cos_to_y_before": float(up_alignment_cos),
+        **contact_postprocess_metadata(
+            max_hole_frames=contact_max_hole_frames,
+            min_contact_frames=contact_min_duration_frames,
+            skip_object_displacement_without_hand_contact=(
+                skip_object_displacement_without_hand_contact
+            ),
+            unheld_object_displacement_threshold_m=(
+                unheld_object_displacement_threshold_m
+            ),
+        ),
     }
 
     os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, f"{entry.seq_name}.pt")
     torch.save(output, out_path)
 
     if device.type == "cuda":
         torch.cuda.empty_cache()
+    return out_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -807,6 +884,8 @@ def parse_args() -> argparse.Namespace:
         default=256,
         help="Number of canonical object points to save per sequence.",
     )
+    add_contact_postprocess_arguments(parser)
+    parser.set_defaults(skip_object_displacement_without_hand_contact=False)
     return parser.parse_args()
 
 
@@ -825,9 +904,12 @@ def main() -> None:
     if not object_names:
         raise FileNotFoundError(f"No object templates found in {args.objects_root}")
 
+    processed_count = 0
+    skipped_sequences = []
+    failed_sequences = []
     for entry in tqdm(sequences, desc="Processing IMHD sequences"):
         try:
-            process_imhd_sequence(
+            output_path = process_imhd_sequence(
                 entry,
                 bm_loader,
                 args.objects_root,
@@ -837,9 +919,41 @@ def main() -> None:
                 frame_trim=args.frame_trim,
                 smpl_batch=args.smpl_batch,
                 obj_points_count=args.obj_points_count,
+                contact_max_hole_frames=args.contact_max_hole_frames,
+                contact_min_duration_frames=args.contact_min_duration_frames,
+                skip_object_displacement_without_hand_contact=(
+                    args.skip_object_displacement_without_hand_contact
+                ),
+                unheld_object_displacement_threshold_m=(
+                    args.unheld_object_displacement_threshold_m
+                ),
+                skipped_sequences=skipped_sequences,
             )
+            processed_count += int(output_path is not None)
         except Exception as exc:
+            failed_sequences.append(entry.seq_name)
             print(f"Failed to process {entry.seq_name}: {exc}")
+
+    manifest_path = write_contact_skip_manifest(
+        args.output_dir,
+        dataset="IMHD",
+        source_sequences=len(sequences),
+        saved_sequences=processed_count,
+        skipped_sequences=skipped_sequences,
+        max_hole_frames=args.contact_max_hole_frames,
+        min_contact_frames=args.contact_min_duration_frames,
+        skip_object_displacement_without_hand_contact=(
+            args.skip_object_displacement_without_hand_contact
+        ),
+        unheld_object_displacement_threshold_m=(
+            args.unheld_object_displacement_threshold_m
+        ),
+    )
+    print(
+        f"IMHD preprocessing finished: saved={processed_count}, "
+        f"contact-skipped={len(skipped_sequences)}, "
+        f"failed={len(failed_sequences)}, manifest={manifest_path}"
+    )
 
 
 if __name__ == "__main__":

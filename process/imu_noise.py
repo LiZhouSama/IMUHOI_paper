@@ -54,39 +54,95 @@ def _normalize_rot(rot6d: torch.Tensor) -> Tuple[torch.Tensor, bool]:
     return rot6d, False
 
 
-def _apply_acc_noise(acc: torch.Tensor, cfg: Dict[str, float], fps: float) -> torch.Tensor:
+def _randn(shape, *, device, dtype, generator=None) -> torch.Tensor:
+    return torch.randn(shape, device=device, dtype=dtype, generator=generator)
+
+
+def _rand(shape, *, device, generator=None) -> torch.Tensor:
+    return torch.rand(shape, device=device, generator=generator)
+
+
+def _apply_acc_noise(
+    acc: torch.Tensor,
+    cfg: Dict[str, float],
+    fps: float,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
     seq_len, num_sensors, _ = acc.shape
     device, dtype = acc.device, acc.dtype
     dt = 1.0 / float(fps)
     sqrt_dt = math.sqrt(dt)
 
-    bias0 = torch.randn(num_sensors, 3, device=device, dtype=dtype) * cfg["acc_bias_std"]
-    bias_walk = torch.randn(seq_len, num_sensors, 3, device=device, dtype=dtype) * cfg["acc_bias_rw_std"] * sqrt_dt
+    bias0 = _randn(
+        (num_sensors, 3),
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    ) * cfg["acc_bias_std"]
+    bias_walk = _randn(
+        (seq_len, num_sensors, 3),
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    ) * cfg["acc_bias_rw_std"] * sqrt_dt
     bias = bias0.unsqueeze(0) + torch.cumsum(bias_walk, dim=0)
 
     acc_base = acc + bias
 
     if cfg.get("acc_drift_per_s", 0.0) > 0:
         t = torch.arange(seq_len, device=device, dtype=dtype).view(seq_len, 1, 1) * dt
-        drift_dir = torch.randn(num_sensors, 3, device=device, dtype=dtype) * cfg["acc_drift_per_s"]
+        drift_dir = _randn(
+            (num_sensors, 3),
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        ) * cfg["acc_drift_per_s"]
         acc_base = acc_base + t * drift_dir
 
     if cfg.get("acc_scale_std", 0.0) > 0:
-        scale = 1.0 + torch.randn(num_sensors, 3, device=device, dtype=dtype) * cfg["acc_scale_std"]
+        scale = 1.0 + _randn(
+            (num_sensors, 3),
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        ) * cfg["acc_scale_std"]
         acc_base = acc_base * scale.view(1, num_sensors, 3)
 
     if cfg.get("acc_misalignment_std", 0.0) > 0:
-        misalign = torch.randn(num_sensors, 3, device=device, dtype=dtype) * cfg["acc_misalignment_std"]
+        misalign = _randn(
+            (num_sensors, 3),
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        ) * cfg["acc_misalignment_std"]
         misalign_R = axis_angle_to_matrix(misalign).to(dtype=dtype)
         acc_flat = acc_base.reshape(seq_len * num_sensors, 3)
         misalign_R_expanded = misalign_R.unsqueeze(0).repeat(seq_len, 1, 1, 1).reshape(seq_len * num_sensors, 3, 3)
         acc_base = torch.bmm(misalign_R_expanded, acc_flat.unsqueeze(-1)).reshape(seq_len, num_sensors, 3)
 
-    acc_noisy = acc_base + torch.randn_like(acc_base) * cfg["acc_noise_std"]
+    acc_noisy = acc_base + _randn(
+        acc_base.shape,
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    ) * cfg["acc_noise_std"]
 
     if cfg.get("acc_spike_prob", 0.0) > 0:
-        spike_mask = (torch.rand(seq_len, num_sensors, device=device) < cfg["acc_spike_prob"]).unsqueeze(-1)
-        acc_noisy = acc_noisy + spike_mask * (torch.randn_like(acc_noisy) * cfg["acc_spike_std"])
+        spike_mask = (
+            _rand(
+                (seq_len, num_sensors),
+                device=device,
+                generator=generator,
+            ) < cfg["acc_spike_prob"]
+        ).unsqueeze(-1)
+        acc_noisy = acc_noisy + spike_mask * (
+            _randn(
+                acc_noisy.shape,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            ) * cfg["acc_spike_std"]
+        )
 
     clip = cfg.get("acc_clip", 0.0)
     if clip and clip > 0:
@@ -95,7 +151,12 @@ def _apply_acc_noise(acc: torch.Tensor, cfg: Dict[str, float], fps: float) -> to
     return acc_noisy
 
 
-def _apply_rot_noise(rot6d: torch.Tensor, cfg: Dict[str, float], fps: float) -> torch.Tensor:
+def _apply_rot_noise(
+    rot6d: torch.Tensor,
+    cfg: Dict[str, float],
+    fps: float,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
     seq_len, num_sensors, _ = rot6d.shape
     device, dtype = rot6d.device, rot6d.dtype
     dt = 1.0 / float(fps)
@@ -103,20 +164,53 @@ def _apply_rot_noise(rot6d: torch.Tensor, cfg: Dict[str, float], fps: float) -> 
 
     rot_mat = rotation_6d_to_matrix(rot6d.reshape(-1, 6)).reshape(seq_len, num_sensors, 3, 3)
 
-    bias0 = torch.randn(num_sensors, 3, device=device, dtype=dtype) * cfg["ori_bias_std"]
-    bias_walk = torch.randn(seq_len, num_sensors, 3, device=device, dtype=dtype) * cfg["ori_rw_std"] * sqrt_dt
+    bias0 = _randn(
+        (num_sensors, 3),
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    ) * cfg["ori_bias_std"]
+    bias_walk = _randn(
+        (seq_len, num_sensors, 3),
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    ) * cfg["ori_rw_std"] * sqrt_dt
     bias = bias0.unsqueeze(0) + torch.cumsum(bias_walk, dim=0)
 
-    noise_white = torch.randn(seq_len, num_sensors, 3, device=device, dtype=dtype) * cfg["ori_noise_std"]
+    noise_white = _randn(
+        (seq_len, num_sensors, 3),
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    ) * cfg["ori_noise_std"]
     aa_total = bias + noise_white
 
     if cfg.get("ori_spike_prob", 0.0) > 0:
-        spike_mask = (torch.rand(seq_len, num_sensors, device=device) < cfg["ori_spike_prob"]).unsqueeze(-1)
-        aa_total = aa_total + spike_mask * (torch.randn_like(aa_total) * cfg["ori_spike_std"])
+        spike_mask = (
+            _rand(
+                (seq_len, num_sensors),
+                device=device,
+                generator=generator,
+            ) < cfg["ori_spike_prob"]
+        ).unsqueeze(-1)
+        aa_total = aa_total + spike_mask * (
+            _randn(
+                aa_total.shape,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            ) * cfg["ori_spike_std"]
+        )
 
     misalign_std = cfg.get("ori_misalignment_std", 0.0)
     if misalign_std > 0:
-        misalign = torch.randn(num_sensors, 3, device=device, dtype=dtype) * misalign_std
+        misalign = _randn(
+            (num_sensors, 3),
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        ) * misalign_std
         misalign_R = axis_angle_to_matrix(misalign).to(dtype=dtype)
         misalign_R_expanded = misalign_R.unsqueeze(0).expand(seq_len, -1, -1, -1)
     else:
@@ -132,6 +226,7 @@ def _apply_drop_and_hold(
     acc: torch.Tensor,
     rot6d: torch.Tensor,
     cfg: Dict[str, float],
+    generator: Optional[torch.Generator] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     drop_prob = cfg.get("sample_drop_prob", 0.0)
     hold_prob = cfg.get("sample_hold_prob", 0.0)
@@ -143,8 +238,16 @@ def _apply_drop_and_hold(
     rot_out = rot6d.clone()
 
     for t in range(1, seq_len):
-        drop_mask = torch.rand(num_sensors, device=acc.device) < drop_prob
-        hold_mask = torch.rand(num_sensors, device=acc.device) < hold_prob
+        drop_mask = _rand(
+            (num_sensors,),
+            device=acc.device,
+            generator=generator,
+        ) < drop_prob
+        hold_mask = _rand(
+            (num_sensors,),
+            device=acc.device,
+            generator=generator,
+        ) < hold_prob
         mask = drop_mask | hold_mask
         if mask.any():
             acc_out[t, mask] = acc_out[t - 1, mask]
@@ -158,6 +261,7 @@ def apply_imu_noise(
     rot6d: torch.Tensor,
     fps: float,
     noise_cfg: Optional[Dict[str, float]] = None,
+    generator: Optional[torch.Generator] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
     """
     Apply a realistic IMU noise model (bias, random walk, misalignment, spikes, dropouts).
@@ -167,6 +271,7 @@ def apply_imu_noise(
         rot6d: [..., 6] orientations shaped [T, 6] or [T, N, 6].
         fps: frame rate.
         noise_cfg: optional overrides for NOITOM_IMU_NOISE_CFG.
+        generator: optional local RNG used for deterministic sequence noise.
 
     Returns:
         noisy_acc, noisy_rot6d, merged_noise_cfg
@@ -176,9 +281,14 @@ def apply_imu_noise(
     acc_norm, acc_squeezed = _normalize_acc(acc)
     rot_norm, rot_squeezed = _normalize_rot(rot6d)
 
-    acc_noisy = _apply_acc_noise(acc_norm, cfg, fps)
-    rot_noisy = _apply_rot_noise(rot_norm, cfg, fps)
-    acc_noisy, rot_noisy = _apply_drop_and_hold(acc_noisy, rot_noisy, cfg)
+    acc_noisy = _apply_acc_noise(acc_norm, cfg, fps, generator=generator)
+    rot_noisy = _apply_rot_noise(rot_norm, cfg, fps, generator=generator)
+    acc_noisy, rot_noisy = _apply_drop_and_hold(
+        acc_noisy,
+        rot_noisy,
+        cfg,
+        generator=generator,
+    )
 
     if acc_squeezed:
         acc_noisy = acc_noisy.squeeze(1)

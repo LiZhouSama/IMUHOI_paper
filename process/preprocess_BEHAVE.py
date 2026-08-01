@@ -12,11 +12,28 @@ from human_body_prior.body_model.body_model import BodyModel
 from human_body_prior.tools.rotation_tools import local2global_pose
 import pytorch3d.transforms as transforms
 
-from preprocess import (
-    compute_improved_contact_labels,
-    compute_foot_contact_labels,
-    load_canonical_points_from_mesh_path,
-)
+try:
+    from preprocess import (
+        add_contact_postprocess_arguments,
+        build_unheld_object_motion_skip_record,
+        contact_postprocess_metadata,
+        compute_improved_contact_labels,
+        compute_foot_contact_labels,
+        load_canonical_points_from_mesh_path,
+        postprocess_sequence_contact_labels,
+        write_contact_skip_manifest,
+    )
+except ModuleNotFoundError:
+    from process.preprocess import (
+        add_contact_postprocess_arguments,
+        build_unheld_object_motion_skip_record,
+        contact_postprocess_metadata,
+        compute_improved_contact_labels,
+        compute_foot_contact_labels,
+        load_canonical_points_from_mesh_path,
+        postprocess_sequence_contact_labels,
+        write_contact_skip_manifest,
+    )
 
 DEFAULT_CHUNK_LEN = 1500      # 视显存/机型可调
 
@@ -213,8 +230,15 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
                             object_names: List[str], device: torch.device,
                             output_dir: str, frame_trim: Optional[int] = None,
                             smpl_batch: int = 256,
-                            obj_points_count: int = 256) -> None:
+                            obj_points_count: int = 256,
+                            contact_max_hole_frames: int = 30,
+                            contact_min_duration_frames: int = 30,
+                            skip_object_displacement_without_hand_contact: bool = True,
+                            unheld_object_displacement_threshold_m: float = 0.10,
+                            skipped_sequences=None) -> Optional[str]:
     seq_name = os.path.basename(seq_dir.rstrip(os.sep))
+    output_file = f"{seq_name}.pt"
+    out_path = os.path.join(output_dir, output_file)
     smpl_path = os.path.join(seq_dir, "smpl_fit_all.npz")
     obj_path = os.path.join(seq_dir, "object_fit_all.npz")
     if not (os.path.exists(smpl_path) and os.path.exists(obj_path)):
@@ -358,12 +382,52 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
     rotation_global        = torch.cat(rot_global_list, dim=0).float()
     lfoot_contact = torch.cat(lfoot_list, dim=0)
     rfoot_contact = torch.cat(rfoot_list, dim=0)
-    lhand_contact = torch.cat(lhand_list, dim=0)
-    rhand_contact = torch.cat(rhand_list, dim=0)
-    obj_contact   = torch.cat(objcontact_list, dim=0)
+    lhand_contact_raw = torch.cat(lhand_list, dim=0).bool()
+    rhand_contact_raw = torch.cat(rhand_list, dim=0).bool()
+    obj_contact_raw = torch.cat(objcontact_list, dim=0).bool()
     obj_trans_cpu = torch.cat(obj_trans_all, dim=0)
     obj_rot_cpu   = torch.cat(obj_rot_all,   dim=0)
     obj_scale_cpu = torch.cat(obj_scale_all, dim=0)
+    (
+        lhand_contact,
+        rhand_contact,
+        obj_contact,
+        unheld_motion_interval,
+    ) = postprocess_sequence_contact_labels(
+        lhand_contact_raw,
+        rhand_contact_raw,
+        obj_contact_raw,
+        obj_trans_cpu,
+        max_hole_frames=contact_max_hole_frames,
+        min_contact_frames=contact_min_duration_frames,
+        skip_object_displacement_without_hand_contact=(
+            skip_object_displacement_without_hand_contact
+        ),
+        unheld_object_displacement_threshold_m=(
+            unheld_object_displacement_threshold_m
+        ),
+    )
+    if unheld_motion_interval is not None:
+        if skipped_sequences is not None:
+            skipped_sequences.append(build_unheld_object_motion_skip_record(
+                dataset="BEHAVE",
+                seq_name=seq_name,
+                output_file=output_file,
+                obj_name=object_name,
+                obj_trans=obj_trans_cpu,
+                lhand_contact_raw=lhand_contact_raw,
+                rhand_contact_raw=rhand_contact_raw,
+                obj_contact_raw=obj_contact_raw,
+                lhand_contact=lhand_contact,
+                rhand_contact=rhand_contact,
+                obj_contact=obj_contact,
+                unheld_motion_interval=unheld_motion_interval,
+            ))
+        if os.path.isfile(out_path):
+            os.remove(out_path)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return None
 
     output = {
         "seq_name": seq_name,
@@ -388,15 +452,28 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
         "lhand_contact": lhand_contact,
         "rhand_contact": rhand_contact,
         "obj_contact": obj_contact,
+        "lhand_contact_raw": lhand_contact_raw,
+        "rhand_contact_raw": rhand_contact_raw,
+        "obj_contact_raw": obj_contact_raw,
         "source_pkls": [os.path.basename(smpl_path), os.path.basename(obj_path)],
+        **contact_postprocess_metadata(
+            max_hole_frames=contact_max_hole_frames,
+            min_contact_frames=contact_min_duration_frames,
+            skip_object_displacement_without_hand_contact=(
+                skip_object_displacement_without_hand_contact
+            ),
+            unheld_object_displacement_threshold_m=(
+                unheld_object_displacement_threshold_m
+            ),
+        ),
     }
 
     os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, f"{seq_name}.pt")
     torch.save(output, out_path)
 
     if device.type == "cuda": 
         torch.cuda.empty_cache()
+    return out_path
 
 
 
@@ -433,6 +510,8 @@ def parse_args() -> argparse.Namespace:
         default=16,
         help="Number of body shape coefficients expected by the SMPL-H model.",
     )
+    add_contact_postprocess_arguments(parser)
+    parser.set_defaults(skip_object_displacement_without_hand_contact=False)
     return parser.parse_args()
 
 
@@ -452,8 +531,10 @@ def main() -> None:
     if not object_names:
         raise FileNotFoundError(f"No object subdirectories found in {args.objects_root}")
 
+    processed_count = 0
+    skipped_sequences = []
     for seq_dir in tqdm(seq_dirs, desc="Processing BEHAVE sequences"):
-        process_behave_sequence(
+        output_path = process_behave_sequence(
             seq_dir,
             bm_loader,
             args.objects_root,
@@ -463,7 +544,37 @@ def main() -> None:
             args.frame_trim,
             args.smpl_batch,
             args.obj_points_count,
+            contact_max_hole_frames=args.contact_max_hole_frames,
+            contact_min_duration_frames=args.contact_min_duration_frames,
+            skip_object_displacement_without_hand_contact=(
+                args.skip_object_displacement_without_hand_contact
+            ),
+            unheld_object_displacement_threshold_m=(
+                args.unheld_object_displacement_threshold_m
+            ),
+            skipped_sequences=skipped_sequences,
         )
+        processed_count += int(output_path is not None)
+
+    manifest_path = write_contact_skip_manifest(
+        args.output_dir,
+        dataset="BEHAVE",
+        source_sequences=len(seq_dirs),
+        saved_sequences=processed_count,
+        skipped_sequences=skipped_sequences,
+        max_hole_frames=args.contact_max_hole_frames,
+        min_contact_frames=args.contact_min_duration_frames,
+        skip_object_displacement_without_hand_contact=(
+            args.skip_object_displacement_without_hand_contact
+        ),
+        unheld_object_displacement_threshold_m=(
+            args.unheld_object_displacement_threshold_m
+        ),
+    )
+    print(
+        f"BEHAVE preprocessing finished: saved={processed_count}, "
+        f"skipped={len(skipped_sequences)}, manifest={manifest_path}"
+    )
 
 
 if __name__ == "__main__":

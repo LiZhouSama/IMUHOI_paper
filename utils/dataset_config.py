@@ -42,6 +42,16 @@ def get_dataset_configs(config: Any) -> Dict[str, Dict[str, Any]]:
     return normalized
 
 
+def get_full_sequence_test_path(dataset_config: Any) -> Any:
+    """Select the original-sequence test split, with legacy fallback."""
+    dataset_config = _as_mapping(dataset_config)
+    return (
+        dataset_config.get("full_sequence_test_path")
+        or dataset_config.get("test_path")
+        or dataset_config.get("data_dir")
+    )
+
+
 def resolve_dataset_path(path_like: Any, project_root: Path) -> Path:
     """Resolve a YAML path relative to the repository root."""
     if path_like is None or str(path_like).strip() == "":

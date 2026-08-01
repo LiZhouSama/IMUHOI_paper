@@ -18,7 +18,7 @@ from model.rnn.velocity_contact import (
     build_velocity_contact_module,
     normalize_velocity_contact_arch,
 )
-from train.rnn.loss.velocity_contact_loss import VelocityContactLoss
+from train.rnn.loss import VelocityContactLoss, IMUHOIVelocityContactLoss
 from torch.nn.utils import clip_grad_norm_
 from train.rnn.train_utils import (
     get_base_args,
@@ -71,7 +71,9 @@ def _milestone_lr_lambda(milestones, gamma):
 
 
 def _vc_parameter_group(name):
-    if name.startswith("vel_net."):
+    if name.startswith(
+        ("vel_net.", "hand_vel_net.", "obj_vel_net.")
+    ):
         return "velocity"
     if name.startswith("contact_endpoint_"):
         return "endpoint"
@@ -245,9 +247,13 @@ def get_args():
     parser.add_argument(
         '--velocity_contact_arch', '--velocity-contact-arch',
         dest='velocity_contact_arch',
+        type=str.lower,
         choices=VELOCITY_CONTACT_ARCH_CHOICES,
         default=None,
-        help='VelocityContact架构；legacy不包含interaction boundary模块。',
+        help=(
+            'VelocityContact架构；legacy不包含interaction boundary模块，'
+            'imuhoi恢复EgoIMU的全身手速度/独立物体速度/联合接触网络。'
+        ),
     )
     return parser.parse_args()
 
@@ -456,6 +462,23 @@ class VelocityContactTrainer(BaseTrainer):
                 velocity_only=True,
             )
 
+        if (
+            str(getattr(self.cfg, "velocity_contact_arch", "current"))
+            .strip()
+            .lower()
+            == "imuhoi"
+        ):
+            # Keep the complete VC training path independent of HP tensors,
+            # matching EgoIMU rather than merely ignoring hp_out in the model.
+            if training:
+                return self.model(data_dict, hp_out=None)
+            return call_model_inference(
+                self.model,
+                data_dict,
+                hp_out=None,
+                inference_mode="offline",
+            )
+
         pred_hp_out = None
         if self.hp_model is not None:
             with torch.no_grad():
@@ -505,7 +528,11 @@ class VelocityContactTrainer(BaseTrainer):
         self.current_epoch = epoch
         stage = self.stage_for_epoch(epoch)
         self._configure_stage(stage)
-        active_loss_keys = self.STAGE_LOSS_KEYS[stage]
+        active_loss_keys = (
+            set(self.loss_fn.LOSS_KEYS)
+            if stage == "all"
+            else self.STAGE_LOSS_KEYS[stage]
+        )
         total_loss = 0
         loss_components = {}
 
@@ -612,9 +639,14 @@ class VelocityContactTrainer(BaseTrainer):
             for key, value in weighted_sums.items()
         }
         stage = self.stage_for_epoch(epoch)
+        stage_keys = (
+            set(self.loss_fn.LOSS_KEYS)
+            if stage == "all"
+            else self.STAGE_LOSS_KEYS[stage]
+        )
         stage_loss = sum(
             components.get(key, 0.0)
-            for key in self.STAGE_LOSS_KEYS[stage]
+            for key in stage_keys
         )
         unified_loss = None
         if stage != "velocity":
@@ -782,14 +814,20 @@ def main():
         if args.velocity_contact_arch is not None
         else getattr(cfg, "velocity_contact_arch", "current")
     )
+    if cfg.velocity_contact_arch == "imuhoi":
+        # The EgoIMU VC is deliberately independent of HumanPose.
+        cfg.hp_ckpt = None
+        # EgoIMU trains hand/object velocity and three-channel contact
+        # together; the newer endpoint-specific VC curriculum does not apply.
+        cfg.vc_staged_training = False
 
     setup_seed(cfg.seed)
     cfg = setup_device(cfg)
-    module_name = (
-        'velocity_contact'
-        if cfg.velocity_contact_arch == 'current'
-        else 'velocity_contact_legacy'
-    )
+    module_name = {
+        "current": "velocity_contact",
+        "legacy": "velocity_contact_legacy",
+        "imuhoi": "velocity_contact_IMUHOI",
+    }[cfg.velocity_contact_arch]
     save_dir = create_save_dir(cfg, module_name)
     save_config_snapshot(cfg)
 
@@ -820,7 +858,7 @@ def main():
 
     # frozen HP model (Stage 1) for hp_out
     hp_model = None
-    if cfg.hp_ckpt:
+    if cfg.hp_ckpt and cfg.velocity_contact_arch != "imuhoi":
         device = torch.device(cfg.device)
         try:
             hp_model = HumanPoseModule(cfg, device, no_trans=cfg.no_trans)
@@ -835,8 +873,16 @@ def main():
             hp_model = None
 
     # loss
-    loss_weights = getattr(cfg, 'loss_weights', {})
-    loss_fn = VelocityContactLoss(weights=loss_weights)
+    if cfg.velocity_contact_arch == "imuhoi":
+        loss_weights = getattr(
+            cfg,
+            "imuhoi_loss_weights",
+            IMUHOIVelocityContactLoss.DEFAULT_WEIGHTS,
+        )
+        loss_fn = IMUHOIVelocityContactLoss(weights=loss_weights)
+    else:
+        loss_weights = getattr(cfg, 'loss_weights', {})
+        loss_fn = VelocityContactLoss(weights=loss_weights)
 
     # trainer
     trainer = VelocityContactTrainer(cfg, model, loss_fn, train_loader, test_loader, hp_model=hp_model)

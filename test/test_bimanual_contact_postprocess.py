@@ -77,3 +77,34 @@ def test_bimanual_contact_postprocess_can_be_disabled(tmp_path):
 
     assert sample["lhand_contact"][:5].all()
     assert sample["rhand_contact"][:5].all()
+
+
+def test_simulated_imu_noise_is_deterministic_per_sequence(tmp_path):
+    _write_synthetic_sequence(tmp_path)
+    dataset = IMUDataset(
+        data_dir=str(tmp_path),
+        window_size=1,
+        full_sequence=True,
+        simulate_imu_noise=True,
+        simulate_imu_noise_seed=42,
+    )
+
+    rng_state = torch.random.get_rng_state()
+    first = dataset[0]
+    assert torch.equal(torch.random.get_rng_state(), rng_state)
+
+    torch.manual_seed(9876)
+    second = dataset[0]
+    assert torch.equal(first["human_imu"], second["human_imu"])
+    assert torch.equal(first["obj_imu"], second["obj_imu"])
+
+    different_seed_dataset = IMUDataset(
+        data_dir=str(tmp_path),
+        window_size=1,
+        full_sequence=True,
+        simulate_imu_noise=True,
+        simulate_imu_noise_seed=43,
+    )
+    different = different_seed_dataset[0]
+    assert not torch.equal(first["human_imu"], different["human_imu"])
+    assert not torch.equal(first["obj_imu"], different["obj_imu"])

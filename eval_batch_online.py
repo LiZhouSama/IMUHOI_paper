@@ -759,6 +759,23 @@ def _format_metric(results: Dict[str, float], key: str) -> str:
     return f"{value:.4f}" if not np.isnan(value) else "NaN"
 
 
+OBJECT_TRANS_ARCH_CHOICES = (
+    "current",
+    "legacy",
+    "legacy_mesh",
+    "mergeHeads_obs",
+    "imuhoi",
+)
+
+
+def _normalize_object_trans_arch(value: str) -> str:
+    """Normalize CLI/config spelling while retaining the legacy display name."""
+    normalized = str(value).strip().lower()
+    if normalized == "mergeheads_obs":
+        return "mergeHeads_obs"
+    return normalized
+
+
 def _make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate RNN IMUHOI with cross-sequence batched online inference.")
     parser.add_argument("--config", type=str, default="configs/IMUHOI_train_rnn.yaml")
@@ -778,19 +795,25 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--object_trans_arch",
         "--object-trans-arch",
-        choices=("current", "legacy", "legacy_mesh", "mergeHeads_obs"),
+        type=_normalize_object_trans_arch,
+        choices=OBJECT_TRANS_ARCH_CHOICES,
         default=None,
         help=(
-            "ObjectTrans架构；legacy为无prior多head，legacy_mesh为ObsEncoder多head，"
-            "mergeHeads_obs为共享head+ObsEncoder。"
+            "ObjectTrans架构（不区分大小写）；legacy为无prior多head，"
+            "legacy_mesh为ObsEncoder多head，mergeHeads_obs为共享head+ObsEncoder，"
+            "imuhoi为EgoIMU三路融合。"
         ),
     )
     parser.add_argument(
         "--velocity_contact_arch",
         "--velocity-contact-arch",
+        type=normalize_velocity_contact_arch,
         choices=VELOCITY_CONTACT_ARCH_CHOICES,
         default=None,
-        help="VelocityContact架构；legacy不包含interaction boundary模块。",
+        help=(
+            "VelocityContact架构（不区分大小写）；legacy不包含interaction "
+            "boundary模块，imuhoi为EgoIMU VC。"
+        ),
     )
     parser.add_argument(
         "--object_trans_state_feedback",
@@ -823,6 +846,13 @@ def _make_parser() -> argparse.ArgumentParser:
         "--eval-imu-noise",
         action="store_true",
         help="Apply one fixed split-Gaussian IMU noise draw per full sequence before online slicing.",
+    )
+    parser.add_argument(
+        "--simulate_imu_noise_seed",
+        "--simulate-imu-noise-seed",
+        type=int,
+        default=42,
+        help="Base seed for deterministic Dataset IMU noise; sequence path is mixed in.",
     )
     parser.add_argument(
         "--eval_imu_noise_seed",
@@ -859,7 +889,8 @@ def main() -> int:
     print(
         "simulate_imu_noise: "
         f"{'enabled' if args.simulate_imu_noise else 'disabled'}"
-        " (sequence-level)"
+        + (f" | base_seed={args.simulate_imu_noise_seed}" if args.simulate_imu_noise else "")
+        + " (sequence-level)"
     )
 
     try:
@@ -873,12 +904,17 @@ def main() -> int:
     all_results = {}
     resolved_ot_state_feedback = None
     resolved_ot_online_mode = None
+    resolved_ot_arch = None
     for dataset_name, dataset_cfg in dataset_runs:
         print(f"\n=== Batch-online evaluating dataset: {dataset_name} ===")
         config = load_config(args.config)
         config.model_arch = "rnn"
         if args.object_trans_arch is not None:
             config.object_trans_arch = args.object_trans_arch
+        resolved_ot_arch = _normalize_object_trans_arch(
+            getattr(config, "object_trans_arch", "current")
+        )
+        config.object_trans_arch = resolved_ot_arch
         if args.velocity_contact_arch is not None:
             config.velocity_contact_arch = args.velocity_contact_arch
         resolved_vc_arch = normalize_velocity_contact_arch(
@@ -956,6 +992,7 @@ def main() -> int:
             # full_sequence=True makes simulate_imu_noise operate once per sequence,
             # before the online evaluator creates its rolling windows.
             simulate_imu_noise=bool(args.simulate_imu_noise),
+            simulate_imu_noise_seed=args.simulate_imu_noise_seed,
             min_obj_contact_frames=0,
             full_sequence=True,
             resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", False),
@@ -1086,10 +1123,15 @@ def main() -> int:
             "online_batch_size": args.online_batch_size,
             "object_trans_state_feedback": resolved_ot_state_feedback,
             "object_trans_online_mode": resolved_ot_online_mode,
-            "object_trans_arch": args.object_trans_arch or getattr(load_config(args.config), "object_trans_arch", "current"),
+            "object_trans_arch": resolved_ot_arch or _normalize_object_trans_arch(
+                getattr(load_config(args.config), "object_trans_arch", "current")
+            ),
             "velocity_contact_arch": args.velocity_contact_arch or getattr(load_config(args.config), "velocity_contact_arch", "current"),
             "seed": seed,
             "simulate_imu_noise": bool(args.simulate_imu_noise),
+            "simulate_imu_noise_seed": (
+                args.simulate_imu_noise_seed if args.simulate_imu_noise else None
+            ),
             "eval_imu_noise": bool(args.eval_imu_noise),
             "eval_imu_noise_seed": args.eval_imu_noise_seed if args.eval_imu_noise else None,
             "results": all_results,

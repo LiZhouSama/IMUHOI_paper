@@ -19,7 +19,12 @@ from utils.human_pose import (
     append_virtual_palm_rotations,
     select_hand_anchor_positions,
 )
-from utils.utils import _central_diff, _smooth_acceleration
+from utils.utils import (
+    _central_diff,
+    _make_noise_generator,
+    _smooth_acceleration,
+    _stable_sequence_seed,
+)
 
 _VEL_SELECTION_INDEX_LIST = (
     _VEL_SELECTION_INDICES.tolist()
@@ -286,6 +291,7 @@ class IMUDataset(Dataset):
         full_sequence=False,
         imu_noise_cfg=None,
         simulate_imu_noise=False,
+        simulate_imu_noise_seed=None,
         sequence_paths=None,
         obj_points_sample_count=256,
         resolve_bimanual_contact_conflicts=False,
@@ -301,6 +307,7 @@ class IMUDataset(Dataset):
             full_sequence: 是否使用整段模式
             imu_noise_cfg: 可选，IMU 噪声配置（None 使用 Noitom 风格默认值）
             simulate_imu_noise: 是否对合成 IMU 施加真实感噪声模型
+            simulate_imu_noise_seed: 可选基础种子；结合序列路径生成与访问顺序无关的固定噪声
             resolve_bimanual_contact_conflicts: 是否后处理双手同时接触段，清掉骨长变化更大的手部接触标签
             random_window: 窗口模式下是否随机选起点；验证集可关闭以获得可重复曲线
         """
@@ -317,6 +324,7 @@ class IMUDataset(Dataset):
         self.min_obj_contact_frames = min_obj_contact_frames
         self.full_sequence = full_sequence
         self.simulate_imu_noise = simulate_imu_noise
+        self.simulate_imu_noise_seed = simulate_imu_noise_seed
         self.imu_noise_cfg = merge_noise_cfg(imu_noise_cfg)
         self.obj_points_sample_count = int(max(1, obj_points_sample_count))
         self.resolve_bimanual_contact_conflicts = bool(resolve_bimanual_contact_conflicts)
@@ -562,6 +570,11 @@ class IMUDataset(Dataset):
             seq_noise_cfg_raw = seq_data.get("imu_noise_params", None)
             seq_noise_cfg = merge_noise_cfg(seq_noise_cfg_raw) if seq_noise_cfg_raw is not None else self.imu_noise_cfg
             imu_noise_applied = False
+            noise_seed = _stable_sequence_seed(
+                self.simulate_imu_noise_seed,
+                os.path.realpath(os.path.abspath(file_path)),
+            )
+            noise_generator = _make_noise_generator(noise_seed, device)
 
             # --- DynaIP 风格的人体 IMU 与速度处理 ---
             if human_imu_real is not None:
@@ -572,7 +585,13 @@ class IMUDataset(Dataset):
                 if self.simulate_imu_noise:
                     human_acc = human_imu[:, :, :3]
                     human_rot6d = human_imu[:, :, 3:]
-                    human_acc, human_rot6d, _ = apply_imu_noise(human_acc, human_rot6d, FRAME_RATE, seq_noise_cfg)
+                    human_acc, human_rot6d, _ = apply_imu_noise(
+                        human_acc,
+                        human_rot6d,
+                        FRAME_RATE,
+                        seq_noise_cfg,
+                        generator=noise_generator,
+                    )
                     human_imu = torch.cat((human_acc, human_rot6d), dim=-1)
                     imu_noise_applied = True
             joint_vel_root = _compute_joint_velocity_root(rotation_global_full, position_global_full, FRAME_RATE)
@@ -612,7 +631,13 @@ class IMUDataset(Dataset):
                     if self.simulate_imu_noise:
                         obj_acc = obj_imu[:, :3]
                         obj_rot6d = obj_imu[:, 3:]
-                        obj_acc, obj_rot6d, _ = apply_imu_noise(obj_acc, obj_rot6d, FRAME_RATE, seq_noise_cfg)
+                        obj_acc, obj_rot6d, _ = apply_imu_noise(
+                            obj_acc,
+                            obj_rot6d,
+                            FRAME_RATE,
+                            seq_noise_cfg,
+                            generator=noise_generator,
+                        )
                         obj_imu = torch.cat((obj_acc, obj_rot6d), dim=-1)
                         imu_noise_applied = True
                 obj_vel = _central_diff(obj_trans, 1.0 / FRAME_RATE)
