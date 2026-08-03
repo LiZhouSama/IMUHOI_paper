@@ -175,6 +175,7 @@ class IMUHOIObjectTransLoss:
         "hoi_error_r",
         "obj_vel_cons",
         "obj_acc_cons",
+        "gate_weak",
     }
     TEST_LOSS_KEYS = {
         "lhand_obj_direction",
@@ -195,6 +196,7 @@ class IMUHOIObjectTransLoss:
         "hoi_error_r": 0.2,
         "obj_vel_cons": 0.1,
         "obj_acc_cons": 0.01,
+        "gate_weak": 0.0,
     }
 
     def __init__(self, weights=None):
@@ -202,6 +204,26 @@ class IMUHOIObjectTransLoss:
 
     def __call__(self, pred_dict, batch, device):
         return self.compute_loss(pred_dict, batch, device)
+
+    @staticmethod
+    def _build_gate_weak_target(contact_prob, eps=1e-6):
+        """Soft target for [left FK, right FK, IMU motion, static hold]."""
+        p_left = contact_prob[..., 0:1].clamp(0.0, 1.0)
+        p_right = contact_prob[..., 1:2].clamp(0.0, 1.0)
+        p_move = contact_prob[..., 2:3].clamp(0.0, 1.0)
+        p_left_cond = (p_left / p_move.clamp_min(eps)).clamp(0.0, 1.0)
+        p_right_cond = (p_right / p_move.clamp_min(eps)).clamp(0.0, 1.0)
+        no_hand_cond = (1.0 - p_left_cond) * (1.0 - p_right_cond)
+        scores = torch.cat(
+            (
+                p_left,
+                p_right,
+                p_move * no_hand_cond,
+                1.0 - p_move,
+            ),
+            dim=-1,
+        ).clamp_min(eps)
+        return scores / scores.sum(dim=-1, keepdim=True).clamp_min(eps)
 
     @staticmethod
     def _wrist_geometry_targets(
@@ -308,6 +330,53 @@ class IMUHOIObjectTransLoss:
                 zero,
             )
 
+        gate_contact_source = None
+        contact_values = []
+        for key in ("lhand_contact", "rhand_contact", "obj_contact"):
+            value = batch.get(key)
+            if not isinstance(value, torch.Tensor):
+                contact_values = []
+                break
+            value = value.to(device=device, dtype=dtype)
+            if value.shape != (batch_size, seq_len):
+                contact_values = []
+                break
+            contact_values.append(value)
+        if len(contact_values) == 3:
+            gate_contact_source = torch.stack(contact_values, dim=-1)
+        elif isinstance(
+            pred_dict.get("gating_contact_prob"), torch.Tensor
+        ):
+            candidate = pred_dict["gating_contact_prob"]
+            if candidate.shape == (batch_size, seq_len, 3):
+                gate_contact_source = candidate.to(device=device, dtype=dtype)
+
+        gating_weights = pred_dict.get("gating_weights_raw")
+        if (
+            gate_contact_source is not None
+            and isinstance(gating_weights, torch.Tensor)
+            and gating_weights.shape == (batch_size, seq_len, 4)
+        ):
+            target = self._build_gate_weak_target(
+                gate_contact_source
+            ).detach()
+            smoothing = float(
+                self.weights.get("gate_weak_target_smoothing", 0.1)
+            )
+            smoothing = min(max(smoothing, 0.0), 1.0)
+            if smoothing > 0.0:
+                target = (
+                    (1.0 - smoothing) * target
+                    + smoothing / target.shape[-1]
+                )
+            gate_ce = -(
+                target
+                * torch.log(
+                    gating_weights.to(device=device, dtype=dtype).clamp_min(1e-6)
+                )
+            ).sum(dim=-1)
+            losses["gate_weak"] = _masked_mean(gate_ce, obj_mask, zero)
+
         position_global = batch.get("position_global")
         if isinstance(position_global, torch.Tensor):
             position_global = position_global.to(
@@ -376,7 +445,10 @@ class IMUHOIObjectTransLoss:
         weighted = {}
         total = zero.clone()
         for key, value in losses.items():
-            weighted[key] = value * float(self.weights.get(key, 1.0))
+            default_weight = 0.0 if key == "gate_weak" else 1.0
+            weighted[key] = value * float(
+                self.weights.get(key, default_weight)
+            )
             total = total + weighted[key]
         return total, losses, weighted
 

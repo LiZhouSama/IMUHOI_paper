@@ -29,6 +29,7 @@ from eval_IMUHOI import (
     get_default_dataset_config,
 )
 from model.rnn.imuhoi_model import load_model
+from model.rnn.object_trans_IMUHOI import is_imuhoi_object_trans_arch
 from model.rnn.velocity_contact import (
     VELOCITY_CONTACT_ARCH_CHOICES,
     normalize_velocity_contact_arch,
@@ -43,7 +44,7 @@ from model.rnn.online import (
     update_data_inits_from_history,
 )
 from utils.utils import apply_eval_imu_noise_to_sequence, build_model_input_dict, load_config, load_smpl_model
-from utils.dataset_config import resolve_dataset_path
+from utils.dataset_config import get_full_sequence_test_path, resolve_dataset_path
 
 
 TEMPORAL_SAMPLE_KEYS = {
@@ -765,6 +766,7 @@ OBJECT_TRANS_ARCH_CHOICES = (
     "legacy_mesh",
     "mergeHeads_obs",
     "imuhoi",
+    "imuhoi_4heads",
 )
 
 
@@ -797,11 +799,12 @@ def _make_parser() -> argparse.ArgumentParser:
         "--object-trans-arch",
         type=_normalize_object_trans_arch,
         choices=OBJECT_TRANS_ARCH_CHOICES,
-        default=None,
+        default='current',
         help=(
             "ObjectTrans架构（不区分大小写）；legacy为无prior多head，"
             "legacy_mesh为ObsEncoder多head，mergeHeads_obs为共享head+ObsEncoder，"
-            "imuhoi为EgoIMU三路融合。"
+            "imuhoi为EgoIMU原始三路融合，"
+            "imuhoi_4heads为增加静止头的四路融合。"
         ),
     )
     parser.add_argument(
@@ -809,7 +812,7 @@ def _make_parser() -> argparse.ArgumentParser:
         "--velocity-contact-arch",
         type=normalize_velocity_contact_arch,
         choices=VELOCITY_CONTACT_ARCH_CHOICES,
-        default=None,
+        default='current',
         help=(
             "VelocityContact架构（不区分大小写）；legacy不包含interaction "
             "boundary模块，imuhoi为EgoIMU VC。"
@@ -927,7 +930,9 @@ def main() -> int:
             config.object_trans_online_mode = args.object_trans_online_mode
         resolved_ot_state_feedback = bool(getattr(config, "object_trans_state_feedback", False))
         resolved_ot_online_mode = str(getattr(config, "object_trans_online_mode", "window"))
-        ot_refine = (
+        ot_refine = False if is_imuhoi_object_trans_arch(
+            resolved_ot_arch
+        ) else (
             bool(args.ot_refine)
             if args.ot_refine is not None
             else bool(getattr(config, "enable_ot_refine", False))
@@ -970,7 +975,7 @@ def main() -> int:
             print(f"[BatchEval] Skipping '{dataset_name}': {exc}")
             continue
 
-        data_dir_default = dataset_cfg.get("test_path") or dataset_cfg.get("data_dir")
+        data_dir_default = get_full_sequence_test_path(dataset_cfg)
         if data_dir_default is None:
             print(f"[BatchEval] Skipping '{dataset_name}' (no dataset directory configured).")
             continue

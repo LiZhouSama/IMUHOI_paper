@@ -11,8 +11,18 @@ from .base import RNNWithInit
 from .object_trans_legacy import LegacyObjectTransModule
 
 
+IMUHOI_OBJECT_TRANS_ARCHES = frozenset({"imuhoi", "imuhoi_4heads"})
+
+
+def is_imuhoi_object_trans_arch(value) -> bool:
+    return str(value).strip().lower() in IMUHOI_OBJECT_TRANS_ARCHES
+
+
 class IMUHOIObjectTransModule(nn.Module):
     """Original left-FK/right-FK/IMU-integration fusion architecture."""
+
+    GATING_OUTPUT_DIM = 3
+    ARCH_NAME = "IMUHOI"
 
     _slice_optional_time = staticmethod(
         LegacyObjectTransModule._slice_optional_time
@@ -67,7 +77,7 @@ class IMUHOIObjectTransModule(nn.Module):
         )
         self.gating_head = RNNWithInit(
             n_input=9,
-            n_output=3,
+            n_output=self.GATING_OUTPUT_DIM,
             n_hidden=64 * hidden_dim_multiplier,
             n_init=6,
             n_rnn_layer=1,
@@ -78,7 +88,9 @@ class IMUHOIObjectTransModule(nn.Module):
     def validate_checkpoint_state_dict(self, state_dict):
         """Reject checkpoints containing a different ObjectTrans topology."""
         if not isinstance(state_dict, dict):
-            raise ValueError("IMUHOI ObjectTrans checkpoint must contain a state_dict.")
+            raise ValueError(
+                f"{self.ARCH_NAME} ObjectTrans checkpoint must contain a state_dict."
+            )
         normalized = {
             key[7:] if key.startswith("module.") else key: value
             for key, value in state_dict.items()
@@ -98,7 +110,7 @@ class IMUHOIObjectTransModule(nn.Module):
             if mismatched:
                 details.append(f"shape mismatches: {mismatched[:3]}")
             raise ValueError(
-                "Checkpoint is incompatible with the EgoIMU IMUHOI "
+                f"Checkpoint is incompatible with the EgoIMU {self.ARCH_NAME} "
                 "ObjectTrans architecture (" + "; ".join(details) + ")."
             )
 
@@ -250,6 +262,55 @@ class IMUHOIObjectTransModule(nn.Module):
             previous = frame_weights
         return smoothed
 
+    @staticmethod
+    def _build_gating_prior(contact_prob: torch.Tensor, eps: float = 1e-6):
+        """Build the original [left FK, right FK, IMU] contact prior."""
+        p_left = contact_prob[..., 0:1].clamp(0.0, 1.0)
+        p_right = contact_prob[..., 1:2].clamp(0.0, 1.0)
+        prior_imu = 1.0 - torch.maximum(p_left, p_right)
+        return torch.cat((p_left, p_right, prior_imu), dim=-1).clamp_min(eps)
+
+    def _fuse_positions(
+        self,
+        weights,
+        left_fk,
+        right_fk,
+        obj_vel_input,
+        obj_trans_init,
+        prefix,
+        prefix_len,
+    ):
+        """Fuse the original three candidates and expose branch diagnostics."""
+        fused_steps = []
+        imu_steps = []
+        dt = 1.0 / FRAME_RATE
+        for frame in range(weights.shape[1]):
+            if frame < prefix_len:
+                fused_steps.append(prefix[:, frame])
+                imu_steps.append(prefix[:, frame])
+                continue
+            previous = fused_steps[-1] if frame > 0 else obj_trans_init
+            imu_position = previous + obj_vel_input[:, frame] * dt
+            imu_steps.append(imu_position)
+            fused_steps.append(
+                weights[:, frame, 0:1] * left_fk[:, frame]
+                + weights[:, frame, 1:2] * right_fk[:, frame]
+                + weights[:, frame, 2:3] * imu_position
+            )
+        return (
+            torch.stack(fused_steps, dim=1),
+            torch.stack(imu_steps, dim=1),
+            {},
+        )
+
+    def _extra_forward_outputs(self, prior, auxiliary_positions):
+        del prior
+        return auxiliary_positions
+
+    def _mask_gate_diagnostics(self, mask, gate_logits_with_prior, prior):
+        del mask
+        return gate_logits_with_prior, prior
+
     def forward(
         self,
         hand_positions: torch.Tensor,
@@ -376,13 +437,7 @@ class IMUHOIObjectTransModule(nn.Module):
             dtype,
         )
         gate_logits = self.gating_head((gating_input, gating_init))
-        prior_imu = 1.0 - torch.maximum(
-            p_left.squeeze(-1), p_right.squeeze(-1)
-        )
-        prior = torch.stack(
-            (p_left.squeeze(-1), p_right.squeeze(-1), prior_imu),
-            dim=-1,
-        )
+        prior = self._build_gating_prior(pred_hand_contact_prob)
         gate_logits_with_prior = (
             gate_logits
             + self.gating_prior_beta * torch.log(prior.clamp_min(1e-6))
@@ -402,24 +457,15 @@ class IMUHOIObjectTransModule(nn.Module):
             if prefix.dim() == 3 and prefix.shape[0] == batch_size:
                 prefix_len = min(prefix.shape[1], seq_len)
 
-        fused_steps = []
-        imu_steps = []
-        dt = 1.0 / FRAME_RATE
-        for frame in range(seq_len):
-            if frame < prefix_len:
-                fused_steps.append(prefix[:, frame])
-                imu_steps.append(prefix[:, frame])
-                continue
-            previous = fused_steps[-1] if frame > 0 else obj_trans_init
-            imu_position = previous + obj_vel_input[:, frame] * dt
-            imu_steps.append(imu_position)
-            fused_steps.append(
-                weights[:, frame, 0:1] * left_fk[:, frame]
-                + weights[:, frame, 1:2] * right_fk[:, frame]
-                + weights[:, frame, 2:3] * imu_position
-            )
-        fused_pos = torch.stack(fused_steps, dim=1)
-        imu_pos = torch.stack(imu_steps, dim=1)
+        fused_pos, imu_pos, auxiliary_positions = self._fuse_positions(
+            weights,
+            left_fk,
+            right_fk,
+            obj_vel_input,
+            obj_trans_init,
+            prefix,
+            prefix_len,
+        )
 
         velocity = torch.zeros_like(fused_pos)
         acceleration = torch.zeros_like(fused_pos)
@@ -453,11 +499,20 @@ class IMUHOIObjectTransModule(nn.Module):
             batch_mask = mask.reshape(batch_size)
             fused_pos = fused_pos * mask
             imu_pos = imu_pos * mask
+            auxiliary_positions = {
+                key: value * mask
+                for key, value in auxiliary_positions.items()
+            }
             velocity = velocity * mask
             acceleration = acceleration * mask
             weights = weights * mask
             weights_raw = weights_raw * mask
             gate_logits = gate_logits * mask
+            gate_logits_with_prior, prior = self._mask_gate_diagnostics(
+                mask,
+                gate_logits_with_prior,
+                prior,
+            )
             left_fk = left_fk * mask
             right_fk = right_fk * mask
             left_dir = left_dir * mask
@@ -472,7 +527,7 @@ class IMUHOIObjectTransModule(nn.Module):
             left_len0 = left_len0.squeeze(-1)
             right_len0 = right_len0.squeeze(-1)
 
-        return {
+        result = {
             "pred_obj_trans": fused_pos,
             "gating_weights": weights,
             "gating_weights_raw": weights_raw,
@@ -498,12 +553,17 @@ class IMUHOIObjectTransModule(nn.Module):
                 not self.training and self.gating_smoothing_enabled
             ),
         }
+        result.update(self._extra_forward_outputs(prior, auxiliary_positions))
+        return result
 
-    @staticmethod
-    def empty_output(batch_size: int, seq_len: int, device: torch.device):
+    @classmethod
+    def empty_output(cls, batch_size: int, seq_len: int, device: torch.device):
         zeros_pos = torch.zeros(batch_size, seq_len, 3, device=device)
         zeros_scalar = torch.zeros(batch_size, seq_len, device=device)
-        zeros_weights = torch.zeros(batch_size, seq_len, 3, device=device)
+        zeros_weights = torch.zeros(
+            batch_size, seq_len, cls.GATING_OUTPUT_DIM, device=device
+        )
+        zeros_contact = torch.zeros(batch_size, seq_len, 3, device=device)
         return {
             "pred_obj_trans": zeros_pos.clone(),
             "gating_weights": zeros_weights.clone(),
@@ -521,7 +581,7 @@ class IMUHOIObjectTransModule(nn.Module):
             "pred_lhand_obj_trans": zeros_pos.clone(),
             "pred_rhand_obj_trans": zeros_pos.clone(),
             "pred_imu_obj_trans": zeros_pos.clone(),
-            "gating_contact_prob": zeros_weights.clone(),
+            "gating_contact_prob": zeros_contact,
             "init_lhand_oe_ho": torch.zeros(batch_size, 3, device=device),
             "init_rhand_oe_ho": torch.zeros(batch_size, 3, device=device),
             "init_lhand_lb": torch.zeros(batch_size, device=device),
@@ -532,4 +592,9 @@ class IMUHOIObjectTransModule(nn.Module):
 
 ObjectTransModule = IMUHOIObjectTransModule
 
-__all__ = ["IMUHOIObjectTransModule", "ObjectTransModule"]
+__all__ = [
+    "IMUHOI_OBJECT_TRANS_ARCHES",
+    "IMUHOIObjectTransModule",
+    "ObjectTransModule",
+    "is_imuhoi_object_trans_arch",
+]

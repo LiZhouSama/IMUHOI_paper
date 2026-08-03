@@ -41,6 +41,7 @@ from model.rnn.velocity_contact import (
     VELOCITY_CONTACT_ARCH_CHOICES,
     normalize_velocity_contact_arch,
 )
+from model.rnn.object_trans_IMUHOI import is_imuhoi_object_trans_arch
 from utils.dataset_config import (
     get_dataset_configs,
     get_full_sequence_test_path,
@@ -952,6 +953,7 @@ OBJECT_TRANS_ARCH_CHOICES = (
     "legacy_mesh",
     "mergeHeads_obs",
     "imuhoi",
+    "imuhoi_4heads",
 )
 
 
@@ -978,7 +980,8 @@ def _make_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             'ObjectTrans architecture (case-insensitive); imuhoi selects the '
-            'EgoIMU three-branch fusion model.'
+            'original EgoIMU three-branch model and imuhoi_4heads selects the '
+            'static-hold four-branch ablation.'
         ),
     )
     parser.add_argument(
@@ -1006,7 +1009,7 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument('--pred_offset', type=float, nargs=3, default=[0.0, 0.0, 0.0], help='Prediction translation offset')
     parser.add_argument('--overlay_frames', type=int, nargs='+', default=None, help='Overlay selected 0-based frames in one scene')
     parser.add_argument('--no_trans', action='store_true', help='Enable noTrans mode')
-    parser.add_argument('--inference_mode', '--inference-mode', choices=['online', 'offline'], default='offline', help='RNN inference mode')
+    parser.add_argument('--inference_mode', '--inference-mode', choices=['online', 'offline'], default='online', help='RNN inference mode')
     parser.add_argument('--online_window', '--online-window', type=int, default=None, help='RNN online sliding window size')
     noise_group = parser.add_mutually_exclusive_group()
     noise_group.add_argument(
@@ -1115,7 +1118,7 @@ def main():
     print(f"VelocityContact architecture: {config.velocity_contact_arch}")
     ot_refine = (
         False
-        if str(config.object_trans_arch).lower() == 'imuhoi'
+        if is_imuhoi_object_trans_arch(config.object_trans_arch)
         else (
             bool(args.ot_refine)
             if args.ot_refine is not None

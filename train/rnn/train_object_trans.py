@@ -28,7 +28,13 @@ from model.rnn.velocity_contact import (
     normalize_velocity_contact_arch,
 )
 from model.rnn.object_trans_legacy import LegacyObjectTransModule
-from model.rnn.object_trans_IMUHOI import IMUHOIObjectTransModule
+from model.rnn.object_trans_IMUHOI import (
+    IMUHOIObjectTransModule,
+    is_imuhoi_object_trans_arch,
+)
+from model.rnn.object_trans_IMUHOI_4heads import (
+    IMUHOI4HeadsObjectTransModule,
+)
 from model.rnn.object_trans_legacy_mesh import LegacyMeshObjectTransModule
 from model.rnn.object_trans_mergeHeads_obsEncoder import (
     ObjectTransModule as MergeHeadsObsObjectTransModule,
@@ -74,6 +80,23 @@ except Exception:
     SummaryWriter = None
 
 
+OBJECT_TRANS_ARCH_CHOICES = (
+    'current',
+    'legacy',
+    'legacy_mesh',
+    'mergeHeads_obs',
+    'imuhoi',
+    'imuhoi_4heads',
+)
+
+
+def _normalize_object_trans_arch(value):
+    normalized = str(value).strip().lower()
+    if normalized == 'mergeheads_obs':
+        return 'mergeHeads_obs'
+    return normalized
+
+
 def get_args():
     """获取命令行参数"""
     parser = get_base_args()
@@ -99,18 +122,13 @@ def get_args():
     parser.add_argument(
         '--object_trans_arch', '--object-trans-arch',
         dest='object_trans_arch',
-        choices=[
-            'current',
-            'legacy',
-            'legacy_mesh',
-            'mergeHeads_obs',
-            'IMUHOI',
-            'imuhoi',
-        ],
+        type=_normalize_object_trans_arch,
+        choices=OBJECT_TRANS_ARCH_CHOICES,
         default=None,
         help=(
             'ObjectTrans架构；legacy为四路无prior多head，IMUHOI为EgoIMU'
-            '三路接触先验融合，legacy_mesh为ObsEncoder多head，'
+            '原始三路融合，IMUHOI_4heads为增加静止头的四路融合，'
+            'legacy_mesh为ObsEncoder多head，'
             'mergeHeads_obs为共享head+ObsEncoder'
         ),
     )
@@ -185,7 +203,7 @@ def _joint_trainable_modules(object_trans_arch, joint_train):
     """Return (hp_trainable, vc_trainable) for the requested joint stage."""
     if not joint_train:
         return False, False
-    if str(object_trans_arch).strip().lower() == "imuhoi":
+    if is_imuhoi_object_trans_arch(object_trans_arch):
         return True, False
     return False, True
 
@@ -207,9 +225,8 @@ class Stage3JointTrainer:
         self.cfg = cfg
         self.device = torch.device(cfg.device)
         self.joint_train = joint_train
-        self.imuhoi_arch = (
-            str(getattr(cfg, "object_trans_arch", "current")).strip().lower()
-            == "imuhoi"
+        self.imuhoi_arch = is_imuhoi_object_trans_arch(
+            getattr(cfg, "object_trans_arch", "current")
         )
         self.vc_model = vc_model.to(self.device)
         self.hp_model = hp_model.to(self.device)
@@ -1044,7 +1061,9 @@ def _run_auto_joint_train(cfg, trainer, train_loader, test_loader, base_lr):
     )
 
     print("=" * 50)
-    if str(getattr(cfg, "object_trans_arch", "")).lower() == "imuhoi":
+    if is_imuhoi_object_trans_arch(
+        getattr(cfg, "object_trans_arch", "")
+    ):
         print("自动联合训练: HumanPose + IMUHOI ObjectTrans")
     else:
         print("自动联合训练: ObjectTrans + VelocityContact")
@@ -1094,6 +1113,8 @@ def main():
         cfg.object_trans_arch = 'mergeHeads_obs'
     elif normalized_ot_arch == 'imuhoi':
         cfg.object_trans_arch = 'imuhoi'
+    elif normalized_ot_arch == 'imuhoi_4heads':
+        cfg.object_trans_arch = 'imuhoi_4heads'
     if cfg.object_trans_arch == 'mergeHeads_obs':
         # Persist the architecture's resolved fixed dimensions so the run
         # snapshot describes the actual checkpoint shapes.
@@ -1126,6 +1147,8 @@ def main():
         module_name = 'object_trans_legacy'
     elif cfg.object_trans_arch == 'imuhoi':
         module_name = 'object_trans_IMUHOI'
+    elif cfg.object_trans_arch == 'imuhoi_4heads':
+        module_name = 'object_trans_IMUHOI_4heads'
     elif cfg.object_trans_arch == 'legacy_mesh':
         module_name = 'object_trans_legacy_mesh'
     elif cfg.object_trans_arch == 'mergeHeads_obs':
@@ -1220,6 +1243,8 @@ def main():
         ot_model_cls = LegacyObjectTransModule
     elif cfg.object_trans_arch == 'imuhoi':
         ot_model_cls = IMUHOIObjectTransModule
+    elif cfg.object_trans_arch == 'imuhoi_4heads':
+        ot_model_cls = IMUHOI4HeadsObjectTransModule
     elif cfg.object_trans_arch == 'legacy_mesh':
         ot_model_cls = LegacyMeshObjectTransModule
     elif cfg.object_trans_arch == 'mergeHeads_obs':

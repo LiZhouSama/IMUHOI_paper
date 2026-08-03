@@ -42,8 +42,9 @@ enable_ot_lb_prior: false
 
 # EgoIMU IMUHOI architecture options. Select them with:
 #   --velocity_contact_arch IMUHOI --object_trans_arch IMUHOI
-# The three-way OT has no human-refinement module; these weights reproduce the
-# original IMUHOI stage losses without changing the newer architectures.
+#   --velocity_contact_arch IMUHOI --object_trans_arch IMUHOI_4heads
+# IMUHOI is the original three-way left-FK/right-FK/IMU fusion. IMUHOI_4heads
+# adds static hold; gate_weak applies only to that four-head ablation.
 gating_prior_beta: 5.0
 gating_temperature: 5.0
 gating_smoothing_enabled: false
@@ -62,6 +63,8 @@ imuhoi_loss_weights:
   hoi_error_r: 0.2
   obj_vel_cons: 0.1
   obj_acc_cons: 0.01
+  gate_weak: 0.1
+  gate_weak_target_smoothing: 0.1
 
 # ============ 在线接触段 l_b 统计先验（OT arch v6，替代 VQ/Diffusion prior）============
 # 在线：从已累计的预测历史中统计接触帧 ||pred_obj_trans - hand|| 的 [q10,q50,q90]，
@@ -277,6 +280,6 @@ test:
 # 与 object_trans checkpoint 均为旧架构，加载会被显式拒绝——需先重训 Stage2/Stage3
 # 并把路径替换为新产物（human_pose 不受影响）。
 pretrained_modules:
-  human_pose:       "outputs/IMUHOI_RNN_2/rnn_sequential_seq_20260728_214819/human_pose_07282148_seq_20260728_214819/best.pt"
-  velocity_contact: "outputs/IMUHOI_RNN_2/object_trans_07222103/best_velocity_contact.pt"
-  object_trans:     "outputs/IMUHOI_RNN_2/object_trans_07222103/best_object_trans.pt"
+  human_pose:       null
+  velocity_contact: null
+  object_trans:     null

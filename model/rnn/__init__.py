@@ -9,7 +9,12 @@ from .velocity_contact import (
     normalize_velocity_contact_arch,
 )
 from .velocity_contact_IMUHOI import IMUHOIVelocityContactModule
-from .object_trans_IMUHOI import IMUHOIObjectTransModule
+from .object_trans_IMUHOI import (
+    IMUHOI_OBJECT_TRANS_ARCHES,
+    IMUHOIObjectTransModule,
+    is_imuhoi_object_trans_arch,
+)
+from .object_trans_IMUHOI_4heads import IMUHOI4HeadsObjectTransModule
 from .velocity_contact_legacy import LegacyVelocityContactModule
 from .human_pose import HumanPoseModule
 from .object_trans import ObjectTransModule
@@ -30,6 +35,9 @@ __all__ = [
     'normalize_velocity_contact_arch',
     'IMUHOIVelocityContactModule',
     'IMUHOIObjectTransModule',
+    'IMUHOI4HeadsObjectTransModule',
+    'IMUHOI_OBJECT_TRANS_ARCHES',
+    'is_imuhoi_object_trans_arch',
     'HumanPoseModule',
     'ObjectTransModule',
     'MergeHeadsObsObjectTransModule',

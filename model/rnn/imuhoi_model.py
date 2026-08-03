@@ -16,7 +16,11 @@ from .velocity_contact import (
 from .human_pose import HumanPoseModule
 from .object_trans import ObjectTransModule
 from .object_trans_legacy import LegacyObjectTransModule
-from .object_trans_IMUHOI import IMUHOIObjectTransModule
+from .object_trans_IMUHOI import (
+    IMUHOIObjectTransModule,
+    is_imuhoi_object_trans_arch,
+)
+from .object_trans_IMUHOI_4heads import IMUHOI4HeadsObjectTransModule
 from .object_trans_legacy_mesh import LegacyMeshObjectTransModule
 from .object_trans_mergeHeads_obsEncoder import (
     ObjectTransModule as MergeHeadsObsObjectTransModule,
@@ -187,6 +191,8 @@ class IMUHOIModel(nn.Module):
             self.object_trans_module = LegacyObjectTransModule(cfg)
         elif self.object_trans_arch == "imuhoi":
             self.object_trans_module = IMUHOIObjectTransModule(cfg)
+        elif self.object_trans_arch == "imuhoi_4heads":
+            self.object_trans_module = IMUHOI4HeadsObjectTransModule(cfg)
         elif self.object_trans_arch == "legacy_mesh":
             self.object_trans_module = LegacyMeshObjectTransModule(cfg)
         elif self.object_trans_arch == "mergeheads_obs":
@@ -196,6 +202,7 @@ class IMUHOIModel(nn.Module):
         else:
             raise ValueError(
                 "object_trans_arch must be 'current', 'legacy', 'imuhoi', "
+                "'imuhoi_4heads', "
                 "'legacy_mesh', or 'mergeHeads_obs', "
                 f"got {self.object_trans_arch!r}"
             )
@@ -287,7 +294,9 @@ class IMUHOIModel(nn.Module):
         hp_out: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
         """Use wrists for the EgoIMU IMUHOI OT and palms for newer OTs."""
-        if getattr(self, "object_trans_arch", "current") == "imuhoi":
+        if is_imuhoi_object_trans_arch(
+            getattr(self, "object_trans_arch", "current")
+        ):
             wrist_pos = hp_out.get("pred_hand_glb_pos")
             if isinstance(wrist_pos, torch.Tensor):
                 return wrist_pos
@@ -410,7 +419,9 @@ class IMUHOIModel(nn.Module):
             print(f"Warning: failed to recompute refined human outputs: {exc}")
 
     def _resolve_refine_human(self, refine_human: Optional[bool]) -> bool:
-        if getattr(self, "object_trans_arch", "current") == "imuhoi":
+        if is_imuhoi_object_trans_arch(
+            getattr(self, "object_trans_arch", "current")
+        ):
             return False
         if refine_human is None:
             return bool(getattr(self.cfg, "enable_ot_refine", False))

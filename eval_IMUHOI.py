@@ -43,6 +43,7 @@ from model.rnn.velocity_contact import (
     VELOCITY_CONTACT_ARCH_CHOICES,
     normalize_velocity_contact_arch,
 )
+from model.rnn.object_trans_IMUHOI import is_imuhoi_object_trans_arch
 from utils.dataset_config import (
     get_dataset_configs,
     get_full_sequence_test_path,
@@ -60,6 +61,23 @@ from configs import (
     _REDUCED_POSE_NAMES,
     _SENSOR_ROT_INDICES,
 )
+
+
+OBJECT_TRANS_ARCH_CHOICES = (
+    "current",
+    "legacy",
+    "legacy_mesh",
+    "mergeHeads_obs",
+    "imuhoi",
+    "imuhoi_4heads",
+)
+
+
+def _normalize_object_trans_arch(value):
+    normalized = str(value).strip().lower()
+    if normalized == "mergeheads_obs":
+        return "mergeHeads_obs"
+    return normalized
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -799,6 +817,17 @@ def main():
     parser.add_argument("--interaction_ckpt", type=str, default=None, help="覆盖 Interaction/Object checkpoint")
     parser.add_argument("--vc_ckpt", type=str, default=None, help="覆盖 VelocityContact checkpoint")
     parser.add_argument(
+        "--object_trans_arch",
+        "--object-trans-arch",
+        type=_normalize_object_trans_arch,
+        choices=OBJECT_TRANS_ARCH_CHOICES,
+        default=None,
+        help=(
+            "ObjectTrans架构；imuhoi为EgoIMU原始三路融合，"
+            "imuhoi_4heads为增加静止头的四路融合。"
+        ),
+    )
+    parser.add_argument(
         "--velocity_contact_arch", "--velocity-contact-arch",
         dest="velocity_contact_arch",
         type=str.lower,
@@ -879,6 +908,7 @@ def main():
         f"online_mode={args.object_trans_online_mode or 'config'}"
     )
     print(f"VelocityContact architecture: {args.velocity_contact_arch or 'config/default'}")
+    print(f"ObjectTrans architecture: {args.object_trans_arch or 'config/default'}")
     seed = _set_eval_seed(args.seed)
     print(f"Eval seed: {seed if seed is not None else 'unset'}")
     print(
@@ -918,7 +948,14 @@ def main():
         config.velocity_contact_arch = normalize_velocity_contact_arch(
             getattr(config, "velocity_contact_arch", "current")
         )
-        ot_refine = (
+        if args.object_trans_arch is not None:
+            config.object_trans_arch = args.object_trans_arch
+        config.object_trans_arch = _normalize_object_trans_arch(
+            getattr(config, "object_trans_arch", "current")
+        )
+        ot_refine = False if is_imuhoi_object_trans_arch(
+            getattr(config, "object_trans_arch", "current")
+        ) else (
             bool(args.ot_refine)
             if args.ot_refine is not None
             else bool(getattr(config, "enable_ot_refine", False))
@@ -967,6 +1004,7 @@ def main():
             device,
             no_trans=args.no_trans,
             module_paths=module_paths,
+            object_trans_arch=args.object_trans_arch,
             velocity_contact_arch=args.velocity_contact_arch,
         )
         model_kind = _infer_model_kind(model)
@@ -1128,6 +1166,7 @@ def main():
             "object_trans_state_feedback_override": args.object_trans_state_feedback,
             "object_trans_online_mode_override": args.object_trans_online_mode,
             "velocity_contact_arch": args.velocity_contact_arch or getattr(load_config(args.config), "velocity_contact_arch", "current"),
+            "object_trans_arch": args.object_trans_arch or getattr(load_config(args.config), "object_trans_arch", "current"),
             "seed": seed,
             "results": all_results,
         }
