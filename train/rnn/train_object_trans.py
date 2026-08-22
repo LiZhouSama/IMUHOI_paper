@@ -43,6 +43,7 @@ from model.rnn.lb_vq_diffusion import FrozenLBPriorPredictor
 from train.rnn.loss import (
     HumanPoseLoss,
     VelocityContactLoss,
+    V2VelocityContactLoss,
     ObjectTransLoss,
     IMUHOIObjectTransLoss,
 )
@@ -61,6 +62,7 @@ from train.rnn.train_utils import (
     setup_device,
     create_save_dir,
     create_dataloaders,
+    prime_dataloader_workers,
     build_model_input_dict,
     flatten_lstm_parameters,
     save_config_snapshot,
@@ -72,6 +74,8 @@ from train.rnn.train_utils import (
     _capture_rng_state,
     _restore_rng_state,
     _torch_load_checkpoint,
+    autocast,
+    resolve_amp_settings,
 )
 from torch.nn.utils import clip_grad_norm_
 try:
@@ -146,13 +150,6 @@ def get_args():
         choices=['none', 'fused'],
         default=None,
         help='覆盖 OT 融合状态反馈开关；none=shared-head无反馈，fused=显式OT state feedback',
-    )
-    parser.add_argument(
-        '--object_trans_online_mode', '--object-trans-online-mode',
-        dest='object_trans_online_mode',
-        choices=['window', 'stateful'],
-        default=None,
-        help='记录到本次配置快照的 OT online 评测模式；训练本身始终使用完整序列扫描',
     )
 
     return parser.parse_args()
@@ -349,8 +346,8 @@ class Stage3JointTrainer:
         self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
             self.optimizer, milestones=cfg.milestones, gamma=cfg.gamma
         )
-        # Stage3/joint 训练是纯 fp32：此前挂着的 GradScaler 没有配套 autocast，
-        # 只是误导性的空转，已移除；换成与其它 stage 一致的梯度裁剪。
+        self.amp_enabled, self.amp_dtype = resolve_amp_settings(cfg, self.device)
+        print(f"AMP: enabled={self.amp_enabled}, dtype={self.amp_dtype}")
         self.gradient_clip = float(getattr(cfg, "gradient_clip", 1.0))
         if self.resume_checkpoint is not None:
             self._restore_training_state(self.resume_checkpoint)
@@ -396,11 +393,17 @@ class Stage3JointTrainer:
                 weights=imuhoi_weights
             )
         else:
-            self.vc_loss_fn = (
-                VelocityContactLoss(weights=loss_weights)
-                if joint_train
-                else None
-            )
+            if joint_train:
+                self.vc_loss_fn = (
+                    V2VelocityContactLoss(weights=loss_weights)
+                    if str(getattr(cfg, "velocity_contact_arch", "current"))
+                    .strip()
+                    .lower()
+                    == "v2"
+                    else VelocityContactLoss(weights=loss_weights)
+                )
+            else:
+                self.vc_loss_fn = None
             self.hp_loss_fn = None
             self.ot_loss_fn = ObjectTransLoss(weights=loss_weights)
 
@@ -541,22 +544,8 @@ class Stage3JointTrainer:
                 gt_hp = build_gt_human_pose_outputs(batch, self.device, dtype=hp_out['pred_hand_glb_pos'].dtype)
             gt_vc = build_gt_velocity_contact_outputs(batch, self.device, dtype=vc_out['pred_obj_vel'].dtype)
             if mix_mask is None:
-                gt_hand_positions = (
-                    gt_hp["pred_hand_glb_pos"]
-                    if self.imuhoi_arch
-                    else gt_hp.get(
-                        "pred_palm_glb_pos",
-                        gt_hp["pred_hand_glb_pos"],
-                    )
-                )
-                pred_hand_positions = (
-                    hp_out["pred_hand_glb_pos"]
-                    if self.imuhoi_arch
-                    else hp_out.get(
-                        "pred_palm_glb_pos",
-                        hp_out["pred_hand_glb_pos"],
-                    )
-                )
+                gt_hand_positions = gt_hp["pred_palm_glb_pos"]
+                pred_hand_positions = hp_out["pred_palm_glb_pos"]
                 hand_positions, mix_mask = sample_mix_tensor(
                     gt_hand_positions,
                     pred_hand_positions,
@@ -564,22 +553,8 @@ class Stage3JointTrainer:
                     return_mask=True,
                 )
             else:
-                gt_hand_positions = (
-                    gt_hp["pred_hand_glb_pos"]
-                    if self.imuhoi_arch
-                    else gt_hp.get(
-                        "pred_palm_glb_pos",
-                        gt_hp["pred_hand_glb_pos"],
-                    )
-                )
-                pred_hand_positions = (
-                    hp_out["pred_hand_glb_pos"]
-                    if self.imuhoi_arch
-                    else hp_out.get(
-                        "pred_palm_glb_pos",
-                        hp_out["pred_hand_glb_pos"],
-                    )
-                )
+                gt_hand_positions = gt_hp["pred_palm_glb_pos"]
+                pred_hand_positions = hp_out["pred_palm_glb_pos"]
                 hand_positions = sample_mix_tensor(
                     gt_hand_positions,
                     pred_hand_positions,
@@ -611,14 +586,7 @@ class Stage3JointTrainer:
                 mask=mix_mask,
             )
         else:
-            hand_positions = (
-                hp_out["pred_hand_glb_pos"]
-                if self.imuhoi_arch
-                else hp_out.get(
-                    "pred_palm_glb_pos",
-                    hp_out["pred_hand_glb_pos"],
-                )
-            )
+            hand_positions = hp_out["pred_palm_glb_pos"]
             contact_prob = vc_out['pred_hand_contact_prob']
             obj_vel_input = vc_out['pred_obj_vel']
             human_pose_input = hp_out.get('p_pred')
@@ -688,44 +656,46 @@ class Stage3JointTrainer:
             for batch in train_iter:
                 data_dict = build_model_input_dict(batch, self.cfg, self.device, add_noise=True)
 
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
 
-                results, vc_out, hp_out, ot_out = self.forward_all(data_dict, batch=batch, epoch=epoch, training=True)
-
-                # 计算损失
-                losses = {}
-                ot_losses = {}
-                vc_losses = {}
-                hp_losses = {}
-
-                if self.joint_train and self.vc_trainable and self.vc_loss_fn:
-                    vc_loss, vc_losses, vc_weighted_losses = self.vc_loss_fn(vc_out, batch, self.device)
-                    losses.update({f'vc_{k}': v for k, v in vc_weighted_losses.items()})
-                else:
-                    vc_loss = torch.tensor(0.0, device=self.device)
-                    vc_weighted_losses = {}
-
-                if self.hp_trainable and self.hp_loss_fn:
-                    hp_loss, hp_losses, hp_weighted_losses = self.hp_loss_fn(
-                        hp_out,
-                        batch,
-                        self.device,
+                with autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
+                    results, vc_out, hp_out, ot_out = self.forward_all(
+                        data_dict, batch=batch, epoch=epoch, training=True
                     )
-                    losses.update(
-                        {
-                            f"hp_{key}": value
-                            for key, value in hp_weighted_losses.items()
-                        }
+
+                    losses = {}
+                    ot_losses = {}
+                    vc_losses = {}
+                    hp_losses = {}
+
+                    if self.joint_train and self.vc_trainable and self.vc_loss_fn:
+                        vc_loss, vc_losses, vc_weighted_losses = self.vc_loss_fn(vc_out, batch, self.device)
+                        losses.update({f'vc_{k}': v for k, v in vc_weighted_losses.items()})
+                    else:
+                        vc_loss = torch.tensor(0.0, device=self.device)
+                        vc_weighted_losses = {}
+
+                    if self.hp_trainable and self.hp_loss_fn:
+                        hp_loss, hp_losses, hp_weighted_losses = self.hp_loss_fn(
+                            hp_out,
+                            batch,
+                            self.device,
+                        )
+                        losses.update(
+                            {
+                                f"hp_{key}": value
+                                for key, value in hp_weighted_losses.items()
+                            }
+                        )
+                    else:
+                        hp_loss = torch.tensor(0.0, device=self.device)
+                        hp_weighted_losses = {}
+
+                    ot_loss, ot_losses, ot_weighted_losses = self.ot_loss_fn(
+                        ot_out, batch, self.device
                     )
-                else:
-                    hp_loss = torch.tensor(0.0, device=self.device)
-                    hp_weighted_losses = {}
-
-                ot_loss, ot_losses, ot_weighted_losses = self.ot_loss_fn(ot_out, batch, self.device)
-                losses.update({f'ot_{k}': v for k, v in ot_weighted_losses.items()})
-
-                # 总损失
-                batch_loss = hp_loss + vc_loss + ot_loss
+                    losses.update({f'ot_{k}': v for k, v in ot_weighted_losses.items()})
+                    batch_loss = hp_loss + vc_loss + ot_loss
 
                 batch_loss.backward()
                 if self.gradient_clip > 0:
@@ -802,33 +772,36 @@ class Stage3JointTrainer:
 
             for batch in test_iter:
                 data_dict = build_model_input_dict(batch, self.cfg, self.device, add_noise=False)
-                results, vc_out, hp_out, ot_out = self.forward_all(data_dict, batch=batch, epoch=epoch, training=False)
-
-                # 计算测试损失
-                vc_loss = torch.tensor(0.0, device=self.device)
-                vc_losses = {}
-                if self.joint_train and self.vc_trainable and self.vc_loss_fn:
-                    vc_loss, vc_losses, _ = self.vc_loss_fn(vc_out, batch, self.device)
-
-                hp_loss = torch.tensor(0.0, device=self.device)
-                hp_losses = {}
-                if self.hp_trainable and self.hp_loss_fn:
-                    _, _, hp_weighted = self.hp_loss_fn(
-                        hp_out,
-                        batch,
-                        self.device,
+                with autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
+                    results, vc_out, hp_out, ot_out = self.forward_all(
+                        data_dict, batch=batch, epoch=epoch, training=False
                     )
-                    hp_losses = {
-                        key: value
-                        for key, value in hp_weighted.items()
-                        if key in self.hp_loss_fn.TEST_LOSS_KEYS
-                    }
-                    if hp_losses:
-                        hp_loss = sum(hp_losses.values())
 
-                ot_loss, ot_losses = self.ot_loss_fn.compute_test_loss(ot_out, batch, self.device)
+                    vc_loss = torch.tensor(0.0, device=self.device)
+                    vc_losses = {}
+                    if self.joint_train and self.vc_trainable and self.vc_loss_fn:
+                        vc_loss, vc_losses, _ = self.vc_loss_fn(vc_out, batch, self.device)
 
-                combined_loss = ot_loss + vc_loss + hp_loss
+                    hp_loss = torch.tensor(0.0, device=self.device)
+                    hp_losses = {}
+                    if self.hp_trainable and self.hp_loss_fn:
+                        _, _, hp_weighted = self.hp_loss_fn(
+                            hp_out,
+                            batch,
+                            self.device,
+                        )
+                        hp_losses = {
+                            key: value
+                            for key, value in hp_weighted.items()
+                            if key in self.hp_loss_fn.TEST_LOSS_KEYS
+                        }
+                        if hp_losses:
+                            hp_loss = sum(hp_losses.values())
+
+                    ot_loss, ot_losses = self.ot_loss_fn.compute_test_loss(
+                        ot_out, batch, self.device
+                    )
+                    combined_loss = ot_loss + vc_loss + hp_loss
                 total_loss += combined_loss.item()
                 for key, value in ot_losses.items():
                     if isinstance(value, torch.Tensor):
@@ -1046,6 +1019,9 @@ def _run_auto_joint_train(cfg, trainer, train_loader, test_loader, base_lr):
     joint_cfg.joint_train = True
     joint_cfg.epochs = joint_epochs
     joint_cfg.milestones = joint_milestones
+    joint_cfg.eval_interval = max(
+        1, int(getattr(cfg, "joint_train_eval_interval", cfg.eval_interval))
+    )
     joint_cfg.lr = float(base_lr) * 0.1
     joint_cfg.resume_dir = None
 
@@ -1100,10 +1076,6 @@ def main():
         cfg.object_trans_state_feedback = args.object_trans_state_feedback == 'fused'
     elif not hasattr(cfg, 'object_trans_state_feedback'):
         cfg.object_trans_state_feedback = False
-    if args.object_trans_online_mode is not None:
-        cfg.object_trans_online_mode = args.object_trans_online_mode
-    elif not hasattr(cfg, 'object_trans_online_mode'):
-        cfg.object_trans_online_mode = 'window'
     if args.object_trans_arch is not None:
         cfg.object_trans_arch = args.object_trans_arch
     elif not hasattr(cfg, 'object_trans_arch'):
@@ -1157,8 +1129,12 @@ def main():
         module_name = 'object_trans'
     if cfg.velocity_contact_arch == "legacy":
         module_name = f"{module_name}_vc_legacy"
+    elif cfg.velocity_contact_arch in {"v2", "v3", "v4"}:
+        module_name = f"{module_name}_vc_{cfg.velocity_contact_arch}"
     elif cfg.velocity_contact_arch == "imuhoi":
         module_name = f"{module_name}_vc_IMUHOI"
+    elif cfg.velocity_contact_arch.startswith("imuhoi_cond"):
+        module_name = f"{module_name}_vc_{cfg.velocity_contact_arch}"
     save_dir = create_save_dir(cfg, module_name)
     save_config_snapshot(cfg)
 
@@ -1176,11 +1152,6 @@ def main():
     print(
         "OT state feedback: "
         f"{'enabled' if bool(getattr(cfg, 'object_trans_state_feedback', False)) else 'disabled'}"
-    )
-    print(
-        "OT online mode snapshot: "
-        f"{getattr(cfg, 'object_trans_online_mode', 'window')} "
-        "(Stage3/joint training always scans complete training windows)"
     )
     print(f"保存目录: {save_dir}")
     print("=" * 50)
@@ -1219,6 +1190,7 @@ def main():
 
     # 创建数据加载器
     train_loader, test_loader = create_dataloaders(cfg)
+    prime_dataloader_workers(train_loader, test_loader)
 
     if train_loader is None or len(train_loader) == 0:
         print("错误: 无法创建训练数据加载器")

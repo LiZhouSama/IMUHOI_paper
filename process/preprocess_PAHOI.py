@@ -1,6 +1,7 @@
 import argparse
 import os
 import re
+import shutil
 import struct
 import zlib
 from dataclasses import dataclass
@@ -11,9 +12,13 @@ import numpy as np
 import torch
 from scipy.spatial.transform import Rotation
 from tqdm import tqdm
+from utils.human_pose import (
+    build_smpl24_joint_positions,
+    ensure_smpl24_local_rotations,
+    local_rotations_to_global,
+)
 
 from human_body_prior.body_model.body_model import BodyModel
-from human_body_prior.tools.rotation_tools import local2global_pose
 import pytorch3d.transforms as transforms
 
 try:
@@ -24,9 +29,11 @@ try:
         compute_foot_contact_labels,
         compute_improved_contact_labels,
         load_object_canonical_points,
+        precompute_sequence_features,
         postprocess_sequence_contact_labels,
         resolve_object_mesh_path,
         saved_contact_postprocess_matches,
+        split_unified_by_json,
         write_contact_skip_manifest,
     )
 except ModuleNotFoundError:
@@ -37,9 +44,11 @@ except ModuleNotFoundError:
         compute_foot_contact_labels,
         compute_improved_contact_labels,
         load_object_canonical_points,
+        precompute_sequence_features,
         postprocess_sequence_contact_labels,
         resolve_object_mesh_path,
         saved_contact_postprocess_matches,
+        split_unified_by_json,
         write_contact_skip_manifest,
     )
 
@@ -490,9 +499,6 @@ def compute_motion_features(
     local_chunks: List[torch.Tensor] = []
     global_chunks: List[torch.Tensor] = []
 
-    kintree_table = bm.kintree_table[0].long()[:22]
-    kintree_table[0] = -1
-
     with torch.no_grad():
         for start, end in iter_slices(root_orient.shape[0], chunk_len):
             root_t = torch.tensor(root_orient[start:end], dtype=torch.float32, device=device)
@@ -506,19 +512,23 @@ def compute_motion_features(
                 trans=trans_t,
                 betas=betas_t,
             )
-            position_chunks.append(body_out.Jtr[:, :22, :].detach().cpu().float())
+            position_chunks.append(
+                build_smpl24_joint_positions(body_out.Jtr).detach().cpu().float()
+            )
 
             pose_aa = torch.cat([root_t, body_t], dim=1)
             local_rot_mat = transforms.axis_angle_to_matrix(pose_aa.reshape(-1, 3)).reshape(
                 pose_aa.shape[0], -1, 3, 3
             )
-            rotation_local_6d = transforms.matrix_to_rotation_6d(local_rot_mat).reshape(pose_aa.shape[0], -1)
-            rotation_global = local2global_pose(
-                local_rot_mat.reshape(local_rot_mat.shape[0], -1, 9),
-                kintree_table,
-            ).reshape(local_rot_mat.shape[0], -1, 3, 3)
+            local_rot_mat = ensure_smpl24_local_rotations(local_rot_mat)
+            pose_aa = pose_aa.reshape(pose_aa.shape[0], -1, 3)
+            pose_aa = torch.cat(
+                (pose_aa, torch.zeros(pose_aa.shape[0], 2, 3, device=device)),
+                dim=1,
+            )
+            rotation_global = local_rotations_to_global(local_rot_mat)
 
-            local_chunks.append(rotation_local_6d.detach().cpu().float())
+            local_chunks.append(pose_aa.detach().cpu().float())
             global_chunks.append(rotation_global.detach().cpu().float())
 
             del body_out, root_t, body_t, trans_t, betas_t, pose_aa, local_rot_mat
@@ -739,7 +749,7 @@ def process_pahoi_sequence(
         "object_label": object_label,
         "object_weight": str(metadata["object_weight"]),
         "action": str(metadata["action"]),
-        "rotation_local_full_gt_list": rotation_local.float(),
+        "pose": rotation_local.reshape(T, -1).float(),
         "position_global_full_gt_world": position_global.float(),
         "rotation_global": rotation_global.float(),
         "trans": torch.from_numpy(trans).float(),
@@ -752,7 +762,6 @@ def process_pahoi_sequence(
         "obj_mesh_name": mesh_name,
         "obj_mesh_path": os.path.relpath(mesh_path, Path.cwd()),
         "obj_points_canonical": canonical_points.half().cpu(),
-        "obj_points_sample_count": int(canonical_points.shape[0]),
         "has_object": True,
         "obj_scale": torch.ones(T, dtype=torch.float32),
         "obj_trans": obj_trans_t.detach().cpu().float(),
@@ -761,7 +770,6 @@ def process_pahoi_sequence(
         "smpl_root_world": torch.from_numpy(smpl_root_world).float(),
         "bvh_to_smpl_offset": torch.from_numpy(bvh_to_smpl_offset).float(),
         "obj_rot": obj_rot_t.detach().cpu().float(),
-        "obj_com_pos": obj_trans_t.detach().cpu().float(),
         "lhand_contact": lhand_contact.cpu().bool(),
         "rhand_contact": rhand_contact.cpu().bool(),
         "obj_contact": obj_contact.cpu().bool(),
@@ -784,6 +792,19 @@ def process_pahoi_sequence(
         "fbx_seconds": torch.from_numpy((fbx_key_times[:T].astype(np.float64) / FBX_TICKS_PER_SECOND).astype(np.float32)),
         **contact_postprocess_metadata(**contact_metadata_kwargs),
     }
+    output.update(
+        precompute_sequence_features(
+            position_global,
+            rotation_global,
+            torch.from_numpy(trans).float(),
+            obj_trans=obj_trans_t,
+            obj_rot=obj_rot_t,
+            lhand_contact=lhand_contact,
+            rhand_contact=rhand_contact,
+            obj_contact=obj_contact,
+            has_object=True,
+        )
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(output, out_path)
@@ -809,10 +830,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_frames", type=int, default=None)
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--no_floor_align", action="store_true")
+    parser.add_argument(
+        "--split_info",
+        type=str,
+        default=None,
+        help=(
+            "Existing split JSON (train_files/test_files) used to split the flat "
+            "output into train/ and test/. PAHOI sequences are short, so they are "
+            "processed and split directly instead of going through seg_sample.py."
+        ),
+    )
+    parser.add_argument(
+        "--split_output_dir",
+        type=str,
+        default=None,
+        help="Root that receives train/ and test/ (default: --output_dir)",
+    )
+    parser.add_argument(
+        "--copy_after_split",
+        action="store_true",
+        help="Copy instead of move when applying --split_info",
+    )
     parser.add_argument("--fail_fast", dest="fail_fast", action="store_true", default=True)
     parser.add_argument("--no_fail_fast", dest="fail_fast", action="store_false")
     add_contact_postprocess_arguments(parser)
-    parser.set_defaults(skip_object_displacement_without_hand_contact=False)
+    parser.set_defaults(skip_object_displacement_without_hand_contact=True)
     return parser.parse_args()
 
 
@@ -893,9 +935,29 @@ def main() -> None:
     print(f"  processed: {processed_count} sequences -> {output_root}")
     print(f"  contact-skipped: {len(skipped_sequences)} sequences")
     print(f"  skip manifest: {manifest_path}")
-    print("  output layout: flat top-level .pt files, ready for process/split_dataset.py")
     if errors:
         print(f"  skipped: {len(errors)} sequences")
+
+    if args.split_info:
+        split_root = Path(args.split_output_dir) if args.split_output_dir else output_root
+        split_root.mkdir(parents=True, exist_ok=True)
+        split_unified_by_json(
+            str(output_root),
+            args.split_info,
+            str(split_root / "train"),
+            str(split_root / "test"),
+            copy_files=args.copy_after_split,
+            allowed_missing_files={
+                record["output_file"] for record in skipped_sequences
+            },
+            output_split_info_path=str(split_root / "split_info.json"),
+            enforce_numeric_names=False,
+        )
+        if Path(manifest_path).resolve() != (split_root / "skipped_sequences.json").resolve():
+            shutil.copy2(manifest_path, split_root / "skipped_sequences.json")
+        print(f"  split layout: {split_root}/train, {split_root}/test")
+    else:
+        print("  output layout: flat top-level .pt files, ready for process/split_dataset.py")
 
 
 if __name__ == "__main__":

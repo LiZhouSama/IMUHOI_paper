@@ -12,7 +12,6 @@ import torch
 import joblib
 from tqdm import tqdm
 from human_body_prior.body_model.body_model import BodyModel
-from human_body_prior.tools.rotation_tools import local2global_pose
 import multiprocessing as mp
 from functools import partial
 import torch.nn.functional as F
@@ -25,7 +24,28 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from utils.human_pose import compute_virtual_palm_positions
+from utils.human_pose import (
+    build_smpl24_joint_positions,
+    ensure_smpl24_local_rotations,
+    local_rotations_to_global,
+    select_hand_anchor_positions,
+)
+from configs import (
+    FRAME_RATE,
+    _REDUCED_INDICES,
+    _SENSOR_POS_INDICES,
+    _SENSOR_ROT_INDICES,
+    _VEL_SELECTION_INDICES,
+)
+from dataset.dataset_IMUHOI import (
+    _build_human_imu_root,
+    _build_object_imu,
+    _compute_joint_velocity_root,
+    build_contact_endpoint_labels,
+    compute_obj_direction_supervision,
+)
+from utils.utils import _central_diff
+from utils.rotation_conversions import matrix_to_rotation_6d
 
 contact_threh = 0.25
 _CANONICAL_OBJ_POINTS_CACHE = {}
@@ -50,6 +70,154 @@ _PAHOI_OBJECT_ALIASES = {
     "balloon": "small_balloon",
     "big balloon": "big_balloon",
 }
+
+
+def precompute_sequence_features(
+    position_global,
+    rotation_global,
+    trans,
+    obj_trans=None,
+    obj_rot=None,
+    human_imu=None,
+    obj_imu=None,
+    lhand_contact=None,
+    rhand_contact=None,
+    obj_contact=None,
+    has_object=True,
+):
+    """Build all deterministic full-sequence fields consumed by IMUHOI."""
+    position_global = torch.as_tensor(position_global).float()
+    sequence_length = int(position_global.shape[0])
+    device = position_global.device
+    dtype = position_global.dtype
+    rotation_global = torch.as_tensor(
+        rotation_global, device=device, dtype=dtype
+    )
+
+    if obj_trans is None:
+        obj_trans = torch.zeros(sequence_length, 3, device=device, dtype=dtype)
+    else:
+        obj_trans = torch.as_tensor(obj_trans, device=device, dtype=dtype)
+        if obj_trans.dim() == 3 and obj_trans.shape[-1] == 1:
+            obj_trans = obj_trans.squeeze(-1)
+    if obj_rot is None:
+        obj_rot = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).expand(
+            sequence_length, -1, -1
+        )
+    else:
+        obj_rot = torch.as_tensor(obj_rot, device=device, dtype=dtype)
+    obj_rot_6d = matrix_to_rotation_6d(obj_rot.reshape(-1, 3, 3)).reshape(
+        sequence_length, 6
+    )
+
+    has_object = bool(has_object)
+    if not has_object:
+        obj_trans = torch.zeros_like(obj_trans)
+        obj_rot_6d = matrix_to_rotation_6d(
+            torch.eye(3, device=device, dtype=dtype).expand(sequence_length, -1, -1)
+        )
+
+    def _contacts(value):
+        if value is None:
+            return torch.zeros(sequence_length, device=device, dtype=torch.bool)
+        return torch.as_tensor(value, device=device).reshape(-1)[:sequence_length].bool()
+
+    lhand_contact = _contacts(lhand_contact)
+    rhand_contact = _contacts(rhand_contact)
+    obj_contact = _contacts(obj_contact)
+    if not has_object:
+        lhand_contact = torch.zeros_like(lhand_contact)
+        rhand_contact = torch.zeros_like(rhand_contact)
+        obj_contact = torch.zeros_like(obj_contact)
+
+    if human_imu is None:
+        human_imu = _build_human_imu_root(
+            position_global,
+            rotation_global,
+            _SENSOR_POS_INDICES,
+            _SENSOR_ROT_INDICES,
+            FRAME_RATE,
+        )
+    else:
+        human_imu = torch.as_tensor(human_imu, device=device, dtype=dtype)
+        if human_imu.dim() == 3 and human_imu.shape[1] == 1:
+            human_imu = human_imu.squeeze(1)
+
+    if obj_imu is None and has_object:
+        obj_imu = _build_object_imu(obj_rot_6d, obj_trans, FRAME_RATE)
+    elif obj_imu is None:
+        obj_imu = torch.zeros(sequence_length, 9, device=device, dtype=dtype)
+    else:
+        obj_imu = torch.as_tensor(obj_imu, device=device, dtype=dtype)
+        if obj_imu.dim() == 3 and obj_imu.shape[1] == 1:
+            obj_imu = obj_imu.squeeze(1)
+
+    ori_root_reduced = rotation_global[:, :1].transpose(-1, -2).matmul(
+        rotation_global[:, _REDUCED_INDICES]
+    )
+    joint_vel_root = _compute_joint_velocity_root(
+        rotation_global, position_global, FRAME_RATE
+    )
+    root_vel = _central_diff(position_global[:, 0, :], 1.0 / FRAME_RATE)
+    sensor_vel_root = joint_vel_root[:, _VEL_SELECTION_INDICES]
+    sensor_vel_glb = _central_diff(
+        position_global[:, _SENSOR_POS_INDICES, :], 1.0 / FRAME_RATE
+    )
+    obj_vel = (
+        _central_diff(obj_trans, 1.0 / FRAME_RATE)
+        if has_object
+        else torch.zeros(sequence_length, 3, device=device, dtype=dtype)
+    )
+
+    lhand_obj_direction = torch.zeros(
+        sequence_length, 3, device=device, dtype=dtype
+    )
+    rhand_obj_direction = torch.zeros_like(lhand_obj_direction)
+    lhand_lb = torch.zeros(sequence_length, device=device, dtype=dtype)
+    rhand_lb = torch.zeros_like(lhand_lb)
+    if has_object:
+        direction = compute_obj_direction_supervision(
+            position_global,
+            obj_trans,
+            obj_rot_6d,
+            lhand_contact,
+            rhand_contact,
+        )
+        lhand_obj_direction = direction["lhand_obj_direction"]
+        rhand_obj_direction = direction["rhand_obj_direction"]
+        hand_positions = select_hand_anchor_positions(position_global)
+        lhand_lb = torch.linalg.vector_norm(
+            obj_trans - hand_positions[:, 0, :], dim=-1
+        ) * lhand_contact.to(dtype)
+        rhand_lb = torch.linalg.vector_norm(
+            obj_trans - hand_positions[:, 1, :], dim=-1
+        ) * rhand_contact.to(dtype)
+
+    contact_endpoint, contact_endpoint_gauss = build_contact_endpoint_labels(
+        lhand_contact,
+        rhand_contact,
+        obj_contact,
+        device=device,
+        dtype=dtype,
+    )
+
+    features = {
+        "human_imu": human_imu.detach().cpu().float(),
+        "obj_imu": obj_imu.detach().cpu().float(),
+        "ori_root_reduced": ori_root_reduced.detach().cpu().float(),
+        "root_vel": root_vel.detach().cpu().float(),
+        "obj_vel": obj_vel.detach().cpu().float(),
+        "sensor_vel_root": sensor_vel_root.detach().cpu().float(),
+        "sensor_vel_glb": sensor_vel_glb.detach().cpu().float(),
+        "obj_rot_6d": obj_rot_6d.detach().cpu().float(),
+        "lhand_obj_direction": lhand_obj_direction.detach().cpu().float(),
+        "rhand_obj_direction": rhand_obj_direction.detach().cpu().float(),
+        "lhand_lb": lhand_lb.detach().cpu().float(),
+        "rhand_lb": rhand_lb.detach().cpu().float(),
+        "contact_endpoint": contact_endpoint.detach().cpu().float(),
+        "contact_endpoint_gauss": contact_endpoint_gauss.detach().cpu().float(),
+    }
+    return features
 
 
 def _normalize_object_name(name):
@@ -994,8 +1162,9 @@ def compute_improved_contact_labels(obj_trans, obj_rot, obj_scale, position_glob
         )  # [T, N_v, 3]
 
         # 提取手部关节位置
-        lhand_jnt = position_global_full_gt_world[:, 20, :].to(device)  # [T, 3]
-        rhand_jnt = position_global_full_gt_world[:, 21, :].to(device)  # [T, 3]
+        hand_joints = select_hand_anchor_positions(position_global_full_gt_world).to(device)
+        lhand_jnt = hand_joints[:, 0, :]  # SMPL-24 left metacarpal
+        rhand_jnt = hand_joints[:, 1, :]  # SMPL-24 right metacarpal
 
         # 3. 距离筛选 - 使用更宽松的阈值
         loose_distance_threshold = 0.25  # 15cm 宽松阈值，用于排除非手部接触
@@ -1124,7 +1293,7 @@ def resolve_bimanual_contact_labels_sequence(
     if not bool(both.any()):
         return resolved_left, resolved_right
 
-    hand_anchor = compute_virtual_palm_positions(position_global_full_gt_world)
+    hand_anchor = select_hand_anchor_positions(position_global_full_gt_world)
     obj_trans = obj_trans.to(device=hand_anchor.device, dtype=hand_anchor.dtype)
     left_length = torch.linalg.vector_norm(obj_trans - hand_anchor[:, 0, :], dim=-1)
     right_length = torch.linalg.vector_norm(obj_trans - hand_anchor[:, 1, :], dim=-1)
@@ -1387,19 +1556,45 @@ def process_sequence(
 ):
     import pytorch3d.transforms as transforms
     """处理单个序列并保存为pt文件"""
+
+    seq_name = str(seq_data['seq_name'])
+    subject_gender = str(seq_data['gender']).lower()
+    if isinstance(bm, dict):
+        bm = bm.get(subject_gender, bm.get("neutral") or next(iter(bm.values())))
+
+    root_orient_np = np.asarray(seq_data['root_orient'], dtype=np.float32).reshape(-1, 3)
+    pose_body_np = np.asarray(seq_data['pose_body'], dtype=np.float32).reshape(-1, 63)
+    trans_np = np.asarray(seq_data['trans'], dtype=np.float32).reshape(-1, 3)
+    sequence_length = root_orient_np.shape[0]
+    betas_np = np.asarray(
+        seq_data.get('betas', np.zeros((1, 16), dtype=np.float32)), dtype=np.float32
+    )
+    if betas_np.ndim == 1:
+        betas_np = betas_np[None, :]
+    betas_np = betas_np.reshape(betas_np.shape[0], -1)
+    if betas_np.shape[0] == 1 and sequence_length > 1:
+        betas_np = np.repeat(betas_np, sequence_length, axis=0)
+    elif betas_np.shape[0] < sequence_length:
+        betas_np = np.pad(
+            betas_np,
+            ((0, sequence_length - betas_np.shape[0]), (0, 0)),
+            mode="edge",
+        )
+    else:
+        betas_np = betas_np[:sequence_length]
+    if betas_np.shape[1] < 16:
+        betas_np = np.pad(betas_np, ((0, 0), (0, 16 - betas_np.shape[1])))
+    else:
+        betas_np = betas_np[:, :16]
+
     smpl_init_input = {
-        "root_orient": torch.zeros_like(torch.from_numpy(seq_data['root_orient'].reshape(-1, 3)).to(device).float()),
-        "pose_body": torch.zeros_like(torch.from_numpy(seq_data['pose_body'].reshape(-1, 63)).to(device).float()),
-        "trans": torch.zeros_like(torch.from_numpy(seq_data['trans'].reshape(-1, 3)).to(device).float())
+        "root_orient": torch.zeros(sequence_length, 3, device=device),
+        "pose_body": torch.zeros(sequence_length, 63, device=device),
+        "trans": torch.zeros(sequence_length, 3, device=device),
+        "betas": torch.from_numpy(betas_np).to(device=device),
     }
     Jtr_0 = np.asarray(bm(**smpl_init_input).Jtr[:, 0, :].cpu(), dtype=np.float32)
 
-    # 提取序列数据
-    seq_name_raw = seq_data['seq_name']
-    subject_gender_raw = seq_data['gender']
-
-    seq_name = str(seq_name_raw)
-    subject_gender = str(subject_gender_raw)
     if output_name is None:
         output_name = f"{seq_key}.pt"
     output_name = str(output_name)
@@ -1408,10 +1603,6 @@ def process_sequence(
 
     seq_key_str = str(seq_key)
     dataset_name_str = str(seq_data.get('dataset', ''))
-
-    root_orient_np = np.asarray(seq_data['root_orient'], dtype=np.float32).reshape(-1, 3)
-    pose_body_np = np.asarray(seq_data['pose_body'], dtype=np.float32).reshape(-1, 63)
-    trans_np = np.asarray(seq_data['trans'], dtype=np.float32).reshape(-1, 3)
 
     names_to_check = [seq_name.lower(), seq_key_str.lower(), dataset_name_str.lower()]
 
@@ -1443,38 +1634,47 @@ def process_sequence(
     smpl_input = {
         "root_orient": root_orient_torch,
         "pose_body": pose_body_torch,
-        "trans": trans_torch
+        "trans": trans_torch,
+        "betas": torch.from_numpy(betas_np).to(device=device),
     }
 
     # 使用SMPL模型获取全局姿态
     body_pose_world = bm(**smpl_input)
 
-    # 计算局部旋转的6D表示 - 使用pytorch3d
-    local_rot_mat = transforms.axis_angle_to_matrix(
-        torch.tensor(bdata_poses, device=device).float().reshape(-1, 3)
-    ).reshape(bdata_poses.shape[0], -1, 3, 3)
-
-    # 计算6D表示
-    rotation_local_6d = transforms.matrix_to_rotation_6d(local_rot_mat)
-    rotation_local_full_gt_list = rotation_local_6d.reshape(bdata_poses.shape[0], -1)
-
-    # 只使用前22个关节的层次结构
-    kintree_table = bm.kintree_table[0].long()[:22]  # 只取前22个关节的父子关系
-    kintree_table[0] = -1
-
-    # 计算全局旋转矩阵
-    rotation_global_matrot = local2global_pose(
-        local_rot_mat.reshape(local_rot_mat.shape[0], -1, 9), kintree_table
+    pose_aa = torch.tensor(bdata_poses, device=device, dtype=torch.float32).reshape(
+        bdata_poses.shape[0], -1, 3
     )
-
-    # 重塑全局旋转矩阵为标准形状 [T, J, 3, 3]
-    rotation_global_matrot_reshaped = rotation_global_matrot.reshape(rotation_global_matrot.shape[0], -1, 3, 3)
+    local_rot_mat = ensure_smpl24_local_rotations(transforms.axis_angle_to_matrix(pose_aa))
+    pose_aa = torch.cat(
+        (pose_aa, torch.zeros(pose_aa.shape[0], 2, 3, device=device)),
+        dim=1,
+    )
+    rotation_global_matrot_reshaped = local_rotations_to_global(local_rot_mat)
 
     # 提取头部全局旋转
     # head_rotation_global_matrot = rotation_global_matrot[:, [15], :, :]
 
-    # 获取全局关节位置
-    position_global_full_gt_world = body_pose_world.Jtr[:, :22, :].cpu()
+    # OMOMO provides custom body-24 rest offsets whose 22/23 entries are the
+    # left/right metacarpals. Apply those offsets under the wrist rotations.
+    rest_offsets = seq_data.get("rest_offsets")
+    if rest_offsets is not None:
+        rest_offsets = torch.as_tensor(
+            rest_offsets, device=device, dtype=rotation_global_matrot_reshaped.dtype
+        )
+        if rest_offsets.shape[0] < 24:
+            raise ValueError(f"rest_offsets must contain 24 joints, got {rest_offsets.shape}")
+        palm_offsets = rest_offsets[22:24]
+        wrist_rotations = rotation_global_matrot_reshaped[:, [20, 21], :, :]
+        palm_positions = body_pose_world.Jtr[:, [20, 21], :] + torch.matmul(
+            wrist_rotations, palm_offsets.view(1, 2, 3, 1)
+        ).squeeze(-1)
+        position_global_full_gt_world = torch.cat(
+            (body_pose_world.Jtr[:, :22, :], palm_positions), dim=1
+        ).cpu()
+    else:
+        position_global_full_gt_world = build_smpl24_joint_positions(
+            body_pose_world.Jtr
+        ).cpu()
 
     # 计算足部接触标签
     lfoot_contact, rfoot_contact = compute_foot_contact_labels(
@@ -1500,7 +1700,16 @@ def process_sequence(
 
         # --- 更健壮地加载和处理 obj_trans ---
         obj_rot = torch.tensor(seq_data['obj_rot'], device=device).float()
-        obj_trans = torch.tensor(seq_data['obj_com_pos'], device=device).float()
+        # OMOMO's obj_com_pos is the mesh-centered trajectory used for contact
+        # and evaluation. Raw obj_trans is the object frame origin and can be
+        # tens of centimeters away; the processed output still uses obj_trans
+        # as the canonical field name, without duplicating obj_com_pos.
+        obj_trans_source = seq_data.get("obj_com_pos")
+        if obj_trans_source is None:
+            obj_trans_source = seq_data.get("obj_trans")
+        if obj_trans_source is None:
+            raise KeyError("OMOMO sequence is missing obj_trans")
+        obj_trans = torch.as_tensor(obj_trans_source, device=device).float().squeeze(-1)
         T = obj_trans.shape[0] # 获取时间步长
 
         if rot_x90_torch is not None:
@@ -1588,7 +1797,6 @@ def process_sequence(
             "obj_scale": obj_scale.cpu(),
             "obj_trans": obj_trans.cpu(),
             "obj_rot": obj_rot.cpu(),
-            "obj_com_pos": obj_trans.cpu(),
             "lhand_contact": lhand_contact.cpu(), # 基于距离
             "rhand_contact": rhand_contact.cpu(), # 基于距离
             "lhand_contact_raw": lhand_contact_raw.cpu(),
@@ -1603,20 +1811,35 @@ def process_sequence(
         }
         if isinstance(canonical_points, torch.Tensor) and canonical_points.dim() == 2 and canonical_points.shape[-1] == 3:
             obj_data["obj_points_canonical"] = canonical_points.half().cpu()
-            obj_data["obj_points_sample_count"] = int(canonical_points.shape[0])
 
     # 组装输出数据
     data = {
         "seq_name": seq_name,
         "gender": subject_gender,
         # "head_global_trans": head_global_trans.cpu(),
-        "rotation_local_full_gt_list": rotation_local_full_gt_list.cpu(),   # [T, 132]
-        "position_global_full_gt_world": position_global_full_gt_world.float(), # [T, 22, 3]
+        "pose": pose_aa.reshape(pose_aa.shape[0], -1).cpu(),   # [T, 72]
+        "position_global_full_gt_world": position_global_full_gt_world.float(), # [T, 24, 3]
         "trans": trans_torch.cpu(),
-        "rotation_global": rotation_global_matrot_reshaped.cpu(), # [T, 22, 3, 3]
+        "rotation_global": rotation_global_matrot_reshaped.cpu(), # [T, 24, 3, 3]
         "lfoot_contact": lfoot_contact.cpu(),  # 左脚接触标签
         "rfoot_contact": rfoot_contact.cpu(),   # 右脚接触标签
     }
+
+    data.update(
+        precompute_sequence_features(
+            position_global_full_gt_world,
+            rotation_global_matrot_reshaped,
+            trans_torch,
+            obj_trans=obj_data.get("obj_trans") if obj_data else None,
+            obj_rot=obj_data.get("obj_rot") if obj_data else None,
+            human_imu=seq_data.get("human_imu_real"),
+            obj_imu=seq_data.get("obj_imu_real"),
+            lhand_contact=obj_data.get("lhand_contact") if obj_data else None,
+            rhand_contact=obj_data.get("rhand_contact") if obj_data else None,
+            obj_contact=obj_data.get("obj_contact") if obj_data else None,
+            has_object=bool(obj_data.get("has_object", False)) if obj_data else False,
+        )
+    )
 
     # 添加物体数据(如果存在)
     if obj_data:
@@ -1730,8 +1953,14 @@ def split_unified_by_json(
     copy_files=True,
     allowed_missing_files=None,
     output_split_info_path=None,
+    enforce_numeric_names=True,
 ):
-    """Split numerically named unified files according to an existing JSON."""
+    """Split a flat directory of processed sequences according to an existing JSON.
+
+    ``enforce_numeric_names`` keeps the OMOMO guarantee that the unified directory
+    is exactly ``0.pt..N.pt``.  Datasets that keep their source sequence names
+    (PAHOI) pass False and are checked against the JSON file list instead.
+    """
     with open(split_info_path, "r", encoding="utf-8") as handle:
         split_info = json.load(handle)
     train_files = list(split_info.get("train_files", []))
@@ -1740,9 +1969,12 @@ def split_unified_by_json(
     all_names = train_files + test_files
     if len(all_names) != expected_total or len(set(all_names)) != expected_total:
         raise ValueError("split_info.json 的 train/test 文件列表不完整或存在重复")
-    expected_names = {f"{index}.pt" for index in range(expected_total)}
-    if set(all_names) != expected_names:
-        raise ValueError("split_info.json 文件名必须覆盖统一目录的 0.pt..N.pt")
+    if enforce_numeric_names:
+        expected_names = {f"{index}.pt" for index in range(expected_total)}
+        if set(all_names) != expected_names:
+            raise ValueError("split_info.json 文件名必须覆盖统一目录的 0.pt..N.pt")
+    else:
+        expected_names = set(all_names)
 
     present_names = {
         name for name in os.listdir(input_dir)
@@ -1786,7 +2018,14 @@ def split_unified_by_json(
         "test_ratio": len(kept_test_files) / kept_total if kept_total else 0.0,
         "total_files": kept_total,
         "source_total_files": expected_total,
-        "skipped_files": sorted(missing_names, key=lambda name: int(os.path.splitext(name)[0])),
+        "skipped_files": sorted(
+            missing_names,
+            key=(
+                (lambda name: int(os.path.splitext(name)[0]))
+                if enforce_numeric_names
+                else (lambda name: name)
+            ),
+        ),
         "train_files": kept_train_files,
         "test_files": kept_test_files,
         "source_split_info": os.path.abspath(split_info_path),
@@ -2026,13 +2265,18 @@ def main(args):
     # 处理常规数据集（带有物体交互的数据）
     # 设置SMPL模型
     print("加载SMPL模型...")
-    bm_fname_male = os.path.join(args.support_dir, f"smplh/male/model.npz")
-
     num_betas = 16  # 身体参数数量
-    bm_male = BodyModel(
-        bm_fname=bm_fname_male,
-        num_betas=num_betas,
-    ).to(device)
+    body_models = {}
+    for gender in ("male", "female", "neutral"):
+        model_path = os.path.join(args.support_dir, f"smplh/{gender}/model.npz")
+        if os.path.isfile(model_path):
+            body_models[gender] = BodyModel(
+                bm_fname=model_path,
+                num_betas=num_betas,
+            ).to(device)
+    if not body_models:
+        raise FileNotFoundError(f"No SMPL-H models found under {args.support_dir}")
+    body_models.setdefault("neutral", next(iter(body_models.values())))
 
     # 处理AMASS数据集
     # if args.process_amass:
@@ -2067,7 +2311,7 @@ def main(args):
             data_dict_train,
             data_dict_test,
             args.save_dir_unified,
-            bm_male,
+            body_models,
             device,
             args.obj_mesh_dir,
             args.obj_points_count,
@@ -2123,7 +2367,7 @@ def main(args):
             data_dict_train[seq_key],
             seq_key,
             args.save_dir_train,
-            bm_male,
+            body_models,
             device=device,
             obj_mesh_dir=args.obj_mesh_dir,
             obj_points_count=args.obj_points_count,
@@ -2146,7 +2390,7 @@ def main(args):
             data_dict_test[seq_key],
             seq_key,
             args.save_dir_test,
-            bm_male,
+            body_models,
             device=device,
             obj_mesh_dir=args.obj_mesh_dir,
             obj_points_count=args.obj_points_count,

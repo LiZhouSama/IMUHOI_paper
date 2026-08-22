@@ -8,8 +8,6 @@ import torch
 from configs import _REDUCED_POSE_NAMES
 from model.rnn.lb_vq_diffusion import DEFAULT_LB_QUANTILES, compute_lb_quantile_targets
 from utils.human_pose import (
-    append_virtual_palm_joints,
-    append_virtual_palm_rotations,
     select_hand_anchor_positions,
     select_wrist_positions,
 )
@@ -148,7 +146,7 @@ def build_gt_human_pose_outputs(batch, device, dtype=None, num_joints: int = 24)
         position_global = None
     if position_global is None:
         position_global = torch.zeros(batch_size, seq_len, num_joints, 3, device=device, dtype=dtype)
-    position_global = append_virtual_palm_joints(_pad_joints(position_global, num_joints), num_joints=num_joints)
+    position_global = _pad_joints(position_global, num_joints)
     joints_local = position_global - trans.unsqueeze(2)
     hand_pos = select_wrist_positions(position_global)
     palm_pos = select_hand_anchor_positions(position_global)
@@ -167,10 +165,7 @@ def build_gt_human_pose_outputs(batch, device, dtype=None, num_joints: int = 24)
     if rotation_global is None:
         eye = torch.eye(3, device=device, dtype=dtype).view(1, 1, 1, 3, 3)
         rotation_global = eye.expand(batch_size, seq_len, num_joints, -1, -1)
-    rotation_global = append_virtual_palm_rotations(
-        _pad_joints(rotation_global, num_joints, fill_identity=True),
-        num_joints=num_joints,
-    )
+    rotation_global = _pad_joints(rotation_global, num_joints, fill_identity=True)
     full_pose_6d = matrix_to_rotation_6d(rotation_global.reshape(-1, 3, 3)).reshape(
         batch_size, seq_len, num_joints, 6
     )

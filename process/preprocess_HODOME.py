@@ -8,8 +8,12 @@ import trimesh
 from tqdm import tqdm
 
 from human_body_prior.body_model.body_model import BodyModel
-from human_body_prior.tools.rotation_tools import local2global_pose
 import pytorch3d.transforms as transforms
+from utils.human_pose import (
+    build_smpl24_joint_positions,
+    ensure_smpl24_local_rotations,
+    local_rotations_to_global,
+)
 
 _OBJECT_MESH_CENTROID_CACHE: Dict[Tuple[str, str], np.ndarray] = {}
 
@@ -21,6 +25,7 @@ try:
         compute_foot_contact_labels,
         compute_improved_contact_labels,
         load_object_canonical_points,
+        precompute_sequence_features,
         postprocess_sequence_contact_labels,
         resolve_object_mesh_path,
         saved_contact_postprocess_matches,
@@ -34,6 +39,7 @@ except ModuleNotFoundError:
         compute_foot_contact_labels,
         compute_improved_contact_labels,
         load_object_canonical_points,
+        precompute_sequence_features,
         postprocess_sequence_contact_labels,
         resolve_object_mesh_path,
         saved_contact_postprocess_matches,
@@ -244,9 +250,6 @@ def compute_motion_features(
     local_chunks: List[torch.Tensor] = []
     global_chunks: List[torch.Tensor] = []
 
-    kintree_table = bm.kintree_table[0].long()[:22]
-    kintree_table[0] = -1
-
     with torch.no_grad():
         for start, end in iter_slices(root_orient.shape[0], chunk_len):
             root_chunk = root_orient[start:end].astype(np.float32)
@@ -265,19 +268,23 @@ def compute_motion_features(
                 trans=trans_t,
                 betas=betas_t,
             )
-            position_chunks.append(body_out.Jtr[:, :22, :].detach().cpu().float())
+            position_chunks.append(
+                build_smpl24_joint_positions(body_out.Jtr).detach().cpu().float()
+            )
 
             pose_aa = torch.cat([root_t, body_t], dim=1)
             local_rot_mat = transforms.axis_angle_to_matrix(pose_aa.reshape(-1, 3)).reshape(
                 pose_aa.shape[0], -1, 3, 3
             )
-            rotation_local_6d = transforms.matrix_to_rotation_6d(local_rot_mat).reshape(pose_aa.shape[0], -1)
-            rotation_global = local2global_pose(
-                local_rot_mat.reshape(local_rot_mat.shape[0], -1, 9),
-                kintree_table,
-            ).reshape(local_rot_mat.shape[0], -1, 3, 3)
+            local_rot_mat = ensure_smpl24_local_rotations(local_rot_mat)
+            pose_aa = pose_aa.reshape(pose_aa.shape[0], -1, 3)
+            pose_aa = torch.cat(
+                (pose_aa, torch.zeros(pose_aa.shape[0], 2, 3, device=device)),
+                dim=1,
+            )
+            rotation_global = local_rotations_to_global(local_rot_mat)
 
-            local_chunks.append(rotation_local_6d.detach().cpu().float())
+            local_chunks.append(pose_aa.detach().cpu().float())
             global_chunks.append(rotation_global.detach().cpu().float())
 
             del body_out, root_t, body_t, trans_t, betas_t, pose_aa, local_rot_mat
@@ -432,7 +439,7 @@ def process_hodome_sequence(
         "source_mocap_frame_rate": seq["source_mocap_frame_rate"],
         "mocap_frame_rate": seq["mocap_frame_rate"],
         "source_frame_indices": torch.from_numpy(seq["source_frame_indices"]).long(),
-        "rotation_local_full_gt_list": rotation_local.float(),
+        "pose": rotation_local.reshape(T, -1).float(),
         "position_global_full_gt_world": position_global.float(),
         "rotation_global": rotation_global.float(),
         "trans": torch.from_numpy(trans).float(),
@@ -444,7 +451,6 @@ def process_hodome_sequence(
         "obj_name": seq["obj_name"],
         "obj_mesh_name": mesh_name,
         "obj_points_canonical": canonical_points.half().cpu(),
-        "obj_points_sample_count": int(canonical_points.shape[0]),
         "has_object": True,
         "obj_scale": torch.ones(T, dtype=torch.float32),
         "obj_trans": obj_trans_t.detach().cpu().float(),
@@ -452,7 +458,6 @@ def process_hodome_sequence(
         "obj_mesh_centroid": torch.from_numpy(obj_mesh_centroid).float(),
         "obj_center_offset": torch.from_numpy(obj_center_offset).float(),
         "obj_rot": obj_rot_t.detach().cpu().float(),
-        "obj_com_pos": obj_trans_t.detach().cpu().float(),
         "lhand_contact": lhand_contact.cpu().bool(),
         "rhand_contact": rhand_contact.cpu().bool(),
         "obj_contact": obj_contact.cpu().bool(),
@@ -462,6 +467,19 @@ def process_hodome_sequence(
         "source_pkls": [human_path.name, object_path.name],
         **contact_postprocess_metadata(**contact_metadata_kwargs),
     }
+    output.update(
+        precompute_sequence_features(
+            position_global,
+            rotation_global,
+            torch.from_numpy(trans).float(),
+            obj_trans=obj_trans_t,
+            obj_rot=obj_rot_t,
+            lhand_contact=lhand_contact,
+            rhand_contact=rhand_contact,
+            obj_contact=obj_contact,
+            has_object=True,
+        )
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(output, out_path)

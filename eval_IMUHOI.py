@@ -1,6 +1,6 @@
 """
 IMUHOI评估脚本
-统一版本：通过 --no_trans 参数控制是否使用noTrans模式
+统一版本：通过 --no_trans 参数控制?否使用noTrans模式
 """
 import os
 import sys
@@ -20,7 +20,7 @@ from easydict import EasyDict as edict
 from sklearn.metrics import f1_score, fbeta_score, precision_score, recall_score
 from tqdm import tqdm
 
-# 添加项目根目录到路径
+# 添加项目根目录到??
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
@@ -55,6 +55,7 @@ from utils.utils import (
     build_model_input_dict,
 )
 from utils.human_pose import select_hand_anchor_positions
+from utils.hoi_metrics import compute_hoi_error_at_gt_contact
 from configs import (
     FRAME_RATE,
     _IGNORED_INDICES,
@@ -281,12 +282,14 @@ def evaluate_model(
     object_contact_threshold: float = 0.5,
     inference_mode: str = "online",
     online_window: Optional[int] = None,
+    online_lookahead: int = 5,
 ):
     """评估模型"""
     metrics = {
         "mpjpe": [],
         "mpjre_angle": [],
         "jitter": [],
+        "obj_jitter": [],
     }
 
     # 非noTrans模式添加root_trans_err
@@ -332,7 +335,7 @@ def evaluate_model(
 
     with torch.inference_mode():
         for batch_idx, batch in enumerate(progress_bar):
-            # 移动到设备
+            # 移动到???
             batch_device = {}
             for key, value in batch.items():
                 if isinstance(value, torch.Tensor):
@@ -368,11 +371,14 @@ def evaluate_model(
                         kwargs["inference_mode"] = inference_mode
                     if "online_window" not in kwargs:
                         kwargs["online_window"] = online_window
+                    if "online_lookahead" not in kwargs:
+                        kwargs["online_lookahead"] = online_lookahead
                     try:
                         return model.inference(*args, **kwargs)
                     except TypeError:
                         kwargs.pop("inference_mode", None)
                         kwargs.pop("online_window", None)
+                        kwargs.pop("online_lookahead", None)
                         return model.inference(*args, **kwargs)
 
                 if model_kind == "mix":
@@ -436,15 +442,25 @@ def evaluate_model(
 
             for sample_idx in range(batch_size):
                 human_imu_seq = human_imu[sample_idx]
-                T = human_imu_seq.shape[0]
+                pred_length_source = pred_dict.get("p_pred")
+                if not isinstance(pred_length_source, torch.Tensor):
+                    pred_length_source = pred_dict.get("root_trans_pred")
+                T = (
+                    min(human_imu_seq.shape[0], int(pred_length_source.shape[1]))
+                    if isinstance(pred_length_source, torch.Tensor) and pred_length_source.dim() >= 2
+                    else human_imu_seq.shape[0]
+                )
+                if T <= 0:
+                    continue
+                human_imu_seq = human_imu_seq[:T]
 
                 pose_batch = batch_device.get("pose")
                 trans_batch = batch_device.get("trans")
                 if pose_batch is None or trans_batch is None:
                     continue
 
-                gt_pose_seq = pose_batch[sample_idx]
-                gt_trans_seq = trans_batch[sample_idx]
+                gt_pose_seq = pose_batch[sample_idx, :T]
+                gt_trans_seq = trans_batch[sample_idx, :T]
 
                 if gt_pose_seq.shape[-1] < 6:
                     continue
@@ -470,7 +486,7 @@ def evaluate_model(
 
                 gt_joints_all = gt_smpl_out.Jtr
 
-                # 确定使用的trans
+                # ?定使用的trans
                 if no_trans:
                     pred_trans = gt_trans_seq
                 else:
@@ -629,14 +645,14 @@ def evaluate_model(
                 has_object_sample = bool(has_object_mask[sample_idx].item()) if isinstance(has_object_mask, torch.Tensor) else True
 
                 gt_obj_trans = batch_device.get("obj_trans")
-                gt_obj_trans_seq = gt_obj_trans[sample_idx] if gt_obj_trans is not None else None
+                gt_obj_trans_seq = gt_obj_trans[sample_idx, :T] if gt_obj_trans is not None else None
 
                 gt_lhand_contact = batch_device.get("lhand_contact")
                 gt_rhand_contact = batch_device.get("rhand_contact")
                 gt_obj_contact = batch_device.get("obj_contact")
-                gt_lhand_contact_seq = gt_lhand_contact[sample_idx].bool() if gt_lhand_contact is not None else None
-                gt_rhand_contact_seq = gt_rhand_contact[sample_idx].bool() if gt_rhand_contact is not None else None
-                gt_obj_contact_seq = gt_obj_contact[sample_idx].bool() if gt_obj_contact is not None else None
+                gt_lhand_contact_seq = gt_lhand_contact[sample_idx, :T].bool() if gt_lhand_contact is not None else None
+                gt_rhand_contact_seq = gt_rhand_contact[sample_idx, :T].bool() if gt_rhand_contact is not None else None
+                gt_obj_contact_seq = gt_obj_contact[sample_idx, :T].bool() if gt_obj_contact is not None else None
 
                 pred_obj_trans_fusion = pred_dict.get("pred_obj_trans")
                 if pred_obj_trans_fusion is None:
@@ -675,46 +691,31 @@ def evaluate_model(
                 _append_obj_error("obj_trans_err_fk", pred_obj_trans_fk)
                 _append_obj_error("obj_trans_err_imu", pred_obj_trans_imu)
 
-                def compute_hoi_error(pred_obj_trans_seq_):
-                    if not (evaluate_objects and has_object_sample):
-                        return float("nan")
-                    if pred_obj_trans_seq_ is None or gt_obj_trans_seq is None:
-                        return float("nan")
+                # --- Object Jitter (Fusion trajectory) ---
+                if evaluate_objects and has_object_sample and pred_obj_trans_fusion is not None and T >= 3:
+                    obj_accel = (
+                        pred_obj_trans_fusion[2:]
+                        - 2 * pred_obj_trans_fusion[1:-1]
+                        + pred_obj_trans_fusion[:-2]
+                    )
+                    obj_jitter = torch.linalg.norm(obj_accel, dim=-1).mean().item() * 1000.0
+                    metrics["obj_jitter"].append(obj_jitter)
+                else:
+                    metrics["obj_jitter"].append(float("nan"))
 
-                    root_idx = 0
+                def compute_hoi_error(pred_obj_trans_seq_):
                     pred_hand_pos = select_hand_anchor_positions(pred_joints_all)
                     gt_hand_pos = select_hand_anchor_positions(gt_joints_all)
-                    pred_lhand_pos = pred_hand_pos[:, 0, :]
-                    pred_rhand_pos = pred_hand_pos[:, 1, :]
-                    pred_root_pos = pred_joints_all[:, root_idx, :]
-                    gt_lhand_pos = gt_hand_pos[:, 0, :]
-                    gt_rhand_pos = gt_hand_pos[:, 1, :]
-                    gt_root_pos = gt_joints_all[:, root_idx, :]
-
-                    rel_errors = []
-
-                    if gt_lhand_contact_seq is not None and gt_lhand_contact_seq.any():
-                        mask = gt_lhand_contact_seq
-                        rel_gt = (gt_obj_trans_seq - gt_lhand_pos)[mask]
-                        rel_pred = (pred_obj_trans_seq_ - pred_lhand_pos)[mask]
-                        rel_errors.append(torch.linalg.norm(rel_pred - rel_gt, dim=-1))
-
-                    if gt_rhand_contact_seq is not None and gt_rhand_contact_seq.any():
-                        mask = gt_rhand_contact_seq
-                        rel_gt = (gt_obj_trans_seq - gt_rhand_pos)[mask]
-                        rel_pred = (pred_obj_trans_seq_ - pred_rhand_pos)[mask]
-                        rel_errors.append(torch.linalg.norm(rel_pred - rel_gt, dim=-1))
-
-                    if gt_lhand_contact_seq is not None and gt_rhand_contact_seq is not None:
-                        non_inter_mask = (~gt_lhand_contact_seq) & (~gt_rhand_contact_seq)
-                        if non_inter_mask.any():
-                            rel_gt = (gt_obj_trans_seq - gt_root_pos)[non_inter_mask]
-                            rel_pred = (pred_obj_trans_seq_ - pred_root_pos)[non_inter_mask]
-                            rel_errors.append(torch.linalg.norm(rel_pred - rel_gt, dim=-1))
-
-                    if rel_errors:
-                        return torch.cat(rel_errors, dim=0).mean().item() * 100.0
-                    return float("nan")
+                    if not (evaluate_objects and has_object_sample):
+                        return float("nan")
+                    return compute_hoi_error_at_gt_contact(
+                        pred_obj_trans_seq_,
+                        gt_obj_trans_seq,
+                        pred_hand_pos,
+                        gt_hand_pos,
+                        gt_lhand_contact_seq,
+                        gt_rhand_contact_seq,
+                    )
 
                 metrics["hoi_err_fusion"].append(compute_hoi_error(pred_obj_trans_fusion))
                 metrics["hoi_err_fk"].append(compute_hoi_error(pred_obj_trans_fk))
@@ -794,7 +795,7 @@ def evaluate_model(
                                 float(pred_rhand_bool[hard_neg_mask].mean())
                             )
 
-    # 计算平均值
+    # 计算平均?
     avg_metrics = {}
     for key, values in metrics.items():
         valid = [v for v in values if not np.isnan(v)]
@@ -805,12 +806,12 @@ def evaluate_model(
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate IMUHOI Model")
-    parser.add_argument("--config", type=str, default="configs/IMUHOI_train_rnn.yaml", help="配置文件路径")
-    parser.add_argument("--dataset", type=str, default="omomo", help="数据集名称（默认：omomo）")
-    parser.add_argument("--smpl_model_path", type=str, default="datasets/smpl_models/smplh/male/model.npz", help="SMPL模型路径")
+    parser.add_argument("--config", type=str, default="configs/IMUHOI_train_rnn.yaml", help="配置文件??")
+    parser.add_argument("--dataset", type=str, default="omomo", help="数据集名称（默?：omomo?")
+    parser.add_argument("--smpl_model_path", type=str, default="datasets/smpl_models/smplh/male/model.npz", help="SMPL模型??")
     parser.add_argument("--num_workers", type=int, default=12, help="DataLoader workers")
     parser.add_argument("--no_trans", action="store_true", help="使用noTrans模式")
-    parser.add_argument("--no_eval_objects", action="store_true", help="跳过物体相关指标")
+    parser.add_argument("--no_objects", action="store_true", help="跳过物体相关指标")
     parser.add_argument("--compare_3", action="store_true", help="比较FK/IMU方法")
     parser.add_argument("--model_arch", type=str, choices=["rnn", "dit", "mamba", "mamba_simple"], default=None, help="选择模型架构")
     parser.add_argument("--hp_ckpt", type=str, default=None, help="覆盖 HumanPose checkpoint")
@@ -823,8 +824,8 @@ def main():
         choices=OBJECT_TRANS_ARCH_CHOICES,
         default=None,
         help=(
-            "ObjectTrans架构；imuhoi为EgoIMU原始三路融合，"
-            "imuhoi_4heads为增加静止头的四路融合。"
+            "ObjectTrans架构；imuhoi为EgoIMU原?三?融合?"
+            "imuhoi_4heads为?加静?头的四?融合?"
         ),
     )
     parser.add_argument(
@@ -834,15 +835,22 @@ def main():
         choices=VELOCITY_CONTACT_ARCH_CHOICES,
         default=None,
         help=(
-            "VelocityContact架构；legacy不包含interaction boundary模块，"
-            "imuhoi恢复EgoIMU VC"
+            "VelocityContact架构；v2为velocity→obj_move→direct hand-contact级联；"
+            "imuhoi为EgoIMU VC"
         ),
     )
     parser.add_argument("--ot_ckpt", type=str, default=None, help="覆盖 ObjectTrans checkpoint")
-    parser.add_argument("--hand_contact_threshold", type=float, default=None, help="左右手接触评估阈值")
-    parser.add_argument("--object_contact_threshold", type=float, default=None, help="物体接触评估阈值")
+    parser.add_argument("--hand_contact_threshold", type=float, default=None, help="左右手接触评估阈?")
+    parser.add_argument("--object_contact_threshold", type=float, default=None, help="物体接触评估阈?")
     parser.add_argument("--inference_mode", "--inference-mode", choices=["online", "offline"], default="online", help="RNN inference mode")
     parser.add_argument("--online_window", "--online-window", type=int, default=None, help="RNN online sliding window size")
+    parser.add_argument(
+        "--online_lookahead",
+        "--online-lookahead",
+        type=int,
+        default=5,
+        help="Future frames appended after the legacy RNN online update frame (strict tail)",
+    )
     parser.add_argument(
         "--object_trans_state_feedback",
         "--object-trans-state-feedback",
@@ -851,35 +859,27 @@ def main():
         default=None,
         help="覆盖 OT 融合状态反馈开关；none=shared-head无反馈，fused=显式OT state feedback",
     )
-    parser.add_argument(
-        "--object_trans_online_mode",
-        "--object-trans-online-mode",
-        dest="object_trans_online_mode",
-        choices=["window", "stateful"],
-        default=None,
-        help="覆盖 ObjectTrans online 运行方式",
-    )
-    parser.add_argument("--output_json", type=str, default=None, help="可选：保存评估结果JSON")
-    parser.add_argument("--seed", type=int, default=None, help="可选：固定评估随机种子，用于可复现实验")
+    parser.add_argument("--output_json", type=str, default=None, help="?选：保存评估结果JSON")
+    parser.add_argument("--seed", type=int, default=None, help="?选：固定评估随机种子，用于可复现实验")
     parser.add_argument(
         "--simulate_imu_noise",
         "--simulate-imu-noise",
         action="store_true",
-        help="在完整评估序列上启用确定性的 Dataset IMU 噪声。",
+        help="在完整评估序列上?用确定性的 Dataset IMU ?声?",
     )
     parser.add_argument(
         "--simulate_imu_noise_seed",
         "--simulate-imu-noise-seed",
         type=int,
         default=42,
-        help="Dataset IMU 噪声基础种子；与序列路径混合以消除访问顺序影响。",
+        help="Dataset IMU ?声基础种子；与序列?径混合以消除访问顺序影响?",
     )
     parser.add_argument(
         "--interaction_human_source",
         type=str,
         default="pred",
         choices=["pred", "gt"],
-        help="Interaction分支人体来源: pred=使用HumanPose预测, gt=使用GT人体状态",
+        help="Interaction分支人体来源: pred=使用HumanPose预测, gt=使用GT人体状?",
     )
     refine_group = parser.add_mutually_exclusive_group()
     refine_group.add_argument(
@@ -887,7 +887,7 @@ def main():
         dest="ot_refine",
         action="store_true",
         default=None,
-        help="允许ObjectTrans refine覆盖人体pose/root trans",
+        help="允?ObjectTrans refine覆盖人体pose/root trans",
     )
     refine_group.add_argument(
         "--disable_ot_refine",
@@ -901,12 +901,11 @@ def main():
     print(f"Using device: {device}")
     print(f"Mode: {'noTrans' if args.no_trans else 'Normal'}")
     print(f"Interaction human source: {args.interaction_human_source}")
-    print(f"Inference mode: {args.inference_mode} | online_window: {args.online_window or 'config/default'}")
     print(
-        "OT overrides: "
-        f"state_feedback={args.object_trans_state_feedback or 'config'} | "
-        f"online_mode={args.object_trans_online_mode or 'config'}"
+        f"Inference mode: {args.inference_mode} | online_window: "
+        f"{args.online_window or 'config/default'} | online_lookahead: {args.online_lookahead}"
     )
+    print(f"OT state feedback: {args.object_trans_state_feedback or 'config'}")
     print(f"VelocityContact architecture: {args.velocity_contact_arch or 'config/default'}")
     print(f"ObjectTrans architecture: {args.object_trans_arch or 'config/default'}")
     seed = _set_eval_seed(args.seed)
@@ -927,7 +926,6 @@ def main():
 
     all_results = {}
     effective_ot_state_feedback = None
-    effective_ot_online_mode = None
     for dataset_name, dataset_cfg in dataset_runs:
         print(f"\n=== Evaluating dataset: {dataset_name} ===")
         config = load_config(args.config)
@@ -937,12 +935,7 @@ def main():
             config.object_trans_state_feedback = args.object_trans_state_feedback == "fused"
         elif not hasattr(config, "object_trans_state_feedback"):
             config.object_trans_state_feedback = False
-        if args.object_trans_online_mode is not None:
-            config.object_trans_online_mode = args.object_trans_online_mode
-        elif not hasattr(config, "object_trans_online_mode"):
-            config.object_trans_online_mode = "window"
         effective_ot_state_feedback = bool(getattr(config, "object_trans_state_feedback", False))
-        effective_ot_online_mode = str(getattr(config, "object_trans_online_mode", "window"))
         if args.velocity_contact_arch is not None:
             config.velocity_contact_arch = args.velocity_contact_arch
         config.velocity_contact_arch = normalize_velocity_contact_arch(
@@ -1008,24 +1001,24 @@ def main():
             velocity_contact_arch=args.velocity_contact_arch,
         )
         model_kind = _infer_model_kind(model)
-        evaluate_contacts = (not args.no_eval_objects) and has_velocity_contact_ckpt
-        evaluate_objects = (not args.no_eval_objects) and has_velocity_contact_ckpt
+        evaluate_contacts = (not args.no_objects) and has_velocity_contact_ckpt
+        evaluate_objects = (not args.no_objects) and has_velocity_contact_ckpt
         run_object_branch = evaluate_objects and has_object_trans_ckpt
         if model_kind == "human_pose" and evaluate_objects:
-            print("[Eval] 当前加载的是 human-only 模型；如需评估物体，请提供 pretrained_modules.interaction 或 --interaction_ckpt。")
+            print("[Eval] 当前加载的是 human-only 模型；?需评估物体，?提? pretrained_modules.interaction ? --interaction_ckpt?")
             evaluate_objects = False
             evaluate_contacts = False
             run_object_branch = False
-        elif model_kind == "pipeline" and not args.no_eval_objects:
+        elif model_kind == "pipeline" and not args.no_objects:
             if not has_velocity_contact_ckpt:
                 print(
-                    "[Eval] 未加载 velocity_contact/interaction checkpoint；跳过 contact/object 指标，"
-                    "避免使用随机初始化的 VC 分支。"
+                    "[Eval] ?加载 velocity_contact/interaction checkpoint；跳? contact/object 指标?"
+                    "避免使用随机初?化? VC 分支?"
                 )
             elif not has_object_trans_ckpt:
                 print(
-                    "[Eval] 未加载 object_trans/interaction checkpoint；不运行 object_trans 分支，"
-                    "仅评估 VC 产生的 contact 和 obj_vel/IMU object baseline。"
+                    "[Eval] ?加载 object_trans/interaction checkpoint；不运?? object_trans 分支?"
+                    "仅评? VC 产生? contact ? obj_vel/IMU object baseline?"
                 )
 
         data_dir_default = get_full_sequence_test_path(dataset_cfg)
@@ -1093,6 +1086,7 @@ def main():
             object_contact_threshold=object_contact_threshold,
             inference_mode=args.inference_mode,
             online_window=args.online_window,
+            online_lookahead=args.online_lookahead,
         )
 
         eval_duration = time.time() - eval_start_time
@@ -1143,11 +1137,11 @@ def main():
             print(f"HardNeg FP Any Hand:            {_fmt('contact_hard_neg_fp_rate_any')}")
             print(f"HardNeg FP Left:                {_fmt('contact_hard_neg_fp_rate_lhand')}")
             print(f"HardNeg FP Right:               {_fmt('contact_hard_neg_fp_rate_rhand')}")
-        elif not args.no_eval_objects:
+        elif not args.no_objects:
             print("\n--- Contact Prediction ---")
             print("Skipped: no velocity_contact/interaction checkpoint was loaded.")
 
-        print(f"\n评估耗时: {eval_duration:.2f}秒")
+        print(f"\n评估耗时: {eval_duration:.2f}?")
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1161,10 +1155,9 @@ def main():
             "config": args.config,
             "inference_mode": args.inference_mode,
             "online_window": args.online_window,
+            "online_lookahead": args.online_lookahead,
             "object_trans_state_feedback": effective_ot_state_feedback,
-            "object_trans_online_mode": effective_ot_online_mode,
             "object_trans_state_feedback_override": args.object_trans_state_feedback,
-            "object_trans_online_mode_override": args.object_trans_online_mode,
             "velocity_contact_arch": args.velocity_contact_arch or getattr(load_config(args.config), "velocity_contact_arch", "current"),
             "object_trans_arch": args.object_trans_arch or getattr(load_config(args.config), "object_trans_arch", "current"),
             "seed": seed,

@@ -19,7 +19,6 @@ import errno
 import glob
 import json
 import os
-import pty
 import re
 import select
 import subprocess
@@ -30,6 +29,11 @@ from pathlib import Path
 from typing import Sequence
 
 import yaml
+
+if os.name == "posix":
+    import pty
+else:  # pragma: no cover - exercised on Windows runners
+    pty = None
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -83,6 +87,22 @@ def parse_args() -> argparse.Namespace:
         help="Forward --model_arch to every stage.",
     )
     parser.add_argument(
+        "--velocity_contact_arch",
+        default=None,
+        help=(
+            "Override the VC architecture for Stage 2, Stage 3/joint_train, "
+            "and the final validation eval (for example: imuhoi or v3)."
+        ),
+    )
+    parser.add_argument(
+        "--object_trans_arch",
+        default=None,
+        help=(
+            "Override the ObjectTrans architecture for Stage 3/joint_train "
+            "and the final validation eval (for example: current)."
+        ),
+    )
+    parser.add_argument(
         "--train_datasets",
         nargs="+",
         default=None,
@@ -92,15 +112,39 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--start_stage",
+        choices=["human_pose", "velocity_contact", "object_trans"],
+        default="human_pose",
+        help=(
+            "Resume an existing pipeline from this stage. Earlier stages must "
+            "already have a best.pt checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=None,
+        help="Override DataLoader workers for every stage (0 avoids WSL worker deadlocks).",
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Print/write the planned commands without launching training.",
     )
-    parser.add_argument(
-        "--no_simulate_imu_noise",
+    noise_group = parser.add_mutually_exclusive_group()
+    noise_group.add_argument(
+        "--simulate_imu_noise",
+        dest="simulate_imu_noise",
         action="store_true",
-        help="Disable simulate_imu_noise for this pipeline (enabled by default).",
+        help="Enable simulate_imu_noise for this pipeline (the default).",
     )
+    noise_group.add_argument(
+        "--no_simulate_imu_noise",
+        dest="simulate_imu_noise",
+        action="store_false",
+        help="Disable simulate_imu_noise for this pipeline.",
+    )
+    parser.set_defaults(simulate_imu_noise=True)
     return parser.parse_args()
 
 
@@ -113,7 +157,7 @@ def safe_tag(value: str) -> str:
 
 
 def load_base_save_dir(cfg_path: Path) -> Path:
-    with cfg_path.open("r") as f:
+    with cfg_path.open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
     save_dir = Path(cfg.get("save_dir", "outputs"))
     if not save_dir.is_absolute():
@@ -170,9 +214,9 @@ def common_args(
         values.extend(["--model_arch", args.model_arch])
     if args.train_datasets:
         values.extend(["--train_datasets", *args.train_datasets])
-    values.append(
-        "--no_simulate_imu_noise" if args.no_simulate_imu_noise else "--simulate_imu_noise"
-    )
+    if args.num_workers is not None:
+        values.extend(["--num_workers", str(max(0, int(args.num_workers)))])
+    values.append("--simulate_imu_noise" if args.simulate_imu_noise else "--no_simulate_imu_noise")
     return values
 
 
@@ -250,14 +294,17 @@ def build_eval_command(
         command.extend(["--seed", str(args.seed)])
     if args.no_trans:
         command.append("--no_trans")
-    if not args.no_simulate_imu_noise:
-        command.append("--simulate_imu_noise")
+    if args.object_trans_arch:
+        command.extend(["--object_trans_arch", args.object_trans_arch])
+    if args.velocity_contact_arch:
+        command.extend(["--velocity_contact_arch", args.velocity_contact_arch])
+    command.append("--simulate_imu_noise" if args.simulate_imu_noise else "--no_simulate_imu_noise")
     return command, log_path, output_json
 
 
 def write_manifest(path: Path, payload: dict) -> None:
     tmp_path = path.with_suffix(f"{path.suffix}.tmp")
-    with tmp_path.open("w") as f:
+    with tmp_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
         f.write("\n")
     os.replace(tmp_path, path)
@@ -340,7 +387,7 @@ class CompactConsoleRenderer:
 def _run_command_pipe(command: list[str], log_path: Path, env: dict[str, str]) -> int:
     """Fallback for non-POSIX systems."""
     renderer = CompactConsoleRenderer()
-    with log_path.open("w") as log_file:
+    with log_path.open("w", encoding="utf-8") as log_file:
         process = subprocess.Popen(
             command,
             cwd=PROJECT_ROOT,
@@ -367,7 +414,7 @@ def run_command(command: list[str], log_path: Path) -> int:
 
     master_fd, slave_fd = pty.openpty()
     renderer = CompactConsoleRenderer()
-    with log_path.open("w") as log_file:
+    with log_path.open("w", encoding="utf-8") as log_file:
         process = subprocess.Popen(
             command,
             cwd=PROJECT_ROOT,
@@ -447,7 +494,31 @@ def main() -> None:
     }
 
     specs = stage_specs()
-    for spec in specs:
+    start_index = next(
+        index for index, spec in enumerate(specs) if spec.name == args.start_stage
+    )
+
+    # Keep completed stages in the manifest and restore their checkpoint
+    # dependencies when resuming a long-running WSL pipeline.
+    if start_index > 0 and not args.dry_run:
+        prior_ckpt_keys = {"human_pose": "hp_ckpt", "velocity_contact": "vc_ckpt"}
+        for prior_spec in specs[:start_index]:
+            save_dir, best_ckpt = find_stage_best(
+                pipeline_dir, prior_spec.module_name, run_suffix
+            )
+            results.append(
+                StageResult(
+                    name=prior_spec.name,
+                    command=[],
+                    log_path=str(pipeline_dir / f"{prior_spec.name}.log"),
+                    save_dir=str(save_dir),
+                    best_ckpt=str(best_ckpt),
+                    returncode=0,
+                )
+            )
+            ckpts[prior_ckpt_keys[prior_spec.name]] = str(best_ckpt)
+
+    for spec in specs[start_index:]:
         planning_ckpts = (
             {"hp_ckpt": "<human_pose_best.pt>", "vc_ckpt": "<velocity_contact_best.pt>"}
             if args.dry_run
@@ -458,8 +529,14 @@ def main() -> None:
             str(PROJECT_ROOT / spec.script),
             *shared_args,
             *spec.fixed_args,
-            *expand_dependency_args(spec.dependency_args, planning_ckpts),
         ]
+        if spec.name in {"velocity_contact", "object_trans"} and args.velocity_contact_arch:
+            command.extend(["--velocity_contact_arch", args.velocity_contact_arch])
+        if spec.name == "object_trans" and args.object_trans_arch:
+            command.extend(["--object_trans_arch", args.object_trans_arch])
+        command.extend([
+            *expand_dependency_args(spec.dependency_args, planning_ckpts),
+        ])
         log_path = pipeline_dir / f"{spec.name}.log"
         result = StageResult(
             name=spec.name,

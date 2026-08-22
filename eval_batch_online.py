@@ -5,7 +5,6 @@ import copy
 import json
 import sys
 import time
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -35,13 +34,9 @@ from model.rnn.velocity_contact import (
     normalize_velocity_contact_arch,
 )
 from model.rnn.online import (
-    TimeDictAccumulator,
-    infer_batch_seq,
-    merge_latest_context,
+    resolve_online_lookahead,
     resolve_online_window,
-    select_time_context,
-    take_latest_frame,
-    update_data_inits_from_history,
+    slice_time_dict,
 )
 from utils.utils import apply_eval_imu_noise_to_sequence, build_model_input_dict, load_config, load_smpl_model
 from utils.dataset_config import get_full_sequence_test_path, resolve_dataset_path
@@ -156,210 +151,6 @@ def _split_batch_dict(output: Dict[str, Any], batch_size: int) -> List[Dict[str,
     ]
 
 
-def _stack_dicts(dicts: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    if not dicts:
-        return {}
-    result: Dict[str, Any] = {}
-    common_keys = [key for key in dicts[0].keys() if all(key in item for item in dicts)]
-    for key in common_keys:
-        values = [item[key] for item in dicts]
-        if all(isinstance(value, torch.Tensor) for value in values):
-            first = values[0]
-            if all(value.shape[1:] == first.shape[1:] and value.dtype == first.dtype for value in values):
-                result[key] = torch.cat(values, dim=0)
-            continue
-        if all(isinstance(value, dict) for value in values):
-            nested = _stack_dicts(values)  # type: ignore[arg-type]
-            if nested:
-                result[key] = nested
-            continue
-        result[key] = values[0]
-    return result
-
-
-def _split_ot_prediction_state(
-    state: Optional[Dict[str, Any]],
-    batch_size: int,
-) -> List[Optional[Dict[str, Any]]]:
-    """Split an ObjectTrans predictor state into one state per sequence.
-
-    LSTM states use batch dimension 1, while every other predictor-state
-    tensor uses batch dimension 0.  Keeping this handling here prevents the
-    batch-online scheduler from accidentally treating the LSTM layer dimension
-    as a sample dimension when sequences finish at different times.
-    """
-    if state is None:
-        return [None] * int(batch_size)
-    if not isinstance(state, dict):
-        raise TypeError(f"ObjectTrans prediction state must be a dict, got {type(state)!r}")
-
-    def _split_lstm_state(value: Any, row: int) -> Any:
-        if value is None:
-            return None
-        if isinstance(value, tuple):
-            return tuple(_split_lstm_state(item, row) for item in value)
-        if isinstance(value, list):
-            return [_split_lstm_state(item, row) for item in value]
-        if isinstance(value, torch.Tensor):
-            if value.dim() < 2 or int(value.shape[1]) != int(batch_size):
-                raise ValueError(
-                    "ObjectTrans LSTM state must have batch dimension 1 with "
-                    f"size {batch_size}, got {tuple(value.shape)}"
-                )
-            return value[:, row:row + 1]
-        raise TypeError(f"Unsupported ObjectTrans LSTM state value: {type(value)!r}")
-
-    rows: List[Optional[Dict[str, Any]]] = []
-    for row in range(int(batch_size)):
-        row_state: Dict[str, Any] = {}
-        for key, value in state.items():
-            if key == "rnn_state":
-                row_state[key] = _split_lstm_state(value, row)
-            elif isinstance(value, torch.Tensor) and value.dim() > 0 and int(value.shape[0]) == int(batch_size):
-                row_state[key] = value[row:row + 1]
-            else:
-                row_state[key] = value
-        rows.append(row_state)
-    return rows
-
-
-def _stack_ot_prediction_states(states: Sequence[Optional[Dict[str, Any]]]) -> Dict[str, Any]:
-    """Stack active per-sequence ObjectTrans predictor states into one batch."""
-    if not states:
-        raise ValueError("Cannot stack an empty set of ObjectTrans predictor states.")
-    if any(state is None for state in states):
-        raise ValueError("Every active sequence must have an ObjectTrans predictor state.")
-    typed_states = [state for state in states if isinstance(state, dict)]
-    if len(typed_states) != len(states):
-        raise TypeError("ObjectTrans predictor states must be dictionaries.")
-
-    def _stack_lstm_state(values: Sequence[Any]) -> Any:
-        first = values[0]
-        if first is None:
-            if not all(value is None for value in values):
-                raise ValueError("Inconsistent None/non-None ObjectTrans LSTM states.")
-            return None
-        if isinstance(first, tuple):
-            if not all(isinstance(value, tuple) and len(value) == len(first) for value in values):
-                raise ValueError("Inconsistent ObjectTrans LSTM tuple states.")
-            return tuple(_stack_lstm_state([value[index] for value in values]) for index in range(len(first)))
-        if isinstance(first, list):
-            if not all(isinstance(value, list) and len(value) == len(first) for value in values):
-                raise ValueError("Inconsistent ObjectTrans LSTM list states.")
-            return [_stack_lstm_state([value[index] for value in values]) for index in range(len(first))]
-        if isinstance(first, torch.Tensor):
-            if not all(isinstance(value, torch.Tensor) for value in values):
-                raise TypeError("Inconsistent ObjectTrans LSTM tensor states.")
-            if not all(value.shape[0] == first.shape[0] and value.shape[2:] == first.shape[2:] for value in values):
-                raise ValueError("ObjectTrans LSTM states have incompatible layer/feature shapes.")
-            return torch.cat(values, dim=1)
-        raise TypeError(f"Unsupported ObjectTrans LSTM state value: {type(first)!r}")
-
-    common_keys = set(typed_states[0])
-    if any(set(state) != common_keys for state in typed_states[1:]):
-        raise ValueError("ObjectTrans predictor states do not expose the same keys.")
-    stacked: Dict[str, Any] = {}
-    for key in typed_states[0]:
-        values = [state[key] for state in typed_states]
-        if key == "rnn_state":
-            stacked[key] = _stack_lstm_state(values)
-        elif all(isinstance(value, torch.Tensor) for value in values):
-            first = values[0]
-            if not all(value.shape[1:] == first.shape[1:] for value in values):
-                raise ValueError(f"ObjectTrans state '{key}' has incompatible feature shapes.")
-            stacked[key] = torch.cat(values, dim=0)
-        else:
-            first = values[0]
-            if not all(value == first for value in values[1:]):
-                raise ValueError(f"ObjectTrans scalar state '{key}' differs across active sequences.")
-            stacked[key] = first
-    return stacked
-
-
-def _initialize_stateful_ot_states(
-    model,
-    warmup_data: Dict[str, Any],
-    batch_size: int,
-) -> List[Optional[Dict[str, Any]]]:
-    """Replay the warmup once to obtain OT state from the unrefined HP/VC outputs.
-
-    ``model.forward`` may promote OT-refined human outputs into its result.
-    Those are intentionally *not* the HP hand positions that originally fed
-    ObjectTrans during warmup, so reconstruct the raw Stage-1/2 path here.
-    """
-    hp_out = model.human_pose_module.forward(model._build_hp_input_dict(warmup_data))
-    vc_input_dict = {
-        "human_imu": warmup_data["human_imu"],
-        "obj_imu": warmup_data["obj_imu"],
-        "hand_vel_glb_init": warmup_data["hand_vel_glb_init"],
-        "obj_vel_init": warmup_data["obj_vel_init"],
-        "obj_trans_init": warmup_data["obj_trans_init"],
-        "contact_init": warmup_data.get("contact_init"),
-        "hp_out": hp_out,
-    }
-    vc_out = model.velocity_contact_module.forward(vc_input_dict, hp_out=hp_out)
-    apply_segment_contact = getattr(
-        model,
-        "_apply_vc_segment_contact_if_enabled",
-        None,
-    )
-    if callable(apply_segment_contact):
-        vc_out = apply_segment_contact(
-            vc_out,
-            warmup_data.get("contact_init"),
-        )
-    lb_prior_quantiles = _predict_lb_prior_if_available(
-        model,
-        hp_out,
-        vc_out,
-        warmup_data["obj_imu"],
-    )
-    _, prediction_state = model.object_trans_module.forward(
-        model._resolve_hoi_hand_positions(hp_out),
-        vc_out["pred_hand_contact_prob"],
-        warmup_data["obj_trans_init"],
-        obj_imu=warmup_data["obj_imu"],
-        human_imu=warmup_data["human_imu"],
-        obj_vel_input=vc_out["pred_obj_vel"],
-        contact_init=warmup_data.get("contact_init"),
-        has_object_mask=warmup_data.get("has_object"),
-        lb_prior_quantiles=lb_prior_quantiles,
-        enable_refine=False,
-        compute_refine=False,
-        return_prediction_state=True,
-    )
-    return _split_ot_prediction_state(prediction_state, batch_size)
-
-
-def _predict_lb_prior_if_available(
-    model,
-    hp_out: Dict[str, Any],
-    vc_out: Dict[str, Any],
-    obj_imu: torch.Tensor,
-    history: Optional[Dict[str, Any]] = None,
-) -> Optional[torch.Tensor]:
-    predict = getattr(model, "_predict_lb_prior", None)
-    if callable(predict):
-        prior = predict(hp_out, vc_out, obj_imu)
-        if prior is not None:
-            return prior
-    return _compute_online_lb_stats_if_available(model, history)
-
-
-def _compute_online_lb_stats_if_available(
-    model,
-    history: Optional[Dict[str, Any]],
-) -> Optional[torch.Tensor]:
-    """Mirror IMUHOIModel's contact-segment l_b statistics for batched eval."""
-    if history is None:
-        return None
-    stats_enabled = getattr(model, "_online_lb_stats_enabled", None)
-    compute_stats = getattr(model, "_compute_online_lb_stats", None)
-    if not callable(stats_enabled) or not callable(compute_stats) or not stats_enabled():
-        return None
-    return compute_stats(history)
-
-
 def _sample_seq_len(sample: Dict[str, Any]) -> int:
     human_imu = sample.get("human_imu")
     if not isinstance(human_imu, torch.Tensor):
@@ -420,31 +211,34 @@ def _collate_sample_slices(
     return batch
 
 
-def _merge_stage_context(prefix: Dict[str, Any], latest: Dict[str, Any]) -> Dict[str, Any]:
-    stage_prefix = {key: prefix[key] for key in latest.keys() if key in prefix}
-    return merge_latest_context(stage_prefix, latest)
+def _pad_sample_to_length(sample: Dict[str, Any], target_len: int) -> Dict[str, Any]:
+    """Repeat-pad temporal fields for batched strict-lookahead inference.
 
+    A sample with length ``T`` only publishes targets through ``T-D-1``.  Those
+    targets read input frames no later than ``T-1``, so padding after ``T`` can
+    never affect the retained output.  Repeat padding keeps rotations and other
+    structured inputs valid while allowing differently sized sequences to run
+    in one GPU batch.
+    """
+    seq_len = _sample_seq_len(sample)
+    if seq_len >= target_len:
+        return dict(sample)
+    if seq_len <= 0:
+        raise ValueError("Cannot pad an empty online sequence.")
 
-def _run_forward_batch(
-    model,
-    config,
-    device: torch.device,
-    samples: Sequence[Dict[str, Any]],
-    use_object_data: bool,
-    compute_fk: bool,
-    refine_human: bool,
-) -> Dict[str, Any]:
-    seq_lens = [_sample_seq_len(sample) for sample in samples]
-    if len(set(seq_lens)) != 1:
-        raise ValueError("Forward batch requires equal sequence lengths.")
-    raw_batch = _collate_sample_slices(samples, [0] * len(samples), seq_lens)
-    data_dict = build_model_input_dict(raw_batch, config, device, add_noise=False)
-    return model.forward(
-        data_dict,
-        use_object_data=use_object_data,
-        compute_fk=compute_fk,
-        refine_human=refine_human,
-    )
+    padded = dict(sample)
+    pad_len = int(target_len) - seq_len
+    for key, value in sample.items():
+        if (
+            key in TEMPORAL_SAMPLE_KEYS
+            and isinstance(value, torch.Tensor)
+            and value.dim() >= 1
+            and int(value.shape[0]) == seq_len
+        ):
+            repeat_shape = (pad_len,) + tuple(value.shape[1:])
+            pad = value[-1:].expand(repeat_shape).clone()
+            padded[key] = torch.cat((value, pad), dim=0)
+    return padded
 
 
 def _run_batched_online_group(
@@ -453,6 +247,7 @@ def _run_batched_online_group(
     device: torch.device,
     samples: Sequence[Dict[str, Any]],
     online_window: int,
+    online_lookahead: int,
     use_object_data: bool,
     compute_fk: bool,
     refine_human: bool,
@@ -461,228 +256,89 @@ def _run_batched_online_group(
     if not samples:
         return []
 
-    outputs: List[Optional[Dict[str, Any]]] = [None] * len(samples)
     seq_lens = [_sample_seq_len(sample) for sample in samples]
-    object_trans_module = getattr(model, "object_trans_module", None)
-    stateful_ot = bool(
-        use_object_data
-        and object_trans_module is not None
-        and getattr(object_trans_module, "online_mode", lambda: "window")() == "stateful"
+    # The first online call consumes W+D frames at once.  Padding a shorter
+    # warmup would leak repeated tail frames into every retained warmup output,
+    # so sequences that do not exceed W+D must be grouped by exact length.
+    # Longer sequences are safe to repeat-pad: every retained target only
+    # reads real frames through its own strict endpoint T-1.
+    initial_context_len = int(online_window) + int(online_lookahead)
+    grouped_positions: List[List[int]] = []
+    long_positions = [
+        idx for idx, seq_len in enumerate(seq_lens) if seq_len > initial_context_len
+    ]
+    if long_positions:
+        grouped_positions.append(long_positions)
+    short_by_len: Dict[int, List[int]] = {}
+    for idx, seq_len in enumerate(seq_lens):
+        if seq_len <= initial_context_len:
+            short_by_len.setdefault(seq_len, []).append(idx)
+    grouped_positions.extend(short_by_len.values())
+    if len(grouped_positions) > 1:
+        outputs: List[Optional[Dict[str, Any]]] = [None] * len(samples)
+        for group_idx, positions in enumerate(grouped_positions, start=1):
+            group_outputs = _run_batched_online_group(
+                model,
+                config,
+                device,
+                [samples[idx] for idx in positions],
+                online_window=online_window,
+                online_lookahead=online_lookahead,
+                use_object_data=use_object_data,
+                compute_fk=compute_fk,
+                refine_human=refine_human,
+                desc=f"{desc}.{group_idx}",
+            )
+            for idx, output in zip(positions, group_outputs):
+                outputs[idx] = output
+        return [output for output in outputs if output is not None]
+
+    max_len = max(seq_lens)
+    padded_samples = [_pad_sample_to_length(sample, max_len) for sample in samples]
+    raw_batch = _collate_sample_slices(
+        padded_samples,
+        [0] * len(padded_samples),
+        [max_len] * len(padded_samples),
+    )
+    data_dict = build_model_input_dict(raw_batch, config, device, add_noise=False)
+    max_publish_len = max(max_len - int(online_lookahead), 0)
+    frame_progress = tqdm(
+        total=max_publish_len,
+        desc=desc,
+        unit="frame",
+        leave=False,
+        dynamic_ncols=True,
     )
 
-    short_by_len: Dict[int, List[int]] = defaultdict(list)
-    long_positions = []
-    for pos, seq_len in enumerate(seq_lens):
-        if seq_len <= online_window:
-            short_by_len[seq_len].append(pos)
-        else:
-            long_positions.append(pos)
+    def _update_progress(completed: int, _total: int) -> None:
+        frame_progress.update(max(0, int(completed) - frame_progress.n))
 
-    for same_len, positions in short_by_len.items():
-        same_samples = [samples[pos] for pos in positions]
-        out = _run_forward_batch(
-            model,
-            config,
-            device,
-            same_samples,
+    try:
+        out = model.inference(
+            data_dict,
             use_object_data=use_object_data,
             compute_fk=compute_fk,
             refine_human=refine_human,
+            inference_mode="online",
+            online_window=online_window,
+            online_lookahead=online_lookahead,
+            online_progress_callback=_update_progress,
         )
-        for pos, row_out in zip(positions, _split_batch_dict(out, len(positions))):
-            outputs[pos] = _detach_to_cpu(row_out)
+    finally:
+        frame_progress.close()
 
-    if long_positions:
-        long_samples = [samples[pos] for pos in long_positions]
-        long_lens = [seq_lens[pos] for pos in long_positions]
-        warmup_batch = _collate_sample_slices(
-            long_samples,
-            [0] * len(long_samples),
-            [online_window] * len(long_samples),
+    outputs = []
+    for seq_len, row_out in zip(seq_lens, _split_batch_dict(out, len(samples))):
+        publish_len = max(seq_len - int(online_lookahead), 0)
+        row_out = slice_time_dict(
+            row_out,
+            0,
+            publish_len,
+            batch_size=1,
+            seq_len=max_publish_len,
         )
-        warmup_data = build_model_input_dict(warmup_batch, config, device, add_noise=False)
-        warmup_out = model.forward(
-            warmup_data,
-            use_object_data=use_object_data,
-            compute_fk=compute_fk,
-            refine_human=refine_human,
-        )
-        ot_prediction_states = (
-            _initialize_stateful_ot_states(model, warmup_data, len(long_positions))
-            if stateful_ot
-            else None
-        )
-        warmup_rows = _split_batch_dict(warmup_out, len(long_positions))
-        accumulators = {
-            local_pos: TimeDictAccumulator(row_out, total_seq_len=long_lens[local_pos])
-            for local_pos, row_out in enumerate(warmup_rows)
-        }
-
-        max_len = max(long_lens)
-        step_iter = range(online_window + 1, max_len + 1)
-        for end in tqdm(step_iter, desc=desc, unit="step", leave=False, dynamic_ncols=True):
-            active_local = [idx for idx, seq_len in enumerate(long_lens) if seq_len >= end]
-            if not active_local:
-                continue
-            start = end - online_window
-            active_samples = [long_samples[idx] for idx in active_local]
-            window_batch = _collate_sample_slices(
-                active_samples,
-                [start] * len(active_samples),
-                [end] * len(active_samples),
-            )
-            window_data = build_model_input_dict(window_batch, config, device, add_noise=False)
-            histories = [accumulators[idx].current() for idx in active_local]
-            history = _stack_dicts(histories)
-            stage1_history_fn = getattr(model, "_stage1_history_for_inits", None)
-            history_for_inits = stage1_history_fn(history) if callable(stage1_history_fn) else history
-            window_data = update_data_inits_from_history(
-                window_data,
-                history_for_inits,
-                index=start - 1,
-                contact_index=start,
-            )
-            active_batch, window_len = infer_batch_seq(window_data)
-            prefix = select_time_context(history, start, end - 1)
-
-            hp_out_raw = model.human_pose_module.forward(model._build_hp_input_dict(window_data))
-            hp_latest = take_latest_frame(hp_out_raw, active_batch, window_len)
-            merge_raw_hp_fn = getattr(model, "_merge_raw_human_pose_context", None)
-            hp_context = (
-                merge_raw_hp_fn(prefix, hp_latest)
-                if callable(merge_raw_hp_fn)
-                else _merge_stage_context(prefix, hp_latest)
-            )
-
-            vc_input_dict = {
-                "human_imu": window_data["human_imu"],
-                "obj_imu": window_data["obj_imu"],
-                "hand_vel_glb_init": window_data["hand_vel_glb_init"],
-                "obj_vel_init": window_data["obj_vel_init"],
-                "obj_trans_init": window_data["obj_trans_init"],
-                "contact_init": window_data.get("contact_init"),
-                "hp_out": hp_context,
-            }
-            vc_out_raw = model.velocity_contact_module.forward(vc_input_dict, hp_out=hp_context)
-            apply_segment_contact = getattr(
-                model,
-                "_apply_vc_segment_contact_if_enabled",
-                None,
-            )
-            if callable(apply_segment_contact):
-                vc_out_raw = apply_segment_contact(
-                    vc_out_raw,
-                    window_data.get("contact_init"),
-                )
-            vc_latest = take_latest_frame(vc_out_raw, active_batch, window_len)
-            vc_context = _merge_stage_context(prefix, vc_latest)
-
-            results: Dict[str, Any] = {}
-            results.update(hp_context)
-            results.update(vc_context)
-
-            has_object = window_data.get("has_object")
-            if use_object_data and (has_object is None or has_object.any()):
-                if stateful_ot:
-                    if ot_prediction_states is None:
-                        raise RuntimeError("Stateful ObjectTrans evaluation is missing warmup predictor states.")
-                    active_states = _stack_ot_prediction_states(
-                        [ot_prediction_states[local_pos] for local_pos in active_local]
-                    )
-                    # IMUHOIModel's stateful stream computes these statistics
-                    # from its bounded output_window; slice the accumulated
-                    # history to the same trailing window for parity.
-                    hist_len = int(end - 1)
-                    lb_history = (
-                        select_time_context(history, hist_len - online_window, hist_len)
-                        if hist_len > online_window
-                        else history
-                    )
-                    lb_prior_quantiles = _compute_online_lb_stats_if_available(model, lb_history)
-                    ot_latest, next_active_state = model.object_trans_module.forward(
-                        model._resolve_hoi_hand_positions(hp_latest),
-                        vc_latest["pred_hand_contact_prob"],
-                        window_data["obj_trans_init"],
-                        obj_imu=window_data["obj_imu"][:, -1:],
-                        human_imu=window_data["human_imu"][:, -1:],
-                        obj_vel_input=vc_latest["pred_obj_vel"],
-                        contact_init=window_data.get("contact_init"),
-                        has_object_mask=has_object,
-                        lb_prior_quantiles=lb_prior_quantiles,
-                        enable_refine=False,
-                        compute_refine=False,
-                        prediction_state=active_states,
-                        return_prediction_state=True,
-                    )
-                    for local_pos, row_state in zip(
-                        active_local,
-                        _split_ot_prediction_state(next_active_state, active_batch),
-                    ):
-                        ot_prediction_states[local_pos] = row_state
-
-                    ot_obj_trans_init = window_data["obj_trans_init"]
-                    ot_out = _merge_stage_context(prefix, ot_latest)
-                    ot_out.update(
-                        model.object_trans_module.compute_human_refinement_from_prediction(
-                            ot_out,
-                            model._resolve_hoi_hand_positions(hp_context),
-                            vc_context["pred_hand_contact_prob"],
-                            obj_vel_input=vc_context["pred_obj_vel"],
-                            human_pose_input=hp_context.get("p_pred"),
-                            root_trans_input=hp_context.get("root_trans_pred"),
-                            has_object_mask=has_object,
-                            enable_refine=refine_human,
-                        )
-                    )
-                else:
-                    lb_prior_quantiles = _predict_lb_prior_if_available(
-                        model,
-                        hp_context,
-                        vc_context,
-                        window_data["obj_imu"],
-                        history=history,
-                    )
-                    obj_prefix = prefix.get("pred_obj_trans")
-                    gate_prefix = prefix.get("gating_weights")
-                    if isinstance(obj_prefix, torch.Tensor) and obj_prefix.shape[1] > 0:
-                        ot_obj_trans_init = obj_prefix[:, 0]
-                    else:
-                        ot_obj_trans_init = window_data["obj_trans_init"]
-                    ot_out = model.object_trans_module.forward(
-                        model._resolve_hoi_hand_positions(hp_context),
-                        vc_context["pred_hand_contact_prob"],
-                        ot_obj_trans_init,
-                        obj_imu=window_data["obj_imu"],
-                        human_imu=window_data["human_imu"],
-                        obj_vel_input=vc_context["pred_obj_vel"],
-                        contact_init=window_data.get("contact_init"),
-                        has_object_mask=has_object,
-                        human_pose_input=hp_context.get("p_pred"),
-                        root_trans_input=hp_context.get("root_trans_pred"),
-                        lb_prior_quantiles=lb_prior_quantiles,
-                        enable_refine=refine_human,
-                        known_obj_trans_prefix=obj_prefix,
-                        known_gating_weights_prefix=gate_prefix,
-                    )
-                results.update(ot_out)
-                if refine_human:
-                    model._promote_refined_human_outputs(results, ot_out, window_data)
-                if compute_fk:
-                    model._compute_fk_output(results, vc_context, window_data, ot_obj_trans_init)
-
-            results["has_object"] = has_object
-            latest = take_latest_frame(results, active_batch, window_len)
-            latest_rows = _split_batch_dict(latest, active_batch)
-            for local_pos, row_latest in zip(active_local, latest_rows):
-                accumulators[local_pos].append(row_latest)
-
-        for local_pos, original_pos in enumerate(long_positions):
-            outputs[original_pos] = _detach_to_cpu(accumulators[local_pos].current())
-
-    missing = [idx for idx, output in enumerate(outputs) if output is None]
-    if missing:
-        raise RuntimeError(f"Batched online inference missed outputs for local positions: {missing}")
-    return [output for output in outputs if output is not None]
+        outputs.append(_detach_to_cpu(row_out))
+    return outputs
 
 
 def _batched_online_predict_dataset(
@@ -692,6 +348,7 @@ def _batched_online_predict_dataset(
     device: torch.device,
     online_batch_size: int,
     online_window: int,
+    online_lookahead: int,
     use_object_data: bool,
     compute_fk: bool,
     refine_human: bool,
@@ -710,7 +367,7 @@ def _batched_online_predict_dataset(
         unit="batch",
         dynamic_ncols=True,
     )
-    for group_id, offset in enumerate(progress):
+    for offset in progress:
         group_indices = order[offset:offset + online_batch_size]
         samples = []
         keys = []
@@ -742,10 +399,11 @@ def _batched_online_predict_dataset(
             device,
             samples,
             online_window=online_window,
+            online_lookahead=online_lookahead,
             use_object_data=use_object_data,
             compute_fk=compute_fk,
             refine_human=refine_human,
-            desc=f"online {group_id + 1}",
+            desc=f"OnlineFrames {offset // online_batch_size + 1}",
         )
         for key, output in zip(keys, outputs):
             pred_cache[key] = output
@@ -784,11 +442,32 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset", type=str, default="omomo", help="Dataset key under config.datasets (default: omomo).")
     parser.add_argument("--smpl_model_path", type=str, default="datasets/smpl_models/smplh/male/model.npz")
     parser.add_argument("--num_workers", type=int, default=12, help="Kept for dataset parity; metric pass uses cached samples.")
-    parser.add_argument("--online_batch_size", "--online-batch-size", type=int, default=64)
-    parser.add_argument("--online_window", "--online-window", type=int, default=None)
+    parser.add_argument(
+        "--online_batch_size",
+        "--online-batch-size",
+        type=int,
+        default=64,
+        help=(
+            "Sequences per padded online batch. Each batch also reports frame-level progress."
+        ),
+    )
+    parser.add_argument(
+        "--online_window",
+        "--online-window",
+        type=int,
+        default=60,
+        help="Base online window; defaults to test.window from the config.",
+    )
+    parser.add_argument(
+        "--online_lookahead",
+        "--online-lookahead",
+        type=int,
+        default=5,
+        help="Future frames appended after the legacy online update frame (strict tail).",
+    )
     parser.add_argument("--sort_asc", action="store_true", help="Sort sequence lengths ascending instead of descending.")
     parser.add_argument("--no_trans", action="store_true")
-    parser.add_argument("--no_eval_objects", action="store_true")
+    parser.add_argument("--no_objects", action="store_true")
     parser.add_argument("--compare_3", action="store_true")
     parser.add_argument("--hp_ckpt", type=str, default=None)
     parser.add_argument("--interaction_ckpt", type=str, default=None)
@@ -815,7 +494,8 @@ def _make_parser() -> argparse.ArgumentParser:
         default='current',
         help=(
             "VelocityContact架构（不区分大小写）；legacy不包含interaction "
-            "boundary模块，imuhoi为EgoIMU VC。"
+            "boundary模块，v2为velocity→obj_move→direct hand-contact级联，"
+            "imuhoi为EgoIMU VC。"
         ),
     )
     parser.add_argument(
@@ -823,12 +503,6 @@ def _make_parser() -> argparse.ArgumentParser:
         choices=("none", "fused"),
         default=None,
         help="Override OT feedback mode for a shared-head checkpoint.",
-    )
-    parser.add_argument(
-        "--object_trans_online_mode",
-        choices=("window", "stateful"),
-        default=None,
-        help="Use reset-window OT replay or persist only the OT predictor state.",
     )
     parser.add_argument("--hand_contact_threshold", type=float, default=None)
     parser.add_argument("--object_contact_threshold", type=float, default=None)
@@ -882,6 +556,7 @@ def main() -> int:
     print("Model arch: rnn")
     print(f"Mode: {'noTrans' if args.no_trans else 'Normal'}")
     print(f"Batch online size: {args.online_batch_size}")
+    print("Batch scheduler: sorted repeat-padding + strict per-sequence crop")
     print(f"VelocityContact architecture: {args.velocity_contact_arch or 'config/default'}")
     print(f"Eval seed: {seed if seed is not None else 'unset'}")
     print(
@@ -906,7 +581,6 @@ def main() -> int:
 
     all_results = {}
     resolved_ot_state_feedback = None
-    resolved_ot_online_mode = None
     resolved_ot_arch = None
     for dataset_name, dataset_cfg in dataset_runs:
         print(f"\n=== Batch-online evaluating dataset: {dataset_name} ===")
@@ -926,10 +600,7 @@ def main() -> int:
         config.velocity_contact_arch = resolved_vc_arch
         if args.object_trans_state_feedback is not None:
             config.object_trans_state_feedback = args.object_trans_state_feedback == "fused"
-        if args.object_trans_online_mode is not None:
-            config.object_trans_online_mode = args.object_trans_online_mode
         resolved_ot_state_feedback = bool(getattr(config, "object_trans_state_feedback", False))
-        resolved_ot_online_mode = str(getattr(config, "object_trans_online_mode", "window"))
         ot_refine = False if is_imuhoi_object_trans_arch(
             resolved_ot_arch
         ) else (
@@ -1017,23 +688,24 @@ def main() -> int:
         model = _unwrap_model(model)
         model.eval()
 
-        evaluate_contacts = (not args.no_eval_objects) and has_velocity_contact_ckpt
-        evaluate_objects = (not args.no_eval_objects) and has_velocity_contact_ckpt
+        evaluate_contacts = (not args.no_objects) and has_velocity_contact_ckpt
+        evaluate_objects = (not args.no_objects) and has_velocity_contact_ckpt
         run_object_branch = evaluate_objects and has_object_trans_ckpt
-        if not args.no_eval_objects:
+        if not args.no_objects:
             if not has_velocity_contact_ckpt:
                 print("[BatchEval] No velocity_contact checkpoint loaded; skipping contact/object metrics.")
             elif not has_object_trans_ckpt:
                 print("[BatchEval] No object_trans checkpoint loaded; object branch is disabled.")
 
         online_window = resolve_online_window(config, args.online_window)
+        online_lookahead = resolve_online_lookahead(config, args.online_lookahead)
         compute_fk = bool(args.compare_3 and run_object_branch)
         print(f"Dataset size: {len(test_dataset)}")
         print(f"Online window: {online_window}")
+        print(f"Online lookahead: {online_lookahead} (strict tail)")
         print(
-            "OT predictor: "
-            f"feedback={'fused' if bool(getattr(config, 'object_trans_state_feedback', False)) else 'none'} | "
-            f"online_mode={getattr(config, 'object_trans_online_mode', 'window')}"
+            "OT predictor feedback: "
+            f"{'fused' if bool(getattr(config, 'object_trans_state_feedback', False)) else 'none'}"
         )
         print(f"VC architecture: {resolved_vc_arch}")
         print(f"OT human refine: {'enabled' if ot_refine else 'disabled'}")
@@ -1047,6 +719,7 @@ def main() -> int:
                 device,
                 online_batch_size=args.online_batch_size,
                 online_window=online_window,
+                online_lookahead=online_lookahead,
                 use_object_data=run_object_branch,
                 compute_fk=compute_fk,
                 refine_human=ot_refine,
@@ -1081,6 +754,7 @@ def main() -> int:
             object_contact_threshold=object_contact_threshold,
             inference_mode="online",
             online_window=online_window,
+            online_lookahead=online_lookahead,
         )
         eval_duration = time.time() - eval_start
         all_results[dataset_name] = results
@@ -1125,9 +799,10 @@ def main() -> int:
             "inference_mode": "batch_online",
             "online_window": args.online_window,
             "resolved_online_window": resolve_online_window(load_config(args.config), args.online_window),
+            "online_lookahead": args.online_lookahead,
+            "resolved_online_lookahead": resolve_online_lookahead(load_config(args.config), args.online_lookahead),
             "online_batch_size": args.online_batch_size,
             "object_trans_state_feedback": resolved_ot_state_feedback,
-            "object_trans_online_mode": resolved_ot_online_mode,
             "object_trans_arch": resolved_ot_arch or _normalize_object_trans_arch(
                 getattr(load_config(args.config), "object_trans_arch", "current")
             ),

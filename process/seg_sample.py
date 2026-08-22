@@ -19,7 +19,7 @@ def _sequence_length(data: Dict[str, Any]) -> int:
     for key in [
         'position_global_full_gt_world',
         'trans',
-        'rotation_local_full_gt_list',
+        'pose',
     ]:
         value = data.get(key)
         if isinstance(value, (torch.Tensor, np.ndarray)) and value.ndim >= 1:

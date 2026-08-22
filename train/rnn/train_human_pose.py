@@ -32,6 +32,19 @@ def get_args():
     """获取命令行参数"""
     parser = get_base_args()
     parser.description = 'HumanPoseModule训练 (Stage 1)'
+    parser.add_argument(
+        '--target_only',
+        '--target-only',
+        action='store_true',
+        help='只在原 online 窗口的末帧计算 loss。',
+    )
+    parser.add_argument(
+        '--target_lookahead',
+        '--target-lookahead',
+        type=int,
+        default=None,
+        help='追加到训练窗口末尾、仅作为目标帧未来上下文的帧数。',
+    )
     return parser.parse_args()
 
 
@@ -55,6 +68,24 @@ def main():
     """主函数"""
     args = get_args()
     cfg = merge_config(args)
+
+    cfg.target_only = bool(args.target_only)
+    cfg.target_lookahead = max(
+        int(
+            args.target_lookahead
+            if args.target_lookahead is not None
+            else getattr(cfg.test, 'online_lookahead', 5)
+        ),
+        0,
+    )
+    if cfg.target_only:
+        if int(cfg.train.window) != int(cfg.test.window):
+            raise ValueError(
+                'target-only fine-tuning requires train.window == test.window so '
+                'the same target index is used for training and model selection.'
+            )
+        cfg.train_data_window = int(cfg.train.window) + cfg.target_lookahead
+        cfg.test_data_window = int(cfg.test.window) + cfg.target_lookahead
     
     setup_seed(cfg.seed)
     cfg = setup_device(cfg)
@@ -69,6 +100,15 @@ def main():
     print(f"批次大小: {cfg.batch_size}")
     print(f"训练轮数: {cfg.epochs}")
     print(f"noTrans模式: {cfg.no_trans}")
+    print(
+        f"Target-only: {cfg.target_only}"
+        + (
+            f" | target_index={int(cfg.train.window) - 1}"
+            f" | lookahead={cfg.target_lookahead}"
+            if cfg.target_only
+            else ""
+        )
+    )
     print(f"保存目录: {save_dir}")
     print("=" * 50)
     
@@ -87,7 +127,11 @@ def main():
     
     # 创建损失函数
     loss_weights = getattr(cfg, 'loss_weights', {})
-    loss_fn = HumanPoseLoss(weights=loss_weights, no_trans=cfg.no_trans)
+    loss_fn = HumanPoseLoss(
+        weights=loss_weights,
+        no_trans=cfg.no_trans,
+        target_frame_index=int(cfg.train.window) - 1 if cfg.target_only else None,
+    )
     
     # 创建训练器
     trainer = HumanPoseTrainer(cfg, model, loss_fn, train_loader, test_loader)

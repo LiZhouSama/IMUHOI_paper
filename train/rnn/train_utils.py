@@ -18,15 +18,22 @@ try:
 except Exception:
     SummaryWriter = None
 try:  # torch>=2.3 unified AMP namespace; torch.cuda.amp.* is deprecated.
-    from torch.amp import GradScaler as _AmpGradScaler
+    from torch.amp import GradScaler as _AmpGradScaler, autocast as _AmpAutocast
 
     def GradScaler(enabled: bool):
         return _AmpGradScaler("cuda", enabled=enabled)
+
+    def autocast(enabled: bool, dtype: torch.dtype):
+        return _AmpAutocast("cuda", enabled=enabled, dtype=dtype)
 except ImportError:
     from torch.cuda.amp.grad_scaler import GradScaler as _AmpGradScaler
+    from torch.cuda.amp.autocast_mode import autocast as _AmpAutocast
 
     def GradScaler(enabled: bool):
         return _AmpGradScaler(enabled=enabled)
+
+    def autocast(enabled: bool, dtype: torch.dtype):
+        return _AmpAutocast(enabled=enabled, dtype=dtype)
 from tqdm import tqdm
 
 # 从 utils 导入共用函数
@@ -47,6 +54,7 @@ __all__ = [
     'setup_device',
     'create_save_dir',
     'create_dataloaders',
+    'prime_dataloader_workers',
     'flatten_lstm_parameters',
     'build_optimizer_and_scheduler',
     'save_checkpoint',
@@ -58,14 +66,33 @@ __all__ = [
     'load_checkpoint',
     'build_model_input_dict',
     'BaseTrainer',
+    'autocast',
+    'resolve_amp_settings',
 ]
+
+
+def resolve_amp_settings(cfg, device):
+    enabled = bool(getattr(cfg, "amp_enabled", False)) and device.type == "cuda"
+    dtype_name = str(getattr(cfg, "amp_dtype", "bfloat16")).strip().lower()
+    dtype_map = {
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+    }
+    if dtype_name not in dtype_map:
+        raise ValueError(f"Unsupported amp_dtype: {dtype_name}")
+    dtype = dtype_map[dtype_name]
+    if enabled and dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("amp_dtype=bfloat16 requires a CUDA device with BF16 support")
+    return enabled, dtype
 
 
 def get_base_args():
     """获取基础命令行参数"""
     parser = argparse.ArgumentParser(description='IMUHOI模块化训练')
     parser.add_argument('--cfg', type=str, default='configs/IMUHOI_train_rnn.yaml', help='配置文件路径')
-    parser.add_argument('--seed', type=int, default=10, help='随机种子')
+    parser.add_argument('--seed', type=int, default=42, help='随机种子')
     parser.add_argument('--batch_size', type=int, default=None, help='批量大小')
     parser.add_argument('--epochs', type=int, default=None, help='训练轮数')
     parser.add_argument('--num_workers', type=int, default=None, help='DataLoader worker 数；Docker 大数据预加载可设为 0')
@@ -140,7 +167,7 @@ def merge_config(args):
             resume_config_missing = True
             print(f"警告: resume_dir 内未找到 config.yaml，将回退读取 --cfg: {args.cfg}")
 
-    with open(config_path, 'r') as f:
+    with open(config_path, 'r', encoding='utf-8') as f:
         cfg = yaml.load(f, Loader=yaml.FullLoader)
     
     cfg = edict(cfg)
@@ -225,7 +252,7 @@ def save_config_snapshot(cfg, extra=None, filename="config.yaml"):
     if extra:
         cfg_dict.update(_to_plain_data(extra))
     config_path = os.path.join(save_dir, filename)
-    with open(config_path, "w") as f:
+    with open(config_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg_dict, f, allow_unicode=True, sort_keys=False)
     print(f"保存配置: {config_path}")
     return config_path
@@ -279,23 +306,40 @@ def create_dataloaders(cfg, project_root=None):
     print(f"训练数据路径: {train_paths}")
     resolve_bimanual_contact_conflicts = bool(getattr(cfg, "resolve_bimanual_contact_conflicts", False))
     
+    train_window = int(getattr(cfg, "train_data_window", cfg.train.window))
+    test_window = int(getattr(cfg, "test_data_window", cfg.test.window))
+    print(f"训练/验证数据窗口: {train_window}/{test_window}")
+
     train_dataset = IMUDataset(
         data_dir=train_paths,
-        window_size=cfg.train.window,
+        window_size=train_window,
         debug=cfg.debug,
         obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
         simulate_imu_noise=bool(getattr(cfg, 'simulate_imu_noise', False)),
+        simulate_imu_noise_seed=int(getattr(cfg, 'simulate_imu_noise_seed', 42)),
         resolve_bimanual_contact_conflicts=resolve_bimanual_contact_conflicts,
         random_window=True,
     )
     
+    # IMUDataset preloads the full corpus in the parent process.  WSL's
+    # default fork + persistent workers can segfault when both train and
+    # validation iterators are pre-started against that large read-only
+    # object.  Keep the requested worker count, but allow the runner to use
+    # non-persistent workers for a safer process lifecycle.
+    persistent_workers = (
+        cfg.num_workers > 0
+        and os.environ.get("IMUHOI_PERSISTENT_WORKERS", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg.batch_size,
         shuffle=True,
         num_workers=cfg.num_workers,
-        pin_memory=True,
-        drop_last=True
+        pin_memory=False,
+        drop_last=True,
+        persistent_workers=persistent_workers,
     )
     
     print(f"训练数据集大小: {len(train_dataset)}")
@@ -304,11 +348,12 @@ def create_dataloaders(cfg, project_root=None):
     if test_paths:
         test_dataset = IMUDataset(
             data_dir=test_paths,
-            window_size=cfg.test.window,
+            window_size=test_window,
             debug=cfg.debug,
             obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
-            # Keep validation deterministic; noise is enabled for the training split only.
-            simulate_imu_noise=False,
+            # Validation uses the same fixed sequence-level noise policy by design.
+            simulate_imu_noise=bool(getattr(cfg, 'simulate_imu_noise', False)),
+            simulate_imu_noise_seed=int(getattr(cfg, 'simulate_imu_noise_seed', 42)),
             resolve_bimanual_contact_conflicts=resolve_bimanual_contact_conflicts,
             random_window=not bool(getattr(cfg, "deterministic_test_windows", False)),
         )
@@ -318,12 +363,38 @@ def create_dataloaders(cfg, project_root=None):
                 batch_size=cfg.batch_size,
                 shuffle=False,
                 num_workers=cfg.num_workers,
-                pin_memory=True,
-                drop_last=False
+                pin_memory=False,
+                drop_last=False,
+                persistent_workers=persistent_workers,
             )
             print(f"测试数据集大小: {len(test_dataset)}")
     
     return train_loader, test_loader
+
+
+def prime_dataloader_workers(*loaders):
+    """Start persistent workers before CUDA models/TensorBoard create threads.
+
+    IMUDataset preloads its tensors in the parent process.  On Linux/WSL,
+    starting fork workers only at the first training epoch can deadlock when
+    CUDA or TensorBoard has already initialized background threads.  Creating
+    each persistent iterator immediately after the loaders are built preserves
+    copy-on-write dataset sharing and lets CPU preprocessing overlap GPU work.
+    """
+    if os.environ.get("IMUHOI_SKIP_DATALOADER_PRIME", "0").strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        print("跳过 persistent DataLoader worker 预启动（WSL 安全模式）")
+        return
+
+    started = []
+    for loader in loaders:
+        if loader is None or int(getattr(loader, "num_workers", 0)) <= 0:
+            continue
+        iter(loader)
+        started.append(int(loader.num_workers))
+    if started:
+        print(f"已预启动persistent DataLoader workers: {started}")
 
 
 def build_optimizer_and_scheduler(model, cfg):
@@ -545,7 +616,14 @@ class BaseTrainer:
         flatten_lstm_parameters(self.model)
         
         self.optimizer, self.scheduler = self.build_optimizer_and_scheduler()
-        self.scaler = GradScaler(enabled=self.device.type == "cuda")
+        self.amp_enabled, self.amp_dtype = resolve_amp_settings(cfg, self.device)
+        self.scaler = GradScaler(
+            enabled=self.amp_enabled and self.amp_dtype == torch.float16
+        )
+        print(
+            f"AMP: enabled={self.amp_enabled}, dtype={self.amp_dtype}, "
+            f"grad_scaler={self.scaler.is_enabled()}"
+        )
         if self.resume_checkpoint is not None:
             self._restore_training_state(self.resume_checkpoint)
         
@@ -636,14 +714,20 @@ class BaseTrainer:
         for batch in train_iter:
             data_dict = build_model_input_dict(batch, self.cfg, self.device, add_noise=True)
             
-            self.optimizer.zero_grad()
-            pred_dict = self.model_forward(data_dict, batch=batch)
-            
-            total_loss, losses, weighted_losses = self.loss_fn(pred_dict, batch, self.device)
-            
-            self.scaler.scale(total_loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            self.optimizer.zero_grad(set_to_none=True)
+            with autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
+                pred_dict = self.model_forward(data_dict, batch=batch)
+                total_loss, losses, weighted_losses = self.loss_fn(
+                    pred_dict, batch, self.device
+                )
+
+            if self.scaler.is_enabled():
+                self.scaler.scale(total_loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                total_loss.backward()
+                self.optimizer.step()
             
             train_loss += total_loss.item()
             for key, value in weighted_losses.items():
@@ -686,14 +770,15 @@ class BaseTrainer:
             
             for batch in test_iter:
                 data_dict = build_model_input_dict(batch, self.cfg, self.device, add_noise=False)
-                pred_dict = self.model_forward(data_dict, batch=batch)
-                
-                if hasattr(self.loss_fn, 'compute_test_loss'):
-                    total_loss, losses = self.loss_fn.compute_test_loss(pred_dict, batch, self.device)
-                    component_losses = losses
-                else:
-                    total_loss, losses, weighted_losses = self.loss_fn(pred_dict, batch, self.device)
-                    component_losses = weighted_losses
+                with autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
+                    pred_dict = self.model_forward(data_dict, batch=batch)
+
+                    if hasattr(self.loss_fn, 'compute_test_loss'):
+                        total_loss, losses = self.loss_fn.compute_test_loss(pred_dict, batch, self.device)
+                        component_losses = losses
+                    else:
+                        total_loss, losses, weighted_losses = self.loss_fn(pred_dict, batch, self.device)
+                        component_losses = weighted_losses
                 
                 test_loss += total_loss.item()
                 for key, value in component_losses.items():

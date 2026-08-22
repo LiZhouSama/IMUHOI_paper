@@ -89,6 +89,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--inference-mode", "--inference_mode", choices=["online", "offline"], default="online", help="RNN inference mode.")
     parser.add_argument("--online-window", "--online_window", type=int, default=None, help="RNN online sliding window size.")
+    parser.add_argument("--online-lookahead", "--online_lookahead", type=int, default=5, help="RNN online fixed-lag lookahead frames (strict tail).")
     parser.add_argument(
         "--save-pred",
         default=None,
@@ -208,6 +209,7 @@ def run_inference(
     compute_fk: bool,
     inference_mode: str = "online",
     online_window: int = None,
+    online_lookahead: int = 5,
 ) -> Dict[str, torch.Tensor]:
 
     with torch.no_grad():
@@ -220,6 +222,7 @@ def run_inference(
                     compute_fk=compute_fk,
                     inference_mode=inference_mode,
                     online_window=online_window,
+                    online_lookahead=online_lookahead,
                 )
             except TypeError:
                 outputs = model.inference(
@@ -260,7 +263,7 @@ def reconstruct_human_sequence(
     seq_len = p_seq.shape[0]
 
     reduced_pose = p_seq.view(seq_len, len(_REDUCED_POSE_NAMES), 6)
-    imu_rot_6d = human_imu[0, :, :, -6:]
+    imu_rot_6d = human_imu[0, :seq_len, :, -6:]
     imu_rot_mat = t3d.rotation_6d_to_matrix(imu_rot_6d.reshape(-1, 6)).reshape(
         seq_len, human_imu.shape[2], 3, 3
     )
@@ -672,7 +675,10 @@ def main():
     cfg = load_config(args.config, device)
     if args.model_arch is not None:
         cfg.model_arch = args.model_arch
-    print(f"[demo] Inference mode: {args.inference_mode} | online_window: {args.online_window or 'config/default'}")
+    print(
+        f"[demo] Inference mode: {args.inference_mode} | online_window: "
+        f"{args.online_window or 'config/default'} | online_lookahead: {args.online_lookahead}"
+    )
     model = build_model(cfg, args, device)
     smpl_model = load_body_model(args.body_model, device)
     data_dict = load_data_dict(args.data_dict, device)
@@ -685,6 +691,7 @@ def main():
         compute_fk=args.compute_fk,
         inference_mode=args.inference_mode,
         online_window=args.online_window,
+        online_lookahead=args.online_lookahead,
     )
     foot_contact_watch = outputs.get("contact_pred").detach().cpu().numpy()
 

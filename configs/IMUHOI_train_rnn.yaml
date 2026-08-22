@@ -2,10 +2,10 @@
 # 使用 --no_trans 切换是否预测根节点位移
 
 # ============ 基本配置 ============
-save_dir: "outputs/IMUHOI_RNN_2"
+save_dir: "outputs/IMUHOI++/RNN"
 body_model_path: datasets/smpl_models/smplh/male/model.npz
 use_tensorboard: true
-use_multi_gpu: true
+use_multi_gpu: false
 device: "cuda:0"
 gpus: [0]
 model_arch: "rnn"
@@ -18,11 +18,14 @@ human_pose_dropout: 0.2
 velocity_hidden_dim: 128
 velocity_num_layers: 2
 velocity_dropout: 0.2
-velocity_contact_arch: "current"  # current | legacy | imuhoi
+velocity_contact_arch: "current"  # current | legacy | v2 | v3 | v4 | imuhoi | imuhoi_cond*
+# v3 uses this many future frames in its finite-receptive-field interaction
+# branch. Keep it equal to test.online_lookahead for train/eval parity.
+v3_lookahead: 5
 boundary_group_hidden: 64
 boundary_hidden_dim: 128
-# 在线滑窗只保留窗口末帧，而双向 boundary GRU 在末帧没有反向信息，离线训练
-# 与在线部署分布不一致；改为因果单向。注意：修改后必须重训 VelocityContact，
+# 在线采用固定延迟并只发布 target 帧；boundary GRU 仍保持因果单向，避免其
+# 未来上下文策略与整窗训练不一致。注意：修改后必须重训 VelocityContact，
 # 旧的双向 checkpoint 会在加载时被 validate_checkpoint_state_dict 拒绝。
 boundary_bidirectional: false
 
@@ -35,7 +38,6 @@ object_trans_length_init: 0.4
 # 向量），接触开始时才能几何推导锚定骨长，而不是从 IMU 历史里猜。
 object_trans_state_feedback: true
 object_trans_feedback_hidden_dim: 64
-object_trans_online_mode: "window"  # window | stateful
 mesh_downsample_points: 256
 enable_ot_refine: true
 enable_ot_lb_prior: false
@@ -80,7 +82,7 @@ lb_stats_drop_prob: 0.3
 # ============ 独立 l_b VQ + latent diffusion（暂不接入OT）============
 lb_vq_prior:
   batch_size: 200
-  num_workers: 4
+  num_workers: 8
   quantiles: [0.1, 0.5, 0.9]
   min_contact_frames: 10
   max_seq_len: 256
@@ -141,11 +143,15 @@ joint_train_epochs: 100
 input_mix_start_epoch: 0
 input_mix_end_epoch: 30  # 0 means use predicted HP/VC inputs from epoch 0
 deterministic_test_windows: true
-eval_interval: 1
+eval_interval: 5
+# joint_train阶段单独设置评估间隔（epoch）
+joint_train_eval_interval: 1
 batch_size: 200
 lr: 0.002 # jt:0.0002
 weight_decay: 0.0001
 gradient_clip: 1.0
+amp_enabled: true
+amp_dtype: "bfloat16"
 milestones: [100, 200, 300, 350, 400, 450, 500]
 joint_train_milestones: [10,20,30,40,50,60,70,80,90,100] 
 gamma: 0.2
@@ -170,6 +176,7 @@ num_joints: 24
 
 # ============ 噪声配置 ============
 simulate_imu_noise: true
+simulate_imu_noise_seed: 42
 imu_acc_noise_std: 0.2
 imu_rot_noise_std: 0.005
 obj_imu_acc_noise_std: 0.2
@@ -195,33 +202,33 @@ train_datasets: ["omomo"]  # 可选: behave, imhd, omomo, pahoi, hodome
 # ============ 数据集路径 ============
 datasets:
   omomo:
-    train_path: "process/processed_split_data_OMOMO_bps_fixed/train"
-    test_path:  "process/processed_split_data_OMOMO_bps_fixed/test"
-    debug_path: "process/processed_split_data_OMOMO_bps_fixed/debug"
+    train_path: "process/IMUHOI++/processed_split_data_OMOMO/train"
+    test_path:  "process/IMUHOI++/processed_split_data_OMOMO/test"
+    debug_path: "process/IMUHOI++/processed_split_data_OMOMO/debug"
     object_geo_root: "datasets/OMOMO/captured_objects"
   imhd:
-    train_path: "process/processed_seg_data_IMHD/train"
-    test_path:  "process/processed_seg_data_IMHD/test"
-    debug_path: "process/processed_seg_data_IMHD/train"
-    full_sequence_test_path: "process/processed_split_data_IMHD/test"
+    train_path: "process/IMUHOI++/processed_seg_data_IMHD/train"
+    test_path: "process/IMUHOI++/processed_seg_data_IMHD/test"
+    debug_path: "process/IMUHOI++/processed_seg_data_IMHD/train"
+    full_sequence_test_path: "process/IMUHOI++/processed_split_data_IMHD/test"
     object_geo_root: "datasets/IMHD/IMHD Dataset/object_templates"
   behave:
-    train_path: "process/processed_seg_data_BEHAVE/train"
-    test_path:  "process/processed_seg_data_BEHAVE/test"
-    debug_path: "process/processed_seg_data_BEHAVE/train"
-    full_sequence_test_path: "process/processed_split_data_BEHAVE/test"
+    train_path: "process/IMUHOI++/processed_seg_data_BEHAVE/train"
+    test_path: "process/IMUHOI++/processed_seg_data_BEHAVE/test"
+    debug_path: "process/IMUHOI++/processed_seg_data_BEHAVE/train"
+    full_sequence_test_path: "process/IMUHOI++/processed_split_data_BEHAVE/test"
     object_geo_root: "datasets/BEHAVE/objects"
   pahoi:
-    train_path: "process/processed_seg_data_PAHOI/train"
-    test_path:  "process/processed_seg_data_PAHOI/test"
-    debug_path: "process/processed_seg_data_PAHOI/train"
-    full_sequence_test_path: "process/processed_split_data_PAHOI/test"
+    train_path: "process/IMUHOI++/processed_split_data_PAHOI_v2/train"
+    test_path: "process/IMUHOI++/processed_split_data_PAHOI_v2/test"
+    debug_path: "process/IMUHOI++/processed_split_data_PAHOI_v2/train"
+    full_sequence_test_path: "process/IMUHOI++/processed_split_data_PAHOI_v2/test"
     object_geo_root: "datasets/PAHOI/Object_mesh"
   hodome:
-    train_path: "process/processed_seg_data_HODOME/train"
-    test_path:  "process/processed_seg_data_HODOME/test"
-    debug_path: "process/processed_seg_data_HODOME/train"
-    full_sequence_test_path: "process/processed_split_data_HODOME/test"
+    train_path: "process/IMUHOI++/processed_seg_data_HODOME/train"
+    test_path: "process/IMUHOI++/processed_seg_data_HODOME/test"
+    debug_path: "process/IMUHOI++/processed_seg_data_HODOME/train"
+    full_sequence_test_path: "process/IMUHOI++/processed_split_data_HODOME/test"
     object_geo_root: "datasets/HODome/scaned_object"
 
 # ============ 损失权重 ============
@@ -233,16 +240,23 @@ loss_weights:
   root_vel: 1.0
   root_trans: 1.0
   hand_pos: 1.0
-  contact: 0
+  contact: 1.0
 
   # Stage 2: VelocityContactModule
   obj_vel: 1.0
   hand_vel: 1.0
   obj_move: 1.0
   hand_contact_cond: 1.0
+  # v3-only: supervise the hand probability product consumed by OT/eval.
+  hand_contact_marginal: 0.5
+  hand_contact: 1.0
   hand_contact_pos_weight: 1.0
   hand_contact_neg_weight: 2.0
   hand_contact_hard_neg_weight: 4.0
+  # v2直接预测边缘接触概率；使用proper BCE保持概率标定。
+  v2_hand_contact_pos_weight: 1.0
+  v2_hand_contact_neg_weight: 1.0
+  v2_hand_contact_hard_neg_weight: 1.0
   contact_endpoint: 1.0
   contact_endpoint_order: 0.5
   endpoint_contact_consistency: 0.5
@@ -274,12 +288,14 @@ train:
 
 test:
   window: 120
+  online_lookahead: 5
 
 # ============ 预训练模块路径（可选）============
-# 注意：boundary_bidirectional=false 与 OT arch v6 之后，下面的 velocity_contact
-# 与 object_trans checkpoint 均为旧架构，加载会被显式拒绝——需先重训 Stage2/Stage3
-# 并把路径替换为新产物（human_pose 不受影响）。
+# 注意：boundary_bidirectional=false 与 OT arch v6 之后，旧 VC/OT checkpoint
+# 不兼容；HumanPose 的速度量纲与足接触监督也已改变。需依次重训 Stage1/2/3。
 pretrained_modules:
-  human_pose:       null
-  velocity_contact: null
-  object_trans:     null
+  # Root-velocity units and foot-contact supervision changed; retrain Stage 1
+  # instead of silently loading a checkpoint trained with the old semantics.
+  human_pose:       "outputs/IMUHOI++/RNN/per_dataset_baseline_v3_independent_hp_20260819/hp/omomo/human_pose_08191605_hp_omomo_parallel_independent_20260819/best.pt"
+  velocity_contact: "outputs/IMUHOI++/RNN/per_dataset_baseline_v3_independent_hp_20260819/v3/omomo/velocity_contact_v3_08191905_v3_omomo_parallel_independenthp_20260819/best.pt"
+  object_trans:     "outputs/IMUHOI++/RNN/per_dataset_baseline_v3_independent_hp_20260819/v3/omomo/object_trans_vc_v3_08191924_v3_omomo_parallel_independenthp_20260819/best.pt"

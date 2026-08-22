@@ -301,9 +301,11 @@ def test_imuhoi_joint_forward_uses_predictions_without_scheduled_gt():
 
         def forward(self, data):
             batch_size, seq_len = data["human_imu"].shape[:2]
-            hand = self.offset.expand(batch_size, seq_len, 2, 3)
+            wrist = self.offset.expand(batch_size, seq_len, 2, 3)
+            palm = wrist + 1.0
             return {
-                "pred_hand_glb_pos": hand,
+                "pred_hand_glb_pos": wrist,
+                "pred_palm_glb_pos": palm,
                 "p_pred": self.offset.expand(batch_size, seq_len, 1),
                 "root_trans_pred": self.offset.expand(
                     batch_size, seq_len, 3
@@ -374,5 +376,5 @@ def test_imuhoi_joint_forward_uses_predictions_without_scheduled_gt():
         epoch=0,
         training=True,
     )
-    assert trainer.ot_model.last_hands is hp_out["pred_hand_glb_pos"]
+    assert trainer.ot_model.last_hands is hp_out["pred_palm_glb_pos"]
     assert trainer.ot_model.last_hands.requires_grad

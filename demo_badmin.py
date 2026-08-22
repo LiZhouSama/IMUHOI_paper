@@ -198,6 +198,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--interaction-human-trans-source", choices=["pred", "gt"], default="pred")
     parser.add_argument("--inference-mode", "--inference_mode", choices=["online", "offline"], default="online")
     parser.add_argument("--online-window", "--online_window", type=int, default=None)
+    parser.add_argument("--online-lookahead", "--online_lookahead", type=int, default=5)
     parser.add_argument("--sample-steps", type=int, default=None)
     parser.add_argument("--sampler", default=None)
     parser.add_argument("--eta", type=float, default=None)
@@ -1011,6 +1012,7 @@ def run_inference(args: argparse.Namespace, model, data_dict: Dict[str, torch.Te
                     interaction_use_human_pred=args.interaction_human_source == "pred",
                     inference_mode=args.inference_mode,
                     online_window=args.online_window,
+                    online_lookahead=args.online_lookahead,
                 )
             except TypeError:
                 outputs = model.inference(
@@ -1229,7 +1231,10 @@ def main() -> None:
     if args.model_arch is not None:
         cfg.model_arch = args.model_arch
     cfg.body_model_path = str(args.body_model)
-    print(f"[demo_badmin] Inference mode: {args.inference_mode} | online_window: {args.online_window or 'config/default'}")
+    print(
+        f"[demo_badmin] Inference mode: {args.inference_mode} | online_window: "
+        f"{args.online_window or 'config/default'} | online_lookahead: {args.online_lookahead}"
+    )
 
     fit_module = load_fit_module(args.badminton_root)
     betas = load_betas(args.betas_npz, args.num_betas, fit_module)

@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """Run the controlled shared-head/ObjectTrans feedback comparison.
 
-This launcher intentionally trains only two models:
+This launcher trains and evaluates two models:
 
 1. shared prediction head without OT-state feedback;
 2. the same architecture with explicit OT-state feedback.
 
-The feedback checkpoint is evaluated twice (windowed and stateful online), so
-the online-policy comparison is not confounded by a second stochastic training
-run.  The source config is never modified: all three effective YAML snapshots,
+The source config is never modified: both effective YAML snapshots,
 commands, result JSON paths, and GPU memory samples are stored under one
 experiment directory.
 """
@@ -173,7 +171,6 @@ class _GpuMonitor:
 class _Variant:
     name: str
     feedback: bool
-    online_mode: str
     run_suffix: str
 
 
@@ -204,7 +201,6 @@ def _make_effective_config(
 ) -> None:
     payload = copy.deepcopy(base_config)
     payload["object_trans_state_feedback"] = bool(variant.feedback)
-    payload["object_trans_online_mode"] = variant.online_mode
     payload["object_trans_experiment"] = {
         "tag": tag,
         "variant": variant.name,
@@ -320,7 +316,7 @@ def _write_comparison_summary(
 
 def _make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run two joint-training OT variants and three controlled online evaluations."
+        description="Run two joint-training OT variants and two controlled online evaluations."
     )
     parser.add_argument("--cfg", default="configs/IMUHOI_train_rnn.yaml", help="Untouched source config.")
     parser.add_argument(
@@ -352,6 +348,7 @@ def _make_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional eval override. Default: preserve test.window from --cfg.",
     )
+    parser.add_argument("--online-lookahead", type=int, default=5)
     parser.add_argument(
         "--gpu-monitor-interval-sec",
         type=float,
@@ -418,23 +415,15 @@ def main() -> int:
     baseline = _Variant(
         name="shared_head_no_feedback_window",
         feedback=False,
-        online_mode="window",
         run_suffix=f"otfb-{tag}-baseline",
     )
     feedback_window = _Variant(
         name="feedback_window",
         feedback=True,
-        online_mode="window",
         run_suffix=f"otfb-{tag}-feedback",
     )
-    feedback_stateful = _Variant(
-        name="feedback_stateful",
-        feedback=True,
-        online_mode="stateful",
-        run_suffix=feedback_window.run_suffix,
-    )
 
-    variants = (baseline, feedback_window, feedback_stateful)
+    variants = (baseline, feedback_window)
     config_paths: Dict[str, Path] = {}
     for variant in variants:
         config_path = configs_dir / f"{variant.name}.yaml"
@@ -468,10 +457,10 @@ def main() -> int:
         "num_workers_effective": args.num_workers if args.num_workers is not None else base_config.get("num_workers"),
         "online_batch_size": args.online_batch_size,
         "online_window_override": args.online_window,
+        "online_lookahead": args.online_lookahead,
         "variants": {
             variant.name: {
                 "feedback": variant.feedback,
-                "online_mode": variant.online_mode,
                 "config": str(config_paths[variant.name]),
             }
             for variant in variants
@@ -516,11 +505,7 @@ def main() -> int:
             print("Dry run complete; training output directories/checkpoints were not resolved.", flush=True)
             return 0
 
-        for variant, source_variant in (
-            (baseline, baseline),
-            (feedback_window, feedback_window),
-            (feedback_stateful, feedback_window),
-        ):
+        for variant, source_variant in ((baseline, baseline), (feedback_window, feedback_window)):
             run_dir = run_dirs[source_variant.name]
             result_path = results_dir / f"{variant.name}.json"
             eval_command = [
@@ -541,6 +526,8 @@ def main() -> int:
                 "--compare_3",
                 "--output_json",
                 str(result_path),
+                "--online_lookahead",
+                str(args.online_lookahead),
             ]
             if args.online_window is not None:
                 eval_command.extend(["--online_window", str(args.online_window)])
@@ -560,7 +547,6 @@ def main() -> int:
             {
                 baseline.name: results_dir / f"{baseline.name}.json",
                 feedback_window.name: results_dir / f"{feedback_window.name}.json",
-                feedback_stateful.name: results_dir / f"{feedback_stateful.name}.json",
             },
             results_dir,
         )

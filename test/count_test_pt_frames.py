@@ -15,7 +15,7 @@ DATASET_ROOTS: Dict[str, Path] = {
 
 # Prefer keys where the first dimension corresponds to frames.
 FRAME_KEYS: Tuple[str, ...] = (
-    "rotation_local_full_gt_list",
+    "pose",
     "position_global_full_gt_world",
     "rotation_global",
     "trans",

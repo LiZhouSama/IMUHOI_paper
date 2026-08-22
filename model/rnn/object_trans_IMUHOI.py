@@ -114,9 +114,6 @@ class IMUHOIObjectTransModule(nn.Module):
                 "ObjectTrans architecture (" + "; ".join(details) + ")."
             )
 
-    def online_mode(self) -> str:
-        return "window"
-
     @staticmethod
     def _unit_vector(value: torch.Tensor, eps: float = 1e-8):
         return value / value.norm(dim=-1, keepdim=True).clamp_min(eps)

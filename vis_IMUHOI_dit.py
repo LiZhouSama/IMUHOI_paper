@@ -1152,7 +1152,7 @@ def main():
                 pt_data = torch.load(target_pt, map_location="cpu")
             except Exception as exc:
                 raise SystemExit(f"Failed to load pt file: {target_pt}. Error: {exc}")
-            required_key = "rotation_local_full_gt_list"
+            required_key = "pose"
             if not isinstance(pt_data, dict) or required_key not in pt_data:
                 raise SystemExit(
                     f"Unsupported pt format for --test_data_dir: {target_pt}. "

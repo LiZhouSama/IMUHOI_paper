@@ -50,10 +50,9 @@ def _small_cfg():
     )
 
 
-def _feedback_cfg(online_mode="window"):
+def _feedback_cfg():
     cfg = _small_cfg()
     cfg.object_trans_state_feedback = True
-    cfg.object_trans_online_mode = online_mode
     cfg.object_trans_hidden_dim = 16
     cfg.object_trans_num_layers = 2
     cfg.object_trans_dropout = 0.0
@@ -216,7 +215,7 @@ def test_object_trans_window_prefix_preserves_published_gate_weights_for_refine_
     assert torch.allclose(torch.softmax(out["gate_logits"], dim=-1), out["gating_weights_raw"])
 
 
-def test_object_trans_feedback_state_matches_full_causal_scan_and_is_causal():
+def test_object_trans_feedback_scan_is_causal():
     torch.manual_seed(10)
     model = ObjectTransModule(_feedback_cfg()).eval()
     # The zero-initialized residual is intentional for stable training, but a
@@ -231,19 +230,6 @@ def test_object_trans_feedback_state_matches_full_causal_scan_and_is_causal():
             obj_imu=data["obj_imu"], human_imu=data["human_imu"],
             obj_vel_input=data["obj_vel"], enable_refine=False,
         )
-        first, state = model(
-            data["hand_pos"][:, :3], data["contact"][:, :3], data["obj_trans_init"],
-            obj_imu=data["obj_imu"][:, :3], human_imu=data["human_imu"][:, :3],
-            obj_vel_input=data["obj_vel"][:, :3], enable_refine=False,
-            return_prediction_state=True,
-        )
-        second, state = model(
-            data["hand_pos"][:, 3:], data["contact"][:, 3:], data["obj_trans_init"],
-            obj_imu=data["obj_imu"][:, 3:], human_imu=data["human_imu"][:, 3:],
-            obj_vel_input=data["obj_vel"][:, 3:], enable_refine=False,
-            prediction_state=state, return_prediction_state=True,
-        )
-
         perturbed_hand_pos = data["hand_pos"].clone()
         perturbed_hand_pos[:, 5:] += 100.0
         perturbed = model(
@@ -256,10 +242,7 @@ def test_object_trans_feedback_state_matches_full_causal_scan_and_is_causal():
         "pred_obj_trans", "gating_weights", "gate_logits", "lhand_fk_out",
         "rhand_fk_out", "pred_obj_vel_from_posdiff", "pred_obj_acc_from_posdiff",
     ):
-        assert torch.allclose(torch.cat((first[key], second[key]), dim=1), full[key], atol=1e-6)
         assert torch.allclose(perturbed[key][:, :5], full[key][:, :5], atol=1e-6)
-    assert state["frames_seen"] == 7
-    assert state["prev_obj_rotm"].shape == (2, 3, 3)
 
 
 def test_online_concat_keeps_non_temporal_init_vectors_out_of_history_time():
@@ -284,9 +267,30 @@ def test_online_concat_keeps_non_temporal_init_vectors_out_of_history_time():
     assert context["p_pred"].shape == (1, 2, 1)
 
 
+def test_online_concat_keeps_frame_when_followed_by_empty_future():
+    frame = {
+        "p_pred": torch.ones(1, 1, 6),
+        "root_trans_pred": torch.ones(1, 1, 3),
+    }
+    empty = {
+        "p_pred": torch.empty(1, 0, 6),
+        "root_trans_pred": torch.empty(1, 0, 3),
+    }
+
+    out = concat_time_dicts([frame, empty])
+
+    assert out["p_pred"].shape == (1, 1, 6)
+    assert torch.equal(out["p_pred"], frame["p_pred"])
+
+
 class _FakeHumanPose(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.window_values = []
+
     def forward(self, data_dict):
         human_imu = data_dict["human_imu"]
+        self.window_values.append(human_imu[0, :, 0, 0].detach().clone())
         batch_size, seq_len = human_imu.shape[:2]
         device = human_imu.device
         dtype = human_imu.dtype
@@ -401,96 +405,98 @@ def test_imuhoi_offline_inference_matches_forward_with_stub_modules():
 def test_imuhoi_online_uses_object_history_prefix_for_new_frames():
     model = _fake_pipeline_model()
     data = _pipeline_data(seq_len=5)
-    out = model.inference(data, use_object_data=True, compute_fk=False, refine_human=False, inference_mode="online", online_window=3)
-    assert out["pred_obj_trans"].shape == (1, 5, 3)
+    progress = []
+    out = model.inference(
+        data,
+        use_object_data=True,
+        compute_fk=False,
+        refine_human=False,
+        inference_mode="online",
+        online_window=3,
+        online_lookahead=1,
+        online_progress_callback=lambda completed, total: progress.append((completed, total)),
+    )
+    assert out["pred_obj_trans"].shape == (1, 4, 3)
+    assert torch.allclose(out["pred_obj_trans"][0, :, 0], torch.arange(1, 5, dtype=torch.float32))
+    assert torch.allclose(out["p_pred"][0, :, 0], torch.arange(4, dtype=torch.float32))
+    assert torch.equal(
+        model.human_pose_module.window_values[0],
+        torch.tensor([0.0, 1.0, 2.0, 3.0]),
+    )
+    assert torch.equal(model.human_pose_module.window_values[-1], torch.tensor([1.0, 2.0, 3.0, 4.0]))
+    assert model.object_trans_module.prefix_lengths == [0, 2]
+    assert progress == [(3, 4), (4, 4)]
+
+
+def test_imuhoi_zero_lookahead_preserves_legacy_warmup_behavior():
+    model = _fake_pipeline_model()
+    data = _pipeline_data(seq_len=5)
+
+    out = model.inference(
+        data,
+        use_object_data=True,
+        compute_fk=False,
+        refine_human=False,
+        inference_mode="online",
+        online_window=3,
+        online_lookahead=0,
+    )
+
+    assert out["p_pred"].shape == (1, 5, len(_REDUCED_POSE_NAMES) * 6)
+    assert torch.allclose(out["p_pred"][0, :, 0], torch.arange(5, dtype=torch.float32))
     assert torch.allclose(out["pred_obj_trans"][0, :, 0], torch.arange(1, 6, dtype=torch.float32))
     assert model.object_trans_module.prefix_lengths == [0, 2, 2]
+    expected_windows = (
+        torch.tensor([0.0, 1.0, 2.0]),
+        torch.tensor([1.0, 2.0, 3.0]),
+        torch.tensor([2.0, 3.0, 4.0]),
+    )
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(model.human_pose_module.window_values, expected_windows)
+    )
 
 
-def test_imuhoi_stateful_ot_persists_across_public_online_chunks():
-    torch.manual_seed(11)
-    model = _fake_pipeline_model()
-    model.cfg = _feedback_cfg(online_mode="stateful")
-    model.object_trans_module = ObjectTransModule(model.cfg)
-    model.eval()
-    data = _pipeline_data(seq_len=8)
-    data["obj_imu"][..., 3:9] = torch.eye(3)[:, :2].reshape(6)
+def test_imuhoi_strict_lookahead_stream_matches_single_call():
+    data = _pipeline_data(seq_len=5)
+    whole_model = _fake_pipeline_model()
+    whole = whole_model.inference(
+        data,
+        use_object_data=True,
+        compute_fk=False,
+        refine_human=False,
+        inference_mode="online",
+        online_window=3,
+        online_lookahead=1,
+    )
 
-    with torch.no_grad():
-        whole = model.inference(
-            data,
-            use_object_data=True,
-            compute_fk=False,
-            refine_human=False,
-            inference_mode="online",
-            online_window=3,
-        )
-        state = None
-        chunks = []
-        for start, end in ((0, 2), (2, 5), (5, 8)):
-            chunk = slice_time_dict(data, start, end, 1, 8)
-            out, state = model.inference(
-                chunk,
-                use_object_data=True,
-                compute_fk=False,
-                refine_human=False,
-                inference_mode="online",
-                online_window=3,
-                online_state=state,
-                return_online_state=True,
-            )
-            chunks.append(out)
-        streamed = concat_time_dicts(chunks)
+    stream_model = _fake_pipeline_model()
+    first, state = stream_model.inference(
+        slice_time_dict(data, 0, 2, 1, 5),
+        use_object_data=True,
+        compute_fk=False,
+        refine_human=False,
+        inference_mode="online",
+        online_window=3,
+        online_lookahead=1,
+        return_online_state=True,
+    )
+    second, state = stream_model.inference(
+        slice_time_dict(data, 2, 5, 1, 5),
+        use_object_data=True,
+        compute_fk=False,
+        refine_human=False,
+        inference_mode="online",
+        online_window=3,
+        online_lookahead=1,
+        online_state=state,
+        return_online_state=True,
+    )
+    streamed = concat_time_dicts([first, second])
 
-    for key in ("p_pred", "pred_hand_contact_prob", "pred_obj_trans", "gating_weights", "gate_logits"):
-        assert torch.allclose(streamed[key], whole[key], atol=1e-6)
-    assert state["input_window"]["human_imu"].shape[1] == 3
-    assert state["output_window"]["p_pred"].shape[1] == 3
-    assert state["ot_prediction_state"]["frames_seen"] == 8
-
-
-def test_imuhoi_stateful_ot_stream_matches_single_call_with_refinement_enabled():
-    torch.manual_seed(12)
-    model = _fake_pipeline_model()
-    model.cfg = _feedback_cfg(online_mode="stateful")
-    model.cfg.enable_ot_refine = True
-    model.object_trans_module = ObjectTransModule(model.cfg)
-    model.eval()
-    data = _pipeline_data(seq_len=6)
-    data["obj_imu"][..., 3:9] = torch.eye(3)[:, :2].reshape(6)
-
-    with torch.no_grad():
-        whole = model.inference(
-            data,
-            use_object_data=True,
-            compute_fk=False,
-            refine_human=True,
-            inference_mode="online",
-            online_window=3,
-        )
-        first, state = model.inference(
-            slice_time_dict(data, 0, 1, 1, 6),
-            use_object_data=True,
-            compute_fk=False,
-            refine_human=True,
-            inference_mode="online",
-            online_window=3,
-            return_online_state=True,
-        )
-        second, state = model.inference(
-            slice_time_dict(data, 1, 6, 1, 6),
-            use_object_data=True,
-            compute_fk=False,
-            refine_human=True,
-            inference_mode="online",
-            online_window=3,
-            online_state=state,
-            return_online_state=True,
-        )
-        streamed = concat_time_dicts((first, second))
-
-    for key in ("p_pred", "stage1_p_pred", "pred_obj_trans", "refined_pose", "refined_root_trans"):
-        assert torch.allclose(streamed[key], whole[key], atol=1e-6)
+    assert state["emitted_len"] == 4
+    for key in ("p_pred", "pred_hand_contact_prob", "pred_obj_trans"):
+        assert torch.allclose(streamed[key], whole[key])
 
 
 class _InferenceOnly(nn.Module):

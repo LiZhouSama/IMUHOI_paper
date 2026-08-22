@@ -215,12 +215,6 @@ class ObjectTransModule(nn.Module):
             return value.strip().lower() in {"1", "true", "on", "yes", "fused", "enabled"}
         return bool(value)
 
-    def online_mode(self) -> str:
-        mode = str(getattr(self.cfg, "object_trans_online_mode", "window")).strip().lower()
-        if mode not in {"window", "stateful"}:
-            raise ValueError(f"object_trans_online_mode must be 'window' or 'stateful', got {mode!r}")
-        return mode
-
     def validate_checkpoint_state_dict(self, state_dict) -> None:
         """Reject checkpoints from incompatible ObjectTrans architectures."""
         if not isinstance(state_dict, dict):
@@ -385,7 +379,6 @@ class ObjectTransModule(nn.Module):
         human_pose_input,
         root_trans_input,
         has_object_mask,
-        prediction_state=None,
     ):
         batch_size, seq_len = hand_positions.shape[:2]
         device = hand_positions.device
@@ -394,17 +387,12 @@ class ObjectTransModule(nn.Module):
         root_trans = self._prepare_root_feature(root_trans_input, batch_size, seq_len, device, dtype)
         sample_has_object = self._sample_has_object(has_object_mask, batch_size, device)
 
-        previous_obs_state = (
-            prediction_state.get("obs_encoder_state")
-            if isinstance(prediction_state, dict)
-            else None
-        )
         obs_code, obs_encoder_state = self.obs_encoder(
             obj_imu,
             human_pose,
             root_trans,
             hand_positions,
-            hidden_state=previous_obs_state,
+            hidden_state=None,
             return_state=True,
         )
         if bool(getattr(self.cfg, "ablate_ot_obs_encoder", False)):
@@ -592,7 +580,6 @@ class ObjectTransModule(nn.Module):
         has_object_mask=None,
         human_pose_input=None,
         root_trans_input=None,
-        prediction_state=None,
     ):
         if hand_positions is None:
             raise ValueError("hand_positions cannot be None")
@@ -630,8 +617,7 @@ class ObjectTransModule(nn.Module):
 
         obj_rot6d = obj_imu[:, :, 3:9]
         obj_rotm = rotation_6d_to_matrix(obj_rot6d.reshape(-1, 6)).reshape(batch_size, seq_len, 3, 3)
-        previous_obj_rotm = prediction_state.get("prev_obj_rotm") if isinstance(prediction_state, dict) else None
-        obj_rot_delta = self._rotm_delta(obj_rotm, previous_obj_rotm)
+        obj_rot_delta = self._rotm_delta(obj_rotm, None)
         l_idx = _SENSOR_NAMES.index("LeftForeArm")
         r_idx = _SENSOR_NAMES.index("RightForeArm")
         lhand_imu = human_imu[:, :, l_idx, :]
@@ -642,7 +628,6 @@ class ObjectTransModule(nn.Module):
             human_pose_input=human_pose_input,
             root_trans_input=root_trans_input,
             has_object_mask=has_object_mask,
-            prediction_state=prediction_state,
         )
 
         obj_trans_init = obj_trans_init.to(device=device, dtype=dtype)
@@ -700,7 +685,7 @@ class ObjectTransModule(nn.Module):
             "root_trans_input": root_trans_input,
         }
 
-    def _init_prediction_state(self, context):
+    def _init_scan_state(self, context):
         batch_size = context["batch_size"]
         obj_trans_init = context["obj_trans_init"]
         return {
@@ -831,15 +816,13 @@ class ObjectTransModule(nn.Module):
     def _scan_predictor(
         self,
         context,
-        prediction_state=None,
         known_obj_trans_prefix=None,
         known_obj_trans_prefix_mask=None,
         known_gating_weights_prefix=None,
     ):
-        state = prediction_state if isinstance(prediction_state, dict) else self._init_prediction_state(context)
+        state = self._init_scan_state(context)
         use_vectorized_fast_path = (
             not self._state_feedback_enabled()
-            and not isinstance(prediction_state, dict)
             and not isinstance(known_obj_trans_prefix, torch.Tensor)
             and not isinstance(known_gating_weights_prefix, torch.Tensor)
         )
@@ -1018,12 +1001,10 @@ class ObjectTransModule(nn.Module):
         known_obj_trans_prefix: torch.Tensor = None,
         known_obj_trans_prefix_mask: torch.Tensor = None,
         known_gating_weights_prefix: torch.Tensor = None,
-        prediction_state: dict = None,
-        return_prediction_state: bool = False,
         compute_refine: bool = True,
         **_,
     ):
-        """Causal OT scan; optionally continue from an explicit prediction state."""
+        """Run a causal OT scan from the supplied window initializers."""
         context = self._prepare_prediction_context(
             hand_positions,
             pred_hand_contact_prob,
@@ -1035,18 +1016,14 @@ class ObjectTransModule(nn.Module):
             has_object_mask=has_object_mask,
             human_pose_input=human_pose_input,
             root_trans_input=root_trans_input,
-            prediction_state=prediction_state,
         )
-        prediction, next_state = self._scan_predictor(
+        prediction, _ = self._scan_predictor(
             context,
-            prediction_state=prediction_state,
             known_obj_trans_prefix=known_obj_trans_prefix,
             known_obj_trans_prefix_mask=known_obj_trans_prefix_mask,
             known_gating_weights_prefix=known_gating_weights_prefix,
         )
         results = self._build_results(context, prediction, enable_refine=enable_refine and compute_refine)
-        if return_prediction_state:
-            return results, next_state
         return results
 
     @staticmethod
@@ -1137,21 +1114,6 @@ class ObjectTransModule(nn.Module):
             )
             if return_online_state:
                 return output, online_state or {}
-            return output
-
-        if self.online_mode() == "stateful":
-            prediction_state = online_state.get("prediction_state") if isinstance(online_state, dict) else None
-            output, prediction_state = self.forward(
-                hand_positions,
-                pred_hand_contact_prob,
-                obj_trans_init,
-                prediction_state=prediction_state,
-                return_prediction_state=True,
-                **kwargs,
-            )
-            state = {"prediction_state": prediction_state}
-            if return_online_state:
-                return output, state
             return output
 
         window = resolve_online_window(self.cfg, online_window)

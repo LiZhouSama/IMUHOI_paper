@@ -115,49 +115,6 @@ def test_nan_prior_hands_fall_back_to_init_geometry():
     assert torch.allclose(quantiles[0, 1], torch.ones(3))
 
 
-def test_stateful_continuation_reuses_stored_lb_quantiles():
-    """Continuation calls without a fresh prior must reuse the quantiles from
-    the state, not re-derive a drifting neutral from the new chunk's init."""
-    torch.manual_seed(7)
-    model = ObjectTransModule(_small_cfg()).eval()
-    batch_size, seq_len = 1, 3
-
-    def _chunk(obj_trans_init):
-        return dict(
-            hand_positions=torch.zeros(batch_size, seq_len, 2, 3),
-            pred_hand_contact_prob=torch.ones(batch_size, seq_len, 3),
-            obj_trans_init=obj_trans_init,
-            obj_imu=torch.zeros(batch_size, seq_len, 9),
-            human_imu=torch.zeros(batch_size, seq_len, 6, 9),
-            obj_vel_input=torch.zeros(batch_size, seq_len, 3),
-        )
-
-    with torch.no_grad():
-        first_kwargs = _chunk(torch.tensor([[1.0, 0.0, 0.0]]))
-        first, state = model(
-            first_kwargs.pop("hand_positions"),
-            first_kwargs.pop("pred_hand_contact_prob"),
-            first_kwargs.pop("obj_trans_init"),
-            enable_refine=False,
-            return_prediction_state=True,
-            **first_kwargs,
-        )
-        second_kwargs = _chunk(torch.tensor([[2.0, 0.0, 0.0]]))
-        second = model(
-            second_kwargs.pop("hand_positions"),
-            second_kwargs.pop("pred_hand_contact_prob"),
-            second_kwargs.pop("obj_trans_init"),
-            enable_refine=False,
-            prediction_state=state,
-            **second_kwargs,
-        )
-
-    # First chunk's neutral: ||(1,0,0) - 0|| = 1 for both hands.
-    assert torch.allclose(first["lb_prior_quantiles"], torch.ones(1, 2, 3))
-    # Continuation keeps it even though the new chunk's init would give 2.
-    assert torch.allclose(second["lb_prior_quantiles"], torch.ones(1, 2, 3))
-
-
 def test_sample_gt_lb_prior_stats_marks_missing_hands_as_nan():
     torch.manual_seed(11)
     batch_size, seq_len = 3, 30

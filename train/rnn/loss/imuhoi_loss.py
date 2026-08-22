@@ -1,6 +1,8 @@
 """Losses used by the original EgoIMU IMUHOI VC and ObjectTrans models."""
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn.functional as F
 
@@ -132,11 +134,30 @@ class IMUHOIVelocityContactLoss:
             losses["hand_vel"] = F.mse_loss(
                 pred_dict["pred_hand_glb_vel"], sensor_vel[:, :, -2:]
             )
-        if isinstance(pred_dict.get("pred_hand_contact_prob"), torch.Tensor):
-            losses["hand_contact"] = F.binary_cross_entropy(
-                pred_dict["pred_hand_contact_prob"].clamp(1e-6, 1.0 - 1e-6),
+        contact_logits = pred_dict.get("pred_hand_contact_logits")
+        if isinstance(contact_logits, torch.Tensor):
+            # The IMUHOI model exposes logits before sigmoid.  Using the
+            # logits form is mathematically equivalent to BCE(sigmoid(x), y)
+            # and remains safe under CUDA autocast.
+            losses["hand_contact"] = F.binary_cross_entropy_with_logits(
+                contact_logits,
                 contact_target,
             )
+        elif isinstance(pred_dict.get("pred_hand_contact_prob"), torch.Tensor):
+            # Compatibility fallback for older/custom models that only expose
+            # probabilities; keep this operation in float32 because CUDA
+            # autocast intentionally rejects BCELoss.
+            if device.type == "cuda":
+                autocast_context = torch.autocast(device_type="cuda", enabled=False)
+            else:
+                autocast_context = nullcontext()
+            with autocast_context:
+                losses["hand_contact"] = F.binary_cross_entropy(
+                    pred_dict["pred_hand_contact_prob"].float().clamp(
+                        1e-6, 1.0 - 1e-6
+                    ),
+                    contact_target.float(),
+                )
 
         active = (
             set(self.LOSS_KEYS)

@@ -167,6 +167,7 @@ def main() -> int:
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--num_workers", type=int, default=12)
     parser.add_argument("--online_window", type=int, default=None)
+    parser.add_argument("--online_lookahead", type=int, default=5)
     parser.add_argument("--seed", type=int, default=10)
     parser.add_argument("--compare_3", action="store_true")
     parser.add_argument("--keep_going", action="store_true")
@@ -200,6 +201,7 @@ def main() -> int:
         ]
         if args.online_window is not None:
             cmd.extend(["--online_window", str(args.online_window)])
+        cmd.extend(["--online_lookahead", str(args.online_lookahead)])
         if args.test_data_dir:
             cmd.extend(["--test_data_dir", args.test_data_dir])
         if args.compare_3:

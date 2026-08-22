@@ -11,7 +11,7 @@ from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_axis_angle, ma
 
 from utils.human_pose import (
     WRIST_JOINT_INDICES,
-    append_virtual_palm_joints,
+    build_smpl24_joint_positions,
     forward_body_model_joints,
     select_hand_anchor_positions,
     select_wrist_positions,
@@ -22,10 +22,11 @@ from .online import (
     append_stream_data,
     infer_batch_seq,
     normalize_inference_mode,
+    resolve_online_lookahead,
     resolve_online_window,
     slice_time_dict,
-    take_latest_frame,
     TimeDictAccumulator,
+    _history_tensor,
     update_data_inits_from_history,
 )
 from configs import (
@@ -63,6 +64,7 @@ class HumanPoseModule(nn.Module):
         self.sensor_names = list(_SENSOR_NAMES)
         self.v_names = list(_SENSOR_VEL_NAMES)
         self.p_names = list(_REDUCED_POSE_NAMES)
+        self._foot_joint_indices = (7, 8)
         n_glb = 6
 
         # 姿态预测器配置
@@ -138,10 +140,14 @@ class HumanPoseModule(nn.Module):
             )
             self.torso_joints = torch.tensor([0, 3, 6, 9, 12, 15], dtype=torch.long)
             self.prob_threshold = (0.5, 0.9)
-            self.gravity_velocity = torch.tensor([0.0, -0.018, 0.0], dtype=torch.float32)
+            # DynaIP's contact branch uses a -0.018 m per-frame vertical bias.
+            # Keep the whole root-velocity pipeline in m/s by converting that
+            # displacement bias once here, alongside the foot finite difference.
+            self.gravity_velocity = torch.tensor(
+                [0.0, -0.018 * self.fps, 0.0], dtype=torch.float32
+            )
             self.floor_height = 0.0
             self.prevent_floor_penetration = True
-            self._foot_joint_indices = (7, 8)
 
         # SMPL相关
         self.smpl_parents = torch.tensor(
@@ -228,11 +234,18 @@ class HumanPoseModule(nn.Module):
         device = glb_p_out_tensor.device
         BT = batch_size * seq_len
 
-        glb_pose = glb_p_out_tensor.reshape(BT, len(_REDUCED_POSE_NAMES), 6)
-        orientation = orientation[:, :, : len(_SENSOR_ROT_INDICES)].reshape(BT, len(_SENSOR_ROT_INDICES), 3, 3)
-        full_glb = self._reduced_glb_6d_to_full_glb_mat(glb_pose, orientation)
-        local_pose = self._global2local(full_glb, self.smpl_parents.tolist())
-        pose_aa = matrix_to_axis_angle(local_pose.reshape(-1, 3, 3)).reshape(BT, 24, 3)
+        with torch.cuda.amp.autocast(enabled=False):
+            glb_pose = glb_p_out_tensor.float().reshape(
+                BT, len(_REDUCED_POSE_NAMES), 6
+            )
+            orientation = orientation.float()[:, :, : len(_SENSOR_ROT_INDICES)].reshape(
+                BT, len(_SENSOR_ROT_INDICES), 3, 3
+            )
+            full_glb = self._reduced_glb_6d_to_full_glb_mat(glb_pose, orientation)
+            local_pose = self._global2local(full_glb, self.smpl_parents.tolist())
+            pose_aa = matrix_to_axis_angle(local_pose.reshape(-1, 3, 3)).reshape(
+                BT, 24, 3
+            )
 
         try:
             with torch.no_grad():
@@ -242,7 +255,7 @@ class HumanPoseModule(nn.Module):
                     root_orient=pose_aa[:, 0].reshape(BT, 3),
                     fallback_to_full=False,
                 )
-            joints = append_virtual_palm_joints(joints[:, :22, :], num_joints=24)
+            joints = build_smpl24_joint_positions(joints)
             return joints.reshape(batch_size, seq_len, 24, 3)
         except Exception as exc:
             print(f"FK计算失败: {exc}")
@@ -277,32 +290,95 @@ class HumanPoseModule(nn.Module):
             vel[:, 0] = vel[:, 1]
         return vel
 
-    def _apply_floor_penetration(self, root_velocities: torch.Tensor, joints_pos: torch.Tensor):
-        if (not getattr(self, "prevent_floor_penetration", False)) or joints_pos is None:
-            return root_velocities
-        batch_size, seq_len, _ = root_velocities.shape
-        device = root_velocities.device
-        axis = 1
-        foot_start, foot_end = self._foot_joint_indices
+    def _apply_ground_correction(
+        self,
+        root_trans: torch.Tensor,
+        joints_pos: torch.Tensor,
+        contact_logits: torch.Tensor,
+        preserve_first_frame: bool = True,
+    ):
+        """Correct root translation from translation-free foot world heights.
 
-        if joints_pos.size(2) <= foot_end:
-            return root_velocities
+        Penetration is always corrected upward.  Downward correction is gated
+        by predicted foot contact so a swing foot is not forced to the ground.
+        The ground plane is the fixed world-space plane y=0; root_trans_y must
+        therefore be included when converting translation-free FK joints to
+        world-space foot heights.
+        """
+        batch_size, seq_len, _ = root_trans.shape
+        zero_correction = root_trans.new_zeros(batch_size, seq_len)
+        if joints_pos is None or contact_logits is None:
+            return root_trans, zero_correction
 
-        floor = torch.as_tensor(self.floor_height, device=device, dtype=root_velocities.dtype)
-        foot_y = joints_pos[:, :, foot_start : foot_end + 1, axis]
-        foot_min_y = foot_y.amin(dim=2)
-        vel_axis = root_velocities[..., axis]
-        vel_cumsum = torch.cumsum(vel_axis, dim=1)
-        adjustment = F.relu(floor - foot_min_y - vel_cumsum)
-        adjustment_max = torch.cummax(adjustment, dim=1).values
-        adjustment_prev = F.pad(adjustment_max[:, :-1], (1, 0))
-        delta = adjustment_max - adjustment_prev
-        corrected = root_velocities.clone()
-        corrected[..., axis] = vel_axis + delta
-        return corrected
+        foot_indices = torch.as_tensor(
+            self._foot_joint_indices, device=joints_pos.device, dtype=torch.long
+        )
+        if joints_pos.size(2) <= int(foot_indices.max().item()):
+            return root_trans, zero_correction
+
+        foot_local_y = torch.index_select(joints_pos[..., 1], dim=2, index=foot_indices)
+        if not getattr(self, "prevent_floor_penetration", False):
+            return root_trans, zero_correction
+
+        floor_height = root_trans.new_zeros(batch_size)
+        running_offset = root_trans.new_zeros(batch_size)
+        corrected_frames = []
+        frame_corrections = []
+        for frame_idx in range(seq_len):
+            frame_trans = root_trans[:, frame_idx]
+            frame_y = frame_trans[:, 1] + running_offset
+            frame_delta = root_trans.new_zeros(batch_size)
+
+            if not (preserve_first_frame and frame_idx == 0):
+                foot_world_y = foot_local_y[:, frame_idx] + frame_y.unsqueeze(-1)
+                contact_prob = torch.sigmoid(contact_logits[:, frame_idx])
+                support_prob, support_index = contact_prob.max(dim=-1)
+                support_world_y = foot_world_y.gather(
+                    dim=-1, index=support_index.unsqueeze(-1)
+                ).squeeze(-1)
+                contact_weight = self._prob_to_weight(support_prob)
+
+                # Signed contact correction lowers a hovering support foot and
+                # raises a penetrating support foot toward its calibrated height.
+                contact_delta = contact_weight * (floor_height - support_world_y)
+                foot_after_contact = foot_world_y + contact_delta.unsqueeze(-1)
+                penetration_delta = F.relu(
+                    floor_height - foot_after_contact.amin(dim=-1)
+                )
+                frame_delta = contact_delta + penetration_delta
+                frame_y = frame_y + frame_delta
+                running_offset = running_offset + frame_delta
+
+            corrected_frames.append(
+                torch.stack((frame_trans[:, 0], frame_y, frame_trans[:, 2]), dim=-1)
+            )
+            frame_corrections.append(frame_delta)
+
+        corrected = torch.stack(corrected_frames, dim=1)
+        correction = torch.stack(frame_corrections, dim=1)
+        return corrected, correction
 
     def _integrate_root_velocity(self, root_velocities: torch.Tensor):
-        return torch.cumsum(root_velocities, dim=1) / self.fps
+        displacement = torch.zeros_like(root_velocities)
+        if root_velocities.size(1) > 1:
+            displacement[:, 1:] = torch.cumsum(
+                root_velocities[:, 1:], dim=1
+            ) / self.fps
+        return displacement
+
+    def _root_velocity_from_translation(
+        self,
+        root_trans: torch.Tensor,
+        first_velocity: torch.Tensor = None,
+    ):
+        velocity = torch.zeros_like(root_trans)
+        if first_velocity is not None:
+            velocity[:, 0] = first_velocity[:, 0]
+        if root_trans.size(1) > 1:
+            velocity[:, 1:] = (
+                root_trans[:, 1:] - root_trans[:, :-1]
+            ) * self.fps
+        return velocity
 
     def _fuse_velocities_batched(
         self,
@@ -310,34 +386,37 @@ class HumanPoseModule(nn.Module):
         contact_logits: torch.Tensor,
         joints_pos: torch.Tensor,
         root_rotation: torch.Tensor,
-        vel_scale: float = 3.0,
+        previous_foot_pos: torch.Tensor = None,
     ):
         device = root_vel_local.device
         batch_size, seq_len, _ = root_vel_local.shape
         tran_b2_vel = torch.matmul(root_rotation, root_vel_local.unsqueeze(-1)).squeeze(-1)
-        tran_b2_vel = tran_b2_vel * vel_scale / self.fps
 
         lfoot_pos = joints_pos[:, :, 7, :]
         rfoot_pos = joints_pos[:, :, 8, :]
         lfoot_vel = torch.zeros_like(lfoot_pos)
         rfoot_vel = torch.zeros_like(rfoot_pos)
+        if previous_foot_pos is not None:
+            previous_foot_pos = previous_foot_pos.to(
+                device=device, dtype=joints_pos.dtype
+            ).reshape(batch_size, 2, 3)
+            lfoot_vel[:, 0] = previous_foot_pos[:, 0] - lfoot_pos[:, 0]
+            rfoot_vel[:, 0] = previous_foot_pos[:, 1] - rfoot_pos[:, 0]
         if seq_len > 1:
             lfoot_vel[:, 1:] = lfoot_pos[:, :-1] - lfoot_pos[:, 1:]
             rfoot_vel[:, 1:] = rfoot_pos[:, :-1] - rfoot_pos[:, 1:]
 
         contact_idx = contact_logits.argmax(dim=-1)
         left_mask = (contact_idx == 0).unsqueeze(-1)
-        tran_b1_vel = torch.where(left_mask, lfoot_vel, rfoot_vel)
+        tran_b1_vel = torch.where(left_mask, lfoot_vel, rfoot_vel) * self.fps
         gravity = self.gravity_velocity.to(device=device, dtype=root_vel_local.dtype).view(1, 1, 3)
-        tran_b1_vel = (tran_b1_vel + gravity) / self.fps
+        tran_b1_vel = tran_b1_vel + gravity
 
         contact_sigmoid = torch.sigmoid(contact_logits)
         contact_max = contact_sigmoid.max(dim=-1).values
         weight = self._prob_to_weight(contact_max).unsqueeze(-1)
 
-        fused = (1.0 - weight) * tran_b2_vel + weight * tran_b1_vel
-        fused = fused * self.fps
-        return fused
+        return (1.0 - weight) * tran_b2_vel + weight * tran_b1_vel
 
     def forward(self, data_dict: dict):
         """
@@ -359,6 +438,7 @@ class HumanPoseModule(nn.Module):
         p_init = data_dict['p_init']
         trans_init = data_dict.get('trans_init')
         trans_gt = data_dict.get('trans_gt')
+        previous_foot_pos = data_dict.get('prev_foot_pos')
         if human_imu.dim() != 4:
             raise ValueError(f"human_imu must be [B, T, num_imu, imu_dim], got {human_imu.shape}")
         batch_size, seq_len, _, _ = human_imu.shape
@@ -404,16 +484,23 @@ class HumanPoseModule(nn.Module):
         if self.body_model is not None:
             joints_pos = self._compute_fk_joints_batched(p_pred, orientation_mat.clone())
             try:
-                BT = batch_size * seq_len
-                glb_pose_flat = p_pred.reshape(BT, len(_REDUCED_POSE_NAMES), 6)
-                orientation_flat = orientation_mat[:, :, : len(_SENSOR_ROT_INDICES)].reshape(
-                    BT, len(_SENSOR_ROT_INDICES), 3, 3
-                )
-                full_glb_rotmats_flat = self._reduced_glb_6d_to_full_glb_mat(glb_pose_flat, orientation_flat)
-                full_glb_rotmats = full_glb_rotmats_flat.reshape(batch_size, seq_len, 24, 3, 3)
-                full_glb_rot6d = matrix_to_rotation_6d(full_glb_rotmats_flat.reshape(-1, 3, 3)).reshape(
-                    batch_size, seq_len, 24, 6
-                )
+                with torch.cuda.amp.autocast(enabled=False):
+                    BT = batch_size * seq_len
+                    glb_pose_flat = p_pred.float().reshape(
+                        BT, len(_REDUCED_POSE_NAMES), 6
+                    )
+                    orientation_flat = orientation_mat.float()[:, :, : len(_SENSOR_ROT_INDICES)].reshape(
+                        BT, len(_SENSOR_ROT_INDICES), 3, 3
+                    )
+                    full_glb_rotmats_flat = self._reduced_glb_6d_to_full_glb_mat(
+                        glb_pose_flat, orientation_flat
+                    )
+                    full_glb_rotmats = full_glb_rotmats_flat.reshape(
+                        batch_size, seq_len, 24, 3, 3
+                    )
+                    full_glb_rot6d = matrix_to_rotation_6d(
+                        full_glb_rotmats_flat.reshape(-1, 3, 3)
+                    ).reshape(batch_size, seq_len, 24, 6)
             except Exception as exc:
                 print(f"Failed to compute full pose rotations: {exc}")
                 full_glb_rotmats = None
@@ -423,6 +510,8 @@ class HumanPoseModule(nn.Module):
             "v_pred": v_pred,
             "p_pred": p_pred,
         }
+        if joints_pos is not None:
+            results["pred_foot_pos"] = joints_pos[:, :, list(self._foot_joint_indices), :]
 
         if self.no_trans:
             # noTrans模式：使用GT位移
@@ -466,16 +555,36 @@ class HumanPoseModule(nn.Module):
             root_vel_local_pred = self.tran_b2(torch.cat((torso_vel, torso_imu, s_glb), dim=-1))
 
             if joints_pos is not None:
-                root_vel_pred = self._fuse_velocities_batched(root_vel_local_pred, contact_pred, joints_pos, root_R)
+                root_vel_unadjusted_pred = self._fuse_velocities_batched(
+                    root_vel_local_pred,
+                    contact_pred,
+                    joints_pos,
+                    root_R,
+                    previous_foot_pos=previous_foot_pos,
+                )
             else:
-                root_vel_pred = torch.matmul(root_R, root_vel_local_pred.unsqueeze(-1)).squeeze(-1) / self.fps
-
-            root_vel_pred = self._apply_floor_penetration(root_vel_pred, joints_pos)
-            root_trans_delta = self._integrate_root_velocity(root_vel_pred)
+                root_vel_unadjusted_pred = (
+                    torch.matmul(root_R, root_vel_local_pred.unsqueeze(-1)).squeeze(-1)
+                )
 
             if trans_init is None:
                 trans_init = torch.zeros(batch_size, 3, device=device, dtype=human_imu.dtype)
-            root_trans_pred = root_trans_delta + trans_init.unsqueeze(1)
+            else:
+                trans_init = trans_init.to(device=device, dtype=human_imu.dtype)
+            root_trans_unadjusted_pred = (
+                self._integrate_root_velocity(root_vel_unadjusted_pred)
+                + trans_init.unsqueeze(1)
+            )
+            root_trans_pred, ground_correction_pred = self._apply_ground_correction(
+                root_trans_unadjusted_pred,
+                joints_pos,
+                contact_pred,
+                preserve_first_frame=True,
+            )
+            root_vel_pred = self._root_velocity_from_translation(
+                root_trans_pred,
+                first_velocity=root_vel_unadjusted_pred,
+            )
 
             if joints_pos is not None:
                 joints_global = joints_pos + root_trans_pred.unsqueeze(2)
@@ -488,8 +597,11 @@ class HumanPoseModule(nn.Module):
             results.update({
                 "contact_pred": contact_pred,
                 "root_vel_local_pred": root_vel_local_pred,
+                "root_vel_unadjusted_pred": root_vel_unadjusted_pred,
                 "root_vel_pred": root_vel_pred,
+                "root_trans_unadjusted_pred": root_trans_unadjusted_pred,
                 "root_trans_pred": root_trans_pred,
+                "ground_correction_pred": ground_correction_pred,
                 "pred_hand_glb_pos": pred_hand_glb_pos,
                 "pred_palm_glb_pos": pred_palm_glb_pos,
             })
@@ -512,24 +624,93 @@ class HumanPoseModule(nn.Module):
 
         return results
 
-    def _inference_online_sequence(self, data_dict: dict, online_window: int):
-        batch_size, seq_len = infer_batch_seq(data_dict)
-        if seq_len <= online_window:
-            return self.forward(data_dict)
+    def finalize_online_frame(self, frame: dict, history: dict):
+        """Advance and ground-correct one published frame from prior history."""
+        if self.no_trans or not history or "root_vel_unadjusted_pred" not in frame:
+            return frame
 
-        warmup_len = int(online_window)
-        warmup_data = slice_time_dict(data_dict, 0, warmup_len, batch_size, seq_len)
-        history = self.forward(warmup_data)
-        history_acc = TimeDictAccumulator(history, seq_len)
+        previous_trans = _history_tensor(history, "root_trans_pred", -1)
+        if previous_trans is None:
+            return frame
+
+        updated = dict(frame)
+        raw_velocity = frame["root_vel_unadjusted_pred"]
+        joints_local = frame.get("pred_joints_local")
+        contact_logits = frame.get("contact_pred")
+        root_trans_unadjusted = previous_trans.unsqueeze(1) + raw_velocity / self.fps
+        root_trans, ground_correction = self._apply_ground_correction(
+            root_trans_unadjusted,
+            joints_local,
+            contact_logits,
+            preserve_first_frame=False,
+        )
+        root_velocity = (root_trans - previous_trans.unsqueeze(1)) * self.fps
+
+        updated["root_vel_pred"] = root_velocity
+        updated["root_trans_unadjusted_pred"] = root_trans_unadjusted
+        updated["root_trans_pred"] = root_trans
+        updated["ground_correction_pred"] = ground_correction
+        if isinstance(joints_local, torch.Tensor):
+            joints_global = joints_local + root_trans.unsqueeze(2)
+            updated["pred_joints_global"] = joints_global
+            updated["pred_hand_glb_pos"] = select_wrist_positions(joints_global)
+            updated["pred_palm_glb_pos"] = select_hand_anchor_positions(joints_global)
+        return updated
+
+    def _inference_online_sequence(
+        self,
+        data_dict: dict,
+        online_window: int,
+        online_lookahead: int,
+    ):
+        batch_size, seq_len = infer_batch_seq(data_dict)
+        window = int(online_window)
+        lookahead = int(online_lookahead)
+        publish_len = max(seq_len - lookahead, 0)
+        if publish_len == 0:
+            template = self.forward(data_dict)
+            return slice_time_dict(template, 0, 0, batch_size, seq_len)
+
+        # Preserve the original online warmup: publish the first base window
+        # together, while appending lookahead frames only as future context.
+        # With lookahead=0 this is exactly the legacy online algorithm.
+        warmup_publish_len = min(window, publish_len)
+        warmup_input_len = warmup_publish_len + lookahead
+        warmup_data = slice_time_dict(
+            data_dict, 0, warmup_input_len, batch_size, seq_len
+        )
+        warmup_raw = self.forward(warmup_data)
+        history = slice_time_dict(
+            warmup_raw,
+            0,
+            warmup_publish_len,
+            batch_size,
+            warmup_input_len,
+        )
+        history_acc = TimeDictAccumulator(history, publish_len)
         history = history_acc.current()
 
-        for end in range(warmup_len + 1, seq_len + 1):
-            start = end - warmup_len
+        for target in range(warmup_publish_len, publish_len):
+            start = target - window + 1
+            end = target + lookahead + 1
             window_data = slice_time_dict(data_dict, start, end, batch_size, seq_len)
-            window_data = update_data_inits_from_history(window_data, history, index=start - 1)
+            window_data = update_data_inits_from_history(
+                window_data,
+                history,
+                index=start - 1,
+                trans_index=start,
+            )
             window_out = self.forward(window_data)
-            latest = take_latest_frame(window_out, batch_size, end - start)
-            history = history_acc.append(latest)
+            target_local = target - start
+            frame = slice_time_dict(
+                window_out,
+                target_local,
+                target_local + 1,
+                batch_size,
+                end - start,
+            )
+            frame = self.finalize_online_frame(frame, history)
+            history = history_acc.append(frame)
 
         return history_acc.current()
 
@@ -538,6 +719,7 @@ class HumanPoseModule(nn.Module):
         data_dict: dict,
         inference_mode: str = "offline",
         online_window: int = None,
+        online_lookahead: int = None,
         online_state: dict = None,
         return_online_state: bool = False,
         **_,
@@ -550,16 +732,27 @@ class HumanPoseModule(nn.Module):
             return output
 
         window = resolve_online_window(self.cfg, online_window)
-        run_data, previous_len = append_stream_data(
+        lookahead = resolve_online_lookahead(self.cfg, online_lookahead)
+        previous_output_len = 0
+        if isinstance(online_state, dict):
+            previous_output_len = int(online_state.get("emitted_len", 0))
+        run_data, _ = append_stream_data(
             online_state.get("data_dict") if isinstance(online_state, dict) else None,
             data_dict,
         )
-        output = self._inference_online_sequence(run_data, window)
-        state = {"data_dict": run_data, "outputs": output}
+        output = self._inference_online_sequence(run_data, window, lookahead)
+        _, output_len = infer_batch_seq(output, key="p_pred")
+        state = {"data_dict": run_data, "outputs": output, "emitted_len": output_len}
         if return_online_state:
-            if previous_len > 0:
-                batch_size, seq_len = infer_batch_seq(run_data)
-                output = slice_time_dict(output, previous_len, seq_len, batch_size, seq_len)
+            if previous_output_len > 0:
+                batch_size, _ = infer_batch_seq(run_data)
+                output = slice_time_dict(
+                    output,
+                    previous_output_len,
+                    output_len,
+                    batch_size,
+                    output_len,
+                )
             return output, state
         return output
 
@@ -582,7 +775,10 @@ class HumanPoseModule(nn.Module):
             results.update({
                 "contact_pred": torch.zeros(batch_size, seq_len, 2, device=device),
                 "root_vel_local_pred": torch.zeros(batch_size, seq_len, 3, device=device),
+                "root_vel_unadjusted_pred": torch.zeros(batch_size, seq_len, 3, device=device),
                 "root_vel_pred": torch.zeros(batch_size, seq_len, 3, device=device),
+                "root_trans_unadjusted_pred": torch.zeros(batch_size, seq_len, 3, device=device),
                 "root_trans_pred": torch.zeros(batch_size, seq_len, 3, device=device),
+                "ground_correction_pred": torch.zeros(batch_size, seq_len, device=device),
             })
         return results

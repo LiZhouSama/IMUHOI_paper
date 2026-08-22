@@ -132,12 +132,6 @@ class ObjectTransModule(nn.Module):
             return value.strip().lower() in {"1", "true", "on", "yes", "fused", "enabled"}
         return bool(value)
 
-    def online_mode(self) -> str:
-        mode = str(getattr(self.cfg, "object_trans_online_mode", "window")).strip().lower()
-        if mode not in {"window", "stateful"}:
-            raise ValueError(f"object_trans_online_mode must be 'window' or 'stateful', got {mode!r}")
-        return mode
-
     def validate_checkpoint_state_dict(self, state_dict) -> None:
         """Reject checkpoints from the removed three-head/prior architecture."""
         if not isinstance(state_dict, dict):
@@ -401,7 +395,6 @@ class ObjectTransModule(nn.Module):
         human_pose_input=None,
         root_trans_input=None,
         lb_prior_quantiles=None,
-        prediction_state=None,
     ):
         if hand_positions is None:
             raise ValueError("hand_positions cannot be None")
@@ -439,8 +432,7 @@ class ObjectTransModule(nn.Module):
 
         obj_rot6d = obj_imu[:, :, 3:9]
         obj_rotm = rotation_6d_to_matrix(obj_rot6d.reshape(-1, 6)).reshape(batch_size, seq_len, 3, 3)
-        previous_obj_rotm = prediction_state.get("prev_obj_rotm") if isinstance(prediction_state, dict) else None
-        obj_rot_delta = self._rotm_delta(obj_rotm, previous_obj_rotm)
+        obj_rot_delta = self._rotm_delta(obj_rotm, None)
         l_idx = _SENSOR_NAMES.index("LeftForeArm")
         r_idx = _SENSOR_NAMES.index("RightForeArm")
         lhand_imu = human_imu[:, :, l_idx, :]
@@ -453,28 +445,14 @@ class ObjectTransModule(nn.Module):
             raise ValueError(f"obj_trans_init must have shape [{batch_size},3], got {tuple(obj_trans_init.shape)}")
         l_oe0, l_lb0 = self._compute_init_dir_len(lhand_position[:, 0], obj_rotm[:, 0], obj_trans_init)
         r_oe0, r_lb0 = self._compute_init_dir_len(rhand_position[:, 0], obj_rotm[:, 0], obj_trans_init)
-        stored_lb_quantiles = (
-            prediction_state.get("lb_prior_quantiles") if isinstance(prediction_state, dict) else None
+        lb_prior_quantiles = self._prepare_lb_prior_quantiles(
+            lb_prior_quantiles,
+            l_lb0,
+            r_lb0,
+            batch_size,
+            device,
+            dtype,
         )
-        if (
-            lb_prior_quantiles is None
-            and isinstance(stored_lb_quantiles, torch.Tensor)
-            and stored_lb_quantiles.shape == (batch_size, 2, 3)
-        ):
-            # Stateful continuation without a fresh prior: keep the constant
-            # stored when the state was created.  Re-deriving the neutral from
-            # the current chunk's init/hand geometry would make the per-frame
-            # broadcast feature drift between streamed and full-sequence runs.
-            lb_prior_quantiles = stored_lb_quantiles.to(device=device, dtype=dtype)
-        else:
-            lb_prior_quantiles = self._prepare_lb_prior_quantiles(
-                lb_prior_quantiles,
-                l_lb0,
-                r_lb0,
-                batch_size,
-                device,
-                dtype,
-            )
         if contact_init is None:
             contact_init_vec = torch.zeros(batch_size, 3, device=device, dtype=dtype)
         else:
@@ -632,7 +610,7 @@ class ObjectTransModule(nn.Module):
             return None
         return output
 
-    def _init_prediction_state(self, context):
+    def _init_scan_state(self, context):
         batch_size = context["batch_size"]
         obj_trans_init = context["obj_trans_init"]
         return {
@@ -736,9 +714,6 @@ class ObjectTransModule(nn.Module):
             "prev_obj_delta": fused_pos - previous_pos,
             "prev_gating_weights": effective_weights,
             "prev_obj_rotm": obj_rotm,
-            # Persist the quantiles in effect for this call so stateful
-            # continuation without a fresh prior reuses them verbatim.
-            "lb_prior_quantiles": context["lb_prior_quantiles"],
             "frames_seen": frames_seen + 1,
         }
         return {
@@ -766,15 +741,13 @@ class ObjectTransModule(nn.Module):
     def _scan_predictor(
         self,
         context,
-        prediction_state=None,
         known_obj_trans_prefix=None,
         known_obj_trans_prefix_mask=None,
         known_gating_weights_prefix=None,
     ):
-        state = prediction_state if isinstance(prediction_state, dict) else self._init_prediction_state(context)
+        state = self._init_scan_state(context)
         use_vectorized_fast_path = (
             not self._state_feedback_enabled()
-            and not isinstance(prediction_state, dict)
             and not isinstance(known_obj_trans_prefix, torch.Tensor)
             and not isinstance(known_gating_weights_prefix, torch.Tensor)
         )
@@ -951,11 +924,9 @@ class ObjectTransModule(nn.Module):
         known_obj_trans_prefix: torch.Tensor = None,
         known_obj_trans_prefix_mask: torch.Tensor = None,
         known_gating_weights_prefix: torch.Tensor = None,
-        prediction_state: dict = None,
-        return_prediction_state: bool = False,
         compute_refine: bool = True,
     ):
-        """Causal OT scan; optionally continue from an explicit prediction state."""
+        """Run a causal OT scan from the supplied window initializers."""
         context = self._prepare_prediction_context(
             hand_positions,
             pred_hand_contact_prob,
@@ -968,18 +939,14 @@ class ObjectTransModule(nn.Module):
             human_pose_input=human_pose_input,
             root_trans_input=root_trans_input,
             lb_prior_quantiles=lb_prior_quantiles,
-            prediction_state=prediction_state,
         )
-        prediction, next_state = self._scan_predictor(
+        prediction, _ = self._scan_predictor(
             context,
-            prediction_state=prediction_state,
             known_obj_trans_prefix=known_obj_trans_prefix,
             known_obj_trans_prefix_mask=known_obj_trans_prefix_mask,
             known_gating_weights_prefix=known_gating_weights_prefix,
         )
         results = self._build_results(context, prediction, enable_refine=enable_refine and compute_refine)
-        if return_prediction_state:
-            return results, next_state
         return results
 
     @staticmethod
@@ -1074,21 +1041,6 @@ class ObjectTransModule(nn.Module):
             )
             if return_online_state:
                 return output, online_state or {}
-            return output
-
-        if self.online_mode() == "stateful":
-            prediction_state = online_state.get("prediction_state") if isinstance(online_state, dict) else None
-            output, prediction_state = self.forward(
-                hand_positions,
-                pred_hand_contact_prob,
-                obj_trans_init,
-                prediction_state=prediction_state,
-                return_prediction_state=True,
-                **kwargs,
-            )
-            state = {"prediction_state": prediction_state}
-            if return_online_state:
-                return output, state
             return output
 
         window = resolve_online_window(self.cfg, online_window)

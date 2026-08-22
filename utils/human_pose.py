@@ -13,6 +13,18 @@ SMPL_PARENTS = [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17
 WRIST_JOINT_INDICES = (20, 21)
 FOREARM_PARENT_JOINT_INDICES = (18, 19)
 VIRTUAL_PALM_JOINT_INDICES = (22, 23)
+SMPLH_METACARPAL_JOINT_INDICES = (22, 37)
+SMPLX_METACARPAL_JOINT_INDICES = (25, 40)
+SMPLH_NATIVE_JOINT_COUNT = 52
+SMPLX_NATIVE_JOINT_COUNT = 55
+# Native joint layouts are not interchangeable: SMPL-X inserts jaw/eye joints at
+# 22..24 before the hand chains, so reusing the SMPL-H indices on SMPL-X output
+# silently returns the jaw and a left-hand joint instead of the two metacarpals.
+METACARPAL_JOINT_INDICES_BY_NATIVE_COUNT = {
+    SMPLH_NATIVE_JOINT_COUNT: SMPLH_METACARPAL_JOINT_INDICES,
+    SMPLX_NATIVE_JOINT_COUNT: SMPLX_METACARPAL_JOINT_INDICES,
+}
+SMPL24_JOINT_COUNT = 24
 # Estimated from zero-pose SMPL-H middle metacarpal offsets. The virtual palm
 # anchor intentionally follows the forearm extension instead of native SMPL-H
 # hand-joint ordering, where Jtr[22:24] are not left/right palm roots.
@@ -72,7 +84,7 @@ def append_virtual_palm_joints(
 
     joint_count = int(joints.shape[-2])
     if joint_count >= num_joints:
-        out = joints[..., :num_joints, :].clone()
+        return joints[..., :num_joints, :].clone()
     else:
         pad_shape = (*joints.shape[:-2], num_joints - joint_count, 3)
         pad = torch.zeros(pad_shape, device=joints.device, dtype=joints.dtype)
@@ -100,7 +112,7 @@ def append_virtual_palm_rotations(
 
     joint_count = int(rotations.shape[-3])
     if joint_count >= num_joints:
-        out = rotations[..., :num_joints, :, :].clone()
+        return rotations[..., :num_joints, :, :].clone()
     else:
         eye = torch.eye(3, device=rotations.device, dtype=rotations.dtype)
         view_shape = (1,) * (rotations.dim() - 3) + (1, 3, 3)
@@ -118,8 +130,76 @@ def append_virtual_palm_rotations(
 
 
 def select_hand_anchor_positions(joints: torch.Tensor) -> torch.Tensor:
-    """Select the left/right hand anchor used by VC/OT: virtual palm positions."""
-    return compute_virtual_palm_positions(joints)
+    """Select the SMPL-24 left/right metacarpal positions used by VC/OT."""
+    if not isinstance(joints, torch.Tensor):
+        raise TypeError("joints must be a torch.Tensor")
+    if joints.shape[-1] != 3:
+        raise ValueError(f"joints must end with xyz coordinates, got {joints.shape}")
+    if int(joints.shape[-2]) < SMPL24_JOINT_COUNT:
+        raise ValueError(
+            "SMPL-24 metacarpal positions require joints 22/23; "
+            f"got only {int(joints.shape[-2])} joints"
+        )
+    return joints[..., list(VIRTUAL_PALM_JOINT_INDICES), :]
+
+
+def build_smpl24_joint_positions(joints: torch.Tensor) -> torch.Tensor:
+    """Map native SMPL-H/SMPL-X joints to body-22 plus left/right metacarpals."""
+    if not isinstance(joints, torch.Tensor):
+        raise TypeError("joints must be a torch.Tensor")
+    if joints.shape[-1] != 3:
+        raise ValueError(f"joints must end with xyz coordinates, got {joints.shape}")
+    native_joint_count = int(joints.shape[-2])
+    palm_indices = METACARPAL_JOINT_INDICES_BY_NATIVE_COUNT.get(native_joint_count)
+    if palm_indices is None:
+        raise ValueError(
+            "native joints must come from SMPL-H "
+            f"({SMPLH_NATIVE_JOINT_COUNT}) or SMPL-X ({SMPLX_NATIVE_JOINT_COUNT}) "
+            f"so the metacarpal indices are unambiguous, got {native_joint_count}"
+        )
+    palms = joints[..., list(palm_indices), :]
+    return torch.cat((joints[..., :22, :], palms), dim=-2)
+
+
+def ensure_smpl24_local_rotations(rotations: torch.Tensor) -> torch.Tensor:
+    """Pad 22-joint local rotations with identity metacarpal rotations."""
+    if not isinstance(rotations, torch.Tensor):
+        raise TypeError("rotations must be a torch.Tensor")
+    if rotations.shape[-2:] != (3, 3):
+        raise ValueError(f"rotations must end with [3,3], got {rotations.shape}")
+    joint_count = int(rotations.shape[-3])
+    if joint_count >= SMPL24_JOINT_COUNT:
+        return rotations[..., :SMPL24_JOINT_COUNT, :, :]
+    if joint_count != 22:
+        raise ValueError(f"expected 22 or 24 local rotations, got {joint_count}")
+
+    identity = torch.eye(3, device=rotations.device, dtype=rotations.dtype)
+    pad_shape = (*rotations.shape[:-3], 2, 3, 3)
+    identity = identity.view((1,) * (rotations.dim() - 3) + (1, 3, 3))
+    identity = identity.expand(pad_shape)
+    return torch.cat((rotations, identity), dim=-3)
+
+
+def local_rotations_to_global(
+    local_rotations: torch.Tensor,
+    parents: Sequence[int] = SMPL_PARENTS,
+) -> torch.Tensor:
+    """Convert local SMPL rotations to global rotations for arbitrary batch dims."""
+    if local_rotations.shape[-2:] != (3, 3):
+        raise ValueError(f"local_rotations must end with [3,3], got {local_rotations.shape}")
+    rotations = local_rotations.reshape(-1, local_rotations.shape[-3], 3, 3)
+    if rotations.shape[1] > len(parents):
+        raise ValueError(
+            f"rotation joint count {rotations.shape[1]} exceeds parent table size {len(parents)}"
+        )
+    global_rotations = torch.empty_like(rotations)
+    global_rotations[:, 0] = rotations[:, 0]
+    for joint_idx in range(1, rotations.shape[1]):
+        parent_idx = int(parents[joint_idx])
+        global_rotations[:, joint_idx] = torch.matmul(
+            global_rotations[:, parent_idx], rotations[:, joint_idx]
+        )
+    return global_rotations.reshape(*local_rotations.shape[:-3], rotations.shape[1], 3, 3)
 
 
 def select_wrist_positions(

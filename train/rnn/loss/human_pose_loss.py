@@ -25,21 +25,35 @@ class HumanPoseLoss:
     
     # 测试阶段用于模型选择的损失键 (可自定义子集)
     TEST_LOSS_KEYS = {'pose_reduced', 'root_trans'}
+
+    TARGET_BATCH_KEYS = {
+        'human_imu',
+        'trans',
+        'root_vel',
+        'sensor_vel_root',
+        'ori_root_reduced',
+        'position_global',
+        'lfoot_contact',
+        'rfoot_contact',
+    }
     
-    def __init__(self, weights=None, no_trans=False):
+    def __init__(self, weights=None, no_trans=False, target_frame_index=None):
         """
         Args:
             weights: dict, 各损失项的权重，默认为1.0
             no_trans: bool, 是否为noTrans模式
+            target_frame_index: 可选；仅使用该时间索引计算所有损失。
         """
         self.weights = weights or {}
         self.no_trans = no_trans
+        self.target_frame_index = target_frame_index
     
     def __call__(self, pred_dict, batch, device):
         return self.compute_loss(pred_dict, batch, device)
     
     def compute_loss(self, pred_dict, batch, device):
         """计算损失"""
+        pred_dict, batch = self._select_target_frame(pred_dict, batch)
         human_imu = batch['human_imu'].to(device)
         dtype = human_imu.dtype
         bs, seq = human_imu.shape[:2]
@@ -141,6 +155,41 @@ class HumanPoseLoss:
             total_loss = total_loss + weighted_losses[key]
         
         return total_loss, losses, weighted_losses
+
+    def _select_target_frame(self, pred_dict, batch):
+        if self.target_frame_index is None:
+            return pred_dict, batch
+
+        human_imu = batch.get('human_imu')
+        if not isinstance(human_imu, torch.Tensor) or human_imu.dim() < 2:
+            raise ValueError('target-only HumanPose loss requires batched human_imu.')
+        batch_size, seq_len = human_imu.shape[:2]
+        target = int(self.target_frame_index)
+        if target < 0:
+            target += int(seq_len)
+        if not 0 <= target < int(seq_len):
+            raise IndexError(
+                f'target_frame_index={self.target_frame_index} is outside sequence length {seq_len}.'
+            )
+
+        def slice_temporal(value):
+            if (
+                isinstance(value, torch.Tensor)
+                and value.dim() >= 2
+                and int(value.shape[0]) == int(batch_size)
+                and int(value.shape[1]) == int(seq_len)
+            ):
+                return value[:, target:target + 1]
+            return value
+
+        selected_pred = {
+            key: slice_temporal(value) for key, value in pred_dict.items()
+        }
+        selected_batch = dict(batch)
+        for key in self.TARGET_BATCH_KEYS:
+            if key in selected_batch:
+                selected_batch[key] = slice_temporal(selected_batch[key])
+        return selected_pred, selected_batch
     
     def compute_test_loss(self, pred_dict, batch, device):
         """计算测试损失（用于模型选择）"""

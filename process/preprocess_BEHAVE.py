@@ -9,14 +9,19 @@ from tqdm import tqdm
 from scipy.spatial.transform import Rotation as R
 
 from human_body_prior.body_model.body_model import BodyModel
-from human_body_prior.tools.rotation_tools import local2global_pose
 import pytorch3d.transforms as transforms
+from utils.human_pose import (
+    build_smpl24_joint_positions,
+    ensure_smpl24_local_rotations,
+    local_rotations_to_global,
+)
 
 try:
     from preprocess import (
         add_contact_postprocess_arguments,
         build_unheld_object_motion_skip_record,
         contact_postprocess_metadata,
+        precompute_sequence_features,
         compute_improved_contact_labels,
         compute_foot_contact_labels,
         load_canonical_points_from_mesh_path,
@@ -28,6 +33,7 @@ except ModuleNotFoundError:
         add_contact_postprocess_arguments,
         build_unheld_object_motion_skip_record,
         contact_postprocess_metadata,
+        precompute_sequence_features,
         compute_improved_contact_labels,
         compute_foot_contact_labels,
         load_canonical_points_from_mesh_path,
@@ -153,21 +159,19 @@ def compute_rotation_features_chunk(
     root_orient_chunk: np.ndarray, pose_body_chunk: np.ndarray,
     bm: BodyModel, device: torch.device
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    # [B, 3] + [B, 63] -> [B, 66]
+    # [B, 3] + [B, 63] -> SMPL-24 local axis-angle and global rotations.
     bdata_poses = np.concatenate([root_orient_chunk, pose_body_chunk], axis=1).astype(np.float32)
-    local_rot_mat = transforms.axis_angle_to_matrix(
-        torch.tensor(bdata_poses, dtype=torch.float32, device=device).reshape(-1, 3)
-    ).reshape(bdata_poses.shape[0], -1, 3, 3)
-    rotation_local_6d = transforms.matrix_to_rotation_6d(local_rot_mat)
-    rotation_local_full_gt = rotation_local_6d.reshape(bdata_poses.shape[0], -1)
-
-    kintree_table = bm.kintree_table[0].long()[:22]
-    kintree_table[0] = -1
-    rotation_global_matrot = local2global_pose(
-        local_rot_mat.reshape(local_rot_mat.shape[0], -1, 9), kintree_table
+    pose_aa = torch.tensor(bdata_poses, dtype=torch.float32, device=device).reshape(
+        bdata_poses.shape[0], -1, 3
     )
-    rotation_global_matrot = rotation_global_matrot.reshape(rotation_global_matrot.shape[0], -1, 3, 3)
-    return rotation_local_full_gt.detach().cpu(), rotation_global_matrot.detach().cpu()
+    local_rot_mat = transforms.axis_angle_to_matrix(pose_aa)
+    local_rot_mat = ensure_smpl24_local_rotations(local_rot_mat)
+    palm_pose = torch.zeros(
+        pose_aa.shape[0], 2, 3, device=device, dtype=pose_aa.dtype
+    )
+    pose_aa = torch.cat((pose_aa, palm_pose), dim=1)
+    rotation_global_matrot = local_rotations_to_global(local_rot_mat)
+    return pose_aa.detach().cpu(), rotation_global_matrot.detach().cpu()
 
 
 def forward_smpl_in_batches(
@@ -187,7 +191,7 @@ def forward_smpl_in_batches(
                 for key, value in smpl_input.items()
             }
             body_out = bm(**kwargs)
-            joints = body_out.Jtr[:, :22, :].detach().cpu()  # 去掉human_body_prior的默认偏移
+            joints = build_smpl24_joint_positions(body_out.Jtr).detach().cpu()
             verts = body_out.v
             batch_min_abs = float(verts[:, :, 1].abs().min().item())
             if min_abs_y_value is None or batch_min_abs < min_abs_y_value:
@@ -215,7 +219,7 @@ def compute_foot_floor_offset(
     with torch.no_grad():
         kwargs = {key: value for key, value in smpl_input.items()}
         body_out = bm(**kwargs)
-        joints = body_out.Jtr[:, :22, :]  # [B, 22, 3]
+        joints = body_out.Jtr[:, :24, :]  # [B, 24, 3]
         # 双脚关节: 7=左脚踝, 8=右脚踝, 10=左脚, 11=右脚
         left_ankle = joints[:, 7, 1]   # [B]
         right_ankle = joints[:, 8, 1]  # [B]
@@ -316,7 +320,7 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
     object_trans_norm[:, 1] -= foot_floor_y
 
     # ---------- 分块产出+拼接 ----------
-    rot_local_list   : List[torch.Tensor] = []
+    pose_list        : List[torch.Tensor] = []
     rot_global_list  : List[torch.Tensor] = []
     pos_global_list  : List[torch.Tensor] = []
     lfoot_list       : List[torch.Tensor] = []
@@ -348,8 +352,8 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
             pos_global_list.append(pos_chunk)
 
             # 旋转特征（分块）
-            rot_local, rot_global = compute_rotation_features_chunk(root_orient_slice, pose_body_slice, bm, device)
-            rot_local_list.append(rot_local.float())
+            pose_chunk, rot_global = compute_rotation_features_chunk(root_orient_slice, pose_body_slice, bm, device)
+            pose_list.append(pose_chunk.float())
             rot_global_list.append(rot_global.float())
 
             # 物体：旋转/平移张量 + 全局 floor
@@ -378,7 +382,7 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
 
     # 拼接
     position_global = torch.cat(pos_global_list, dim=0).float()
-    rotation_local_full_gt = torch.cat(rot_local_list,  dim=0).float()
+    pose = torch.cat(pose_list, dim=0).reshape(T, -1).float()
     rotation_global        = torch.cat(rot_global_list, dim=0).float()
     lfoot_contact = torch.cat(lfoot_list, dim=0)
     rfoot_contact = torch.cat(rfoot_list, dim=0)
@@ -432,7 +436,7 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
     output = {
         "seq_name": seq_name,
         "gender": gender,
-        "rotation_local_full_gt_list": rotation_local_full_gt,
+        "pose": pose,
         "position_global_full_gt_world": position_global,
         "rotation_global": rotation_global,
         "trans": trans_norm,
@@ -444,7 +448,6 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
         "obj_name": object_name,
         "obj_mesh_name": mesh_basename,
         "obj_points_canonical": canonical_points.half().cpu(),
-        "obj_points_sample_count": int(canonical_points.shape[0]),
         "has_object": True,
         "obj_scale": obj_scale_cpu,
         "obj_trans": obj_trans_cpu,
@@ -467,6 +470,21 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
             ),
         ),
     }
+    output.update(
+        precompute_sequence_features(
+            position_global,
+            rotation_global,
+            torch.from_numpy(trans_norm).float(),
+            obj_trans=obj_trans_cpu,
+            obj_rot=obj_rot_cpu,
+            human_imu=human_imu_tensor,
+            obj_imu=obj_imu_tensor,
+            lhand_contact=lhand_contact,
+            rhand_contact=rhand_contact,
+            obj_contact=obj_contact,
+            has_object=True,
+        )
+    )
 
     os.makedirs(output_dir, exist_ok=True)
     torch.save(output, out_path)

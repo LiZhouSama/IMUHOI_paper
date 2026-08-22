@@ -29,7 +29,6 @@ def _cfg():
         object_trans_dropout=0.0,
         object_trans_feedback_hidden_dim=16,
         object_trans_state_feedback=False,
-        object_trans_online_mode="window",
         obs_encoder_hidden_dim=16,
         obs_encoder_layers=1,
         obs_encoder_dropout=0.0,

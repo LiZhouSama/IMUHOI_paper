@@ -18,7 +18,11 @@ from model.rnn.velocity_contact import (
     build_velocity_contact_module,
     normalize_velocity_contact_arch,
 )
-from train.rnn.loss import VelocityContactLoss, IMUHOIVelocityContactLoss
+from train.rnn.loss import (
+    VelocityContactLoss,
+    V2VelocityContactLoss,
+    IMUHOIVelocityContactLoss,
+)
 from torch.nn.utils import clip_grad_norm_
 from train.rnn.train_utils import (
     get_base_args,
@@ -27,12 +31,14 @@ from train.rnn.train_utils import (
     setup_device,
     create_save_dir,
     create_dataloaders,
+    prime_dataloader_workers,
     build_model_input_dict,
     build_optimizer_and_scheduler,
     load_model_state_from_checkpoint,
     save_checkpoint,
     save_config_snapshot,
     BaseTrainer,
+    autocast,
     load_checkpoint,
     call_model_inference,
 )
@@ -252,7 +258,9 @@ def get_args():
         default=None,
         help=(
             'VelocityContact架构；legacy不包含interaction boundary模块，'
-            'imuhoi恢复EgoIMU的全身手速度/独立物体速度/联合接触网络。'
+            'v2使用手物速度→单向obj_move→直接双手接触的级联；'
+            'imuhoi恢复EgoIMU的全身手速度/独立物体速度/联合接触网络；'
+            'imuhoi_cond*为从该基线逐项增加条件接触、几何、boundary和endpoint的消融。'
         ),
     )
     return parser.parse_args()
@@ -266,6 +274,7 @@ class VelocityContactTrainer(BaseTrainer):
         "joint": {
             "obj_move",
             "hand_contact_cond",
+            "hand_contact_marginal",
             "contact_endpoint",
             "contact_endpoint_order",
             "endpoint_contact_consistency",
@@ -289,6 +298,13 @@ class VelocityContactTrainer(BaseTrainer):
             "boundary_hidden_norm",
             "obj_move_net",
             "hand_contact_net",
+            "interaction_input_norm",
+            "interaction_history_net",
+            "interaction_future_proj",
+            "interaction_future_conv",
+            "interaction_fusion",
+            "obj_move_head",
+            "hand_contact_head",
         ),
         "endpoint": (
             "contact_endpoint_input_norm",
@@ -479,13 +495,15 @@ class VelocityContactTrainer(BaseTrainer):
                 inference_mode="offline",
             )
 
+        target = self._target_model()
+        requires_hp = bool(getattr(target, "requires_hp", True))
         pred_hp_out = None
-        if self.hp_model is not None:
+        if requires_hp and self.hp_model is not None:
             with torch.no_grad():
                 pred_hp_out = call_model_inference(self.hp_model, data_dict, inference_mode="offline")
 
         hp_out = pred_hp_out
-        if batch is not None:
+        if requires_hp and batch is not None:
             gt_hp_out = build_gt_human_pose_outputs(
                 batch,
                 self.device,
@@ -550,19 +568,23 @@ class VelocityContactTrainer(BaseTrainer):
         for batch in train_iter:
             data_dict = build_model_input_dict(batch, self.cfg, self.device, add_noise=True)
 
-            self.optimizer.zero_grad()
-            pred_dict = self.model_forward(data_dict, batch=batch, epoch=epoch, training=True)
+            self.optimizer.zero_grad(set_to_none=True)
+            with autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
+                pred_dict = self.model_forward(data_dict, batch=batch, epoch=epoch, training=True)
 
-            total_loss_tensor, losses, weighted_losses = self.loss_fn(
-                pred_dict,
-                batch,
-                self.device,
-                active_loss_keys=active_loss_keys,
-            )
+                total_loss_tensor, losses, weighted_losses = self.loss_fn(
+                    pred_dict,
+                    batch,
+                    self.device,
+                    active_loss_keys=active_loss_keys,
+                )
 
-            self.scaler.scale(total_loss_tensor).backward()
-            # gradient clipping
-            self.scaler.unscale_(self.optimizer)
+            if self.scaler.is_enabled():
+                self.scaler.scale(total_loss_tensor).backward()
+                self.scaler.unscale_(self.optimizer)
+            else:
+                total_loss_tensor.backward()
+
             clip_grad_norm_(
                 (
                     parameter
@@ -571,8 +593,11 @@ class VelocityContactTrainer(BaseTrainer):
                 ),
                 max_norm=float(getattr(self.cfg, "gradient_clip", 1.0)),
             )
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            if self.scaler.is_enabled():
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
 
             total_loss_val = total_loss_tensor.item()
             total_loss += total_loss_val
@@ -826,8 +851,12 @@ def main():
     module_name = {
         "current": "velocity_contact",
         "legacy": "velocity_contact_legacy",
+        "v2": "velocity_contact_v2",
         "imuhoi": "velocity_contact_IMUHOI",
-    }[cfg.velocity_contact_arch]
+    }.get(
+        cfg.velocity_contact_arch,
+        f"velocity_contact_{cfg.velocity_contact_arch}",
+    )
     save_dir = create_save_dir(cfg, module_name)
     save_config_snapshot(cfg)
 
@@ -847,6 +876,7 @@ def main():
 
     # dataloaders
     train_loader, test_loader = create_dataloaders(cfg)
+    prime_dataloader_workers(train_loader, test_loader)
     if train_loader is None or len(train_loader) == 0:
         print("Error: failed to create train dataloader")
         return
@@ -858,7 +888,7 @@ def main():
 
     # frozen HP model (Stage 1) for hp_out
     hp_model = None
-    if cfg.hp_ckpt and cfg.velocity_contact_arch != "imuhoi":
+    if cfg.hp_ckpt and bool(getattr(model, "requires_hp", True)):
         device = torch.device(cfg.device)
         try:
             hp_model = HumanPoseModule(cfg, device, no_trans=cfg.no_trans)
@@ -880,6 +910,9 @@ def main():
             IMUHOIVelocityContactLoss.DEFAULT_WEIGHTS,
         )
         loss_fn = IMUHOIVelocityContactLoss(weights=loss_weights)
+    elif cfg.velocity_contact_arch == "v2":
+        loss_weights = getattr(cfg, 'loss_weights', {})
+        loss_fn = V2VelocityContactLoss(weights=loss_weights)
     else:
         loss_weights = getattr(cfg, 'loss_weights', {})
         loss_fn = VelocityContactLoss(weights=loss_weights)

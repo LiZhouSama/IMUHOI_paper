@@ -16,6 +16,9 @@ from .object_trans_IMUHOI import (
 )
 from .object_trans_IMUHOI_4heads import IMUHOI4HeadsObjectTransModule
 from .velocity_contact_legacy import LegacyVelocityContactModule
+from .velocity_contact_v2 import V2VelocityContactModule
+from .velocity_contact_v3 import V3VelocityContactModule
+from .velocity_contact_v4 import V4VelocityContactModule
 from .human_pose import HumanPoseModule
 from .object_trans import ObjectTransModule
 from .object_trans_mergeHeads_obsEncoder import (
@@ -30,6 +33,9 @@ __all__ = [
     'SubPoser',
     'VelocityContactModule',
     'LegacyVelocityContactModule',
+    'V2VelocityContactModule',
+    'V3VelocityContactModule',
+    'V4VelocityContactModule',
     'VELOCITY_CONTACT_ARCH_CHOICES',
     'build_velocity_contact_module',
     'normalize_velocity_contact_arch',

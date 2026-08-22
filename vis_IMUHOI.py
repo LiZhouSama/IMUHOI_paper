@@ -163,17 +163,20 @@ def _run_model_prediction(
     ot_refine=False,
     inference_mode="online",
     online_window=None,
+    online_lookahead=5,
 ):
     model_kind = _infer_model_kind(model)
 
     def _call_inference(*args, **kwargs):
         kwargs.setdefault("inference_mode", inference_mode)
         kwargs.setdefault("online_window", online_window)
+        kwargs.setdefault("online_lookahead", online_lookahead)
         try:
             return model.inference(*args, **kwargs)
         except TypeError:
             kwargs.pop("inference_mode", None)
             kwargs.pop("online_window", None)
+            kwargs.pop("online_lookahead", None)
             return model.inference(*args, **kwargs)
 
     if model_kind == "human_pose":
@@ -372,7 +375,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                          show_objects=True, vis_gt_only=False, show_foot_contact=False, 
                          show_obj_traj=False, show_hand_traj=False, use_fk=False, compare_3=False, 
                          pred_offset_np=None, no_trans=False, overlay_frames=None, ot_refine=False,
-                         inference_mode="online", online_window=None):
+                         inference_mode="online", online_window=None, online_lookahead=5):
     """Visualize one batch sequence."""
     try:
         nodes_to_remove = [
@@ -513,10 +516,30 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                     ot_refine=ot_refine,
                     inference_mode=inference_mode,
                     online_window=online_window,
+                    online_lookahead=online_lookahead,
                 )
             except Exception as exc:
                 print(f"Model inference failed: {exc}")
                 pred_dict = None
+
+        if pred_dict is not None:
+            pred_length_source = pred_dict.get("p_pred")
+            if not isinstance(pred_length_source, torch.Tensor):
+                pred_length_source = pred_dict.get("root_trans_pred")
+            if isinstance(pred_length_source, torch.Tensor) and pred_length_source.dim() >= 2:
+                T = min(T, int(pred_length_source.shape[1]))
+                if T <= 0:
+                    print("Online strict mode has no publishable frame for this sequence.")
+                    return
+                human_imu_seq = human_imu_seq[:T]
+                verts_gt_seq = verts_gt_seq[:T] if verts_gt_seq is not None else None
+                Jtr_gt_seq = Jtr_gt_seq[:T] if Jtr_gt_seq is not None else None
+                lhand_contact_seq = lhand_contact_seq[:T] if lhand_contact_seq is not None else None
+                rhand_contact_seq = rhand_contact_seq[:T] if rhand_contact_seq is not None else None
+                obj_contact_seq = obj_contact_seq[:T] if obj_contact_seq is not None else None
+                overlay_frame_ids = _normalize_overlay_frames(overlay_frames, T)
+                overlay_mode = overlay_frame_ids is not None
+                overlay_alpha_values = _build_alpha_gradient(len(overlay_frame_ids)) if overlay_mode else None
 
         if pred_dict is not None:
             p_pred_seq = pred_dict.get("p_pred")
@@ -524,7 +547,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                 p_pred_seq = p_pred_seq[bs].to(device)
             
             if no_trans:
-                pred_root_trans_seq = trans_batch[bs] if trans_batch is not None else None
+                pred_root_trans_seq = trans_batch[bs, :T] if trans_batch is not None else None
             else:
                 pred_root_trans_all = pred_dict.get("root_trans_pred")
                 pred_root_trans_seq = pred_root_trans_all[bs].to(device) if pred_root_trans_all is not None else None
@@ -597,7 +620,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
             ):
                 try:
                     reduced_pose = p_pred_seq.view(T, len(_REDUCED_POSE_NAMES), 6)
-                    orientation_6d = human_imu_batch[bs, :, :, -6:]
+                    orientation_6d = human_imu_batch[bs, :T, :, -6:]
                     orientation_mat = transforms.rotation_6d_to_matrix(
                         orientation_6d.reshape(-1, 6)
                     ).reshape(T, human_imu_batch.shape[2], 3, 3)
@@ -637,12 +660,18 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
         gt_obj_rot_mat_seq = None
 
         if has_object_bool and obj_trans_batch is not None:
-            gt_obj_trans_seq = obj_trans_batch[bs]
+            gt_obj_trans_seq = obj_trans_batch[bs, :T]
 
         if show_objects and has_object_bool and obj_trans_batch is not None and obj_rot_batch is not None:
-            gt_obj_rot_6d_seq = obj_rot_batch[bs]
+            gt_obj_rot_6d_seq = obj_rot_batch[bs, :T]
             gt_obj_rot_mat_seq = transforms.rotation_6d_to_matrix(gt_obj_rot_6d_seq)
             gt_obj_scale_seq = obj_scale_batch[bs] if obj_scale_batch is not None else None
+            if (
+                isinstance(gt_obj_scale_seq, torch.Tensor)
+                and gt_obj_scale_seq.dim() >= 1
+                and gt_obj_scale_seq.shape[0] >= T
+            ):
+                gt_obj_scale_seq = gt_obj_scale_seq[:T]
             try:
                 gt_obj_verts_seq, obj_faces_np = load_object_geometry(
                     obj_name, gt_obj_rot_mat_seq, gt_obj_trans_seq, gt_obj_scale_seq,
@@ -852,7 +881,7 @@ class InteractiveViewer(Viewer):
                  show_objects=True, vis_gt_only=False, show_foot_contact=False,
                  show_obj_traj=False, show_hand_traj=False, use_fk=False, compare_3=False, 
                  pred_offset=None, no_trans=False, overlay_frames=None, ot_refine=False,
-                 inference_mode="online", online_window=None, **kwargs):
+                 inference_mode="online", online_window=None, online_lookahead=5, **kwargs):
         super().__init__(**kwargs)
         self.data_list = data_list
         self.current_index = 0
@@ -874,6 +903,7 @@ class InteractiveViewer(Viewer):
         self.ot_refine = ot_refine
         self.inference_mode = inference_mode
         self.online_window = online_window
+        self.online_lookahead = online_lookahead
         self.virtual_bone_info = {'has_data': False}
         
         self.visualize_current_sequence()
@@ -909,7 +939,7 @@ class InteractiveViewer(Viewer):
                     self.obj_geo_root, self.show_objects, self.vis_gt_only,
                     self.show_foot_contact, self.show_obj_traj, self.show_hand_traj,
                     self.use_fk, self.compare_3, self.pred_offset, self.no_trans, self.overlay_frames,
-                    self.ot_refine, self.inference_mode, self.online_window,
+                    self.ot_refine, self.inference_mode, self.online_window, self.online_lookahead,
                 )
                 title_base = f"Sequence: {seq_file_name}" if seq_file_name else f"Sequence Index: {self.current_index}/{len(self.data_list)-1}"
                 self.title = f"{title_base}{mode_str} (q/e:闁?, Ctrl+q/e:闁?0, Alt+q/e:闁?0)"
@@ -992,12 +1022,22 @@ def _make_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             'VelocityContact architecture (case-insensitive); imuhoi selects '
-            'the EgoIMU VC model.'
+            'the EgoIMU VC model; v2 selects the causal velocity-first '
+            'direct-contact cascade.'
         ),
     )
     parser.add_argument('--smpl_model_path', type=str, default=None, help='Path to SMPL model file')
     parser.add_argument('--dataset', type=str, default='omomo', help='Dataset key under config.datasets')
-    parser.add_argument('--num_workers', type=int, default=0, help='DataLoader workers')
+    parser.add_argument(
+        '--data_dir',
+        type=str,
+        default=None,
+        help=(
+            'Override the dataset input path with a single .pt file or a directory '
+            'of .pt files; takes precedence over --dataset.'
+        ),
+    )
+    parser.add_argument('--num_workers', type=int, default=4, help='DataLoader workers')
     parser.add_argument('--no_objects', action='store_true', help='Disable object mesh rendering')
     parser.add_argument('--vis_gt_only', action='store_true', help='Render GT only')
     parser.add_argument('--show_foot_contact', action='store_true', help='Show foot contact')
@@ -1006,11 +1046,18 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument('--use_fk', action='store_true', help='Enable FK branch')
     parser.add_argument('--compare_3', action='store_true', help='Compare three object branches')
     parser.add_argument('--limit_sequences', type=int, default=500, help='Limit number of loaded sequences')
-    parser.add_argument('--pred_offset', type=float, nargs=3, default=[0.0, 0.0, 0.0], help='Prediction translation offset')
+    parser.add_argument('--pred_offset', type=float, nargs=3, default=[1.0, 0.0, 0.0], help='Prediction translation offset')
     parser.add_argument('--overlay_frames', type=int, nargs='+', default=None, help='Overlay selected 0-based frames in one scene')
     parser.add_argument('--no_trans', action='store_true', help='Enable noTrans mode')
     parser.add_argument('--inference_mode', '--inference-mode', choices=['online', 'offline'], default='online', help='RNN inference mode')
-    parser.add_argument('--online_window', '--online-window', type=int, default=None, help='RNN online sliding window size')
+    parser.add_argument('--online_window', '--online-window', type=int, default=60, help='RNN online sliding window size')
+    parser.add_argument(
+        '--online_lookahead',
+        '--online-lookahead',
+        type=int,
+        default=5,
+        help='Future frames appended after the legacy RNN online update frame (strict tail)',
+    )
     noise_group = parser.add_mutually_exclusive_group()
     noise_group.add_argument(
         '--simulate_imu_noise',
@@ -1061,7 +1108,10 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     print(f"Mode: {'noTrans' if args.no_trans else 'Normal'}")
-    print(f"Inference mode: {args.inference_mode} | online_window: {args.online_window or 'config/default'}")
+    print(
+        f"Inference mode: {args.inference_mode} | online_window: "
+        f"{args.online_window or 'config/default'} | online_lookahead: {args.online_lookahead}"
+    )
     print(
         "Eval IMU noise: "
         f"{'enabled' if args.eval_imu_noise else 'disabled'}"
@@ -1077,15 +1127,30 @@ def main():
     print(f"Loading config from: {args.config}")
     config = load_config(args.config)
     try:
-        dataset_configs = get_dataset_configs(config)
-        if args.dataset not in dataset_configs:
-            valid = ', '.join(sorted(dataset_configs))
-            raise ValueError(f"Unknown dataset '{args.dataset}'. Valid datasets: {valid}")
-        dataset_config = dataset_configs[args.dataset]
-        test_data_input = str(resolve_dataset_path(
-            get_full_sequence_test_path(dataset_config),
-            PROJECT_ROOT,
-        ))
+        # ``--data_dir`` is an explicit input override.  It intentionally does
+        # not require a valid dataset key, so a standalone PT can be visualized
+        # with a model-only config as well.  When the key exists, retain its
+        # object mesh root as a fallback for relative object names.
+        if args.data_dir is not None:
+            override_path = Path(args.data_dir).expanduser()
+            if not override_path.is_absolute():
+                override_path = Path.cwd() / override_path
+            test_data_input = str(override_path.resolve())
+            try:
+                dataset_configs = get_dataset_configs(config)
+            except (TypeError, ValueError):
+                dataset_configs = {}
+            dataset_config = dataset_configs.get(args.dataset, {})
+        else:
+            dataset_configs = get_dataset_configs(config)
+            if args.dataset not in dataset_configs:
+                valid = ', '.join(sorted(dataset_configs))
+                raise ValueError(f"Unknown dataset '{args.dataset}'. Valid datasets: {valid}")
+            dataset_config = dataset_configs[args.dataset]
+            test_data_input = str(resolve_dataset_path(
+                get_full_sequence_test_path(dataset_config),
+                PROJECT_ROOT,
+            ))
         obj_geo_setting = dataset_config.get('object_geo_root')
         obj_geo_root = (
             resolve_dataset_path(obj_geo_setting, PROJECT_ROOT)
@@ -1095,8 +1160,11 @@ def main():
     except (TypeError, ValueError) as exc:
         raise SystemExit(f"[Vis] Invalid dataset configuration: {exc}") from exc
 
-    print(f"Dataset: {args.dataset}")
-    print(f"Test data path: {test_data_input}")
+    if args.data_dir is not None:
+        print(f"Data source override (--data_dir): {test_data_input}")
+    else:
+        print(f"Dataset: {args.dataset}")
+        print(f"Test data path: {test_data_input}")
     if obj_geo_root:
         print(f"Object mesh root: {obj_geo_root}")
     elif not args.no_objects:
@@ -1200,7 +1268,7 @@ def main():
                 pt_data = torch.load(target_pt, map_location="cpu")
             except Exception as exc:
                 raise SystemExit(f"Failed to load pt file: {target_pt}. Error: {exc}")
-            required_key = "rotation_local_full_gt_list"
+            required_key = "pose"
             if not isinstance(pt_data, dict) or required_key not in pt_data:
                 raise SystemExit(
                     f"Unsupported pt format for dataset test_path: {target_pt}. "
@@ -1211,7 +1279,9 @@ def main():
                 f"Valid sequence count after filtering: {len(test_dataset.sequence_info)}"
             )
     else:
-        raise SystemExit(f"Dataset test_path must be a directory or a .pt file: {test_data_input}")
+        raise SystemExit(
+            f"Visualization data path must be a directory or a .pt file: {test_data_input}"
+        )
 
     def _natural_key(s):
         return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
@@ -1229,7 +1299,7 @@ def main():
     test_loader = DataLoader(
         test_dataset, batch_size=1, shuffle=False,
         num_workers=config.get('num_workers', 0),
-        pin_memory=True, drop_last=False
+        pin_memory=False, drop_last=False
     )
 
     print(f"Loading data into memory (limit={args.limit_sequences})...")
@@ -1288,6 +1358,7 @@ def main():
         ot_refine=ot_refine,
         inference_mode=args.inference_mode,
         online_window=args.online_window,
+        online_lookahead=args.online_lookahead,
         window_size=(1920, 1080)
     )
     

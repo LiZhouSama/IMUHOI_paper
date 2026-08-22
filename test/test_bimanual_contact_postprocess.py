@@ -5,24 +5,38 @@ from dataset.dataset_IMUHOI import IMUDataset
 
 def _write_synthetic_sequence(tmp_path):
     seq_len = 6
-    joint_count = 22
-    rot6d = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]).repeat(seq_len, joint_count)
+    joint_count = 24
     rotation_global = torch.eye(3).view(1, 1, 3, 3).repeat(seq_len, joint_count, 1, 1)
+    identity_6d = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+    human_imu = torch.cat(
+        (
+            torch.zeros(seq_len, 6, 3),
+            identity_6d.view(1, 1, 6).expand(seq_len, 6, 6),
+        ),
+        dim=-1,
+    )
+    obj_imu = torch.cat(
+        (
+            torch.zeros(seq_len, 3),
+            identity_6d.view(1, 6).expand(seq_len, 6),
+        ),
+        dim=-1,
+    )
 
     position_global = torch.zeros(seq_len, joint_count, 3)
     left_lengths = torch.tensor([0.10, 0.20, 0.30, 0.40, 0.50, 0.50])
     right_lengths = torch.tensor([0.20, 0.20, 0.20, 0.20, 0.20, 0.20])
-    position_global[:, 20, 0] = left_lengths
-    position_global[:, 21, 0] = right_lengths
-    position_global[:, 18, :] = position_global[:, 20, :]
-    position_global[:, 19, :] = position_global[:, 21, :]
+    position_global[:, 22, 0] = left_lengths
+    position_global[:, 23, 0] = right_lengths
 
     lhand_contact = torch.tensor([1, 1, 1, 1, 1, 1], dtype=torch.bool)
     rhand_contact = torch.tensor([1, 1, 1, 1, 1, 0], dtype=torch.bool)
     data = {
         "seq_name": "synthetic_bimanual",
         "gender": "neutral",
-        "rotation_local_full_gt_list": rot6d.float(),
+        "pose": torch.zeros(seq_len, joint_count * 3),
+        "human_imu": human_imu,
+        "obj_imu": obj_imu,
         "position_global_full_gt_world": position_global.float(),
         "trans": torch.zeros(seq_len, 3),
         "rotation_global": rotation_global.float(),
@@ -33,7 +47,6 @@ def _write_synthetic_sequence(tmp_path):
         "obj_scale": torch.ones(seq_len),
         "obj_trans": torch.zeros(seq_len, 3),
         "obj_rot": rotation_global[:, 0],
-        "obj_com_pos": torch.zeros(seq_len, 3),
         "lhand_contact": lhand_contact,
         "rhand_contact": rhand_contact,
         "obj_contact": lhand_contact | rhand_contact,

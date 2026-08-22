@@ -34,7 +34,16 @@ class RNN(nn.Module):
     def forward_with_state(self, x, state=None):
         """Run a sequence and return both decoded output and LSTM state."""
         x = self.encode_input(x)
-        output, state = self.rnn(x, state)
+        # PyTorch 1.13/cu117 has no fused CUDA LSTM kernel for BF16. Keep the
+        # recurrent core in FP32 while allowing surrounding layers to autocast.
+        if x.is_cuda and x.dtype == torch.bfloat16:
+            fp32_state = None
+            if state is not None:
+                fp32_state = tuple(value.float() for value in state)
+            with torch.cuda.amp.autocast(enabled=False):
+                output, state = self.rnn(x.float(), fp32_state)
+        else:
+            output, state = self.rnn(x, state)
         return self.linear2(output), state
 
     def step(self, x, state=None):

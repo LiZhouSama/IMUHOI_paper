@@ -7,6 +7,16 @@ import torch.nn.functional as F
 from configs import _SENSOR_POS_INDICES
 
 
+def _binary_cross_entropy_probability(input_tensor, target, reduction="mean"):
+    """BCE on probabilities, made safe when the caller uses CUDA AMP."""
+    if input_tensor.device.type == "cuda":
+        with torch.autocast(device_type="cuda", enabled=False):
+            return F.binary_cross_entropy(
+                input_tensor.float(), target.float(), reduction=reduction
+            )
+    return F.binary_cross_entropy(input_tensor, target, reduction=reduction)
+
+
 class VelocityContactLoss:
     """Loss computation for velocity, dense contact and contact endpoints."""
 
@@ -15,6 +25,7 @@ class VelocityContactLoss:
         'hand_vel',
         'obj_move',
         'hand_contact_cond',
+        'hand_contact_marginal',
         'contact_endpoint',
         'contact_endpoint_order',
         'endpoint_contact_consistency',
@@ -24,6 +35,7 @@ class VelocityContactLoss:
         'obj_vel',
         'obj_move',
         'hand_contact_cond',
+        'hand_contact_marginal',
         'contact_endpoint',
         'endpoint_contact_consistency',
     }
@@ -32,7 +44,9 @@ class VelocityContactLoss:
         """
         Args:
             weights: dict of loss weights (defaults to 1.0 if missing).
-                - hand_contact: weight for hand_contact_cond
+                - hand_contact_cond: conditional hand-contact BCE
+                - hand_contact_marginal: proper BCE on the downstream-consumed
+                  P(object move) * P(hand contact | object move)
                 - contact_endpoint: endpoint heatmap focal loss
                 - endpoint_contact_consistency: dense endpoint/contact agreement
         """
@@ -128,6 +142,22 @@ class VelocityContactLoss:
         if has_object_mask is not None:
             has_object_mask = torch.as_tensor(has_object_mask, device=device, dtype=dtype).view(bs, 1, 1)
 
+        # v3 emits this mask so contact supervision only uses frames with the
+        # complete fixed-lookahead context. Other architectures retain their
+        # previous all-frame behavior.
+        contact_valid_mask = pred_dict.get('pred_contact_future_valid_mask')
+        if isinstance(contact_valid_mask, torch.Tensor):
+            contact_valid_mask = contact_valid_mask.to(device=device).bool()
+            if contact_valid_mask.dim() == 3 and contact_valid_mask.shape[-1] == 1:
+                contact_valid_mask = contact_valid_mask[..., 0]
+            if contact_valid_mask.shape != (bs, seq):
+                raise ValueError(
+                    'pred_contact_future_valid_mask must be [B,T] or [B,T,1], '
+                    f'got {tuple(contact_valid_mask.shape)}'
+                )
+        else:
+            contact_valid_mask = None
+
         # obj vel
         if 'pred_obj_vel' in pred_dict:
             losses['obj_vel'] = F.mse_loss(pred_dict['pred_obj_vel'], obj_vel_gt)
@@ -145,14 +175,30 @@ class VelocityContactLoss:
         if contact_logits is not None and contact_logits.shape[-1] >= 3:
             obj_move_logits = contact_logits[..., 2:3]
         if obj_move_logits is not None:
-            losses['obj_move'] = F.binary_cross_entropy_with_logits(
-                obj_move_logits, obj_contact_gt.float().unsqueeze(-1)
+            obj_move_element = F.binary_cross_entropy_with_logits(
+                obj_move_logits,
+                obj_contact_gt.float().unsqueeze(-1),
+                reduction='none',
             )
+            if contact_valid_mask is None:
+                losses['obj_move'] = obj_move_element.mean()
+            elif contact_valid_mask.any():
+                losses['obj_move'] = obj_move_element[
+                    contact_valid_mask.unsqueeze(-1)
+                ].mean()
         elif obj_move_pred is not None:
             # fallback to prob if logits missing
-            losses['obj_move'] = F.binary_cross_entropy(
-                obj_move_pred, obj_contact_gt.float().unsqueeze(-1)
+            obj_move_element = _binary_cross_entropy_probability(
+                obj_move_pred,
+                obj_contact_gt.float().unsqueeze(-1),
+                reduction='none',
             )
+            if contact_valid_mask is None:
+                losses['obj_move'] = obj_move_element.mean()
+            elif contact_valid_mask.any():
+                losses['obj_move'] = obj_move_element[
+                    contact_valid_mask.unsqueeze(-1)
+                ].mean()
 
         # conditional hand contact (only when object moving)
         hand_contact_prob = pred_dict.get('pred_hand_contact_prob_cond')
@@ -171,6 +217,8 @@ class VelocityContactLoss:
                 hand_logits_cond, hand_contact_gt_2.float(), reduction='none'
             )
             mask = obj_contact_gt.float()
+            if contact_valid_mask is not None:
+                mask = mask * contact_valid_mask.to(dtype=mask.dtype)
             pos_weight = float(self.weights.get('hand_contact_pos_weight', 1.0))
             neg_weight = float(self.weights.get('hand_contact_neg_weight', 1.0))
             hard_neg_weight = float(self.weights.get('hand_contact_hard_neg_weight', neg_weight))
@@ -200,8 +248,12 @@ class VelocityContactLoss:
             hand_contact_gt_2 = torch.stack(
                 [lhand_contact_gt.float(), rhand_contact_gt.float()], dim=-1
             )
-            cond_loss = F.binary_cross_entropy(hand_contact_prob, hand_contact_gt_2.float(), reduction='none')
+            cond_loss = _binary_cross_entropy_probability(
+                hand_contact_prob, hand_contact_gt_2.float(), reduction='none'
+            )
             mask = obj_contact_gt.float()
+            if contact_valid_mask is not None:
+                mask = mask * contact_valid_mask.to(dtype=mask.dtype)
             pos_weight = float(self.weights.get('hand_contact_pos_weight', 1.0))
             neg_weight = float(self.weights.get('hand_contact_neg_weight', 1.0))
             hard_neg_weight = float(self.weights.get('hand_contact_hard_neg_weight', neg_weight))
@@ -226,6 +278,36 @@ class VelocityContactLoss:
                 if mask.sum() > 0
                 else zero.clone()
             )
+
+        # v3 explicitly opts into supervising the marginal probability that OT
+        # and evaluation consume. Conditional BCE alone cannot calibrate the
+        # product when object-move confidence is imperfect.
+        hand_contact_marginal = pred_dict.get(
+            'pred_hand_contact_prob_marginal'
+        )
+        if isinstance(hand_contact_marginal, torch.Tensor):
+            hand_contact_gt_2 = torch.stack(
+                [lhand_contact_gt.float(), rhand_contact_gt.float()], dim=-1
+            )
+            if hand_contact_marginal.shape != hand_contact_gt_2.shape:
+                raise ValueError(
+                    'pred_hand_contact_prob_marginal must be [B,T,2], '
+                    f'got {tuple(hand_contact_marginal.shape)}'
+                )
+            marginal_element = _binary_cross_entropy_probability(
+                hand_contact_marginal.clamp(1e-6, 1.0 - 1e-6),
+                hand_contact_gt_2,
+                reduction='none',
+            )
+            if contact_valid_mask is None:
+                losses['hand_contact_marginal'] = marginal_element.mean()
+            elif contact_valid_mask.any():
+                marginal_mask = contact_valid_mask.unsqueeze(-1).expand_as(
+                    marginal_element
+                )
+                losses['hand_contact_marginal'] = marginal_element[
+                    marginal_mask
+                ].mean()
 
         # contact segment endpoint heatmaps
         # 6 channels: (l_start, l_end, r_start, r_end, obj_start, obj_end)
@@ -273,7 +355,7 @@ class VelocityContactLoss:
         ):
             endpoint_contact = endpoint_contact[:, 1:].clamp(1e-6, 1.0 - 1e-6)
             frame_teacher = frame_contact[:, 1:].detach().clamp(1e-6, 1.0 - 1e-6)
-            consistency = F.binary_cross_entropy(
+            consistency = _binary_cross_entropy_probability(
                 endpoint_contact,
                 frame_teacher,
                 reduction='none',
@@ -315,10 +397,10 @@ class VelocityContactLoss:
     def compute_test_loss(self, pred_dict, batch, device):
         """Test loss tracks only downstream-consumed VC outputs.
 
-        Stage3 consumes ``pred_obj_vel`` and ``pred_hand_contact_prob``.  The
+        Stage3 consumes ``pred_obj_vel`` and ``pred_hand_contact_prob``. The
         latter is built from conditional hand-contact logits plus object-move
-        probability. Test loss keeps those terms together with endpoint
-        heatmaps and endpoint/contact consistency, excluding hand velocity.
+        probability. Test loss keeps the conditional and optional marginal
+        supervision together with endpoint terms, excluding hand velocity.
         """
         _, _, weighted_losses = self.compute_loss(pred_dict, batch, device)
         test_losses = {
@@ -336,4 +418,201 @@ class VelocityContactLoss:
     @classmethod
     def get_loss_keys(cls):
         """Return loss keys."""
+        return list(cls.LOSS_KEYS)
+
+
+class V2VelocityContactLoss:
+    """Loss for the direct-contact, velocity-first VC v2 cascade.
+
+    Unlike ``VelocityContactLoss``, the two hand channels are unconditional:
+    they are supervised on every frame.  The object channel remains a separate
+    object-move/contact target and is also an input to the hand-contact head.
+    """
+
+    LOSS_KEYS = {"obj_vel", "hand_vel", "obj_move", "hand_contact"}
+    TEST_LOSS_KEYS = {"obj_vel", "obj_move", "hand_contact"}
+
+    def __init__(self, weights=None):
+        self.weights = weights or {}
+
+    def __call__(self, pred_dict, batch, device, active_loss_keys=None):
+        return self.compute_loss(
+            pred_dict,
+            batch,
+            device,
+            active_loss_keys=active_loss_keys,
+        )
+
+    @staticmethod
+    def _target(batch, key, batch_size, seq_len, device, dtype):
+        value = batch.get(key)
+        if isinstance(value, torch.Tensor):
+            return value.to(device=device, dtype=dtype)
+        return torch.zeros(batch_size, seq_len, device=device, dtype=dtype)
+
+    def compute_loss(self, pred_dict, batch, device, active_loss_keys=None):
+        human_imu = batch["human_imu"].to(device)
+        dtype = human_imu.dtype
+        batch_size, seq_len = human_imu.shape[:2]
+        zero = human_imu.new_tensor(0.0)
+        losses = {key: zero.clone() for key in self.LOSS_KEYS}
+
+        obj_vel_gt = batch.get("obj_vel")
+        if isinstance(obj_vel_gt, torch.Tensor):
+            obj_vel_gt = obj_vel_gt.to(device=device, dtype=dtype)
+        else:
+            obj_vel_gt = torch.zeros(
+                batch_size, seq_len, 3, device=device, dtype=dtype
+            )
+        sensor_vel_gt = batch.get("sensor_vel_glb")
+        if isinstance(sensor_vel_gt, torch.Tensor):
+            sensor_vel_gt = sensor_vel_gt.to(device=device, dtype=dtype)
+            if sensor_vel_gt.dim() == 3:
+                sensor_vel_gt = sensor_vel_gt.unsqueeze(0).expand(
+                    batch_size, -1, -1, -1
+                )
+        else:
+            sensor_vel_gt = torch.zeros(
+                batch_size,
+                seq_len,
+                len(_SENSOR_POS_INDICES),
+                3,
+                device=device,
+                dtype=dtype,
+            )
+
+        left_gt = self._target(
+            batch, "lhand_contact", batch_size, seq_len, device, dtype
+        )
+        right_gt = self._target(
+            batch, "rhand_contact", batch_size, seq_len, device, dtype
+        )
+        obj_gt = self._target(
+            batch, "obj_contact", batch_size, seq_len, device, dtype
+        )
+        hand_gt = torch.stack((left_gt, right_gt), dim=-1)
+
+        pred_obj_vel = pred_dict.get("pred_obj_vel")
+        if isinstance(pred_obj_vel, torch.Tensor):
+            losses["obj_vel"] = F.mse_loss(pred_obj_vel, obj_vel_gt)
+        pred_hand_vel = pred_dict.get("pred_hand_glb_vel")
+        if isinstance(pred_hand_vel, torch.Tensor):
+            losses["hand_vel"] = F.mse_loss(
+                pred_hand_vel, sensor_vel_gt[:, :, -2:, :]
+            )
+
+        obj_logits = pred_dict.get("pred_obj_move_logits")
+        if not isinstance(obj_logits, torch.Tensor):
+            contact_logits = pred_dict.get("pred_hand_contact_logits")
+            if (
+                isinstance(contact_logits, torch.Tensor)
+                and contact_logits.shape[-1] >= 3
+            ):
+                obj_logits = contact_logits[..., 2:3]
+        if isinstance(obj_logits, torch.Tensor):
+            losses["obj_move"] = F.binary_cross_entropy_with_logits(
+                obj_logits, obj_gt.unsqueeze(-1)
+            )
+        else:
+            obj_prob = pred_dict.get("pred_obj_move_prob")
+            if isinstance(obj_prob, torch.Tensor):
+                losses["obj_move"] = _binary_cross_entropy_probability(
+                    obj_prob.clamp(1e-6, 1.0 - 1e-6),
+                    obj_gt.unsqueeze(-1),
+                )
+
+        hand_logits = pred_dict.get("pred_hand_contact_logits_direct")
+        if not isinstance(hand_logits, torch.Tensor):
+            contact_logits = pred_dict.get("pred_hand_contact_logits")
+            if (
+                isinstance(contact_logits, torch.Tensor)
+                and contact_logits.shape[-1] >= 2
+            ):
+                hand_logits = contact_logits[..., :2]
+        if isinstance(hand_logits, torch.Tensor):
+            element_loss = F.binary_cross_entropy_with_logits(
+                hand_logits, hand_gt, reduction="none"
+            )
+        else:
+            hand_prob = pred_dict.get("pred_hand_contact_prob_direct")
+            if not isinstance(hand_prob, torch.Tensor):
+                combined_prob = pred_dict.get("pred_hand_contact_prob")
+                if (
+                    isinstance(combined_prob, torch.Tensor)
+                    and combined_prob.shape[-1] >= 2
+                ):
+                    hand_prob = combined_prob[..., :2]
+            element_loss = (
+                _binary_cross_entropy_probability(
+                    hand_prob.clamp(1e-6, 1.0 - 1e-6),
+                    hand_gt,
+                    reduction="none",
+                )
+                if isinstance(hand_prob, torch.Tensor)
+                else None
+            )
+        if element_loss is not None:
+            pos_weight = float(
+                self.weights.get("v2_hand_contact_pos_weight", 1.0)
+            )
+            neg_weight = float(
+                self.weights.get("v2_hand_contact_neg_weight", 1.0)
+            )
+            hard_neg_weight = float(
+                self.weights.get(
+                    "v2_hand_contact_hard_neg_weight", neg_weight
+                )
+            )
+            element_weight = torch.where(
+                hand_gt > 0.5,
+                torch.full_like(hand_gt, pos_weight),
+                torch.full_like(hand_gt, neg_weight),
+            )
+            hard_negative = (
+                (obj_gt > 0.5)
+                & (left_gt <= 0.5)
+                & (right_gt <= 0.5)
+            ).unsqueeze(-1)
+            element_weight = torch.where(
+                hard_negative & (hand_gt <= 0.5),
+                torch.full_like(element_weight, hard_neg_weight),
+                element_weight,
+            )
+            losses["hand_contact"] = (
+                element_loss * element_weight
+            ).sum() / element_weight.sum().clamp_min(1e-6)
+
+        active = (
+            set(self.LOSS_KEYS)
+            if active_loss_keys is None
+            else set(active_loss_keys)
+        )
+        unknown = active - self.LOSS_KEYS
+        if unknown:
+            raise ValueError(f"Unknown VC v2 loss keys: {sorted(unknown)}")
+        weighted = {}
+        total = zero.clone()
+        for key, value in losses.items():
+            if key not in active:
+                continue
+            weighted[key] = value * float(self.weights.get(key, 1.0))
+            total = total + weighted[key]
+        return total, losses, weighted
+
+    def compute_test_loss(self, pred_dict, batch, device):
+        _, _, weighted = self.compute_loss(pred_dict, batch, device)
+        selected = {
+            key: value
+            for key, value in weighted.items()
+            if key in self.TEST_LOSS_KEYS
+        }
+        total = (
+            sum(selected.values())
+            if selected
+            else batch["human_imu"].to(device).new_tensor(0.0)
+        )
+        return total, selected
+
+    @classmethod
+    def get_loss_keys(cls):
         return list(cls.LOSS_KEYS)

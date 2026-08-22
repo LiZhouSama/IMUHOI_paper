@@ -13,8 +13,12 @@ from tqdm import tqdm
 from scipy.spatial.transform import Rotation as R
 
 from human_body_prior.body_model.body_model import BodyModel
-from human_body_prior.tools.rotation_tools import local2global_pose
 import pytorch3d.transforms as transforms
+from utils.human_pose import (
+    build_smpl24_joint_positions,
+    ensure_smpl24_local_rotations,
+    local_rotations_to_global,
+)
 
 try:
     from preprocess import (
@@ -24,6 +28,7 @@ try:
         compute_improved_contact_labels,
         compute_foot_contact_labels,
         load_canonical_points_from_mesh_path,
+        precompute_sequence_features,
         postprocess_sequence_contact_labels,
         write_contact_skip_manifest,
     )
@@ -35,6 +40,7 @@ except ModuleNotFoundError:
         compute_improved_contact_labels,
         compute_foot_contact_labels,
         load_canonical_points_from_mesh_path,
+        precompute_sequence_features,
         postprocess_sequence_contact_labels,
         write_contact_skip_manifest,
     )
@@ -230,16 +236,14 @@ def compute_rotation_features_chunk(
     local_rot_mat = transforms.axis_angle_to_matrix(
         torch.tensor(poses, dtype=torch.float32, device=device).reshape(-1, 3)
     ).reshape(poses.shape[0], -1, 3, 3)
-    rotation_local_6d = transforms.matrix_to_rotation_6d(local_rot_mat)
-    rotation_local_full_gt = rotation_local_6d.reshape(poses.shape[0], -1)
-
-    kintree_table = bm.kintree_table[0].long()[:22]
-    kintree_table[0] = -1
-    rotation_global_matrot = local2global_pose(
-        local_rot_mat.reshape(local_rot_mat.shape[0], -1, 9), kintree_table
+    local_rot_mat = ensure_smpl24_local_rotations(local_rot_mat)
+    pose_aa = torch.cat(
+        (torch.tensor(poses, dtype=torch.float32, device=device).reshape(poses.shape[0], -1, 3),
+         torch.zeros(poses.shape[0], 2, 3, device=device)),
+        dim=1,
     )
-    rotation_global_matrot = rotation_global_matrot.reshape(rotation_global_matrot.shape[0], -1, 3, 3)
-    return rotation_local_full_gt.detach().cpu(), rotation_global_matrot.detach().cpu()
+    rotation_global_matrot = local_rotations_to_global(local_rot_mat)
+    return pose_aa.detach().cpu(), rotation_global_matrot.detach().cpu()
 
 
 def left_multiply_axis_angles(
@@ -313,7 +317,7 @@ def compute_body_up_vector(
             end = min(start + batch_size, total_frames)
             kwargs = {key: value[start:end] for key, value in smpl_input.items()}
             body_out = bm(**kwargs)
-            joints = body_out.Jtr[:, :22, :]
+            joints = build_smpl24_joint_positions(body_out.Jtr)
             body_up = joints[:, IMHD_HEAD_JOINT, :] - joints[:, IMHD_FOOT_JOINTS, :].mean(dim=1)
             valid = torch.linalg.norm(body_up, dim=1) > IMHD_UP_ALIGNMENT_MIN_LEN
             if valid.any():
@@ -366,7 +370,7 @@ def forward_smpl_in_batches(
             end = min(start + batch_size, total_frames)
             kwargs = {key: value[start:end] for key, value in smpl_input.items()}
             body_out = bm(**kwargs)
-            joints = body_out.Jtr[:, :22, :].detach().cpu()
+            joints = build_smpl24_joint_positions(body_out.Jtr).detach().cpu()
             verts = body_out.v
             batch_min_abs = float(verts[:, :, 1].abs().min().item())
             if min_abs_y is None or batch_min_abs < min_abs_y:
@@ -397,7 +401,7 @@ def compute_foot_floor_offset(
             end = min(start + batch_size, T)
             kwargs = {key: value[start:end] for key, value in smpl_input.items()}
             body_out = bm(**kwargs)
-            joints = body_out.Jtr[:, :22, :]  # [B, 22, 3]
+            joints = build_smpl24_joint_positions(body_out.Jtr)
             # 双脚关节: 7=左脚踝, 8=右脚踝, 10=左脚, 11=右脚
             left_ankle = joints[:, 7, 1]   # [B]
             right_ankle = joints[:, 8, 1]  # [B]
@@ -726,7 +730,7 @@ def process_imhd_sequence(
                 torch.cuda.empty_cache()
 
     position_global = torch.cat(pos_chunks, dim=0).float()
-    rotation_local_full_gt = torch.cat(rot_local_chunks, dim=0).float()
+    pose = torch.cat(rot_local_chunks, dim=0).reshape(T, -1).float()
     rotation_global = torch.cat(rot_global_chunks, dim=0).float()
     lfoot_contact = torch.cat(lfoot_chunks, dim=0)
     rfoot_contact = torch.cat(rfoot_chunks, dim=0)
@@ -780,7 +784,7 @@ def process_imhd_sequence(
     output = {
         "seq_name": entry.seq_name,
         "gender": gender,
-        "rotation_local_full_gt_list": rotation_local_full_gt,
+        "pose": pose,
         "position_global_full_gt_world": position_global,
         "rotation_global": rotation_global,
         "trans": trans,
@@ -792,7 +796,6 @@ def process_imhd_sequence(
         "obj_name": object_name,
         "obj_mesh_name": mesh_basename,
         "obj_points_canonical": canonical_points.half().cpu(),
-        "obj_points_sample_count": int(canonical_points.shape[0]),
         "has_object": True,
         "obj_scale": obj_scale_cpu,
         "obj_trans": obj_trans_cpu,
@@ -819,6 +822,21 @@ def process_imhd_sequence(
             ),
         ),
     }
+    output.update(
+        precompute_sequence_features(
+            position_global,
+            rotation_global,
+            trans,
+            obj_trans=obj_trans_cpu,
+            obj_rot=obj_rot_cpu,
+            human_imu=human_imu_tensor,
+            obj_imu=obj_imu_tensor,
+            lhand_contact=lhand_contact,
+            rhand_contact=rhand_contact,
+            obj_contact=obj_contact,
+            has_object=True,
+        )
+    )
 
     os.makedirs(output_dir, exist_ok=True)
     torch.save(output, out_path)

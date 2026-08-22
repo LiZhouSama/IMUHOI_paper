@@ -74,7 +74,6 @@ num_human_imus: 6
 imu_dim: 9
 num_joints: 22
 joint_dim: 6
-vel_scale: 3
 
 # ============ Object Prior (Interaction) ============
 object_code_dim: 128

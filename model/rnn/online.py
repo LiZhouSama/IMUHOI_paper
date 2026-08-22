@@ -31,6 +31,7 @@ NON_TEMPORAL_KEYS = frozenset(
         "v_init",
         "p_init",
         "trans_init",
+        "prev_foot_pos",
         "hand_vel_glb_init",
         "obj_vel_init",
         "obj_trans_init",
@@ -68,6 +69,33 @@ def resolve_online_window(cfg: Any = None, online_window: Optional[int] = None, 
         if value is not None:
             return max(int(value), 1)
     return int(default)
+
+
+def resolve_online_lookahead(
+    cfg: Any = None,
+    online_lookahead: Optional[int] = None,
+    default: int = 5,
+) -> int:
+    """Resolve the fixed-lag online delay in frames.
+
+    The legacy base window is preserved and ``D`` frames are appended after
+    its update frame as future context.  A delay of ``D`` therefore publishes
+    frame ``t`` only after frames through ``t + D`` have arrived.  Strict end
+    handling emits ``max(T - D, 0)`` frames for a sequence of length ``T``;
+    the unseen tail is never padded or flushed with less context.  Setting
+    ``D=0`` recovers the original warmup and sliding-window behavior.
+    """
+    if online_lookahead is not None:
+        return max(int(online_lookahead), 0)
+
+    test_cfg = getattr(cfg, "test", None) if cfg is not None else None
+    if isinstance(test_cfg, dict):
+        value = test_cfg.get("online_lookahead")
+    else:
+        value = getattr(test_cfg, "online_lookahead", None) if test_cfg is not None else None
+    if value is None and cfg is not None:
+        value = getattr(cfg, "online_lookahead", None)
+    return max(int(default if value is None else value), 0)
 
 
 def infer_batch_seq(data_dict: Dict[str, Any], key: str = "human_imu") -> Tuple[int, int]:
@@ -332,7 +360,12 @@ def _infer_output_batch_seq(output: InferenceOutput) -> Tuple[int, int]:
     tensors = list(_iter_named_tensors(output))
     for preferred_key in _SEQUENCE_LENGTH_KEYS:
         for key, value in tensors:
-            if key == preferred_key and _valid_sequence_candidate(value):
+            if (
+                key == preferred_key
+                and isinstance(value, torch.Tensor)
+                and value.dim() >= 2
+                and int(value.shape[0]) > 0
+            ):
                 return int(value.shape[0]), int(value.shape[1])
 
     counts = {}
@@ -357,13 +390,13 @@ def update_data_inits_from_history(
     history: InferenceOutput,
     index: int = -1,
     contact_index: Optional[int] = None,
+    trans_index: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Refresh init tensors from known predictions.
 
-    ``index`` keeps the existing predecessor-frame semantics for kinematic
-    initializers. ``contact_index`` can independently select the first frame
-    of the current window, because contact_init represents frame-0 state rather
-    than the state immediately before the window.
+    ``index`` keeps predecessor-frame semantics for recurrent initializers.
+    ``contact_index`` and ``trans_index`` can independently select the first
+    frame of the current window, because those values represent frame-0 state.
     """
     if not history:
         return data
@@ -378,9 +411,14 @@ def update_data_inits_from_history(
     if value is not None:
         updated["p_init"] = value.reshape(value.shape[0], -1, 6)
 
-    value = _history_tensor(history, "root_trans_pred", index)
+    resolved_trans_index = index if trans_index is None else trans_index
+    value = _history_tensor(history, "root_trans_pred", resolved_trans_index)
     if value is not None:
         updated["trans_init"] = value
+
+    value = _history_tensor(history, "pred_foot_pos", index)
+    if value is not None:
+        updated["prev_foot_pos"] = value
 
     value = _history_tensor(history, "pred_hand_glb_vel", index)
     if value is not None:

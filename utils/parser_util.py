@@ -16,7 +16,7 @@ def get_args():
 
 def merge_file(args):
     """合并配置文件和命令行参数"""
-    with open(args.cfg, 'r') as f:
+    with open(args.cfg, 'r', encoding='utf-8') as f:
         cfg = yaml.load(f, Loader=yaml.FullLoader)
     
     # 转换为EasyDict

@@ -23,7 +23,19 @@ from utils.human_pose import select_hand_anchor_positions
 from utils.utils import _central_diff, _smooth_acceleration
 
 
-VELOCITY_CONTACT_ARCH_CHOICES = ("current", "legacy", "imuhoi")
+VELOCITY_CONTACT_ARCH_CHOICES = (
+    "current",
+    "legacy",
+    "v2",
+    "v3",
+    "v4",
+    "imuhoi",
+    "imuhoi_cond",
+    "imuhoi_cond_bi",
+    "imuhoi_cond_geom",
+    "imuhoi_cond_boundary",
+    "imuhoi_cond_boundary_endpoint",
+)
 
 
 def normalize_velocity_contact_arch(arch):
@@ -44,10 +56,28 @@ def build_velocity_contact_module(cfg, velocity_contact_arch=None):
         from .velocity_contact_legacy import LegacyVelocityContactModule
 
         return LegacyVelocityContactModule(cfg)
+    if arch == "v2":
+        from .velocity_contact_v2 import V2VelocityContactModule
+
+        return V2VelocityContactModule(cfg)
+    if arch == "v3":
+        from .velocity_contact_v3 import V3VelocityContactModule
+
+        return V3VelocityContactModule(cfg)
+    if arch == "v4":
+        from .velocity_contact_v4 import V4VelocityContactModule
+
+        return V4VelocityContactModule(cfg)
     if arch == "imuhoi":
         from .velocity_contact_IMUHOI import IMUHOIVelocityContactModule
 
         return IMUHOIVelocityContactModule(cfg)
+    if arch.startswith("imuhoi_cond"):
+        from .velocity_contact_ablation import (
+            IMUHOIConditionalVelocityContactModule,
+        )
+
+        return IMUHOIConditionalVelocityContactModule(cfg, arch=arch)
     return VelocityContactModule(cfg)
 
 

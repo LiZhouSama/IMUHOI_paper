@@ -160,10 +160,6 @@ class LegacyMeshObjectTransModule(nn.Module):
         nn.init.zeros_(self.refine_head.linear2.weight)
         nn.init.zeros_(self.refine_head.linear2.bias)
 
-    def online_mode(self) -> str:
-        """Expose the reset-window behavior expected by batch-online eval."""
-        return "window"
-
     @staticmethod
     def _unit_vector(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
         norm = x.norm(dim=-1, keepdim=True).clamp_min(eps)
@@ -672,4 +668,3 @@ class LegacyMeshObjectTransModule(nn.Module):
                 obj_trans_init,
                 **kwargs,
             )
-
