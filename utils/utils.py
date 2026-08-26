@@ -415,7 +415,16 @@ def build_model_input_dict(batch, cfg, device, add_noise=True):
     else:
         obj_feat_dim = getattr(cfg, 'obj_imu_dim', 9)
         obj_imu = torch.zeros(bs, seq, obj_feat_dim, device=device, dtype=dtype)
-    
+
+    # Ablation: run the pipeline with no object IMU at all.  On these datasets
+    # the object IMU is synthesized from object motion and the contact labels
+    # are defined by that same motion, so keeping it makes contact nearly
+    # trivial.  Zeroing it here (rather than inside one architecture) keeps
+    # training and evaluation consistent across every architecture.
+    if bool(getattr(cfg, 'disable_obj_imu', False)):
+        obj_imu = torch.zeros_like(obj_imu)
+
+
     def _get_tensor(key, tensor_dtype=dtype):
         value = batch.get(key)
         if isinstance(value, torch.Tensor):

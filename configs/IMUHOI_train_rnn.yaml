@@ -19,15 +19,31 @@ velocity_hidden_dim: 128
 velocity_num_layers: 2
 velocity_dropout: 0.2
 velocity_contact_arch: "current"  # current | legacy | v2 | v3 | v4 | imuhoi | imuhoi_cond*
-# v3 uses this many future frames in its finite-receptive-field interaction
-# branch. Keep it equal to test.online_lookahead for train/eval parity.
-v3_lookahead: 5
+# Legacy compatibility key; current v3 does not read it. Online publication
+# delay is controlled by test.online_lookahead or the matching CLI override.
+v3_lookahead: 10
 boundary_group_hidden: 64
 boundary_hidden_dim: 128
 # 在线采用固定延迟并只发布 target 帧；boundary GRU 仍保持因果单向，避免其
 # 未来上下文策略与整窗训练不一致。注意：修改后必须重训 VelocityContact，
 # 旧的双向 checkpoint 会在加载时被 validate_checkpoint_state_dict 拒绝。
 boundary_bidirectional: false
+
+# ---- VC v4：受监督的人体姿态交互先验（仅 v4 读取，不影响其它架构） ----
+# v4 的 boundary GRU 与 obj_move 一样使用双向：reach 证据在 onset 之前、
+# retract 证据在 offset 之后，这个编码器是最能从双向上下文受益的模块。
+v4_boundary_bidirectional: true
+# 关节加速度是二阶差分，把 HP 的位置抖动放大 fps^2 倍。置 false 可做去掉
+# 加速度通道的对照实验。
+v4_boundary_use_joint_acc: true
+# 送入 boundary 编码器前对速度/加速度做因果滑动平均的窗口（帧）。
+v4_boundary_smooth_window: 5
+# 把 boundary 输入统一旋到 root 水平朝向（绕 +Y 的 yaw）局部系，
+# 使"伸手去拿"这类动作模式与朝向无关；保留俯仰/侧倾这类真实信号。
+v4_heading_normalize: true
+# anticipation 头的预测范围 k（帧）：预测未来 (t, t+k] 内是否发生接触切换。
+# 修改后必须重训——checkpoint 里记录的 horizon 与此不一致会在加载时报错。
+v4_anticipation_horizon: 15
 
 hidden_dim_multiplier: 1
 object_trans_hidden_dim: 192
@@ -155,12 +171,14 @@ amp_dtype: "bfloat16"
 milestones: [100, 200, 300, 350, 400, 450, 500]
 joint_train_milestones: [10,20,30,40,50,60,70,80,90,100] 
 gamma: 0.2
-# VC使用一个模型、optimizer和best.pt，按依赖顺序分三阶段训练。
-vc_staged_training: false #legacy false
+# v3没有endpoint head，三阶段模式不会启用。保持全loss联合训练，但按参数组
+# 独立衰减：contact验证loss在30~70 epoch后过拟合，velocity则持续改善到约200 epoch。
+vc_staged_training: true
+vc_grouped_lr: true
 vc_velocity_stage_epochs: 120
 vc_joint_stage_epochs: 60
-vc_velocity_lr_milestones: [60, 100]       # 相对velocity阶段
-vc_contact_lr_milestones: [20, 35, 50]     # 相对joint阶段
+vc_velocity_lr_milestones: [100]           # 100后继续低lr收敛至约200 epoch
+vc_contact_lr_milestones: [30, 50, 70]     # grouped模式下为绝对epoch
 vc_endpoint_joint_lr_milestones: [30, 50]  # 相对joint阶段
 vc_endpoint_finetune_lr_scale: 0.2
 vc_endpoint_finetune_lr_milestones: [50, 90]  # 相对endpoint微调阶段
@@ -260,6 +278,10 @@ loss_weights:
   contact_endpoint: 1.0
   contact_endpoint_order: 0.5
   endpoint_contact_consistency: 0.5
+  # v4-only: pose-only anticipation head, "未来k帧内是否发生接触切换"。
+  contact_anticipation: 0.5
+  anticipation_focal_alpha: 0.25
+  anticipation_focal_gamma: 2.0
   endpoint_focal_alpha: 0.25
   endpoint_focal_gamma: 2.0
 
@@ -273,8 +295,8 @@ loss_weights:
   # 恒定先验；手在物体上滑动时跟随 GT 的变化，不会误判滑动。
   lhand_lb_cons: 1.0
   rhand_lb_cons: 1.0
-  hoi_error_l: 1
-  hoi_error_r: 1
+  hoi_error_l: 10
+  hoi_error_r: 10
   obj_vel_cons: 0.01
   # gate 弱监督目标改由 GT 接触构建后适当加大权重
   gate_weak: 0.1
@@ -284,11 +306,11 @@ loss_weights:
 
 # ============ 窗口配置 ============
 train:
-  window: 120
+  window: 60
 
 test:
-  window: 120
-  online_lookahead: 5
+  window: 60
+  online_lookahead: 10
 
 # ============ 预训练模块路径（可选）============
 # 注意：boundary_bidirectional=false 与 OT arch v6 之后，旧 VC/OT checkpoint

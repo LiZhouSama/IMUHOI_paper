@@ -140,13 +140,22 @@ class HumanPoseModule(nn.Module):
             )
             self.torso_joints = torch.tensor([0, 3, 6, 9, 12, 15], dtype=torch.long)
             self.prob_threshold = (0.5, 0.9)
-            # DynaIP's contact branch uses a -0.018 m per-frame vertical bias.
-            # Keep the whole root-velocity pipeline in m/s by converting that
-            # displacement bias once here, alongside the foot finite difference.
+            # Small downward bias on the contact branch: paired with the floor
+            # clamp below it pulls the root back down whenever foot integration
+            # drifts it upward. 0.018 is metres per second here (0.6 mm/frame at
+            # 30 fps), the rate this pipeline used before the m/s unit fix.
+            # Reading it as a per-frame displacement instead sinks the root ~1 m
+            # per 60-frame window, which leaves the clamp — not the network —
+            # deciding the root height on almost every frame.
             self.gravity_velocity = torch.tensor(
-                [0.0, -0.018 * self.fps, 0.0], dtype=torch.float32
+                [0.0, -0.018, 0.0], dtype=torch.float32
             )
-            self.floor_height = 0.0
+            # The floor clamp compares against joints 7/8, which are ankles, not
+            # soles: the datasets place the mesh sole at y=0, and the lower ankle
+            # then sits 0.0765 m above it (std 0.0062 over OMOMO, because the
+            # `amin` picks whichever foot is flat). Clamping ankles at y=0 would
+            # sink the root by that offset on every supported frame.
+            self.floor_height = 0.07
             self.prevent_floor_penetration = True
 
         # SMPL相关
@@ -294,20 +303,23 @@ class HumanPoseModule(nn.Module):
         self,
         root_trans: torch.Tensor,
         joints_pos: torch.Tensor,
-        contact_logits: torch.Tensor,
         preserve_first_frame: bool = True,
     ):
-        """Correct root translation from translation-free foot world heights.
+        """Lift the root so the lower foot never penetrates the ground plane.
 
-        Penetration is always corrected upward.  Downward correction is gated
-        by predicted foot contact so a swing foot is not forced to the ground.
-        The ground plane is the fixed world-space plane y=0; root_trans_y must
-        therefore be included when converting translation-free FK joints to
-        world-space foot heights.
+        The correction is upward-only and monotonically non-decreasing over the
+        window, matching TransPose's floor clamp.  A foot is never pulled *down*
+        onto the plane: the contact head is supervised with a pure speed
+        threshold (``compute_foot_contact_labels``), so "in contact" means
+        "stationary", not "at floor height", and joints 7/8 are ankles, which
+        stay ~0.08 m above the ground while standing.
+
+        The ground plane is the fixed world-space plane y=0, so root_trans_y
+        must be added to the translation-free FK joints before comparing.
         """
         batch_size, seq_len, _ = root_trans.shape
         zero_correction = root_trans.new_zeros(batch_size, seq_len)
-        if joints_pos is None or contact_logits is None:
+        if joints_pos is None or not getattr(self, "prevent_floor_penetration", False):
             return root_trans, zero_correction
 
         foot_indices = torch.as_tensor(
@@ -316,46 +328,32 @@ class HumanPoseModule(nn.Module):
         if joints_pos.size(2) <= int(foot_indices.max().item()):
             return root_trans, zero_correction
 
-        foot_local_y = torch.index_select(joints_pos[..., 1], dim=2, index=foot_indices)
-        if not getattr(self, "prevent_floor_penetration", False):
-            return root_trans, zero_correction
-
-        floor_height = root_trans.new_zeros(batch_size)
-        running_offset = root_trans.new_zeros(batch_size)
-        corrected_frames = []
-        frame_corrections = []
-        for frame_idx in range(seq_len):
-            frame_trans = root_trans[:, frame_idx]
-            frame_y = frame_trans[:, 1] + running_offset
-            frame_delta = root_trans.new_zeros(batch_size)
-
-            if not (preserve_first_frame and frame_idx == 0):
-                foot_world_y = foot_local_y[:, frame_idx] + frame_y.unsqueeze(-1)
-                contact_prob = torch.sigmoid(contact_logits[:, frame_idx])
-                support_prob, support_index = contact_prob.max(dim=-1)
-                support_world_y = foot_world_y.gather(
-                    dim=-1, index=support_index.unsqueeze(-1)
-                ).squeeze(-1)
-                contact_weight = self._prob_to_weight(support_prob)
-
-                # Signed contact correction lowers a hovering support foot and
-                # raises a penetrating support foot toward its calibrated height.
-                contact_delta = contact_weight * (floor_height - support_world_y)
-                foot_after_contact = foot_world_y + contact_delta.unsqueeze(-1)
-                penetration_delta = F.relu(
-                    floor_height - foot_after_contact.amin(dim=-1)
-                )
-                frame_delta = contact_delta + penetration_delta
-                frame_y = frame_y + frame_delta
-                running_offset = running_offset + frame_delta
-
-            corrected_frames.append(
-                torch.stack((frame_trans[:, 0], frame_y, frame_trans[:, 2]), dim=-1)
+        floor_height = torch.as_tensor(
+            self.floor_height, device=root_trans.device, dtype=root_trans.dtype
+        )
+        foot_local_y = torch.index_select(
+            joints_pos[..., 1], dim=2, index=foot_indices
+        ).to(device=root_trans.device, dtype=root_trans.dtype)
+        foot_world_y = foot_local_y + root_trans[..., 1:2]
+        penetration = F.relu(floor_height - foot_world_y.amin(dim=-1))
+        if preserve_first_frame:
+            penetration = torch.cat(
+                (torch.zeros_like(penetration[:, :1]), penetration[:, 1:]), dim=1
             )
-            frame_corrections.append(frame_delta)
 
-        corrected = torch.stack(corrected_frames, dim=1)
-        correction = torch.stack(frame_corrections, dim=1)
+        # Lift by the deepest penetration seen so far, so a frame that clears
+        # the floor never drags the root back down.  Applied incrementally on
+        # the already-corrected trajectory (online), this recursion reproduces
+        # the same offsets frame by frame.
+        correction = torch.cummax(penetration, dim=1).values
+        corrected = torch.stack(
+            (
+                root_trans[..., 0],
+                root_trans[..., 1] + correction,
+                root_trans[..., 2],
+            ),
+            dim=-1,
+        )
         return corrected, correction
 
     def _integrate_root_velocity(self, root_velocities: torch.Tensor):
@@ -578,7 +576,6 @@ class HumanPoseModule(nn.Module):
             root_trans_pred, ground_correction_pred = self._apply_ground_correction(
                 root_trans_unadjusted_pred,
                 joints_pos,
-                contact_pred,
                 preserve_first_frame=True,
             )
             root_vel_pred = self._root_velocity_from_translation(
@@ -636,12 +633,10 @@ class HumanPoseModule(nn.Module):
         updated = dict(frame)
         raw_velocity = frame["root_vel_unadjusted_pred"]
         joints_local = frame.get("pred_joints_local")
-        contact_logits = frame.get("contact_pred")
         root_trans_unadjusted = previous_trans.unsqueeze(1) + raw_velocity / self.fps
         root_trans, ground_correction = self._apply_ground_correction(
             root_trans_unadjusted,
             joints_local,
-            contact_logits,
             preserve_first_frame=False,
         )
         root_velocity = (root_trans - previous_trans.unsqueeze(1)) * self.fps

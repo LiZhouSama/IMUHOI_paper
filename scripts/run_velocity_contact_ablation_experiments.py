@@ -34,7 +34,7 @@ EXPERIMENTS = (
     ("05_cond_boundary_endpoint_align", "imuhoi_cond_boundary_endpoint"),
     ("06_v2_velocity_cascade", "v2"),
     ("07_v3_boundary_objmove_bi", "v3"),
-    ("08_v4_boundary_geom_objmove_bi", "v4"),
+    ("08_v4_supervised_pose_prior", "v4"),
 )
 
 
@@ -55,6 +55,12 @@ def parse_args():
         default=None,
     )
     parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument(
+        "--eval_online_lookahead",
+        type=int,
+        default=None,
+        help="Explicit online lookahead for the post-training evaluation.",
+    )
     parser.add_argument(
         "--num_workers",
         type=int,
@@ -312,6 +318,10 @@ def main():
             "--output_json",
             eval_json,
         ]
+        if args.eval_online_lookahead is not None:
+            eval_command.extend(
+                ["--online_lookahead", str(args.eval_online_lookahead)]
+            )
         run_command(
             eval_command,
             experiment_dir / "eval_batch_online.log",

@@ -54,7 +54,11 @@ from utils.utils import (
     load_smpl_model,
     build_model_input_dict,
 )
-from utils.human_pose import select_hand_anchor_positions
+from utils.human_pose import (
+    append_virtual_palm_joints,
+    build_smpl24_joint_positions,
+    select_hand_anchor_positions,
+)
 from utils.hoi_metrics import compute_hoi_error_at_gt_contact
 from configs import (
     FRAME_RATE,
@@ -265,6 +269,151 @@ def _global_to_local_rotmat(global_rotmats, parents):
     return local_rotmats
 
 
+def _to_smpl24_joint_positions(joints: torch.Tensor) -> torch.Tensor:
+    """Return body-22 plus the two virtual palm anchors for evaluation."""
+    if not isinstance(joints, torch.Tensor):
+        raise TypeError("joints must be a torch.Tensor")
+    joint_count = int(joints.shape[-2])
+    if joint_count in {52, 55}:
+        return build_smpl24_joint_positions(joints)
+    if joint_count == 22:
+        return append_virtual_palm_joints(joints)
+    if joint_count >= 24:
+        return joints[..., :24, :]
+    raise ValueError(f"Expected 22, 24, 52, or 55 joints, got {joint_count}")
+
+
+def _build_published_object_trans(
+    raw_obj_trans: Optional[torch.Tensor],
+    stage1_hand_pos: Optional[torch.Tensor],
+    refined_hand_pos: Optional[torch.Tensor],
+    left_fk_pos: Optional[torch.Tensor],
+    right_fk_pos: Optional[torch.Tensor],
+    imu_pos: Optional[torch.Tensor],
+    static_pos: Optional[torch.Tensor],
+    gating_weights: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Re-run fusion with refined hands while keeping the trained OT state raw."""
+    required = (
+        raw_obj_trans,
+        stage1_hand_pos,
+        refined_hand_pos,
+        left_fk_pos,
+        right_fk_pos,
+        imu_pos,
+        static_pos,
+        gating_weights,
+    )
+    if any(not isinstance(value, torch.Tensor) for value in required):
+        return raw_obj_trans
+    if stage1_hand_pos.dim() != 3 or stage1_hand_pos.shape[-2:] != (2, 3):
+        return raw_obj_trans
+    if refined_hand_pos.shape != stage1_hand_pos.shape:
+        return raw_obj_trans
+    if left_fk_pos.shape != raw_obj_trans.shape or right_fk_pos.shape != raw_obj_trans.shape:
+        return raw_obj_trans
+    if imu_pos.shape != raw_obj_trans.shape or static_pos.shape != raw_obj_trans.shape:
+        return raw_obj_trans
+    if gating_weights.dim() != 2 or gating_weights.shape[0] != raw_obj_trans.shape[0]:
+        return raw_obj_trans
+    if gating_weights.shape[-1] not in {3, 4}:
+        return raw_obj_trans
+    if torch.allclose(stage1_hand_pos, refined_hand_pos):
+        return raw_obj_trans
+
+    corrected_left_fk = refined_hand_pos[:, 0] + (left_fk_pos - stage1_hand_pos[:, 0])
+    corrected_right_fk = refined_hand_pos[:, 1] + (right_fk_pos - stage1_hand_pos[:, 1])
+    previous = static_pos[0]
+    published = []
+    for frame_idx in range(raw_obj_trans.shape[0]):
+        imu_delta = imu_pos[frame_idx] - static_pos[frame_idx]
+        imu_candidate = previous + imu_delta
+        if gating_weights.shape[-1] == 4:
+            current = (
+                gating_weights[frame_idx, 0] * corrected_left_fk[frame_idx]
+                + gating_weights[frame_idx, 1] * corrected_right_fk[frame_idx]
+                + gating_weights[frame_idx, 2] * imu_candidate
+                + gating_weights[frame_idx, 3] * previous
+            )
+        else:
+            current = (
+                gating_weights[frame_idx, 0] * corrected_left_fk[frame_idx]
+                + gating_weights[frame_idx, 1] * corrected_right_fk[frame_idx]
+                + gating_weights[frame_idx, 2] * imu_candidate
+            )
+        published.append(current)
+        previous = current
+    return torch.stack(published, dim=0)
+
+
+def _build_published_object_candidates(
+    raw_obj_trans: Optional[torch.Tensor],
+    stage1_hand_pos: Optional[torch.Tensor],
+    refined_hand_pos: Optional[torch.Tensor],
+    left_fk_pos: Optional[torch.Tensor],
+    right_fk_pos: Optional[torch.Tensor],
+    imu_pos: Optional[torch.Tensor],
+    static_pos: Optional[torch.Tensor],
+    gating_weights: Optional[torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Return the four candidate trajectories used by published fusion."""
+    required = (
+        raw_obj_trans,
+        stage1_hand_pos,
+        refined_hand_pos,
+        left_fk_pos,
+        right_fk_pos,
+        imu_pos,
+        static_pos,
+        gating_weights,
+    )
+    if any(not isinstance(value, torch.Tensor) for value in required):
+        return {}
+    if stage1_hand_pos.dim() != 3 or stage1_hand_pos.shape[-2:] != (2, 3):
+        return {}
+    if refined_hand_pos.shape != stage1_hand_pos.shape:
+        return {}
+    if left_fk_pos.shape != raw_obj_trans.shape or right_fk_pos.shape != raw_obj_trans.shape:
+        return {}
+    if imu_pos.shape != raw_obj_trans.shape or static_pos.shape != raw_obj_trans.shape:
+        return {}
+    if gating_weights.dim() != 2 or gating_weights.shape[0] != raw_obj_trans.shape[0]:
+        return {}
+    if gating_weights.shape[-1] not in {3, 4}:
+        return {}
+
+    corrected_left = refined_hand_pos[:, 0] + (left_fk_pos - stage1_hand_pos[:, 0])
+    corrected_right = refined_hand_pos[:, 1] + (right_fk_pos - stage1_hand_pos[:, 1])
+    previous = static_pos[0]
+    replayed_imu = []
+    replayed_static = []
+    for frame_idx in range(raw_obj_trans.shape[0]):
+        imu_candidate = previous + (imu_pos[frame_idx] - static_pos[frame_idx])
+        replayed_imu.append(imu_candidate)
+        replayed_static.append(previous)
+        if gating_weights.shape[-1] == 4:
+            previous = (
+                gating_weights[frame_idx, 0] * corrected_left[frame_idx]
+                + gating_weights[frame_idx, 1] * corrected_right[frame_idx]
+                + gating_weights[frame_idx, 2] * imu_candidate
+                + gating_weights[frame_idx, 3] * previous
+            )
+        else:
+            previous = (
+                gating_weights[frame_idx, 0] * corrected_left[frame_idx]
+                + gating_weights[frame_idx, 1] * corrected_right[frame_idx]
+                + gating_weights[frame_idx, 2] * imu_candidate
+            )
+    candidates = {
+        "left_fk": corrected_left,
+        "right_fk": corrected_right,
+        "imu": torch.stack(replayed_imu, dim=0),
+    }
+    if gating_weights.shape[-1] == 4:
+        candidates["static"] = torch.stack(replayed_static, dim=0)
+    return candidates
+
+
 def evaluate_model(
     model: IMUHOIModel,
     smpl_model,
@@ -283,6 +432,7 @@ def evaluate_model(
     inference_mode: str = "online",
     online_window: Optional[int] = None,
     online_lookahead: int = 5,
+    sequence_records: Optional[list] = None,
 ):
     """评估模型"""
     metrics = {
@@ -303,6 +453,8 @@ def evaluate_model(
 
     # 物体相关指标
     metrics.update({
+        "obj_trans_err_fusion_raw": [],
+        "obj_trans_err_fusion_refine": [],
         "obj_trans_err_fusion": [],
         "obj_trans_err_fk": [],
         "obj_trans_err_imu": [],
@@ -485,6 +637,7 @@ def evaluate_model(
                     continue
 
                 gt_joints_all = gt_smpl_out.Jtr
+                gt_joints_smpl24 = _to_smpl24_joint_positions(gt_joints_all)
 
                 # ?定使用的trans
                 if no_trans:
@@ -616,7 +769,7 @@ def evaluate_model(
                     pred_hand_vel = pred_dict.get("pred_hand_glb_vel")
                     if pred_hand_vel is not None and T >= 2:
                         pred_hand_vel_seq = pred_hand_vel[sample_idx]
-                        gt_hand_pos = select_hand_anchor_positions(gt_joints_all)
+                        gt_hand_pos = select_hand_anchor_positions(gt_joints_smpl24)
                         gt_lhand_pos = gt_hand_pos[:, 0, :]
                         gt_rhand_pos = gt_hand_pos[:, 1, :]
 
@@ -659,6 +812,32 @@ def evaluate_model(
                     pred_obj_trans_fusion = pred_dict.get("p_obj_pred")
                 pred_obj_trans_fusion = pred_obj_trans_fusion[sample_idx] if pred_obj_trans_fusion is not None else None
 
+                pred_joints_smpl24 = _to_smpl24_joint_positions(pred_joints_all)
+                pred_hand_pos_refined = select_hand_anchor_positions(pred_joints_smpl24)
+                stage1_hand_all = pred_dict.get("stage1_pred_palm_glb_pos")
+                if isinstance(stage1_hand_all, torch.Tensor):
+                    stage1_hand_pos = stage1_hand_all[sample_idx, :T]
+                else:
+                    stage1_hand_pos = pred_hand_pos_refined
+
+                def _sample_prediction_tensor(key):
+                    value = pred_dict.get(key)
+                    if not isinstance(value, torch.Tensor) or value.dim() < 2:
+                        return None
+                    return value[sample_idx, :T]
+
+                pred_obj_trans_fusion_raw = pred_obj_trans_fusion
+                pred_obj_trans_fusion_refine = _build_published_object_trans(
+                    pred_obj_trans_fusion_raw,
+                    stage1_hand_pos,
+                    pred_hand_pos_refined,
+                    _sample_prediction_tensor("pred_lhand_obj_trans"),
+                    _sample_prediction_tensor("pred_rhand_obj_trans"),
+                    _sample_prediction_tensor("pred_imu_obj_trans"),
+                    _sample_prediction_tensor("pred_static_obj_trans"),
+                    _sample_prediction_tensor("gating_weights"),
+                )
+
                 pred_obj_trans_fk = pred_dict.get("pred_obj_trans_fk")
                 pred_obj_trans_fk = pred_obj_trans_fk[sample_idx] if pred_obj_trans_fk is not None else None
 
@@ -684,10 +863,18 @@ def evaluate_model(
                     if evaluate_objects and has_object_sample and gt_obj_trans_seq is not None and pred_trans is not None:
                         err = torch.linalg.norm(pred_trans - gt_obj_trans_seq, dim=-1).mean().item() * 100.0
                         metrics[name].append(err)
+                        return err
                     else:
                         metrics[name].append(float("nan"))
+                        return float("nan")
 
-                _append_obj_error("obj_trans_err_fusion", pred_obj_trans_fusion)
+                obj_err_fusion_raw = _append_obj_error(
+                    "obj_trans_err_fusion_raw", pred_obj_trans_fusion_raw
+                )
+                obj_err_fusion_published = _append_obj_error(
+                    "obj_trans_err_fusion_refine", pred_obj_trans_fusion_refine
+                )
+                _append_obj_error("obj_trans_err_fusion", pred_obj_trans_fusion_refine)
                 _append_obj_error("obj_trans_err_fk", pred_obj_trans_fk)
                 _append_obj_error("obj_trans_err_imu", pred_obj_trans_imu)
 
@@ -703,9 +890,9 @@ def evaluate_model(
                 else:
                     metrics["obj_jitter"].append(float("nan"))
 
-                def compute_hoi_error(pred_obj_trans_seq_):
-                    pred_hand_pos = select_hand_anchor_positions(pred_joints_all)
-                    gt_hand_pos = select_hand_anchor_positions(gt_joints_all)
+                gt_hand_pos = select_hand_anchor_positions(gt_joints_smpl24)
+
+                def compute_hoi_error(pred_obj_trans_seq_, pred_hand_pos):
                     if not (evaluate_objects and has_object_sample):
                         return float("nan")
                     return compute_hoi_error_at_gt_contact(
@@ -717,9 +904,331 @@ def evaluate_model(
                         gt_rhand_contact_seq,
                     )
 
-                metrics["hoi_err_fusion"].append(compute_hoi_error(pred_obj_trans_fusion))
-                metrics["hoi_err_fk"].append(compute_hoi_error(pred_obj_trans_fk))
-                metrics["hoi_err_imu"].append(compute_hoi_error(pred_obj_trans_imu))
+                hoi_err_fusion = compute_hoi_error(
+                    pred_obj_trans_fusion_refine, pred_hand_pos_refined
+                )
+                metrics["hoi_err_fusion"].append(hoi_err_fusion)
+                metrics["hoi_err_fk"].append(
+                    compute_hoi_error(pred_obj_trans_fk, pred_hand_pos_refined)
+                )
+                metrics["hoi_err_imu"].append(
+                    compute_hoi_error(pred_obj_trans_imu, pred_hand_pos_refined)
+                )
+
+                if sequence_records is not None:
+                    def _metadata_value(key: str, default=""):
+                        value = batch.get(key, default)
+                        if isinstance(value, (list, tuple)):
+                            return value[sample_idx] if sample_idx < len(value) else default
+                        if isinstance(value, torch.Tensor) and value.numel() > sample_idx:
+                            return value.reshape(-1)[sample_idx].item()
+                        return value
+
+                    def _distance_cm(prediction, target, mask=None):
+                        if not isinstance(prediction, torch.Tensor) or not isinstance(target, torch.Tensor):
+                            return None
+                        if prediction.shape != target.shape:
+                            return None
+                        values = torch.linalg.norm(prediction - target, dim=-1) * 100.0
+                        if isinstance(mask, torch.Tensor):
+                            mask = mask.bool()
+                            if mask.shape != values.shape or not mask.any():
+                                return None
+                            values = values[mask]
+                        return values
+
+                    def _mean_value(values):
+                        if not isinstance(values, torch.Tensor) or values.numel() == 0:
+                            return float("nan")
+                        finite = values[torch.isfinite(values)]
+                        return finite.mean().item() if finite.numel() else float("nan")
+
+                    def _series_summary(values):
+                        if not isinstance(values, torch.Tensor) or values.numel() == 0:
+                            return {}
+                        values = values.detach().float().reshape(-1)
+                        values = values[torch.isfinite(values)]
+                        if values.numel() == 0:
+                            return {}
+                        count = int(values.numel())
+                        edge = max(1, count // 10)
+                        frame_axis = torch.arange(count, device=values.device, dtype=values.dtype)
+                        centered_axis = frame_axis - frame_axis.mean()
+                        denominator = torch.sum(centered_axis.square())
+                        slope = (
+                            torch.sum(centered_axis * (values - values.mean())) / denominator * 100.0
+                            if denominator > 0
+                            else values.new_zeros(())
+                        )
+                        profile = []
+                        for bin_idx in range(10):
+                            start = count * bin_idx // 10
+                            end = count * (bin_idx + 1) // 10
+                            profile.append(values[start:end].mean().item() if end > start else float("nan"))
+                        return {
+                            "mean": values.mean().item(),
+                            "median": values.median().item(),
+                            "p90": torch.quantile(values, 0.90).item(),
+                            "p95": torch.quantile(values, 0.95).item(),
+                            "max": values.max().item(),
+                            "max_frame": int(torch.argmax(values).item()),
+                            "first_10pct_mean": values[:edge].mean().item(),
+                            "last_10pct_mean": values[-edge:].mean().item(),
+                            "slope_per_100_frames": slope.item(),
+                            "decile_means": profile,
+                        }
+
+                    published_frame_error = _distance_cm(
+                        pred_obj_trans_fusion_refine, gt_obj_trans_seq
+                    )
+                    raw_frame_error = _distance_cm(
+                        pred_obj_trans_fusion_raw, gt_obj_trans_seq
+                    )
+                    any_hand_contact = None
+                    if (
+                        isinstance(gt_lhand_contact_seq, torch.Tensor)
+                        and isinstance(gt_rhand_contact_seq, torch.Tensor)
+                    ):
+                        any_hand_contact = gt_lhand_contact_seq | gt_rhand_contact_seq
+
+                    candidate_predictions = _build_published_object_candidates(
+                        pred_obj_trans_fusion_raw,
+                        stage1_hand_pos,
+                        pred_hand_pos_refined,
+                        _sample_prediction_tensor("pred_lhand_obj_trans"),
+                        _sample_prediction_tensor("pred_rhand_obj_trans"),
+                        _sample_prediction_tensor("pred_imu_obj_trans"),
+                        _sample_prediction_tensor("pred_static_obj_trans"),
+                        _sample_prediction_tensor("gating_weights"),
+                    )
+                    candidate_error_series = {
+                        name: _distance_cm(prediction, gt_obj_trans_seq)
+                        for name, prediction in candidate_predictions.items()
+                    }
+                    valid_candidates = [
+                        (name, values)
+                        for name, values in candidate_error_series.items()
+                        if isinstance(values, torch.Tensor) and values.shape == published_frame_error.shape
+                    ] if isinstance(published_frame_error, torch.Tensor) else []
+
+                    candidate_diagnostics = {
+                        name: _mean_value(values)
+                        for name, values in candidate_error_series.items()
+                    }
+                    gating_diagnostics = {}
+                    normalized_weights = None
+                    oracle_candidate_mean = float("nan")
+                    if valid_candidates:
+                        candidate_names = [name for name, _ in valid_candidates]
+                        candidate_matrix = torch.stack([values for _, values in valid_candidates], dim=-1)
+                        oracle_errors, oracle_indices = candidate_matrix.min(dim=-1)
+                        oracle_candidate_mean = oracle_errors.mean().item()
+                        oracle_fractions = []
+                        for candidate_idx in range(len(candidate_names)):
+                            oracle_fractions.append(
+                                (oracle_indices == candidate_idx).float().mean().item()
+                            )
+                        candidate_diagnostics["oracle_per_frame"] = oracle_candidate_mean
+                        candidate_diagnostics["oracle_fraction"] = dict(
+                            zip(candidate_names, oracle_fractions)
+                        )
+
+                        gating_weights = _sample_prediction_tensor("gating_weights")
+                        if (
+                            isinstance(gating_weights, torch.Tensor)
+                            and gating_weights.dim() == 2
+                            and gating_weights.shape == candidate_matrix.shape
+                        ):
+                            normalized_weights = gating_weights.clamp_min(0.0)
+                            normalized_weights = normalized_weights / normalized_weights.sum(
+                                dim=-1, keepdim=True
+                            ).clamp_min(1e-8)
+                            selected_indices = normalized_weights.argmax(dim=-1)
+                            selected_errors = candidate_matrix.gather(
+                                -1, selected_indices.unsqueeze(-1)
+                            ).squeeze(-1)
+                            gate_fractions = []
+                            for candidate_idx in range(len(candidate_names)):
+                                gate_fractions.append(
+                                    (selected_indices == candidate_idx).float().mean().item()
+                                )
+                            gating_diagnostics = {
+                                "candidate_names": candidate_names,
+                                "mean_weights": dict(zip(
+                                    candidate_names,
+                                    normalized_weights.mean(dim=0).tolist(),
+                                )),
+                                "argmax_fraction": dict(zip(candidate_names, gate_fractions)),
+                                "argmax_matches_oracle_fraction": (
+                                    selected_indices == oracle_indices
+                                ).float().mean().item(),
+                                "argmax_candidate_error_cm": selected_errors.mean().item(),
+                                "entropy": (
+                                    -(normalized_weights * normalized_weights.clamp_min(1e-8).log())
+                                    .sum(dim=-1)
+                                    .mean()
+                                    .item()
+                                ),
+                            }
+                            if (
+                                isinstance(gt_lhand_contact_seq, torch.Tensor)
+                                and isinstance(gt_rhand_contact_seq, torch.Tensor)
+                            ):
+                                contact_states = {
+                                    "left_only": gt_lhand_contact_seq & ~gt_rhand_contact_seq,
+                                    "right_only": gt_rhand_contact_seq & ~gt_lhand_contact_seq,
+                                    "bimanual": gt_lhand_contact_seq & gt_rhand_contact_seq,
+                                    "no_hand": ~gt_lhand_contact_seq & ~gt_rhand_contact_seq,
+                                }
+                                gating_diagnostics["mean_weights_by_gt_contact"] = {
+                                    state_name: dict(zip(
+                                        candidate_names,
+                                        normalized_weights[state_mask].mean(dim=0).tolist(),
+                                    ))
+                                    for state_name, state_mask in contact_states.items()
+                                    if state_mask.any()
+                                }
+
+                    refined_hand_error = _distance_cm(pred_hand_pos_refined, gt_hand_pos)
+                    stage1_hand_error = _distance_cm(stage1_hand_pos, gt_hand_pos)
+                    root_error = _distance_cm(pred_trans, gt_trans_seq)
+                    stage1_root_error = None
+                    stage1_root_trans = pred_dict.get("stage1_root_trans_pred")
+                    if isinstance(stage1_root_trans, torch.Tensor):
+                        stage1_root_error = _distance_cm(
+                            stage1_root_trans[sample_idx, :T], gt_trans_seq
+                        )
+
+                    hoi_by_hand = {}
+                    hoi_error_observations = []
+                    for hand_name, hand_idx, contact_mask in (
+                        ("left", 0, gt_lhand_contact_seq),
+                        ("right", 1, gt_rhand_contact_seq),
+                    ):
+                        if (
+                            isinstance(contact_mask, torch.Tensor)
+                            and contact_mask.any()
+                            and isinstance(pred_obj_trans_fusion_refine, torch.Tensor)
+                        ):
+                            relative_error = torch.linalg.norm(
+                                (pred_obj_trans_fusion_refine - pred_hand_pos_refined[:, hand_idx])
+                                - (gt_obj_trans_seq - gt_hand_pos[:, hand_idx]),
+                                dim=-1,
+                            ) * 100.0
+                            contact_error = relative_error[contact_mask]
+                            hoi_by_hand[hand_name] = contact_error.mean().item()
+                            hoi_error_observations.append(contact_error)
+                        else:
+                            hoi_by_hand[hand_name] = float("nan")
+
+                    gt_obj_delta = gt_obj_trans_seq[1:] - gt_obj_trans_seq[:-1]
+                    gt_obj_step = torch.linalg.norm(gt_obj_delta, dim=-1)
+                    contact_counts = {
+                        "left": int(gt_lhand_contact_seq.sum().item())
+                        if isinstance(gt_lhand_contact_seq, torch.Tensor) else 0,
+                        "right": int(gt_rhand_contact_seq.sum().item())
+                        if isinstance(gt_rhand_contact_seq, torch.Tensor) else 0,
+                        "any_hand": int(any_hand_contact.sum().item())
+                        if isinstance(any_hand_contact, torch.Tensor) else 0,
+                    }
+                    contact_diagnostics = {}
+                    pred_contact_all = pred_dict.get("pred_hand_contact_prob")
+                    if pred_contact_all is None:
+                        pred_contact_all = pred_dict.get("contact_prob_pred")
+                    if isinstance(pred_contact_all, torch.Tensor):
+                        pred_contact_seq = pred_contact_all[sample_idx, :T]
+                        for hand_name, hand_idx, target in (
+                            ("left", 0, gt_lhand_contact_seq),
+                            ("right", 1, gt_rhand_contact_seq),
+                        ):
+                            if (
+                                pred_contact_seq.shape[-1] > hand_idx
+                                and isinstance(target, torch.Tensor)
+                            ):
+                                prediction = pred_contact_seq[:, hand_idx] > hand_contact_threshold
+                                target = target.bool()
+                                true_positive = int((prediction & target).sum().item())
+                                false_positive = int((prediction & ~target).sum().item())
+                                false_negative = int((~prediction & target).sum().item())
+                                precision_denominator = true_positive + false_positive
+                                recall_denominator = true_positive + false_negative
+                                precision = (
+                                    true_positive / precision_denominator
+                                    if precision_denominator else float("nan")
+                                )
+                                recall = (
+                                    true_positive / recall_denominator
+                                    if recall_denominator else float("nan")
+                                )
+                                f1_denominator = 2 * true_positive + false_positive + false_negative
+                                contact_diagnostics[hand_name] = {
+                                    "precision": precision,
+                                    "recall": recall,
+                                    "f1": (
+                                        2 * true_positive / f1_denominator
+                                        if f1_denominator else float("nan")
+                                    ),
+                                    "false_positive_frames": false_positive,
+                                    "false_negative_frames": false_negative,
+                                }
+
+                    sequence_records.append({
+                        "seq_name": str(_metadata_value("seq_name")),
+                        "seq_path": str(_metadata_value("seq_path")),
+                        "obj_name": str(_metadata_value("obj_name", "unknown_object")),
+                        "num_frames": int(T),
+                        "duration_s": float(T) / float(FRAME_RATE),
+                        "obj_trans_err_fusion_raw_cm": obj_err_fusion_raw,
+                        "obj_trans_err_fusion_published_cm": obj_err_fusion_published,
+                        "hoi_err_fusion_cm": hoi_err_fusion,
+                        "published_minus_raw_cm": obj_err_fusion_published - obj_err_fusion_raw,
+                        "obj_error_profile_cm": _series_summary(published_frame_error),
+                        "raw_obj_error_profile_cm": _series_summary(raw_frame_error),
+                        "obj_error_on_contact_cm": _mean_value(
+                            published_frame_error[any_hand_contact]
+                            if isinstance(published_frame_error, torch.Tensor)
+                            and isinstance(any_hand_contact, torch.Tensor)
+                            and any_hand_contact.any() else None
+                        ),
+                        "obj_error_off_contact_cm": _mean_value(
+                            published_frame_error[~any_hand_contact]
+                            if isinstance(published_frame_error, torch.Tensor)
+                            and isinstance(any_hand_contact, torch.Tensor)
+                            and (~any_hand_contact).any() else None
+                        ),
+                        "hoi_error_by_hand_cm": hoi_by_hand,
+                        "hoi_error_profile_cm": _series_summary(
+                            torch.cat(hoi_error_observations)
+                            if hoi_error_observations else None
+                        ),
+                        "candidate_error_cm": candidate_diagnostics,
+                        "fusion_minus_oracle_candidate_cm": (
+                            obj_err_fusion_published - oracle_candidate_mean
+                        ),
+                        "gating": gating_diagnostics,
+                        "human_error_cm": {
+                            "mpjpe": joint_distances.mean().item() * 100.0,
+                            "root_trans": _mean_value(root_error),
+                            "stage1_root_trans": _mean_value(stage1_root_error),
+                            "refined_hand": _mean_value(refined_hand_error),
+                            "stage1_hand": _mean_value(stage1_hand_error),
+                        },
+                        "contact_frames": contact_counts,
+                        "contact_fraction": {
+                            name: count / float(T) for name, count in contact_counts.items()
+                        },
+                        "contact_prediction": contact_diagnostics,
+                        "gt_object_motion": {
+                            "path_length_m": gt_obj_step.sum().item(),
+                            "displacement_m": torch.linalg.norm(
+                                gt_obj_trans_seq[-1] - gt_obj_trans_seq[0]
+                            ).item(),
+                            "mean_speed_mps": gt_obj_step.mean().item() * float(FRAME_RATE)
+                            if gt_obj_step.numel() else 0.0,
+                            "max_speed_mps": gt_obj_step.max().item() * float(FRAME_RATE)
+                            if gt_obj_step.numel() else 0.0,
+                        },
+                    })
 
                 # --- Contact F1 ---
                 pred_hand_contact_prob = pred_dict.get("pred_hand_contact_prob")
@@ -1111,12 +1620,13 @@ def main():
 
         if evaluate_objects:
             print("\n--- Object Translation Errors ---")
-            print(f"Fusion (cm):                    {_fmt('obj_trans_err_fusion')}")
+            print(f"Fusion raw (cm):                {_fmt('obj_trans_err_fusion_raw')}")
+            print(f"Fusion refine/published (cm):   {_fmt('obj_trans_err_fusion_refine')}")
             print(f"FK (cm):                        {_fmt('obj_trans_err_fk')}")
             print(f"IMU (cm):                       {_fmt('obj_trans_err_imu')}")
 
             print("\n--- HOI Errors ---")
-            print(f"Fusion (cm):                    {_fmt('hoi_err_fusion')}")
+            print(f"Fusion published (cm):          {_fmt('hoi_err_fusion')}")
             print(f"FK (cm):                        {_fmt('hoi_err_fk')}")
             print(f"IMU (cm):                       {_fmt('hoi_err_imu')}")
 

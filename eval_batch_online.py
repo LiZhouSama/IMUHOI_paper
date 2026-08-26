@@ -440,6 +440,13 @@ def _make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate RNN IMUHOI with cross-sequence batched online inference.")
     parser.add_argument("--config", type=str, default="configs/IMUHOI_train_rnn.yaml")
     parser.add_argument("--dataset", type=str, default="omomo", help="Dataset key under config.datasets (default: omomo).")
+    parser.add_argument(
+        "--sequence_path",
+        "--sequence-path",
+        action="append",
+        default=None,
+        help="Evaluate an explicit PT sequence path; repeat to select multiple files.",
+    )
     parser.add_argument("--smpl_model_path", type=str, default="datasets/smpl_models/smplh/male/model.npz")
     parser.add_argument("--num_workers", type=int, default=12, help="Kept for dataset parity; metric pass uses cached samples.")
     parser.add_argument(
@@ -455,14 +462,14 @@ def _make_parser() -> argparse.ArgumentParser:
         "--online_window",
         "--online-window",
         type=int,
-        default=60,
+        default=None,
         help="Base online window; defaults to test.window from the config.",
     )
     parser.add_argument(
         "--online_lookahead",
         "--online-lookahead",
         type=int,
-        default=5,
+        default=None,
         help="Future frames appended after the legacy online update frame (strict tail).",
     )
     parser.add_argument("--sort_asc", action="store_true", help="Sort sequence lengths ascending instead of descending.")
@@ -507,6 +514,13 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hand_contact_threshold", type=float, default=None)
     parser.add_argument("--object_contact_threshold", type=float, default=None)
     parser.add_argument("--output_json", type=str, default=None)
+    parser.add_argument(
+        "--sequence_records_json",
+        "--sequence-records-json",
+        type=str,
+        default=None,
+        help="Save per-sequence object/HOI metrics and diagnostic factors as JSON.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     noise_group = parser.add_mutually_exclusive_group()
     noise_group.add_argument(
@@ -580,6 +594,7 @@ def main() -> int:
         return 2
 
     all_results = {}
+    all_sequence_records = {}
     resolved_ot_state_feedback = None
     resolved_ot_arch = None
     for dataset_name, dataset_cfg in dataset_runs:
@@ -663,6 +678,7 @@ def main() -> int:
         test_window = config.test.get("window", config.train.get("window", 60))
         test_dataset = IMUDataset(
             data_dir=str(data_path),
+            sequence_paths=args.sequence_path,
             window_size=test_window,
             debug=config.get("debug", False),
             # full_sequence=True makes simulate_imu_noise operate once per sequence,
@@ -737,6 +753,7 @@ def main() -> int:
             pin_memory=False,
             drop_last=False,
         )
+        sequence_records = [] if args.sequence_records_json else None
         results = evaluate_model(
             metric_model,
             smpl_model,
@@ -755,9 +772,13 @@ def main() -> int:
             inference_mode="online",
             online_window=online_window,
             online_lookahead=online_lookahead,
+            sequence_records=sequence_records,
         )
         eval_duration = time.time() - eval_start
         all_results[dataset_name] = results
+        if sequence_records is not None:
+            all_sequence_records[dataset_name] = sequence_records
+            print(f"Per-sequence diagnostic records: {len(sequence_records)}")
 
         print("\n--- Batch Online Evaluation Results ---")
         print(f"MPJPE (cm):                     {_format_metric(results, 'mpjpe')}")
@@ -772,11 +793,12 @@ def main() -> int:
         print(f"Jitter (mm/frame^2):            {_format_metric(results, 'jitter')}")
         if evaluate_objects:
             print("\n--- Object Translation Errors ---")
-            print(f"Fusion (cm):                    {_format_metric(results, 'obj_trans_err_fusion')}")
+            print(f"Fusion raw (cm):                {_format_metric(results, 'obj_trans_err_fusion_raw')}")
+            print(f"Fusion refine/published (cm):   {_format_metric(results, 'obj_trans_err_fusion_refine')}")
             print(f"FK (cm):                        {_format_metric(results, 'obj_trans_err_fk')}")
             print(f"IMU (cm):                       {_format_metric(results, 'obj_trans_err_imu')}")
             print("\n--- HOI Errors ---")
-            print(f"Fusion (cm):                    {_format_metric(results, 'hoi_err_fusion')}")
+            print(f"Fusion published (cm):          {_format_metric(results, 'hoi_err_fusion')}")
             print(f"FK (cm):                        {_format_metric(results, 'hoi_err_fk')}")
             print(f"IMU (cm):                       {_format_metric(results, 'hoi_err_imu')}")
         if evaluate_contacts:
@@ -794,13 +816,22 @@ def main() -> int:
         if not output_path.is_absolute():
             output_path = (Path.cwd() / output_path).resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_config = load_config(args.config)
+        output_online_window = resolve_online_window(
+            output_config,
+            args.online_window,
+        )
+        output_online_lookahead = resolve_online_lookahead(
+            output_config,
+            args.online_lookahead,
+        )
         payload = {
             "config": args.config,
             "inference_mode": "batch_online",
-            "online_window": args.online_window,
-            "resolved_online_window": resolve_online_window(load_config(args.config), args.online_window),
-            "online_lookahead": args.online_lookahead,
-            "resolved_online_lookahead": resolve_online_lookahead(load_config(args.config), args.online_lookahead),
+            "online_window": output_online_window,
+            "resolved_online_window": output_online_window,
+            "online_lookahead": output_online_lookahead,
+            "resolved_online_lookahead": output_online_lookahead,
             "online_batch_size": args.online_batch_size,
             "object_trans_state_feedback": resolved_ot_state_feedback,
             "object_trans_arch": resolved_ot_arch or _normalize_object_trans_arch(
@@ -818,6 +849,47 @@ def main() -> int:
         }
         output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         print(f"[BatchEval] Results saved to: {output_path}")
+
+    if args.sequence_records_json:
+        records_path = Path(args.sequence_records_json).expanduser()
+        if not records_path.is_absolute():
+            records_path = (Path.cwd() / records_path).resolve()
+        records_path.parent.mkdir(parents=True, exist_ok=True)
+        records_payload = {
+            "config": args.config,
+            "protocol": {
+                "inference_mode": "batch_online",
+                "online_window": resolve_online_window(
+                    load_config(args.config), args.online_window
+                ),
+                "online_lookahead": resolve_online_lookahead(
+                    load_config(args.config), args.online_lookahead
+                ),
+                "online_batch_size": args.online_batch_size,
+                "seed": seed,
+                "simulate_imu_noise": bool(args.simulate_imu_noise),
+                "simulate_imu_noise_seed": (
+                    args.simulate_imu_noise_seed if args.simulate_imu_noise else None
+                ),
+                "eval_imu_noise": bool(args.eval_imu_noise),
+                "eval_imu_noise_seed": (
+                    args.eval_imu_noise_seed if args.eval_imu_noise else None
+                ),
+                "velocity_contact_arch": args.velocity_contact_arch,
+                "object_trans_arch": resolved_ot_arch,
+                "object_trans_state_feedback": resolved_ot_state_feedback,
+                "human_pose_checkpoint": args.hp_ckpt,
+                "velocity_contact_checkpoint": args.vc_ckpt,
+                "object_trans_checkpoint": args.ot_ckpt,
+                "sequence_paths": args.sequence_path,
+            },
+            "aggregate_results": all_results,
+            "datasets": all_sequence_records,
+        }
+        records_path.write_text(
+            json.dumps(records_payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        print(f"[BatchEval] Per-sequence diagnostics saved to: {records_path}")
 
     return 0
 

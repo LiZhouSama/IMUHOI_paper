@@ -385,3 +385,25 @@ def test_stage3_joint_trains_vc_immediately():
     assert all(not p.requires_grad for p in trainer.hp_model.parameters())
     assert all(p.requires_grad for p in trainer.vc_model.parameters())
     assert any(p.requires_grad for p in trainer.ot_model.parameters())
+
+
+def test_joint_checkpoint_selection_uses_only_hoi_and_obj_trans():
+    weighted_losses = {
+        "hoi_error_l": torch.tensor(1.25),
+        "hoi_error_r": torch.tensor(2.5),
+        "obj_trans": torch.tensor(4.0),
+        "lhand_lb": torch.tensor(100.0),
+        "vc_contact": torch.tensor(100.0),
+        "hp_pose": torch.tensor(100.0),
+    }
+
+    score = Stage3JointTrainer._joint_checkpoint_selection_loss(
+        weighted_losses
+    )
+
+    assert score.item() == 7.75
+    assert Stage3JointTrainer.JOINT_CHECKPOINT_SELECTION_KEYS == (
+        "hoi_error_l",
+        "hoi_error_r",
+        "obj_trans",
+    )

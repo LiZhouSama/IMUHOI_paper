@@ -86,7 +86,20 @@ def _vc_parameter_group(name):
     return "contact"
 
 
-def _staged_lr_lambda(group_name, cfg):
+def _vc_endpoint_finetune_stage(target):
+    """Whether this architecture wants a final endpoint-only fine-tune stage.
+
+    An architecture whose endpoint head reads features owned by the contact
+    group (VC v4 reads boundary features only) gains nothing from a stage that
+    freezes that group, so it opts out and the joint stage runs to the end.
+    """
+    return bool(
+        hasattr(target, "contact_endpoint_head")
+        and getattr(target, "SUPPORTS_ENDPOINT_FINETUNE_STAGE", True)
+    )
+
+
+def _staged_lr_lambda(group_name, cfg, endpoint_stage=True):
     velocity_epochs = int(getattr(cfg, "vc_velocity_stage_epochs", 120))
     joint_epochs = int(getattr(cfg, "vc_joint_stage_epochs", 60))
     endpoint_start = velocity_epochs + joint_epochs
@@ -133,20 +146,21 @@ def _staged_lr_lambda(group_name, cfg):
             if group_name != "velocity":
                 return 0.0
             return decay(epoch, velocity_milestones)
-        if epoch < endpoint_start:
-            relative_epoch = epoch - velocity_epochs
-            if group_name == "contact":
-                return decay(relative_epoch, contact_milestones)
-            if group_name == "endpoint":
-                return decay(relative_epoch, endpoint_joint_milestones)
-            return 0.0
-        if group_name != "endpoint":
-            return 0.0
-        relative_epoch = epoch - endpoint_start
-        return endpoint_finetune_scale * decay(
-            relative_epoch,
-            endpoint_finetune_milestones,
-        )
+        if endpoint_stage and epoch >= endpoint_start:
+            if group_name != "endpoint":
+                return 0.0
+            relative_epoch = epoch - endpoint_start
+            return endpoint_finetune_scale * decay(
+                relative_epoch,
+                endpoint_finetune_milestones,
+            )
+        # Joint stage; without an endpoint tail it runs to the last epoch.
+        relative_epoch = epoch - velocity_epochs
+        if group_name == "contact":
+            return decay(relative_epoch, contact_milestones)
+        if group_name == "endpoint":
+            return decay(relative_epoch, endpoint_joint_milestones)
+        return 0.0
 
     return lr_lambda
 
@@ -192,11 +206,12 @@ def build_velocity_contact_optimizer_and_scheduler(model, cfg):
         weight_decay=weight_decay,
     )
     gamma = float(getattr(cfg, "vc_group_lr_gamma", getattr(cfg, "gamma", 0.2)))
+    endpoint_stage = _vc_endpoint_finetune_stage(target)
     if staged_training:
         scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer,
             lr_lambda=[
-                _staged_lr_lambda(group_name, cfg)
+                _staged_lr_lambda(group_name, cfg, endpoint_stage=endpoint_stage)
                 for group_name in active_names
             ],
         )
@@ -223,12 +238,19 @@ def build_velocity_contact_optimizer_and_scheduler(model, cfg):
     if staged_training:
         velocity_epochs = int(getattr(cfg, "vc_velocity_stage_epochs", 120))
         joint_epochs = int(getattr(cfg, "vc_joint_stage_epochs", 60))
-        print(
-            "VC三阶段学习: "
-            f"velocity=[0,{velocity_epochs}), "
-            f"joint=[{velocity_epochs},{velocity_epochs + joint_epochs}), "
-            f"endpoint=[{velocity_epochs + joint_epochs},{int(cfg.epochs)})"
-        )
+        if endpoint_stage:
+            print(
+                "VC三阶段学习: "
+                f"velocity=[0,{velocity_epochs}), "
+                f"joint=[{velocity_epochs},{velocity_epochs + joint_epochs}), "
+                f"endpoint=[{velocity_epochs + joint_epochs},{int(cfg.epochs)})"
+            )
+        else:
+            print(
+                "VC两阶段学习（该架构的endpoint头只读boundary特征，不做endpoint单独微调）: "
+                f"velocity=[0,{velocity_epochs}), "
+                f"joint=[{velocity_epochs},{int(cfg.epochs)})"
+            )
     else:
         print(
             "VC分组学习率里程碑: "
@@ -259,6 +281,10 @@ def get_args():
         help=(
             'VelocityContact架构；legacy不包含interaction boundary模块，'
             'v2使用手物速度→单向obj_move→直接双手接触的级联；'
+            'v3在imuhoi_cond_boundary上加双向obj_move；'
+            'v4在v3基础上把人体姿态先验变成受监督模块：朝向归一化+分模态归一化+'
+            '双向boundary，boundary同时喂给obj_move，并加端点/anticipation两个'
+            '纯姿态辅助头；'
             'imuhoi恢复EgoIMU的全身手速度/独立物体速度/联合接触网络；'
             'imuhoi_cond*为从该基线逐项增加条件接触、几何、boundary和endpoint的消融。'
         ),
@@ -278,6 +304,10 @@ class VelocityContactTrainer(BaseTrainer):
             "contact_endpoint",
             "contact_endpoint_order",
             "endpoint_contact_consistency",
+            # The anticipation head lives in the contact group with the body
+            # encoder it supervises, so it is trained here and not in the
+            # endpoint-only stage.
+            "contact_anticipation",
         },
         "endpoint": {
             "contact_endpoint",
@@ -288,14 +318,23 @@ class VelocityContactTrainer(BaseTrainer):
     }
 
     GROUP_MODULE_NAMES = {
-        "velocity": ("vel_net",),
+        # hand_vel_net/obj_vel_net are the IMUHOI-family split of vel_net; without
+        # them a frozen velocity group keeps its dropout active and injects noise
+        # into the velocities the contact heads consume.
+        "velocity": ("vel_net", "hand_vel_net", "obj_vel_net"),
         "contact": (
             "group_encoders",
             "group_norms",
+            "group_pose_norms",
+            "group_vel_norms",
+            "group_acc_norms",
+            "root_vel_norm",
             "boundary_rnn",
             "boundary_fusion",
             "boundary_input_norm",
             "boundary_hidden_norm",
+            "contact_anticipation_norm",
+            "contact_anticipation_head",
             "obj_move_net",
             "hand_contact_net",
             "interaction_input_norm",
@@ -319,17 +358,27 @@ class VelocityContactTrainer(BaseTrainer):
             bool(getattr(cfg, "vc_staged_training", False))
             and hasattr(target, "contact_endpoint_head")
         )
+        self.endpoint_finetune_stage = _vc_endpoint_finetune_stage(target)
         super().__init__(cfg, model, loss_fn, train_loader, test_loader)
         self.hp_model = hp_model
         self.current_epoch = 0
         self.current_stage = None
         self.velocity_stage_best_loss = float("inf")
         self.velocity_stage_best_state = None
-        if self.staged_training and self.endpoint_stage_start >= int(cfg.epochs):
+        if (
+            self.staged_training
+            and self.endpoint_finetune_stage
+            and self.endpoint_stage_start >= int(cfg.epochs)
+        ):
             raise ValueError(
                 "VC staged training leaves no endpoint-only epochs: "
                 f"velocity={self.velocity_stage_epochs}, "
                 f"joint={self.joint_stage_epochs}, total={int(cfg.epochs)}"
+            )
+        if self.staged_training and self.velocity_stage_epochs >= int(cfg.epochs):
+            raise ValueError(
+                "VC staged training leaves no joint epochs: "
+                f"velocity={self.velocity_stage_epochs}, total={int(cfg.epochs)}"
             )
         if isinstance(self.resume_checkpoint, dict):
             self.velocity_stage_best_loss = float(
@@ -359,6 +408,9 @@ class VelocityContactTrainer(BaseTrainer):
 
     @property
     def endpoint_stage_start(self):
+        if not self.endpoint_finetune_stage:
+            # No endpoint tail: the joint stage owns every remaining epoch.
+            return int(self.cfg.epochs)
         return self.velocity_stage_epochs + self.joint_stage_epochs
 
     def stage_for_epoch(self, epoch):
@@ -915,7 +967,10 @@ def main():
         loss_fn = V2VelocityContactLoss(weights=loss_weights)
     else:
         loss_weights = getattr(cfg, 'loss_weights', {})
-        loss_fn = VelocityContactLoss(weights=loss_weights)
+        loss_fn = VelocityContactLoss(
+            weights=loss_weights,
+            anticipation_horizon=getattr(cfg, 'v4_anticipation_horizon', None),
+        )
 
     # trainer
     trainer = VelocityContactTrainer(cfg, model, loss_fn, train_loader, test_loader, hp_model=hp_model)

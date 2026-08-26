@@ -208,6 +208,14 @@ def _joint_trainable_modules(object_trans_arch, joint_train):
 class Stage3JointTrainer:
     """Stage3和联合训练器"""
 
+    # Joint checkpoint selection deliberately follows the deployment target.
+    # Values are the weighted loss components produced by the configured loss.
+    JOINT_CHECKPOINT_SELECTION_KEYS = (
+        "hoi_error_l",
+        "hoi_error_r",
+        "obj_trans",
+    )
+
     def __init__(
         self,
         cfg,
@@ -283,6 +291,10 @@ class Stage3JointTrainer:
                 f"drop_prob={self.lb_stats_drop_prob}"
             )
         if joint_train:
+            print(
+                "联合训练checkpoint选择（按配置权重）: "
+                + " + ".join(self.JOINT_CHECKPOINT_SELECTION_KEYS)
+            )
             if self.imuhoi_arch:
                 print(
                     "IMUHOI联合训练模式：冻结VelocityContact，"
@@ -400,7 +412,12 @@ class Stage3JointTrainer:
                     .strip()
                     .lower()
                     == "v2"
-                    else VelocityContactLoss(weights=loss_weights)
+                    else VelocityContactLoss(
+                        weights=loss_weights,
+                        anticipation_horizon=getattr(
+                            cfg, "v4_anticipation_horizon", None
+                        ),
+                    )
                 )
             else:
                 self.vc_loss_fn = None
@@ -478,6 +495,15 @@ class Stage3JointTrainer:
         )
 
     def _resolve_resume_best_loss(self, checkpoint):
+        if self.joint_train:
+            saved_keys = checkpoint.get("checkpoint_selection_keys")
+            expected_keys = list(self.JOINT_CHECKPOINT_SELECTION_KEYS)
+            if saved_keys != expected_keys:
+                print(
+                    "警告：resume joint checkpoint 的选择标准与当前配置不一致；"
+                    "保留训练状态，但重置 best_loss 并按新标准重新选优。"
+                )
+                return float("inf")
         if isinstance(checkpoint.get("best_loss"), (int, float)):
             return float(checkpoint["best_loss"])
         if os.path.basename(self.resume_path or "") == "best.pt" and isinstance(checkpoint.get("loss"), (int, float)):
@@ -492,6 +518,23 @@ class Stage3JointTrainer:
             except Exception as exc:
                 print(f"警告：读取 best.pt 的 best_loss 失败: {exc}")
         return float("inf")
+
+    @classmethod
+    def _joint_checkpoint_selection_loss(cls, weighted_losses):
+        """Return the weighted three-term score used only by joint training."""
+        missing = [
+            key
+            for key in cls.JOINT_CHECKPOINT_SELECTION_KEYS
+            if key not in weighted_losses
+        ]
+        if missing:
+            raise KeyError(
+                "Joint checkpoint selection is missing loss components: "
+                + ", ".join(missing)
+            )
+        return torch.stack(
+            [weighted_losses[key] for key in cls.JOINT_CHECKPOINT_SELECTION_KEYS]
+        ).sum()
 
     def forward_all(self, data_dict, batch=None, epoch: int = 0, training: bool = True):
         """完整的前向传播"""
@@ -798,10 +841,26 @@ class Stage3JointTrainer:
                         if hp_losses:
                             hp_loss = sum(hp_losses.values())
 
-                    ot_loss, ot_losses = self.ot_loss_fn.compute_test_loss(
-                        ot_out, batch, self.device
-                    )
-                    combined_loss = ot_loss + vc_loss + hp_loss
+                    if self.joint_train:
+                        _, _, ot_weighted_losses = self.ot_loss_fn.compute_loss(
+                            ot_out, batch, self.device
+                        )
+                        report_keys = set(self.ot_loss_fn.TEST_LOSS_KEYS).union(
+                            self.JOINT_CHECKPOINT_SELECTION_KEYS
+                        )
+                        ot_losses = {
+                            key: value
+                            for key, value in ot_weighted_losses.items()
+                            if key in report_keys
+                        }
+                        combined_loss = self._joint_checkpoint_selection_loss(
+                            ot_weighted_losses
+                        )
+                    else:
+                        ot_loss, ot_losses = self.ot_loss_fn.compute_test_loss(
+                            ot_out, batch, self.device
+                        )
+                        combined_loss = ot_loss + vc_loss + hp_loss
                 total_loss += combined_loss.item()
                 for key, value in ot_losses.items():
                     if isinstance(value, torch.Tensor):
@@ -819,6 +878,8 @@ class Stage3JointTrainer:
         total_loss /= len(self.test_loader)
         for key in loss_components:
             loss_components[key] /= len(self.test_loader)
+        if self.joint_train:
+            loss_components["checkpoint_selection_total"] = total_loss
 
         return total_loss, loss_components
 
@@ -940,27 +1001,43 @@ class Stage3JointTrainer:
             checkpoint.update(extra)
         return checkpoint
 
-    def _save_module_checkpoint(self, path, state_dict, epoch, loss):
-        self._write_checkpoint(
-            path,
-            {
-                'epoch': epoch,
-                'module_state_dict': state_dict,
-                'model_state_dict': state_dict,
-                'loss': loss,
-                'best_loss': self.best_loss,
-                'n_iter': self.n_iter,
-            },
-        )
+    def _save_module_checkpoint(self, path, state_dict, epoch, loss, extra=None):
+        checkpoint = {
+            'epoch': epoch,
+            'module_state_dict': state_dict,
+            'model_state_dict': state_dict,
+            'loss': loss,
+            'best_loss': self.best_loss,
+            'n_iter': self.n_iter,
+        }
+        if extra:
+            checkpoint.update(extra)
+        self._write_checkpoint(path, checkpoint)
 
     def _save_models(self, epoch, loss, prefix, extra=None):
         """保存模型"""
+        extra = dict(extra or {})
+        if self.joint_train:
+            extra.update(
+                {
+                    'checkpoint_selection_keys': list(
+                        self.JOINT_CHECKPOINT_SELECTION_KEYS
+                    ),
+                    'checkpoint_selection_uses_weighted_losses': True,
+                }
+            )
         checkpoint = self._build_joint_checkpoint(epoch, loss, extra=extra)
 
         if self.joint_train:
             # joint阶段与OT阶段共用目录，但不覆盖OT的best.pt/last.pt/final.pt。
             ot_path = os.path.join(self.cfg.save_dir, f'{prefix}_object_trans.pt')
-            self._save_module_checkpoint(ot_path, checkpoint['object_trans_state_dict'], epoch, loss)
+            self._save_module_checkpoint(
+                ot_path,
+                checkpoint['object_trans_state_dict'],
+                epoch,
+                loss,
+                extra=extra,
+            )
             if self.hp_trainable:
                 hp_path = os.path.join(
                     self.cfg.save_dir,
@@ -971,6 +1048,7 @@ class Stage3JointTrainer:
                     checkpoint['human_pose_state_dict'],
                     epoch,
                     loss,
+                    extra=extra,
                 )
             if self.vc_trainable:
                 vc_path = os.path.join(
@@ -982,6 +1060,7 @@ class Stage3JointTrainer:
                     checkpoint['velocity_contact_state_dict'],
                     epoch,
                     loss,
+                    extra=extra,
                 )
         else:
             checkpoint_path = os.path.join(self.cfg.save_dir, f'{prefix}.pt')
@@ -1032,6 +1111,10 @@ def _run_auto_joint_train(cfg, trainer, train_loader, test_loader, base_lr):
         extra={
             "joint_train_auto_started_from": best_ot_path,
             "joint_train_lr_source": "lr * 0.1",
+            "joint_checkpoint_selection_keys": list(
+                Stage3JointTrainer.JOINT_CHECKPOINT_SELECTION_KEYS
+            ),
+            "joint_checkpoint_selection_uses_weighted_losses": True,
         },
         filename="joint_train_config.yaml",
     )

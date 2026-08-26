@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from configs import _SENSOR_POS_INDICES
+from model.rnn.velocity_contact_v4 import DEFAULT_ANTICIPATION_HORIZON
 
 
 def _binary_cross_entropy_probability(input_tensor, target, reduction="mean"):
@@ -29,6 +30,7 @@ class VelocityContactLoss:
         'contact_endpoint',
         'contact_endpoint_order',
         'endpoint_contact_consistency',
+        'contact_anticipation',
     }
 
     TEST_LOSS_KEYS = {
@@ -40,7 +42,7 @@ class VelocityContactLoss:
         'endpoint_contact_consistency',
     }
 
-    def __init__(self, weights=None):
+    def __init__(self, weights=None, anticipation_horizon=None):
         """
         Args:
             weights: dict of loss weights (defaults to 1.0 if missing).
@@ -49,8 +51,20 @@ class VelocityContactLoss:
                   P(object move) * P(hand contact | object move)
                 - contact_endpoint: endpoint heatmap focal loss
                 - endpoint_contact_consistency: dense endpoint/contact agreement
+                - contact_anticipation: focal loss on "a contact transition
+                  occurs within the next k frames"
+            anticipation_horizon: k, in frames. Must match the horizon the
+                anticipation head was built for (``v4_anticipation_horizon``).
         """
         self.weights = weights or {}
+        self.anticipation_horizon = max(
+            1,
+            int(
+                DEFAULT_ANTICIPATION_HORIZON
+                if anticipation_horizon is None
+                else anticipation_horizon
+            ),
+        )
 
     def __call__(self, pred_dict, batch, device, active_loss_keys=None):
         return self.compute_loss(
@@ -76,6 +90,38 @@ class VelocityContactLoss:
             denom = mask.sum().clamp_min(eps)
             return loss.sum() / denom
         return loss.mean()
+
+    @staticmethod
+    def _future_transition_target(endpoint_gt, horizon):
+        """Target and validity for "a transition occurs in the next k frames".
+
+        Human pose leads the contact labels: reach and retract are visible
+        before the object starts or stops moving, so a per-frame target
+        penalizes the pose prior for firing early.  Pooling the hard endpoint
+        labels over ``(t, t + horizon]`` turns that lead into the signal.
+
+        Frames whose horizon runs past the window end are invalid rather than
+        negative — a transition may sit just outside the window.
+        """
+        batch_size, seq_len, channels = endpoint_gt.shape
+        horizon = int(horizon)
+        shifted = torch.cat(
+            (
+                endpoint_gt[:, 1:],
+                endpoint_gt.new_zeros(batch_size, horizon, channels),
+            ),
+            dim=1,
+        )
+        target = F.max_pool1d(
+            shifted.transpose(1, 2),
+            kernel_size=horizon,
+            stride=1,
+        ).transpose(1, 2)
+        frames = torch.arange(seq_len, device=endpoint_gt.device)
+        valid = (frames <= seq_len - 1 - horizon).view(1, seq_len).expand(
+            batch_size, seq_len
+        )
+        return target, valid
 
     @staticmethod
     def _soft_order_penalty(start_prob, end_prob, has_object_mask, zero):
@@ -338,6 +384,43 @@ class VelocityContactLoss:
                 ))
             if order_terms:
                 losses['contact_endpoint_order'] = sum(order_terms) / len(order_terms)
+
+        # Contact anticipation from pose-only boundary features.
+        anticipation_logits = pred_dict.get('pred_contact_anticipation_logits')
+        endpoint_hard_gt = batch.get('contact_endpoint')
+        # Without the hard endpoint labels the target would be all-negative,
+        # which trains the head to never anticipate while still producing a
+        # healthy-looking decreasing loss. Leaving the term at exactly zero
+        # makes the missing label visible in the logs instead.
+        if isinstance(anticipation_logits, torch.Tensor) and isinstance(
+            endpoint_hard_gt, torch.Tensor
+        ):
+            channels = int(anticipation_logits.shape[-1])
+            endpoint_hard_gt = endpoint_hard_gt.to(device=device, dtype=dtype)
+            if endpoint_hard_gt.shape != (bs, seq, channels):
+                raise ValueError(
+                    "contact_endpoint must be [B,T,"
+                    f"{channels}] to supervise the anticipation head, got "
+                    f"{tuple(endpoint_hard_gt.shape)}"
+                )
+            anticipation_gt, horizon_valid = self._future_transition_target(
+                endpoint_hard_gt, self.anticipation_horizon
+            )
+            anticipation_mask = horizon_valid.to(dtype=dtype)
+            if has_object_mask is not None:
+                anticipation_mask = anticipation_mask * has_object_mask.view(bs, 1)
+            if contact_valid_mask is not None:
+                anticipation_mask = anticipation_mask * contact_valid_mask.to(
+                    dtype=dtype
+                )
+            if anticipation_mask.sum() > 0:
+                losses['contact_anticipation'] = self._focal_binary(
+                    torch.sigmoid(anticipation_logits),
+                    anticipation_gt,
+                    alpha=float(self.weights.get('anticipation_focal_alpha', 0.25)),
+                    gamma=float(self.weights.get('anticipation_focal_gamma', 2.0)),
+                    mask=anticipation_mask,
+                )
 
         # Endpoint-recovered dense state should agree with the original
         # per-frame contact prediction. Detaching the dense prediction makes it
