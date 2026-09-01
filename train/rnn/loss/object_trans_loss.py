@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from utils.rotation_conversions import matrix_to_rotation_6d
 from utils.human_pose import select_hand_anchor_positions
+from utils.object_fusion import build_contact_fusion_weights
 from configs import FRAME_RATE, _REDUCED_POSE_NAMES
 
 
@@ -88,24 +89,7 @@ class ObjectTransLoss:
     @staticmethod
     def _build_gate_weak_target(contact_prob, eps=1e-6):
         """Build soft targets for [left_fk, right_fk, imu_velocity, static_hold]."""
-        p_l = contact_prob[..., 0:1].clamp(0.0, 1.0)
-        p_r = contact_prob[..., 1:2].clamp(0.0, 1.0)
-        p_move = contact_prob[..., 2:3].clamp(0.0, 1.0)
-
-        p_l_cond = (p_l / p_move.clamp_min(eps)).clamp(0.0, 1.0)
-        p_r_cond = (p_r / p_move.clamp_min(eps)).clamp(0.0, 1.0)
-        no_hand_cond = (1.0 - p_l_cond) * (1.0 - p_r_cond)
-
-        scores = torch.cat(
-            (
-                p_l,
-                p_r,
-                p_move * no_hand_cond,
-                1.0 - p_move,
-            ),
-            dim=-1,
-        ).clamp_min(0.0)
-        return scores / scores.sum(dim=-1, keepdim=True).clamp_min(eps)
+        return build_contact_fusion_weights(contact_prob, eps=eps)
     
     def __call__(self, pred_dict, batch, device):
         return self.compute_loss(pred_dict, batch, device)
@@ -254,7 +238,7 @@ class ObjectTransLoss:
             and gating_contact_prob.shape[-1] >= 3
         ):
             gate_contact_source = gating_contact_prob[..., :3].to(device=device, dtype=dtype)
-        if gate_contact_source is not None:
+        if gate_contact_source is not None and not bool(pred_dict.get('gating_is_fixed', False)):
             target = self._build_gate_weak_target(gate_contact_source).detach()
             smooth = float(self.weights.get('gate_weak_target_smoothing', 0.1))
             if smooth > 0.0:

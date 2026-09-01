@@ -21,11 +21,34 @@ from .velocity_contact_v3 import V3VelocityContactModule
 from .velocity_contact_v4 import V4VelocityContactModule
 from .human_pose import HumanPoseModule
 from .object_trans import ObjectTransModule
+from .object_trans_v2 import V2ObjectTransModule
+from .object_trans_legacy import LegacyObjectTransModule
+from .object_trans_legacy_mesh import LegacyMeshObjectTransModule
 from .object_trans_mergeHeads_obsEncoder import (
     ObjectTransModule as MergeHeadsObsObjectTransModule,
 )
 from .lb_vq_diffusion import LBVQAutoEncoder, LBLatentDiffusion
 from .imuhoi_model import IMUHOIModel, load_model
+
+
+def build_object_trans_module(cfg, object_trans_arch=None, *args, **kwargs):
+    """Build the configured RNN ObjectTrans implementation."""
+    arch = str(
+        object_trans_arch or getattr(cfg, "object_trans_arch", "current")
+    ).strip().lower()
+    modules = {
+        "current": ObjectTransModule,
+        "v2": V2ObjectTransModule,
+        "legacy": LegacyObjectTransModule,
+        "legacy_mesh": LegacyMeshObjectTransModule,
+        "mergeheads_obs": MergeHeadsObsObjectTransModule,
+        "imuhoi": IMUHOIObjectTransModule,
+        "imuhoi_4heads": IMUHOI4HeadsObjectTransModule,
+    }
+    if arch not in modules:
+        choices = ", ".join(modules)
+        raise ValueError(f"object_trans_arch must be one of: {choices}; got {arch!r}")
+    return modules[arch](cfg, *args, **kwargs)
 
 __all__ = [
     'RNN',
@@ -46,6 +69,8 @@ __all__ = [
     'is_imuhoi_object_trans_arch',
     'HumanPoseModule',
     'ObjectTransModule',
+    'V2ObjectTransModule',
+    'build_object_trans_module',
     'MergeHeadsObsObjectTransModule',
     'LBVQAutoEncoder',
     'LBLatentDiffusion',

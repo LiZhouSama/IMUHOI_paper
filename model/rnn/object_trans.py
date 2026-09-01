@@ -352,6 +352,58 @@ class ObjectTransModule(nn.Module):
         }
 
     @staticmethod
+    def _prepare_feedback_tensor(
+        value,
+        batch_size,
+        seq_len,
+        feature_dim,
+        device,
+        dtype,
+        name,
+    ):
+        if value is None:
+            return None
+        if not isinstance(value, torch.Tensor):
+            value = torch.as_tensor(value, device=device, dtype=dtype)
+        value = value.to(device=device, dtype=dtype)
+        if value.dim() == 2:
+            value = value.unsqueeze(0)
+        if value.dim() != 3 or value.shape[-1] != feature_dim:
+            raise ValueError(
+                f"{name} must have shape [B,T,{feature_dim}], got {tuple(value.shape)}"
+            )
+        if value.shape[0] == 1 and batch_size > 1:
+            value = value.expand(batch_size, -1, -1)
+        if value.shape != (batch_size, seq_len, feature_dim):
+            raise ValueError(
+                f"{name} must have shape [{batch_size},{seq_len},{feature_dim}], "
+                f"got {tuple(value.shape)}"
+            )
+        return value
+
+    @staticmethod
+    def _prepare_feedback_mask(value, batch_size, seq_len, device):
+        if value is None:
+            return None
+        if not isinstance(value, torch.Tensor):
+            value = torch.as_tensor(value, device=device)
+        value = value.to(device=device, dtype=torch.bool)
+        if value.dim() == 1:
+            value = value.unsqueeze(0)
+        if value.dim() != 2:
+            raise ValueError(
+                f"feedback_injection_mask must have shape [B,T], got {tuple(value.shape)}"
+            )
+        if value.shape[0] == 1 and batch_size > 1:
+            value = value.expand(batch_size, -1)
+        if value.shape != (batch_size, seq_len):
+            raise ValueError(
+                "feedback_injection_mask must have shape "
+                f"[{batch_size},{seq_len}], got {tuple(value.shape)}"
+            )
+        return value
+
+    @staticmethod
     def _prepare_known_sequence(value, batch_size, seq_len, feature_dim, device, dtype, mask=None):
         values = torch.zeros(batch_size, seq_len, feature_dim, device=device, dtype=dtype)
         valid = torch.zeros(batch_size, seq_len, device=device, dtype=torch.bool)
@@ -395,6 +447,7 @@ class ObjectTransModule(nn.Module):
         human_pose_input=None,
         root_trans_input=None,
         lb_prior_quantiles=None,
+        feedback_control=None,
     ):
         if hand_positions is None:
             raise ValueError("hand_positions cannot be None")
@@ -477,6 +530,79 @@ class ObjectTransModule(nn.Module):
             rhand_imu,
             lb_prior_feature,
         )
+
+        feedback_mode = "normal"
+        feedback_prev_obj_trans = None
+        feedback_prev_prev_obj_trans = None
+        feedback_prev_obj_delta = None
+        feedback_perturbation = None
+        feedback_injection_mask = None
+        if isinstance(feedback_control, dict):
+            feedback_mode = str(feedback_control.get("mode", "normal")).strip().lower()
+            if feedback_mode not in {"normal", "gt_prev", "perturb"}:
+                raise ValueError(
+                    "feedback_control.mode must be one of normal, gt_prev, perturb"
+                )
+            feedback_prev_obj_trans = self._prepare_feedback_tensor(
+                feedback_control.get("prev_obj_trans"),
+                batch_size,
+                seq_len,
+                3,
+                device,
+                dtype,
+                "feedback_prev_obj_trans",
+            )
+            feedback_prev_prev_obj_trans = self._prepare_feedback_tensor(
+                feedback_control.get("prev_prev_obj_trans"),
+                batch_size,
+                seq_len,
+                3,
+                device,
+                dtype,
+                "feedback_prev_prev_obj_trans",
+            )
+            feedback_prev_obj_delta = self._prepare_feedback_tensor(
+                feedback_control.get("prev_obj_delta"),
+                batch_size,
+                seq_len,
+                3,
+                device,
+                dtype,
+                "feedback_prev_obj_delta",
+            )
+            feedback_perturbation = self._prepare_feedback_tensor(
+                feedback_control.get("perturbation"),
+                batch_size,
+                seq_len,
+                3,
+                device,
+                dtype,
+                "feedback_perturbation",
+            )
+            feedback_injection_mask = self._prepare_feedback_mask(
+                feedback_control.get("injection_mask"),
+                batch_size,
+                seq_len,
+                device,
+            )
+            if feedback_mode == "gt_prev" and any(
+                value is None
+                for value in (
+                    feedback_prev_obj_trans,
+                    feedback_prev_prev_obj_trans,
+                    feedback_prev_obj_delta,
+                )
+            ):
+                raise ValueError(
+                    "gt_prev feedback requires previous position, previous-previous "
+                    "position, and previous delta tensors"
+                )
+            if feedback_mode == "perturb" and (
+                feedback_perturbation is None or feedback_injection_mask is None
+            ):
+                raise ValueError(
+                    "perturb feedback requires perturbation and injection_mask tensors"
+                )
         return {
             "batch_size": batch_size,
             "seq_len": seq_len,
@@ -510,6 +636,12 @@ class ObjectTransModule(nn.Module):
             "has_object_mask": has_object_mask,
             "human_pose_input": human_pose_input,
             "root_trans_input": root_trans_input,
+            "feedback_mode": feedback_mode,
+            "feedback_prev_obj_trans": feedback_prev_obj_trans,
+            "feedback_prev_prev_obj_trans": feedback_prev_prev_obj_trans,
+            "feedback_prev_obj_delta": feedback_prev_obj_delta,
+            "feedback_perturbation": feedback_perturbation,
+            "feedback_injection_mask": feedback_injection_mask,
         }
 
     def _prepare_lb_prior_quantiles(
@@ -640,6 +772,11 @@ class ObjectTransModule(nn.Module):
             dim=-1,
         )
 
+    def _decode_prediction_output(self, prediction_out, contact_prob=None):
+        del contact_prob
+        l_fk_out, r_fk_out, gate_logits = prediction_out.split((4, 4, 4), dim=-1)
+        return l_fk_out, r_fk_out, F.softmax(gate_logits, dim=-1), gate_logits
+
     def _predict_step(
         self,
         context,
@@ -652,20 +789,41 @@ class ObjectTransModule(nn.Module):
         prediction_out=None,
         next_rnn_state=None,
     ):
+        step_state = state
+        feedback_mode = context.get("feedback_mode", "normal")
+        if feedback_mode == "gt_prev":
+            step_state = dict(state)
+            step_state["prev_obj_trans"] = context["feedback_prev_obj_trans"][:, time_index]
+            step_state["prev_prev_obj_trans"] = context["feedback_prev_prev_obj_trans"][:, time_index]
+            step_state["prev_obj_delta"] = context["feedback_prev_obj_delta"][:, time_index]
+        elif feedback_mode == "perturb":
+            injection_mask = context["feedback_injection_mask"][:, time_index]
+            if bool(injection_mask.any().item()):
+                step_state = dict(state)
+                step_state["prev_obj_trans"] = torch.where(
+                    injection_mask.unsqueeze(-1),
+                    state["prev_obj_trans"]
+                    + context["feedback_perturbation"][:, time_index],
+                    state["prev_obj_trans"],
+                )
+
         obj_rotm = context["obj_rotm"][:, time_index]
         lhand_position = context["lhand_position"][:, time_index]
         rhand_position = context["rhand_position"][:, time_index]
         step_input = context["prediction_input"][:, time_index]
         if self._state_feedback_enabled():
             step_input = step_input + self.feedback_embed(
-                self._feedback_features(obj_rotm, lhand_position, rhand_position, state)
+                self._feedback_features(obj_rotm, lhand_position, rhand_position, step_state)
             )
 
         if prediction_out is None:
             prediction_out, rnn_state = self.object_trans_head.step(step_input, state["rnn_state"])
         else:
             rnn_state = state["rnn_state"] if next_rnn_state is None else next_rnn_state
-        l_fk_out, r_fk_out, gate_logits = prediction_out.split((4, 4, 4), dim=-1)
+        l_fk_out, r_fk_out, weights, gate_logits = self._decode_prediction_output(
+            prediction_out,
+            context["pred_hand_contact_prob"][:, time_index],
+        )
         l_dir = self._unit_vector(l_fk_out[:, :3])
         r_dir = self._unit_vector(r_fk_out[:, :3])
         l_len = self._softplus_positive(l_fk_out[:, 3])
@@ -675,8 +833,7 @@ class ObjectTransModule(nn.Module):
         l_pos_fk = lhand_position + l_dir_world * l_len.unsqueeze(-1)
         r_pos_fk = rhand_position + r_dir_world * r_len.unsqueeze(-1)
 
-        weights = F.softmax(gate_logits, dim=-1)
-        previous_pos = state["prev_obj_trans"]
+        previous_pos = step_state["prev_obj_trans"]
         imu_integrated_pos = previous_pos + context["obj_vel_input"][:, time_index] / FRAME_RATE
         static_pos = previous_pos
         fused_model_pos = (
@@ -700,10 +857,10 @@ class ObjectTransModule(nn.Module):
             known_weights = known_weights.to(device=weights.device, dtype=weights.dtype)
             feedback_mask = known_mask & known_weights_mask.to(device=weights.device, dtype=torch.bool)
             effective_weights = torch.where(feedback_mask.unsqueeze(-1), known_weights, weights)
-        frames_seen = int(state.get("frames_seen", 0))
+        frames_seen = int(step_state.get("frames_seen", 0))
         velocity = (fused_pos - previous_pos) * FRAME_RATE if frames_seen > 0 else torch.zeros_like(fused_pos)
         acceleration = (
-            (fused_pos - 2.0 * previous_pos + state["prev_prev_obj_trans"]) * (FRAME_RATE ** 2)
+            (fused_pos - 2.0 * previous_pos + step_state["prev_prev_obj_trans"]) * (FRAME_RATE ** 2)
             if frames_seen > 1
             else torch.zeros_like(fused_pos)
         )
@@ -716,7 +873,7 @@ class ObjectTransModule(nn.Module):
             "prev_obj_rotm": obj_rotm,
             "frames_seen": frames_seen + 1,
         }
-        return {
+        frame_output = {
             "pred_obj_trans": fused_pos,
             # Published window prefixes are authoritative for all derived
             # quantities (not only position feedback).  Keep raw logits and
@@ -735,8 +892,10 @@ class ObjectTransModule(nn.Module):
             "pred_static_obj_trans": static_pos,
             "lhand_fk_out": l_fk_out,
             "rhand_fk_out": r_fk_out,
-            "gate_logits": gate_logits,
-        }, next_state
+        }
+        if gate_logits is not None:
+            frame_output["gate_logits"] = gate_logits
+        return frame_output, next_state
 
     def _scan_predictor(
         self,
@@ -925,6 +1084,7 @@ class ObjectTransModule(nn.Module):
         known_obj_trans_prefix_mask: torch.Tensor = None,
         known_gating_weights_prefix: torch.Tensor = None,
         compute_refine: bool = True,
+        feedback_control=None,
     ):
         """Run a causal OT scan from the supplied window initializers."""
         context = self._prepare_prediction_context(
@@ -939,6 +1099,7 @@ class ObjectTransModule(nn.Module):
             human_pose_input=human_pose_input,
             root_trans_input=root_trans_input,
             lb_prior_quantiles=lb_prior_quantiles,
+            feedback_control=feedback_control,
         )
         prediction, _ = self._scan_predictor(
             context,

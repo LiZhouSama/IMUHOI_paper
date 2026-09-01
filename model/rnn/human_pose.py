@@ -12,6 +12,8 @@ from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_axis_angle, ma
 from utils.human_pose import (
     WRIST_JOINT_INDICES,
     build_smpl24_joint_positions,
+    load_body_models_from_cfg,
+    normalize_body_model_type,
     forward_body_model_joints,
     select_hand_anchor_positions,
     select_wrist_positions,
@@ -165,14 +167,15 @@ class HumanPoseModule(nn.Module):
         )
         self.body_model = None
         self.body_model_device = None
-        body_model_path = getattr(cfg, "body_model_path", None)
-        if body_model_path is None:
-            raise ValueError("body_model_path is not set")
         try:
-            self.body_model = BodyModel(bm_fname=body_model_path, num_betas=16)
-            self.body_model.eval()
-            for param in self.body_model.parameters():
-                param.requires_grad_(False)
+            # A config may declare one `body_model_path` or a `body_model_paths`
+            # map.  Holding every declared family lets FK run in the same
+            # skeleton that produced each sample's ground truth; OMOMO/PAHOI are
+            # SMPL-X while AMASS/BEHAVE/HODome/IMHD are SMPL-H.
+            models, default_type = load_body_models_from_cfg(cfg, num_betas=16)
+            self.body_models = nn.ModuleDict(models)
+            self.default_body_model_type = default_type
+            self.body_model = self.body_models[default_type]
             self.body_model_device = torch.device("cpu")
         except Exception as exc:
             print(f"加载Body Model失败: {exc}")
@@ -235,7 +238,76 @@ class HumanPoseModule(nn.Module):
         full_pose[:, _IGNORED_INDICES] = full_pose[:, ignored_parents]
         return full_pose
 
-    def _compute_fk_joints_batched(self, glb_p_out_tensor: torch.Tensor, orientation: torch.Tensor):
+    def _resolve_batch_body_model_types(self, body_model_type, batch_size: int):
+        """Normalise a batch's declared family into one entry per sample.
+
+        Accepts what the collate produces: a single string, or a list of strings
+        of length ``batch_size``.  Families this module did not load fall back to
+        the default so an unexpected value degrades instead of crashing.
+        """
+        if body_model_type is None:
+            return [self.default_body_model_type] * batch_size
+        if isinstance(body_model_type, str):
+            body_model_type = [body_model_type] * batch_size
+        resolved = []
+        for value in list(body_model_type)[:batch_size]:
+            name = normalize_body_model_type(value)
+            resolved.append(name if name in self.body_models else self.default_body_model_type)
+        while len(resolved) < batch_size:
+            resolved.append(self.default_body_model_type)
+        return resolved
+
+    def _smpl24_rest_joints(self, family: str, device, dtype) -> torch.Tensor:
+        """Zero-betas SMPL-24 rest joints for one family, cached per device.
+
+        Only 24 of the body model's 52/55 joints are ever used, and with zero
+        betas the rest pose is constant, so it is computed once instead of being
+        re-derived from the shaped template on every call.
+        """
+        cache = self.__dict__.setdefault("_smpl24_rest_cache", {})
+        key = (family, str(device), str(dtype))
+        cached = cache.get(key)
+        if cached is None:
+            joints = forward_body_model_joints(
+                self.body_models[family], fallback_to_full=False
+            )
+            cached = build_smpl24_joint_positions(joints)[0].to(device=device, dtype=dtype)
+            cache[key] = cached
+        return cached
+
+    def _fk_from_smpl24_rest(self, pose_aa: torch.Tensor, families) -> torch.Tensor:
+        """Rigid-transform 24 joints directly from per-sample rest offsets.
+
+        Equivalent to running each family's full body model and then selecting
+        body-22 plus the palms: joints 0..21 share a kinematic tree across
+        families, and the palms inherit the wrist transform because their local
+        rotation is identity.  Doing it over 24 joints instead of 52/55 makes a
+        mixed-family batch cost the same as a single-family one.
+        """
+        from human_body_prior.body_model.lbs import batch_rigid_transform, batch_rodrigues
+
+        batch_size, seq_len = pose_aa.shape[:2]
+        device, dtype = pose_aa.device, pose_aa.dtype
+        rot_mats = batch_rodrigues(pose_aa.reshape(-1, 3), dtype=dtype).reshape(
+            batch_size * seq_len, 24, 3, 3
+        )
+        rest = torch.stack(
+            [self._smpl24_rest_joints(family, device, dtype) for family in families]
+        )
+        rest = rest.unsqueeze(1).expand(batch_size, seq_len, 24, 3).reshape(
+            batch_size * seq_len, 24, 3
+        )
+        joints, _ = batch_rigid_transform(
+            rot_mats, rest, self.smpl_parents.to(device), dtype=dtype
+        )
+        return joints.reshape(batch_size, seq_len, 24, 3)
+
+    def _compute_fk_joints_batched(
+        self,
+        glb_p_out_tensor: torch.Tensor,
+        orientation: torch.Tensor,
+        body_model_type=None,
+    ):
         if self.body_model is None:
             return None
 
@@ -253,19 +325,14 @@ class HumanPoseModule(nn.Module):
             full_glb = self._reduced_glb_6d_to_full_glb_mat(glb_pose, orientation)
             local_pose = self._global2local(full_glb, self.smpl_parents.tolist())
             pose_aa = matrix_to_axis_angle(local_pose.reshape(-1, 3, 3)).reshape(
-                BT, 24, 3
+                batch_size, seq_len, 24, 3
             )
 
+        families = self._resolve_batch_body_model_types(body_model_type, batch_size)
         try:
             with torch.no_grad():
-                joints = forward_body_model_joints(
-                    self.body_model,
-                    pose_body=pose_aa[:, 1:22].reshape(BT, 63),
-                    root_orient=pose_aa[:, 0].reshape(BT, 3),
-                    fallback_to_full=False,
-                )
-            joints = build_smpl24_joint_positions(joints)
-            return joints.reshape(batch_size, seq_len, 24, 3)
+                joints = self._fk_from_smpl24_rest(pose_aa, families)
+            return joints
         except Exception as exc:
             print(f"FK计算失败: {exc}")
             return None
@@ -443,7 +510,8 @@ class HumanPoseModule(nn.Module):
         device = human_imu.device
 
         if self.body_model is not None and (self.body_model_device != device):
-            self.body_model = self.body_model.to(device)
+            self.body_models = self.body_models.to(device)
+            self.body_model = self.body_models[self.default_body_model_type]
             self.body_model_device = device
 
         human_flat = human_imu.reshape(batch_size, seq_len, -1)
@@ -480,7 +548,9 @@ class HumanPoseModule(nn.Module):
         full_glb_rotmats = None
         full_glb_rot6d = None
         if self.body_model is not None:
-            joints_pos = self._compute_fk_joints_batched(p_pred, orientation_mat.clone())
+            joints_pos = self._compute_fk_joints_batched(
+                p_pred, orientation_mat.clone(), data_dict.get('body_model_type')
+            )
             try:
                 with torch.cuda.amp.autocast(enabled=False):
                     BT = batch_size * seq_len

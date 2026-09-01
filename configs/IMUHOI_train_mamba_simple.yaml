@@ -4,7 +4,13 @@
 
 # ============ 基本配置 ============
 save_dir: "outputs/IMUHOI_MambaSimple"
-body_model_path: datasets/smpl_models/smplh/male/model.npz
+# 每个数据集用哪一族由数据自己决定（.pt 里的 body_model_type）：
+# OMOMO/PAHOI 是 SMPL-X 拟合，AMASS/BEHAVE/HODome/IMHD 是 SMPL-H。
+# body_model_path 作为未声明族的样本的回退。
+body_model_paths:
+  smplh: datasets/smpl_models/smplh/male/model.npz
+  smplx: datasets/smpl_models/smplx/SMPLX_MALE.npz
+body_model_path: datasets/smpl_models/smplx/SMPLX_MALE.npz
 use_tensorboard: true
 use_multi_gpu: true
 device: "cuda:0"

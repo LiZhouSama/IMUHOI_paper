@@ -99,7 +99,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Override the ObjectTrans architecture for Stage 3/joint_train "
-            "and the final validation eval (for example: current)."
+            "and the final validation eval (for example: current or v2)."
         ),
     )
     parser.add_argument(

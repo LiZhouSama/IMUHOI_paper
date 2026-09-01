@@ -979,6 +979,7 @@ class InteractiveViewer(Viewer):
 
 OBJECT_TRANS_ARCH_CHOICES = (
     "current",
+    "v2",
     "legacy",
     "legacy_mesh",
     "mergeHeads_obs",
@@ -1011,7 +1012,7 @@ def _make_parser() -> argparse.ArgumentParser:
         help=(
             'ObjectTrans architecture (case-insensitive); imuhoi selects the '
             'original EgoIMU three-branch model and imuhoi_4heads selects the '
-            'static-hold four-branch ablation.'
+            'static-hold four-branch ablation; v2 uses fixed VC fusion weights.'
         ),
     )
     parser.add_argument(

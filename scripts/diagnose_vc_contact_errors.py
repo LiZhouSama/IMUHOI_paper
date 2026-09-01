@@ -108,6 +108,22 @@ def average_precision(scores: np.ndarray, labels: np.ndarray) -> float:
     return float((precision * labels).sum() / labels.sum())
 
 
+def score_quantiles(scores: np.ndarray) -> dict:
+    if scores.size == 0:
+        return {"count": 0}
+    values = np.quantile(scores, [0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99])
+    return {
+        "count": int(scores.size),
+        "p01": float(values[0]),
+        "p05": float(values[1]),
+        "p25": float(values[2]),
+        "p50": float(values[3]),
+        "p75": float(values[4]),
+        "p95": float(values[5]),
+        "p99": float(values[6]),
+    }
+
+
 def signed_distance_to_transitions(mask: np.ndarray) -> np.ndarray:
     """Signed frame distance to the nearest onset/offset of a boolean channel.
 
@@ -371,6 +387,38 @@ def collect(pred_cache, sample_cache, hand_threshold, horizon):
         contact_quality["hard_negative_average_precision"] = average_precision(
             scores[selected], targets[selected]
         )
+        contact_quality["score_quantiles"] = {
+            "positive_any_hand": score_quantiles(scores[targets > 0.5]),
+            "hard_negative": score_quantiles(scores[hard]),
+            "other_negative": score_quantiles(
+                scores[(targets <= 0.5) & ~hard]
+            ),
+        }
+        threshold_sweep = {}
+        for threshold in (0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50):
+            predicted = scores > threshold
+            true_positive = float((predicted & (targets > 0.5)).sum())
+            predicted_positive = float(predicted.sum())
+            positive_count = float((targets > 0.5).sum())
+            threshold_sweep[str(threshold)] = {
+                "f1": (
+                    2.0 * true_positive
+                    / (predicted_positive + positive_count)
+                    if predicted_positive + positive_count
+                    else None
+                ),
+                "precision": (
+                    true_positive / predicted_positive
+                    if predicted_positive
+                    else None
+                ),
+                "recall": (
+                    true_positive / positive_count if positive_count else None
+                ),
+                "predicted_positive_rate": float(predicted.mean()),
+                "hard_negative_fp_rate": float(predicted[hard].mean()),
+            }
+        contact_quality["threshold_sweep"] = threshold_sweep
         best = {"f1": -1.0}
         for threshold in np.arange(0.05, 0.96, 0.05):
             predicted = scores > threshold
@@ -426,6 +474,14 @@ def print_stats(stats):
         print(f"  best-threshold F1          : {best['f1']:.4f} @ thr={best['threshold']} "
               f"(P={best['precision']:.4f} R={best['recall']:.4f} "
               f"hardFP={best['hard_neg_fp_rate']:.4f})")
+        quantiles = quality.get("score_quantiles", {})
+        if quantiles:
+            print(
+                "  score medians (positive/hard-negative/other-negative): "
+                f"{quantiles['positive_any_hand']['p50']:.4f} / "
+                f"{quantiles['hard_negative']['p50']:.4f} / "
+                f"{quantiles['other_negative']['p50']:.4f}"
+            )
     for name, probe in stats.get("pose_only_probes", {}).items():
         lift = probe["lift"]
         print(

@@ -1,5 +1,12 @@
 import argparse
 import os
+import sys
+
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+import os
 import glob
 from typing import Dict, List, Optional, Tuple
 
@@ -11,6 +18,7 @@ from scipy.spatial.transform import Rotation as R
 from human_body_prior.body_model.body_model import BodyModel
 import pytorch3d.transforms as transforms
 from utils.human_pose import (
+    GenderedBodyModelLoader,
     build_smpl24_joint_positions,
     ensure_smpl24_local_rotations,
     local_rotations_to_global,
@@ -59,33 +67,12 @@ def npz_get(npz_file: np.lib.npyio.NpzFile, key: str, default=None):
     return npz_file[key] if key in npz_file.files else default
 
 
-class BodyModelLoader:
+class BodyModelLoader(GenderedBodyModelLoader):
+    """BEHAVE ships SMPL-H fits (156-dim poses, 10 betas); the family is still
+    re-confirmed per sequence through :meth:`resolve`."""
+
     def __init__(self, support_dir: str, device: torch.device, num_betas: int = 16) -> None:
-        self._device = device
-        self._num_betas = num_betas
-        self._models: Dict[str, BodyModel] = {}
-        for gender in ["male", "female", "neutral"]:
-            bm_path = os.path.join(support_dir, f"smplh/{gender}/model.npz")
-            if os.path.exists(bm_path):
-                self._models[gender] = BodyModel(
-                    bm_fname=bm_path,
-                    num_betas=num_betas,
-                ).to(device).eval()
-        if not self._models:
-            raise FileNotFoundError(f"No SMPL-H models found under {support_dir}")
-        self._default_gender = "neutral" if "neutral" in self._models else "male"
-
-    @property
-    def num_betas(self) -> int:
-        return self._num_betas
-
-    def get(self, gender: Optional[str]) -> BodyModel:
-        if gender is None:
-            return self._models[self._default_gender]
-        key = str(gender).lower()
-        if key not in self._models:
-            return self._models[self._default_gender]
-        return self._models[key]
+        super().__init__(support_dir, device=device, num_betas=num_betas, default_type="smplh")
 
 
 def infer_object_name(seq_name: str, object_names: List[str]) -> str:
@@ -219,7 +206,7 @@ def compute_foot_floor_offset(
     with torch.no_grad():
         kwargs = {key: value for key, value in smpl_input.items()}
         body_out = bm(**kwargs)
-        joints = body_out.Jtr[:, :24, :]  # [B, 24, 3]
+        joints = build_smpl24_joint_positions(body_out.Jtr)  # [B, 24, 3]
         # 双脚关节: 7=左脚踝, 8=右脚踝, 10=左脚, 11=右脚
         left_ankle = joints[:, 7, 1]   # [B]
         right_ankle = joints[:, 8, 1]  # [B]
@@ -284,7 +271,11 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
         sample_count=int(max(1, obj_points_count)),
         device="cpu",
     )
-    bm = bm_loader.get(gender)
+    # BEHAVE fits are SMPL-H (156-dim poses); confirm from the sequence rather
+    # than assuming, so a re-released SMPL-X variant would not silently pass.
+    bm, body_model_type = bm_loader.resolve(
+        {"poses": poses, "betas": betas_raw, "gender": gender}, gender=gender
+    )
     smpl_init_input = {
             "root_orient": torch.zeros_like(torch.from_numpy(poses[:, :3].reshape(-1, 3)).to(device).float()),
             "pose_body": torch.zeros_like(torch.from_numpy(poses[:, 3:66].reshape(-1, 63)).to(device).float()),
@@ -436,6 +427,7 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
     output = {
         "seq_name": seq_name,
         "gender": gender,
+        "body_model_type": body_model_type,
         "pose": pose,
         "position_global_full_gt_world": position_global,
         "rotation_global": rotation_global,

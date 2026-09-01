@@ -3,7 +3,13 @@
 
 # ============ 基本配置 ============
 save_dir: "outputs/IMUHOI++/RNN"
-body_model_path: datasets/smpl_models/smplh/male/model.npz
+# 每个数据集用哪一族由数据自己决定（.pt 里的 body_model_type）：
+# OMOMO/PAHOI 是 SMPL-X 拟合，AMASS/BEHAVE/HODome/IMHD 是 SMPL-H。
+# body_model_path 作为未声明族的样本的回退。
+body_model_paths:
+  smplh: datasets/smpl_models/smplh/male/model.npz
+  smplx: datasets/smpl_models/smplx/SMPLX_MALE.npz
+body_model_path: datasets/smpl_models/smplx/SMPLX_MALE.npz
 use_tensorboard: true
 use_multi_gpu: false
 device: "cuda:0"
@@ -50,9 +56,9 @@ object_trans_hidden_dim: 192
 object_trans_num_layers: 2
 object_trans_dropout: 0.2
 object_trans_length_init: 0.4
-# 打开 OT 状态反馈：预测器每帧看到自己上一帧的物体位置（物体系下相对双手的
-# 向量），接触开始时才能几何推导锚定骨长，而不是从 IMU 历史里猜。
-object_trans_state_feedback: true
+# OT-v2 默认关闭状态反馈，使窗口内 LSTM 一次性向量化前向；物体位置融合仍按
+# previous position 做因果递推。需要反馈消融时用 CLI 显式覆盖为 fused。
+object_trans_state_feedback: false
 object_trans_feedback_hidden_dim: 64
 mesh_downsample_points: 256
 enable_ot_refine: true
@@ -220,9 +226,15 @@ train_datasets: ["omomo"]  # 可选: behave, imhd, omomo, pahoi, hodome
 # ============ 数据集路径 ============
 datasets:
   omomo:
-    train_path: "process/IMUHOI++/processed_split_data_OMOMO/train"
-    test_path:  "process/IMUHOI++/processed_split_data_OMOMO/test"
-    debug_path: "process/IMUHOI++/processed_split_data_OMOMO/debug"
+    train_path: "process/IMUHOI++/processed_split_data_OMOMO_smplx/train"
+    test_path:  "process/IMUHOI++/processed_split_data_OMOMO_smplx/test"
+    debug_path: "process/IMUHOI++/processed_split_data_OMOMO_smplx/debug"
+    object_geo_root: "datasets/OMOMO/captured_objects"
+  omomo_full:
+    train_path: "process/IMUHOI++/processed_split_data_OMOMO_smplx_full/train"
+    test_path:  "process/IMUHOI++/processed_split_data_OMOMO_smplx_full/test"
+    debug_path: "process/IMUHOI++/processed_split_data_OMOMO_smplx_full/train"
+    full_sequence_test_path: "process/IMUHOI++/processed_split_data_OMOMO_smplx_full/test"
     object_geo_root: "datasets/OMOMO/captured_objects"
   imhd:
     train_path: "process/IMUHOI++/processed_seg_data_IMHD/train"
@@ -237,10 +249,16 @@ datasets:
     full_sequence_test_path: "process/IMUHOI++/processed_split_data_BEHAVE/test"
     object_geo_root: "datasets/BEHAVE/objects"
   pahoi:
-    train_path: "process/IMUHOI++/processed_split_data_PAHOI_v2/train"
-    test_path: "process/IMUHOI++/processed_split_data_PAHOI_v2/test"
-    debug_path: "process/IMUHOI++/processed_split_data_PAHOI_v2/train"
-    full_sequence_test_path: "process/IMUHOI++/processed_split_data_PAHOI_v2/test"
+    train_path:              "process/IMUHOI++/processed_split_data_PAHOI_smplx/train"
+    test_path:               "process/IMUHOI++/processed_split_data_PAHOI_smplx/test"
+    debug_path:              "process/IMUHOI++/processed_split_data_PAHOI_smplx/train"
+    full_sequence_test_path: "process/IMUHOI++/processed_split_data_PAHOI_smplx/test"
+    object_geo_root: "datasets/PAHOI/Object_mesh"
+  pahoi_full:
+    train_path:              "process/IMUHOI++/processed_split_data_PAHOI_smplx_full/train"
+    test_path:               "process/IMUHOI++/processed_split_data_PAHOI_smplx_full/test"
+    debug_path:              "process/IMUHOI++/processed_split_data_PAHOI_smplx_full/train"
+    full_sequence_test_path: "process/IMUHOI++/processed_split_data_PAHOI_smplx_full/test"
     object_geo_root: "datasets/PAHOI/Object_mesh"
   hodome:
     train_path: "process/IMUHOI++/processed_seg_data_HODOME/train"

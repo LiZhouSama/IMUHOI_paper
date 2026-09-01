@@ -36,6 +36,7 @@ from model.rnn.object_trans_IMUHOI_4heads import (
     IMUHOI4HeadsObjectTransModule,
 )
 from model.rnn.object_trans_legacy_mesh import LegacyMeshObjectTransModule
+from model.rnn.object_trans_v2 import V2ObjectTransModule
 from model.rnn.object_trans_mergeHeads_obsEncoder import (
     ObjectTransModule as MergeHeadsObsObjectTransModule,
 )
@@ -86,6 +87,7 @@ except Exception:
 
 OBJECT_TRANS_ARCH_CHOICES = (
     'current',
+    'v2',
     'legacy',
     'legacy_mesh',
     'mergeHeads_obs',
@@ -278,7 +280,7 @@ class Stage3JointTrainer:
         self.lb_stats_enabled = (
             self.lb_prior_model is None
             and bool(getattr(cfg, "object_trans_lb_stats", True))
-            and str(getattr(cfg, "object_trans_arch", "current")).strip().lower() == "current"
+            and str(getattr(cfg, "object_trans_arch", "current")).strip().lower() in {"current", "v2"}
         )
         self.lb_stats_min_frames = int(getattr(cfg, "lb_stats_min_frames", 10))
         self.lb_stats_noise_std = float(getattr(cfg, "lb_stats_noise_std", 0.02))
@@ -1185,8 +1187,8 @@ def main():
         print("mergeHeads_obs使用内置ObsEncoder；已关闭外部l_b VQ/Diffusion prior。")
         enable_lb_prior = False
         cfg.enable_ot_lb_prior = False
-    if enable_lb_prior and cfg.object_trans_arch != 'current':
-        raise ValueError("l_b VQ/Diffusion prior supports object_trans_arch=current only")
+    if enable_lb_prior and cfg.object_trans_arch not in {'current', 'v2'}:
+        raise ValueError("l_b VQ/Diffusion prior supports object_trans_arch=current or v2 only")
     if enable_lb_prior:
         if prior_cfg is None:
             raise ValueError("enable_ot_lb_prior=true requires an lb_vq_prior config block")
@@ -1200,6 +1202,8 @@ def main():
 
     if cfg.object_trans_arch == 'legacy':
         module_name = 'object_trans_legacy'
+    elif cfg.object_trans_arch == 'v2':
+        module_name = 'object_trans_v2'
     elif cfg.object_trans_arch == 'imuhoi':
         module_name = 'object_trans_IMUHOI'
     elif cfg.object_trans_arch == 'imuhoi_4heads':
@@ -1304,6 +1308,8 @@ def main():
         ot_model_cls = LegacyMeshObjectTransModule
     elif cfg.object_trans_arch == 'mergeHeads_obs':
         ot_model_cls = MergeHeadsObsObjectTransModule
+    elif cfg.object_trans_arch == 'v2':
+        ot_model_cls = V2ObjectTransModule
     else:
         ot_model_cls = ObjectTransModule
     ot_model = ot_model_cls(cfg)

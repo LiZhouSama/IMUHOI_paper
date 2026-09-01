@@ -31,6 +31,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 from human_body_prior.body_model.body_model import BodyModel
+from utils.human_pose import load_body_model
 from pytorch3d.transforms import matrix_to_axis_angle, matrix_to_rotation_6d, rotation_6d_to_matrix
 
 from .base import ConditionalDiT
@@ -192,10 +193,9 @@ class IMUHOIMixModule(nn.Module):
             raise ValueError("body_model_path is not set")
 
         try:
-            self.body_model = BodyModel(bm_fname=body_model_path, num_betas=16)
-            self.body_model.eval()
-            for param in self.body_model.parameters():
-                param.requires_grad_(False)
+            # load_body_model clamps num_betas to what the file ships, so the
+            # same path works for SMPL-H (16), SMPL-X (16) and plain SMPL (10).
+            self.body_model = load_body_model(body_model_path, num_betas=16)
             self.body_model_device = torch.device("cpu")
         except Exception as exc:
             raise RuntimeError(f"Failed to load BodyModel: {exc}") from exc

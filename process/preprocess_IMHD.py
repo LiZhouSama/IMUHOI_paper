@@ -1,5 +1,12 @@
 import argparse
 import os
+import sys
+
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+import os
 import re
 import glob
 import pickle
@@ -15,6 +22,7 @@ from scipy.spatial.transform import Rotation as R
 from human_body_prior.body_model.body_model import BodyModel
 import pytorch3d.transforms as transforms
 from utils.human_pose import (
+    GenderedBodyModelLoader,
     build_smpl24_joint_positions,
     ensure_smpl24_local_rotations,
     local_rotations_to_global,
@@ -127,31 +135,12 @@ def iter_slices(total: int, chunk_len: int) -> Iterable[Tuple[int, int]]:
         yield start, end
 
 
-class BodyModelLoader:
+class BodyModelLoader(GenderedBodyModelLoader):
+    """IMHD ships its own SMPL-H body models; the family is still re-confirmed
+    per sequence through :meth:`resolve`."""
+
     def __init__(self, support_dir: str, device: torch.device, num_betas: int = 16) -> None:
-        self._device = device
-        self._num_betas = num_betas
-        self._models: Dict[str, BodyModel] = {}
-        for gender in ["male", "female", "neutral"]:
-            bm_path = os.path.join(support_dir, f"smplh/{gender}/model.npz")
-            if os.path.exists(bm_path):
-                self._models[gender] = BodyModel(
-                    bm_fname=bm_path,
-                    num_betas=num_betas,
-                ).to(device).eval()
-        if not self._models:
-            raise FileNotFoundError(f"No SMPL-H models found under {support_dir}")
-        self._default_gender = "neutral" if "neutral" in self._models else "male"
-
-    @property
-    def num_betas(self) -> int:
-        return self._num_betas
-
-    def get(self, gender: Optional[str]) -> BodyModel:
-        if gender is None:
-            return self._models[self._default_gender]
-        key = str(gender).lower()
-        return self._models.get(key, self._models[self._default_gender])
+        super().__init__(support_dir, device=device, num_betas=num_betas, default_type="smplh")
 
 
 def infer_object_name(seq_name: str, object_names: List[str]) -> str:
@@ -596,7 +585,10 @@ def process_imhd_sequence(
         sample_count=int(max(1, obj_points_count)),
         device="cpu",
     )
-    bm = bm_loader.get(gender)
+    # IMHD's gt_*.pkl stores root_orient/pose_body already split, so there is
+    # no pose-width signal to detect from; the dataset ships its own SMPL-H
+    # models, so the family is stated explicitly.
+    bm, body_model_type = bm_loader.resolve(gender=gender, model_type="smplh")
 
     smpl_init_input = {
             "root_orient": torch.zeros_like(torch.from_numpy(root_orient.reshape(-1, 3)).to(device).float()),
@@ -784,6 +776,7 @@ def process_imhd_sequence(
     output = {
         "seq_name": entry.seq_name,
         "gender": gender,
+        "body_model_type": body_model_type,
         "pose": pose,
         "position_global_full_gt_world": position_global,
         "rotation_global": rotation_global,

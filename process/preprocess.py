@@ -25,6 +25,8 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from utils.human_pose import (
+    BodyModelRegistry,
+    body_model_type_of,
     build_smpl24_joint_positions,
     ensure_smpl24_local_rotations,
     local_rotations_to_global,
@@ -1559,8 +1561,17 @@ def process_sequence(
 
     seq_name = str(seq_data['seq_name'])
     subject_gender = str(seq_data['gender']).lower()
-    if isinstance(bm, dict):
+    # Resolve the body model family from the sequence itself.  OMOMO is SMPL-X
+    # (its rest_offsets reproduce SMPL-X shaped bones to 0.2 mm) while AMASS is
+    # SMPL-H; the two families' root joints differ by 12.7 cm, so running the
+    # wrong one displaces the whole body relative to the object trajectory.
+    body_model_type = None
+    if isinstance(bm, BodyModelRegistry):
+        bm, body_model_type = bm.for_sequence(seq_data, gender=subject_gender)
+    elif isinstance(bm, dict):
         bm = bm.get(subject_gender, bm.get("neutral") or next(iter(bm.values())))
+    if body_model_type is None:
+        body_model_type = body_model_type_of(bm) or "smplh"
 
     root_orient_np = np.asarray(seq_data['root_orient'], dtype=np.float32).reshape(-1, 3)
     pose_body_np = np.asarray(seq_data['pose_body'], dtype=np.float32).reshape(-1, 63)
@@ -1654,27 +1665,13 @@ def process_sequence(
     # 提取头部全局旋转
     # head_rotation_global_matrot = rotation_global_matrot[:, [15], :, :]
 
-    # OMOMO provides custom body-24 rest offsets whose 22/23 entries are the
-    # left/right metacarpals. Apply those offsets under the wrist rotations.
-    rest_offsets = seq_data.get("rest_offsets")
-    if rest_offsets is not None:
-        rest_offsets = torch.as_tensor(
-            rest_offsets, device=device, dtype=rotation_global_matrot_reshaped.dtype
-        )
-        if rest_offsets.shape[0] < 24:
-            raise ValueError(f"rest_offsets must contain 24 joints, got {rest_offsets.shape}")
-        palm_offsets = rest_offsets[22:24]
-        wrist_rotations = rotation_global_matrot_reshaped[:, [20, 21], :, :]
-        palm_positions = body_pose_world.Jtr[:, [20, 21], :] + torch.matmul(
-            wrist_rotations, palm_offsets.view(1, 2, 3, 1)
-        ).squeeze(-1)
-        position_global_full_gt_world = torch.cat(
-            (body_pose_world.Jtr[:, :22, :], palm_positions), dim=1
-        ).cpu()
-    else:
-        position_global_full_gt_world = build_smpl24_joint_positions(
-            body_pose_world.Jtr
-        ).cpu()
+    # Body-22 plus the two palm anchors, resolved from the native joint layout.
+    # OMOMO's own `rest_offsets[22:24]` used to be applied here as a special
+    # case; with the correct (SMPL-X) body model those offsets are reproduced by
+    # the native middle1 joints to 0.09 mm, so the special case is redundant.
+    position_global_full_gt_world = build_smpl24_joint_positions(
+        body_pose_world.Jtr
+    ).cpu()
 
     # 计算足部接触标签
     lfoot_contact, rfoot_contact = compute_foot_contact_labels(
@@ -1816,6 +1813,9 @@ def process_sequence(
     data = {
         "seq_name": seq_name,
         "gender": subject_gender,
+        # Which family produced the GT joints, so downstream code and audits do
+        # not have to re-derive it.
+        "body_model_type": body_model_type,
         # "head_global_trans": head_global_trans.cpu(),
         "pose": pose_aa.reshape(pose_aa.shape[0], -1).cpu(),   # [T, 72]
         "position_global_full_gt_world": position_global_full_gt_world.float(), # [T, 24, 3]
@@ -1954,12 +1954,20 @@ def split_unified_by_json(
     allowed_missing_files=None,
     output_split_info_path=None,
     enforce_numeric_names=True,
+    allow_unassigned=False,
 ):
     """Split a flat directory of processed sequences according to an existing JSON.
 
     ``enforce_numeric_names`` keeps the OMOMO guarantee that the unified directory
     is exactly ``0.pt..N.pt``.  Datasets that keep their source sequence names
     (PAHOI) pass False and are checked against the JSON file list instead.
+
+    ``allow_unassigned`` relaxes the two coverage checks for the case where the
+    reference JSON only labels a subset of the corpus -- e.g. re-running with a
+    corrected body model recovers sequences that the previous run's contact
+    rules had dropped.  Those files stay in ``input_dir`` and are listed under
+    ``unassigned_files`` in the output JSON rather than being force-assigned to
+    a split, so the reference split's membership is reproduced exactly.
     """
     with open(split_info_path, "r", encoding="utf-8") as handle:
         split_info = json.load(handle)
@@ -1969,24 +1977,38 @@ def split_unified_by_json(
     all_names = train_files + test_files
     if len(all_names) != expected_total or len(set(all_names)) != expected_total:
         raise ValueError("split_info.json 的 train/test 文件列表不完整或存在重复")
+    expected_names = set(all_names)
     if enforce_numeric_names:
-        expected_names = {f"{index}.pt" for index in range(expected_total)}
-        if set(all_names) != expected_names:
+        for name in all_names:
+            # the sort keys below index by number, so every name must be numeric
+            int(os.path.splitext(name)[0])
+        if not allow_unassigned and expected_names != {
+            f"{index}.pt" for index in range(expected_total)
+        }:
+            # A full reference split must enumerate the unified directory exactly.
+            # With allow_unassigned the JSON is a subset by construction, so the
+            # contiguity requirement does not apply.
             raise ValueError("split_info.json 文件名必须覆盖统一目录的 0.pt..N.pt")
-    else:
-        expected_names = set(all_names)
 
     present_names = {
         name for name in os.listdir(input_dir)
         if name.endswith(".pt") and os.path.isfile(os.path.join(input_dir, name))
     }
     unexpected_names = present_names - expected_names
-    if unexpected_names:
+    if unexpected_names and not allow_unassigned:
         raise ValueError(f"统一目录包含 split_info.json 未定义的文件: {sorted(unexpected_names)}")
 
     missing_names = expected_names - present_names
     allowed_missing_files = set(allowed_missing_files or [])
-    if missing_names != allowed_missing_files:
+    if allow_unassigned:
+        # Only the direction that signals a real bug is fatal: a file the JSON
+        # asks for that was neither produced nor deliberately skipped.
+        unexpected_missing = sorted(missing_names - allowed_missing_files)
+        if unexpected_missing:
+            raise ValueError(
+                f"统一目录缺失 split_info.json 要求的文件且未被标记跳过: {unexpected_missing}"
+            )
+    elif missing_names != allowed_missing_files:
         unexpected_missing = sorted(missing_names - allowed_missing_files)
         unexpectedly_present = sorted(allowed_missing_files - missing_names)
         raise ValueError(
@@ -2030,6 +2052,15 @@ def split_unified_by_json(
         "test_files": kept_test_files,
         "source_split_info": os.path.abspath(split_info_path),
     }
+    if allow_unassigned:
+        name_key = (
+            (lambda name: int(os.path.splitext(name)[0]))
+            if enforce_numeric_names
+            else (lambda name: name)
+        )
+        # Produced but not labelled by the reference split; left in input_dir.
+        filtered_split_info["unassigned_files"] = sorted(unexpected_names, key=name_key)
+        filtered_split_info["unassigned_count"] = len(unexpected_names)
     if output_split_info_path:
         output_split_dir = os.path.dirname(os.path.abspath(output_split_info_path))
         os.makedirs(output_split_dir, exist_ok=True)
@@ -2039,6 +2070,8 @@ def split_unified_by_json(
     print(
         f"按 {split_info_path} 完成分割：训练 {len(kept_train_files)}，"
         f"测试 {len(kept_test_files)}，跳过 {len(missing_names)}"
+        + (f"，未分配（参考 split 未覆盖，保留在统一目录）{len(unexpected_names)}"
+           if allow_unassigned and unexpected_names else "")
     )
     return filtered_split_info
 
@@ -2263,20 +2296,18 @@ def main(args):
     print(f"使用设备: {device}")
 
     # 处理常规数据集（带有物体交互的数据）
-    # 设置SMPL模型
-    print("加载SMPL模型...")
-    num_betas = 16  # 身体参数数量
-    body_models = {}
-    for gender in ("male", "female", "neutral"):
-        model_path = os.path.join(args.support_dir, f"smplh/{gender}/model.npz")
-        if os.path.isfile(model_path):
-            body_models[gender] = BodyModel(
-                bm_fname=model_path,
-                num_betas=num_betas,
-            ).to(device)
-    if not body_models:
-        raise FileNotFoundError(f"No SMPL-H models found under {args.support_dir}")
-    body_models.setdefault("neutral", next(iter(body_models.values())))
+    # Body models are resolved per sequence: OMOMO is SMPL-X, AMASS is SMPL-H.
+    print("准备身体模型（按序列自动甄别 SMPL-H / SMPL-X）...")
+    body_models = BodyModelRegistry(
+        args.support_dir,
+        device=device,
+        num_betas=16,
+        default_type=args.body_model_type,
+    )
+    if not any(body_models.has(model_type) for model_type in ("smplh", "smplx")):
+        raise FileNotFoundError(
+            f"No SMPL-H or SMPL-X models found under {args.support_dir}"
+        )
 
     # 处理AMASS数据集
     # if args.process_amass:
@@ -2346,6 +2377,7 @@ def main(args):
                     record["output_file"] for record in process_summary["skipped_sequences"]
                 },
                 output_split_info_path=output_split_info_path,
+                allow_unassigned=args.allow_unassigned,
             )
             output_root = os.path.dirname(os.path.abspath(output_split_info_path))
             shutil.copy2(
@@ -2438,6 +2470,16 @@ if __name__ == "__main__":
     )
     parser.add_argument("--support_dir", type=str, default="datasets/smpl_models",
                         help="SMPL模型目录")
+    parser.add_argument(
+        "--body-model-type",
+        type=str,
+        default="smplh",
+        choices=("smplh", "smplx", "smpl"),
+        help=(
+            "序列没有任何可甄别线索时使用的模型族。OMOMO 会通过 rest_offsets "
+            "自动识别为 smplx，此项只影响回退。"
+        ),
+    )
     parser.add_argument("--obj_mesh_dir", type=str, default="datasets/OMOMO/captured_objects",
                         help="物体网格目录")
     parser.add_argument("--obj_points_count", type=int, default=256,
@@ -2473,6 +2515,14 @@ if __name__ == "__main__":
         type=float,
         default=0.10,
         help="无手接触连续区间内触发整序列排除的物体最大位移，单位米（默认：0.10）。",
+    )
+    parser.add_argument(
+        "--allow-unassigned",
+        action="store_true",
+        help=(
+            "参考 split_info 只覆盖部分语料时，允许本次新产出的未标注序列保留在统一目录，"
+            "并记入输出 split_info 的 unassigned_files，而不是报错。"
+        ),
     )
     parser.add_argument(
         "--output-split-info",

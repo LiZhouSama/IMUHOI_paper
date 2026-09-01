@@ -896,6 +896,10 @@ class IMUDataset(Dataset):
                 "seq_name": seq_name,
                 "seq_path": file_path,
                 "seq_file": os.path.basename(file_path),
+                # Which body model produced this sample's GT joints, so the
+                # model can run FK in the same skeleton.  Empty for .pt files
+                # written before the field existed; the model falls back then.
+                "body_model_type": str(seq_data.get("body_model_type") or ""),
                 "window_start": int(start_idx),
                 "window_end": int(end_idx),
 

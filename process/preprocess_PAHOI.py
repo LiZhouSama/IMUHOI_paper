@@ -1,5 +1,12 @@
 import argparse
 import os
+import sys
+
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+import os
 import re
 import shutil
 import struct
@@ -13,6 +20,7 @@ import torch
 from scipy.spatial.transform import Rotation
 from tqdm import tqdm
 from utils.human_pose import (
+    GenderedBodyModelLoader,
     build_smpl24_joint_positions,
     ensure_smpl24_local_rotations,
     local_rotations_to_global,
@@ -118,30 +126,13 @@ def pad_betas(betas: np.ndarray, target_dim: int, target_frames: int) -> np.ndar
     return betas.astype(np.float32)
 
 
-class BodyModelLoader:
+class BodyModelLoader(GenderedBodyModelLoader):
+    """PAHOI captures are SMPL-X fits (``surface_model_type='smplx'``, 165-dim
+    poses, SMPL-X shape space), so the family defaults to SMPL-X here and is
+    still re-confirmed per sequence via :meth:`resolve`."""
+
     def __init__(self, support_dir: str, device: torch.device, num_betas: int = 16) -> None:
-        self._device = device
-        self._num_betas = int(num_betas)
-        self._models: Dict[str, BodyModel] = {}
-        for gender in ("male", "female", "neutral"):
-            model_path = Path(support_dir) / "smplh" / gender / "model.npz"
-            if model_path.exists():
-                self._models[gender] = BodyModel(
-                    bm_fname=str(model_path),
-                    num_betas=self._num_betas,
-                ).to(device).eval()
-        if not self._models:
-            raise FileNotFoundError(f"No SMPL-H body models found under {support_dir}")
-        self._default_gender = "neutral" if "neutral" in self._models else "male"
-
-    @property
-    def num_betas(self) -> int:
-        return self._num_betas
-
-    def get(self, gender: Optional[str]) -> BodyModel:
-        if gender is None:
-            return self._models[self._default_gender]
-        return self._models.get(str(gender).lower(), self._models[self._default_gender])
+        super().__init__(support_dir, device=device, num_betas=num_betas, default_type="smplx")
 
 
 def collect_pahoi_sequences(dataset_root: str) -> List[PAHOISequence]:
@@ -643,7 +634,9 @@ def process_pahoi_sequence(
     obj_rot = obj_rot[:T].astype(np.float32)
     source_frame_indices = np.arange(T, dtype=np.int64)
 
-    bm = bm_loader.get(human["gender"])
+    # `human` carries `surface_model_type` straight from the capture, so the
+    # family is taken from the data rather than assumed.
+    bm, body_model_type = bm_loader.resolve(human, gender=human["gender"])
     position_global, rotation_local, rotation_global = compute_motion_features(
         bm=bm,
         root_orient=root_orient,
@@ -742,6 +735,7 @@ def process_pahoi_sequence(
         "subject_id": seq.subject_id,
         "gender": human["gender"],
         "surface_model_type": human["surface_model_type"],
+        "body_model_type": body_model_type,
         "source_mocap_frame_rate": human["mocap_frame_rate"],
         "mocap_frame_rate": human["mocap_frame_rate"],
         "source_frame_indices": torch.from_numpy(source_frame_indices).long(),
@@ -845,6 +839,14 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Root that receives train/ and test/ (default: --output_dir)",
+    )
+    parser.add_argument(
+        "--allow_unassigned",
+        action="store_true",
+        help=(
+            "Keep sequences the reference split does not label in the flat output "
+            "dir and record them under unassigned_files instead of failing."
+        ),
     )
     parser.add_argument(
         "--copy_after_split",
@@ -952,6 +954,7 @@ def main() -> None:
             },
             output_split_info_path=str(split_root / "split_info.json"),
             enforce_numeric_names=False,
+            allow_unassigned=args.allow_unassigned,
         )
         if Path(manifest_path).resolve() != (split_root / "skipped_sequences.json").resolve():
             shutil.copy2(manifest_path, split_root / "skipped_sequences.json")

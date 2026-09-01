@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from human_body_prior.body_model.body_model import BodyModel
+from utils.human_pose import build_smpl24_joint_positions, load_body_model
 from utils.rotation_conversions import rotation_6d_to_matrix, matrix_to_axis_angle, matrix_to_rotation_6d
 
 from .base import RNN, RNNWithInit, SubPoser, mamba_kwargs_from_cfg
@@ -140,10 +141,9 @@ class HumanPoseModule(nn.Module):
         if body_model_path is None:
             raise ValueError("body_model_path is not set")
         try:
-            self.body_model = BodyModel(bm_fname=body_model_path, num_betas=16)
-            self.body_model.eval()
-            for param in self.body_model.parameters():
-                param.requires_grad_(False)
+            # load_body_model clamps num_betas to what the file ships, so the
+            # same path works for SMPL-H (16), SMPL-X (16) and plain SMPL (10).
+            self.body_model = load_body_model(body_model_path, num_betas=16)
             self.body_model_device = torch.device("cpu")
         except Exception as exc:
             print(f"加载Body Model失败: {exc}")
@@ -226,7 +226,7 @@ class HumanPoseModule(nn.Module):
                     pose_body=pose_aa[:, 1:22].reshape(BT, 63),
                     root_orient=pose_aa[:, 0].reshape(BT, 3),
                 )
-            joints = body_out.Jtr[:, :24, :]
+            joints = build_smpl24_joint_positions(body_out.Jtr)
             return joints.reshape(batch_size, seq_len, 24, 3)
         except Exception as exc:
             print(f"FK计算失败: {exc}")

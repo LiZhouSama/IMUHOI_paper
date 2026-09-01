@@ -1,4 +1,11 @@
 import argparse
+import os
+import sys
+
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -10,6 +17,7 @@ from tqdm import tqdm
 from human_body_prior.body_model.body_model import BodyModel
 import pytorch3d.transforms as transforms
 from utils.human_pose import (
+    GenderedBodyModelLoader,
     build_smpl24_joint_positions,
     ensure_smpl24_local_rotations,
     local_rotations_to_global,
@@ -134,30 +142,12 @@ def pad_betas(betas: np.ndarray, target_dim: int, target_frames: int) -> np.ndar
     return betas.astype(np.float32)
 
 
-class BodyModelLoader:
+class BodyModelLoader(GenderedBodyModelLoader):
+    """HODome declares ``model='smplh'`` and ships 156-dim poses; the family is
+    still re-confirmed per sequence through :meth:`resolve`."""
+
     def __init__(self, support_dir: str, device: torch.device, num_betas: int = 16) -> None:
-        self._device = device
-        self._num_betas = int(num_betas)
-        self._models: Dict[str, BodyModel] = {}
-        for gender in ("male", "female", "neutral"):
-            model_path = Path(support_dir) / "smplh" / gender / "model.npz"
-            if model_path.exists():
-                self._models[gender] = BodyModel(
-                    bm_fname=str(model_path),
-                    num_betas=self._num_betas,
-                ).to(device).eval()
-        if not self._models:
-            raise FileNotFoundError(f"No SMPL-H body models found under {support_dir}")
-        self._default_gender = "neutral" if "neutral" in self._models else "male"
-
-    @property
-    def num_betas(self) -> int:
-        return self._num_betas
-
-    def get(self, gender: Optional[str]) -> BodyModel:
-        if gender is None:
-            return self._models[self._default_gender]
-        return self._models.get(str(gender).lower(), self._models[self._default_gender])
+        super().__init__(support_dir, device=device, num_betas=num_betas, default_type="smplh")
 
 
 def collect_hodome_pairs(mocap_ground_dir: str) -> List[Tuple[str, Path, Path]]:
@@ -346,7 +336,8 @@ def process_hodome_sequence(
         target_fps=target_fps,
         max_frames=max_frames,
     )
-    bm = bm_loader.get(seq["gender"])
+    # `seq` carries the capture's own `model` field plus the raw pose width.
+    bm, body_model_type = bm_loader.resolve(seq, gender=seq["gender"])
     T = seq["root_orient"].shape[0]
 
     position_global, rotation_local, rotation_global = compute_motion_features(
@@ -436,6 +427,7 @@ def process_hodome_sequence(
         "seq_name": seq_name,
         "dataset": "HODome",
         "gender": seq["gender"],
+        "body_model_type": body_model_type,
         "source_mocap_frame_rate": seq["source_mocap_frame_rate"],
         "mocap_frame_rate": seq["mocap_frame_rate"],
         "source_frame_indices": torch.from_numpy(seq["source_frame_indices"]).long(),

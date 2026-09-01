@@ -105,7 +105,9 @@ def load_smpl_model(smpl_path: str, device: torch.device):
     if not os.path.exists(smpl_path):
         raise FileNotFoundError(f"SMPL model not found at {smpl_path}")
     print(f"Loading SMPL model from: {smpl_path}")
-    smpl_model = BodyModel(bm_fname=smpl_path, num_betas=16)
+    from utils.human_pose import clamp_num_betas
+
+    smpl_model = BodyModel(bm_fname=smpl_path, num_betas=clamp_num_betas(smpl_path, 16))
     return smpl_model.to(device)
 
 

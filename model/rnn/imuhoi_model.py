@@ -199,19 +199,23 @@ class IMUHOIModel(nn.Module):
             self.object_trans_module = MergeHeadsObsObjectTransModule(cfg)
         elif self.object_trans_arch == "current":
             self.object_trans_module = ObjectTransModule(cfg)
+        elif self.object_trans_arch == "v2":
+            from model.rnn.object_trans_v2 import V2ObjectTransModule
+
+            self.object_trans_module = V2ObjectTransModule(cfg)
         else:
             raise ValueError(
-                "object_trans_arch must be 'current', 'legacy', 'imuhoi', "
+                "object_trans_arch must be 'current', 'v2', 'legacy', 'imuhoi', "
                 "'imuhoi_4heads', "
                 "'legacy_mesh', or 'mergeHeads_obs', "
                 f"got {self.object_trans_arch!r}"
             )
         self.lb_prior_predictor = None
         if bool(getattr(cfg, "enable_ot_lb_prior", False)):
-            if self.object_trans_arch == "current":
+            if self.object_trans_arch in {"current", "v2"}:
                 self.lb_prior_predictor = FrozenLBPriorPredictor(cfg)
             elif self.object_trans_arch != "mergeheads_obs":
-                raise ValueError("l_b VQ/Diffusion prior supports object_trans_arch=current only")
+                raise ValueError("l_b VQ/Diffusion prior supports object_trans_arch=current or v2 only")
 
     def _predict_lb_prior(self, hp_out, vc_out, obj_imu):
         predictor = getattr(self, "lb_prior_predictor", None)
@@ -433,6 +437,7 @@ class IMUHOIModel(nn.Module):
         use_object_data: bool = True,
         compute_fk: bool = False,
         refine_human: Optional[bool] = None,
+        feedback_control=None,
     ) -> Dict[str, torch.Tensor]:
         """
         前向传播
@@ -513,6 +518,7 @@ class IMUHOIModel(nn.Module):
                 root_trans_input=hp_out.get("root_trans_pred"),
                 lb_prior_quantiles=lb_prior_quantiles,
                 enable_refine=refine_human,
+                feedback_control=feedback_control,
             )
             results.update(ot_out)
             if refine_human:
@@ -617,6 +623,107 @@ class IMUHOIModel(nn.Module):
             return frame
         return finalizer(frame, self._stage1_history_for_inits(history))
 
+    @staticmethod
+    def _build_feedback_control(
+        data_dict: Dict[str, torch.Tensor],
+        start: int,
+        end: int,
+        mode: str = "normal",
+        perturbation=None,
+        injection_frame: Optional[int] = None,
+        target_frame: Optional[int] = None,
+    ):
+        mode = str(mode or "normal").strip().lower()
+        if mode == "normal":
+            return None
+        if mode not in {"gt_prev", "perturb"}:
+            raise ValueError("feedback_mode must be one of normal, gt_prev, perturb")
+
+        human_imu = data_dict.get("human_imu")
+        if not isinstance(human_imu, torch.Tensor):
+            raise ValueError("feedback diagnostics require tensor human_imu")
+        batch_size = int(human_imu.shape[0])
+        window_len = int(end - start)
+        if window_len < 1:
+            return None
+        device = human_imu.device
+        dtype = human_imu.dtype
+
+        if mode == "gt_prev":
+            obj_trans_gt = data_dict.get("obj_trans_gt")
+            obj_trans_init = data_dict.get("obj_trans_init")
+            if not isinstance(obj_trans_gt, torch.Tensor):
+                raise ValueError("gt_prev feedback requires data_dict['obj_trans_gt']")
+            if not isinstance(obj_trans_init, torch.Tensor):
+                raise ValueError("gt_prev feedback requires data_dict['obj_trans_init']")
+            obj_trans_gt = obj_trans_gt.to(device=device, dtype=dtype)
+            obj_trans_init = obj_trans_init.to(device=device, dtype=dtype)
+            if obj_trans_gt.dim() == 2:
+                obj_trans_gt = obj_trans_gt.unsqueeze(0)
+            if obj_trans_init.dim() == 1:
+                obj_trans_init = obj_trans_init.unsqueeze(0)
+            if (
+                obj_trans_gt.dim() != 3
+                or obj_trans_gt.shape[0] != batch_size
+                or obj_trans_gt.shape[-1] != 3
+                or obj_trans_init.shape != (batch_size, 3)
+            ):
+                raise ValueError("feedback GT object positions must have shape [B,T,3]")
+
+            total_len = int(obj_trans_gt.shape[1])
+            global_indices = torch.arange(
+                int(start), int(end), device=device, dtype=torch.long
+            )
+
+            def _lookup(indices):
+                valid = (indices >= 0) & (indices < total_len)
+                clamped = indices.clamp(0, max(total_len - 1, 0))
+                values = obj_trans_gt.index_select(1, clamped)
+                initial = obj_trans_init.unsqueeze(1).expand(-1, indices.numel(), -1)
+                return torch.where(valid.view(1, -1, 1), values, initial)
+
+            previous = _lookup(global_indices - 1)
+            previous_previous = _lookup(global_indices - 2)
+            return {
+                "mode": "gt_prev",
+                "prev_obj_trans": previous,
+                "prev_prev_obj_trans": previous_previous,
+                "prev_obj_delta": previous - previous_previous,
+            }
+
+        delta = torch.zeros(
+            batch_size, window_len, 3, device=device, dtype=dtype
+        )
+        injection_mask = torch.zeros(
+            batch_size, window_len, device=device, dtype=torch.bool
+        )
+        local_injection = None
+        if injection_frame is not None:
+            injection_frame = int(injection_frame)
+            if target_frame is None:
+                if int(start) == 0 and int(start) <= injection_frame < int(end):
+                    local_injection = injection_frame - int(start)
+            elif int(target_frame) == injection_frame:
+                local_injection = int(target_frame) - int(start)
+        if local_injection is not None and 0 <= local_injection < window_len:
+            value = torch.as_tensor(perturbation, device=device, dtype=dtype)
+            if value.dim() == 1:
+                value = value.unsqueeze(0).expand(batch_size, -1)
+            elif value.dim() == 2 and value.shape[0] == 1 and batch_size > 1:
+                value = value.expand(batch_size, -1)
+            if value.shape != (batch_size, 3):
+                raise ValueError(
+                    f"feedback perturbation must have shape [{batch_size},3], "
+                    f"got {tuple(value.shape)}"
+                )
+            delta[:, local_injection] = value
+            injection_mask[:, local_injection] = True
+        return {
+            "mode": "perturb",
+            "perturbation": delta,
+            "injection_mask": injection_mask,
+        }
+
     def _inference_online_sequence(
         self,
         data_dict: Dict[str, torch.Tensor],
@@ -626,6 +733,9 @@ class IMUHOIModel(nn.Module):
         online_window: int = 120,
         online_lookahead: int = 5,
         progress_callback=None,
+        feedback_mode: str = "normal",
+        feedback_perturbation=None,
+        feedback_injection_frame: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         refine_human = self._resolve_refine_human(refine_human)
         batch_size, seq_len = infer_batch_seq(data_dict)
@@ -633,11 +743,20 @@ class IMUHOIModel(nn.Module):
         lookahead = int(online_lookahead)
         publish_len = max(seq_len - lookahead, 0)
         if publish_len == 0:
+            feedback_control = self._build_feedback_control(
+                data_dict,
+                0,
+                seq_len,
+                mode=feedback_mode,
+                perturbation=feedback_perturbation,
+                injection_frame=feedback_injection_frame,
+            )
             template = self.forward(
                 data_dict,
                 use_object_data=use_object_data,
                 compute_fk=compute_fk,
                 refine_human=refine_human,
+                feedback_control=feedback_control,
             )
             return slice_time_dict(template, 0, 0, batch_size, seq_len)
 
@@ -649,11 +768,20 @@ class IMUHOIModel(nn.Module):
         warmup_data = slice_time_dict(
             data_dict, 0, warmup_input_len, batch_size, seq_len
         )
+        warmup_feedback = self._build_feedback_control(
+            data_dict,
+            0,
+            warmup_input_len,
+            mode=feedback_mode,
+            perturbation=feedback_perturbation,
+            injection_frame=feedback_injection_frame,
+        )
         warmup_raw = self.forward(
             warmup_data,
             use_object_data=use_object_data,
             compute_fk=compute_fk,
             refine_human=refine_human,
+            feedback_control=warmup_feedback,
         )
         history = slice_time_dict(
             warmup_raw,
@@ -681,6 +809,15 @@ class IMUHOIModel(nn.Module):
             window_len = end - start
             target_local = target - start
             prefix = select_time_context(history, start, target)
+            feedback_control = self._build_feedback_control(
+                data_dict,
+                start,
+                end,
+                mode=feedback_mode,
+                perturbation=feedback_perturbation,
+                injection_frame=feedback_injection_frame,
+                target_frame=target,
+            )
 
             hp_out_raw = self.human_pose_module.forward(self._build_hp_input_dict(window_data))
             hp_frame = slice_time_dict(
@@ -746,6 +883,7 @@ class IMUHOIModel(nn.Module):
                     enable_refine=refine_human,
                     known_obj_trans_prefix=obj_prefix,
                     known_gating_weights_prefix=gate_prefix,
+                    feedback_control=feedback_control,
                 )
                 results.update(ot_out)
                 if refine_human:
@@ -777,6 +915,9 @@ class IMUHOIModel(nn.Module):
         online_progress_callback=None,
         online_state: Optional[dict] = None,
         return_online_state: bool = False,
+        feedback_mode: str = "normal",
+        feedback_perturbation=None,
+        feedback_injection_frame: Optional[int] = None,
         **_,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -789,11 +930,21 @@ class IMUHOIModel(nn.Module):
         _ = gt_targets, interaction_use_human_pred
         mode = normalize_inference_mode(inference_mode)
         if mode == "offline":
+            seq_len = int(data_dict["human_imu"].shape[1])
+            feedback_control = self._build_feedback_control(
+                data_dict,
+                0,
+                seq_len,
+                mode=feedback_mode,
+                perturbation=feedback_perturbation,
+                injection_frame=feedback_injection_frame,
+            )
             output = self.forward(
                 data_dict,
                 use_object_data=use_object_data,
                 compute_fk=compute_fk,
                 refine_human=refine_human,
+                feedback_control=feedback_control,
             )
             if return_online_state:
                 return output, online_state or {}
@@ -816,6 +967,9 @@ class IMUHOIModel(nn.Module):
             online_window=window,
             online_lookahead=lookahead,
             progress_callback=online_progress_callback,
+            feedback_mode=feedback_mode,
+            feedback_perturbation=feedback_perturbation,
+            feedback_injection_frame=feedback_injection_frame,
         )
         _, output_len = infer_batch_seq(output, key="p_pred")
         state = {"data_dict": run_data, "outputs": output, "emitted_len": output_len}

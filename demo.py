@@ -25,6 +25,7 @@ from aitviewer.renderables.meshes import Meshes
 from aitviewer.renderables.spheres import Spheres
 
 from human_body_prior.body_model.body_model import BodyModel
+from utils.human_pose import clamp_num_betas
 from model import IMUHOIModel, load_model
 from configs import _REDUCED_POSE_NAMES, _SENSOR_ROT_INDICES
 
@@ -155,7 +156,7 @@ def build_model(cfg: edict, args: argparse.Namespace, device: torch.device) -> I
 def load_body_model(path: str, device: torch.device) -> BodyModel:
     if not os.path.isfile(path):
         raise FileNotFoundError(f"SMPL-H model not found at {path}")
-    smpl = BodyModel(bm_fname=path, num_betas=16).to(device)
+    smpl = BodyModel(bm_fname=path, num_betas=clamp_num_betas(path, 16)).to(device)
     smpl.eval()
     return smpl
 

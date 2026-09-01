@@ -86,6 +86,14 @@ def ObjectTransModule(cfg, *args, **kwargs):
         raise RuntimeError("ObjectTransModule is not implemented for model_arch='mamba' yet.")
     if arch == "mamba_simple":
         return _arch_module(arch).ObjectTransModule(cfg, *args, **kwargs)
+    if arch == "rnn":
+        object_trans_arch = kwargs.pop("object_trans_arch", None)
+        return _arch_module(arch).build_object_trans_module(
+            cfg,
+            *args,
+            object_trans_arch=object_trans_arch,
+            **kwargs,
+        )
     return _arch_module(arch).ObjectTransModule(cfg, *args, **kwargs)
 
 
@@ -104,6 +112,7 @@ def load_model(
     no_trans: bool = False,
     module_paths: Optional[dict] = None,
     velocity_contact_arch: Optional[str] = None,
+    object_trans_arch: Optional[str] = None,
 ):
     arch = _resolve_arch(config)
     if arch == "rnn":
@@ -113,6 +122,7 @@ def load_model(
             no_trans=no_trans,
             module_paths=module_paths,
             velocity_contact_arch=velocity_contact_arch,
+            object_trans_arch=object_trans_arch,
         )
     return _arch_module(arch).load_model(config, device, no_trans=no_trans, module_paths=module_paths)
 
