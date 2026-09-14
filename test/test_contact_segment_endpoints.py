@@ -4,6 +4,7 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -375,6 +376,57 @@ def test_velocity_contact_inference_passes_frame_zero_contact_to_decoder(monkeyp
         out["pred_hand_contact_prob"][0, :, 2],
         torch.full((8,), 0.8),
     )
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("validity", ["all", "mixed", "none"])
+@pytest.mark.parametrize("object_mask", ["absent", "mixed", "none"])
+def test_soft_order_penalty_matches_indexed_loss_and_gradients(
+    device, dtype, validity, object_mask
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    probabilities = torch.rand(
+        200, 60, 6, generator=torch.Generator().manual_seed(42)
+    )
+    if validity == "mixed":
+        probabilities[::3, :, 0] = 0.0
+        probabilities[1::3, :, 1] = 1e-6
+    elif validity == "none":
+        probabilities[:, :, 0] = 0.0
+    probabilities = probabilities.to(device=device, dtype=dtype).requires_grad_()
+    start_prob = probabilities[..., 0]
+    end_prob = probabilities[..., 1]
+    mask = None
+    if object_mask != "absent":
+        mask = torch.zeros(200, device=device)
+        if object_mask == "mixed":
+            mask[::2] = 0.5
+            mask[1::4] = 1.0
+
+    zero = probabilities.new_tensor(0.0)
+    actual = VelocityContactLoss._soft_order_penalty(start_prob, end_prob, mask, zero)
+    start_mass = start_prob.sum(dim=1)
+    end_mass = end_prob.sum(dim=1)
+    valid = (start_mass > 1e-3) & (end_mass > 1e-3)
+    expected = probabilities.sum() * 0.0
+    if valid.any():
+        frames = torch.arange(60, device=device, dtype=dtype).view(1, 60)
+        start_time = (start_prob[valid] * frames).sum(dim=1) / start_mass[valid]
+        end_time = (end_prob[valid] * frames).sum(dim=1) / end_mass[valid]
+        per_sample = torch.relu(start_time - end_time)
+        if mask is None:
+            expected = per_sample.mean()
+        elif mask[valid].sum() > 0:
+            expected = (per_sample * mask[valid]).sum() / mask[valid].sum()
+
+    tolerance = 0.02 if dtype == torch.bfloat16 else 1e-6
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance, check_dtype=False)
+    actual_gradient = torch.autograd.grad(actual, probabilities, retain_graph=True)[0]
+    expected_gradient = torch.autograd.grad(expected, probabilities)[0]
+    assert torch.isfinite(actual_gradient).all()
+    torch.testing.assert_close(actual_gradient, expected_gradient, rtol=tolerance, atol=tolerance)
 
 
 def test_velocity_contact_loss_includes_endpoint_terms():

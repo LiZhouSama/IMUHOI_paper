@@ -316,7 +316,7 @@ def main() -> int:
                     str(PROJECT_ROOT / "eval_batch_online.py"),
                     "--config", str(variant_cfg),
                     "--dataset", dataset,
-                    "--smpl_model_path", "datasets/smpl_models/smplx/SMPLX_MALE.npz",
+                    "--smpl_model_path", "datasets/smpl_models/smplx/SMPLX_NEUTRAL.npz",
                     "--hp_ckpt", str(HP_CKPT),
                     "--vc_ckpt", str(vc_ckpt),
                     "--ot_ckpt", str(ot_ckpt),

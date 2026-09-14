@@ -18,7 +18,14 @@ from tqdm import tqdm
 
 from human_body_prior.body_model.body_model import BodyModel
 from human_body_prior.tools.rotation_tools import local2global_pose
-from utils.human_pose import GenderedBodyModelLoader
+from utils.human_pose import (
+    CANONICAL_BODY_MODEL_GENDER,
+    GenderedBodyModelLoader,
+    append_virtual_palm_joints,
+    append_virtual_palm_rotations,
+    canonical_skeleton_metadata,
+    normalize_body_model_type,
+)
 import pytorch3d.transforms as transforms
 
 try:
@@ -27,6 +34,7 @@ try:
         compute_foot_contact_labels,
         compute_improved_contact_labels,
         load_canonical_points_from_mesh_path,
+        precompute_sequence_features,
     )
 except ModuleNotFoundError:
     from process.preprocess import (
@@ -34,6 +42,7 @@ except ModuleNotFoundError:
         compute_foot_contact_labels,
         compute_improved_contact_labels,
         load_canonical_points_from_mesh_path,
+        precompute_sequence_features,
     )
 
 
@@ -100,33 +109,34 @@ def reshape_body_pose(value, expected_frames: int) -> np.ndarray:
     return body_pose[:expected_frames].astype(np.float32)
 
 
-def pad_betas(betas: np.ndarray, target_dim: int, target_frames: int) -> np.ndarray:
-    betas = np.asarray(betas, dtype=np.float32)
-    if betas.ndim == 1:
-        betas = betas[None, :]
-    betas = betas.reshape(betas.shape[0], -1)
-
-    if betas.shape[0] == 1 and target_frames > 1:
-        betas = np.repeat(betas, target_frames, axis=0)
-    elif betas.shape[0] < target_frames:
-        betas = np.pad(betas, ((0, target_frames - betas.shape[0]), (0, 0)), mode="edge")
-    elif betas.shape[0] > target_frames:
-        betas = betas[:target_frames]
-
-    if betas.shape[1] < target_dim:
-        pad = np.zeros((betas.shape[0], target_dim - betas.shape[1]), dtype=np.float32)
-        betas = np.concatenate([betas, pad], axis=1)
-    elif betas.shape[1] > target_dim:
-        betas = betas[:, :target_dim]
-    return betas.astype(np.float32)
-
-
 class BodyModelLoader(GenderedBodyModelLoader):
-    """InterCap ships SMPL-X fits; the family is still re-confirmed per sequence
-    through :meth:`resolve`."""
+    """Load only the neutral, zero-shape SMPL-X canonical body model."""
 
     def __init__(self, support_dir: str, device: torch.device, num_betas: int = 16) -> None:
         super().__init__(support_dir, device=device, num_betas=num_betas, default_type="smplx")
+
+    @staticmethod
+    def _require_smplx(model_type: Optional[str]) -> str:
+        resolved = normalize_body_model_type(model_type) if model_type is not None else "smplx"
+        if resolved != "smplx":
+            raise ValueError(f"InterCap canonical preprocessing requires SMPL-X, got {model_type!r}")
+        return resolved
+
+    def get(self, gender=None, model_type=None):
+        """Ignore source gender and return the unique neutral SMPL-X instance."""
+        self._require_smplx(model_type)
+        return self.registry.get_canonical("smplx")
+
+    def resolve(self, seq_data=None, gender=None, model_type=None):
+        """Validate the source family while fixing the canonical model to neutral SMPL-X."""
+        if model_type is None and seq_data is not None:
+            model_type = self.registry.infer_type(
+                seq_data,
+                gender=CANONICAL_BODY_MODEL_GENDER,
+            )
+        resolved = self._require_smplx(model_type)
+        self._model_type = resolved
+        return self.get(model_type=resolved), resolved
 
 
 def collect_intercap_segments(dataset_root: str) -> List[Path]:
@@ -178,6 +188,9 @@ def load_intercap_sequence(
     gender: str,
     max_frames: Optional[int],
 ) -> Dict[str, object]:
+    # Retain the legacy arguments for caller compatibility, but source gender and
+    # shape coefficients are not part of the canonical training representation.
+    del num_betas, gender
     with open(segment_dir / "res_2.pkl", "rb") as handle:
         data = pickle.load(handle)
 
@@ -187,38 +200,44 @@ def load_intercap_sequence(
     obj_pose = as_frame_array(data["ob_pose"], "ob_pose", 3)
     obj_origin_trans = as_frame_array(data["ob_trans"], "ob_trans", 3)
 
-    raw_T = min(root_orient.shape[0], pose_body.shape[0], trans.shape[0], obj_pose.shape[0], obj_origin_trans.shape[0])
+    raw_T = min(
+        root_orient.shape[0],
+        pose_body.shape[0],
+        trans.shape[0],
+        obj_pose.shape[0],
+        obj_origin_trans.shape[0],
+    )
     source_frame_indices = build_downsample_indices(raw_T, int(source_fps), int(target_fps))
     if max_frames is not None:
         source_frame_indices = source_frame_indices[: int(max_frames)]
     if source_frame_indices.shape[0] <= 0:
         raise ValueError(f"{segment_dir} has no frames after downsampling")
 
-    betas = pad_betas(np.asarray(data["betas"], dtype=np.float32), num_betas, raw_T)
-    mesh_path, canonical_mesh_frame_index = choose_canonical_mesh(segment_dir / "Mesh", source_frame_indices)
+    mesh_path, canonical_mesh_frame_index = choose_canonical_mesh(
+        segment_dir / "Mesh",
+        source_frame_indices,
+    )
 
     return {
         "root_orient": root_orient[source_frame_indices].astype(np.float32),
         "pose_body": pose_body[source_frame_indices].astype(np.float32),
         "trans": trans[source_frame_indices].astype(np.float32),
-        "betas": betas[source_frame_indices].astype(np.float32),
         "obj_pose": obj_pose[source_frame_indices].astype(np.float32),
         "obj_origin_trans": obj_origin_trans[source_frame_indices].astype(np.float32),
         "source_frame_indices": source_frame_indices.astype(np.int64),
         "source_mocap_frame_rate": int(source_fps),
         "mocap_frame_rate": int(target_fps),
-        "gender": str(gender).lower(),
+        "gender": CANONICAL_BODY_MODEL_GENDER,
+        "surface_model_type": "smplx",
         "canonical_mesh_path": mesh_path,
         "canonical_mesh_frame_index": int(canonical_mesh_frame_index),
     }
-
 
 def compute_motion_features(
     bm: BodyModel,
     root_orient: np.ndarray,
     pose_body: np.ndarray,
     trans: np.ndarray,
-    betas: np.ndarray,
     device: torch.device,
     chunk_len: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -234,7 +253,12 @@ def compute_motion_features(
             root_t = torch.tensor(root_orient[start:end], dtype=torch.float32, device=device)
             body_t = torch.tensor(pose_body[start:end], dtype=torch.float32, device=device)
             trans_t = torch.tensor(trans[start:end], dtype=torch.float32, device=device)
-            betas_t = torch.tensor(betas[start:end], dtype=torch.float32, device=device)
+            betas_t = torch.zeros(
+                end - start,
+                int(bm.num_betas),
+                dtype=torch.float32,
+                device=device,
+            )
 
             body_out = bm(
                 root_orient=root_t,
@@ -275,6 +299,12 @@ def apply_y_up_flip(seq: Dict[str, object], bm: BodyModel, device: torch.device)
         "root_orient": torch.zeros_like(torch.from_numpy(root_orient.reshape(-1, 3)).to(device).float()),
         "pose_body": torch.zeros_like(torch.from_numpy(pose_body.reshape(-1, 63)).to(device).float()),
         "trans": torch.zeros_like(torch.from_numpy(trans.reshape(-1, 3)).to(device).float()),
+        "betas": torch.zeros(
+            root_orient.shape[0],
+            int(bm.num_betas),
+            dtype=torch.float32,
+            device=device,
+        ),
     }
     with torch.no_grad():
         jtr_0 = np.asarray(bm(**smpl_init_input).Jtr[:, 0, :].cpu(), dtype=np.float32)
@@ -309,10 +339,10 @@ def estimate_body_mesh_y_bridge(
     y_up_flip: bool,
     sample_count: int,
 ) -> Tuple[float, int, float, float]:
-    """Estimate the raw InterCap body-mesh to generated SMPL-H y-offset.
+    """Estimate the raw InterCap body-mesh to generated neutral SMPL-X y-offset.
 
     InterCap object poses are in the same coordinate frame as Mesh/*_second.ply,
-    while this preprocessor regenerates the human body with SMPL-H.  The two
+    while this preprocessor regenerates the human body with neutral SMPL-X.  The two
     body surfaces have a stable vertical offset, so bridge the object frame to
     the generated-human frame without using object-ground assumptions.
     """
@@ -383,7 +413,7 @@ def process_intercap_sequence(
         max_frames=max_frames,
     )
     # InterCap fits are SMPL-X (jaw/eye/expression params in res_2.pkl).
-    bm, body_model_type = bm_loader.resolve(seq, gender=seq["gender"])
+    bm, body_model_type = bm_loader.resolve(seq)
     if y_up_flip:
         apply_y_up_flip(seq, bm, device)
     T = int(seq["root_orient"].shape[0])
@@ -393,7 +423,6 @@ def process_intercap_sequence(
         root_orient=seq["root_orient"],
         pose_body=seq["pose_body"],
         trans=seq["trans"],
-        betas=seq["betas"],
         device=device,
         chunk_len=max(1, int(chunk_len)),
     )
@@ -409,13 +438,13 @@ def process_intercap_sequence(
     body_mesh_y_bridge_offset = 0.0
     body_mesh_y_bridge_samples = 0
     raw_body_mesh_floor_y = float("nan")
-    smplh_foot_floor_y = float("nan")
+    canonical_foot_floor_y = float("nan")
     if body_mesh_y_bridge:
         (
             body_mesh_y_bridge_offset,
             body_mesh_y_bridge_samples,
             raw_body_mesh_floor_y,
-            smplh_foot_floor_y,
+            canonical_foot_floor_y,
         ) = estimate_body_mesh_y_bridge(
             segment_dir=segment_dir,
             source_frame_indices=seq["source_frame_indices"],
@@ -435,7 +464,15 @@ def process_intercap_sequence(
         obj_origin_trans[:, 1] -= foot_floor_y
         obj_trans[:, 1] -= foot_floor_y
 
-    lfoot_contact, rfoot_contact = compute_foot_contact_labels(position_global.to(device))
+    # InterCap stores the historical 22-body-joint tensors. For sensor and HOI
+    # features, append deterministic virtual palms derived from the same neutral
+    # canonical joints; no subject shape information is reintroduced.
+    canonical_feature_positions = append_virtual_palm_joints(position_global)
+    canonical_feature_rotations = append_virtual_palm_rotations(rotation_global)
+
+    lfoot_contact, rfoot_contact = compute_foot_contact_labels(
+        canonical_feature_positions.to(device)
+    )
 
     obj_rot_t = torch.tensor(obj_rot, dtype=torch.float32, device=device)
     obj_trans_t = torch.tensor(obj_trans, dtype=torch.float32, device=device)
@@ -444,7 +481,7 @@ def process_intercap_sequence(
         obj_trans_t,
         obj_rot_t,
         obj_scale_t,
-        position_global.to(device),
+        canonical_feature_positions.to(device),
         str(mesh_path.parent),
         str(mesh_path),
         device,
@@ -463,20 +500,19 @@ def process_intercap_sequence(
         "subject_id": subject_id,
         "object_id": object_id,
         "segment_id": segment_id,
-        "gender": seq["gender"],
-        "body_model_type": body_model_type,
+        "surface_model_type": "smplx",
+        **canonical_skeleton_metadata(body_model_type),
         "source_mocap_frame_rate": seq["source_mocap_frame_rate"],
         "mocap_frame_rate": seq["mocap_frame_rate"],
         "source_frame_indices": torch.from_numpy(seq["source_frame_indices"]).long(),
         "rotation_local_full_gt_list": rotation_local.float(),
-        "position_global_full_gt_world": position_global.float(),
-        "rotation_global": rotation_global.float(),
+        "position_global_full_gt_world": canonical_feature_positions.float(),
+        "rotation_global": canonical_feature_rotations.float(),
         "trans": torch.from_numpy(trans).float(),
         "human_imu_real": None,
         "obj_imu_real": None,
         "lfoot_contact": lfoot_contact.cpu().float(),
         "rfoot_contact": rfoot_contact.cpu().float(),
-        "betas": torch.from_numpy(seq["betas"]).float(),
         "obj_name": mesh_rel,
         "obj_mesh_name": mesh_path.stem,
         "obj_mesh_path": mesh_rel,
@@ -486,7 +522,7 @@ def process_intercap_sequence(
         "body_mesh_y_bridge_offset": float(body_mesh_y_bridge_offset),
         "body_mesh_y_bridge_samples": int(body_mesh_y_bridge_samples),
         "raw_body_mesh_floor_y": float(raw_body_mesh_floor_y),
-        "smplh_foot_floor_y": float(smplh_foot_floor_y),
+        "canonical_foot_floor_y": float(canonical_foot_floor_y),
         "obj_points_canonical": canonical_points.half().cpu(),
         "obj_points_sample_count": int(canonical_points.shape[0]),
         "has_object": True,
@@ -505,6 +541,19 @@ def process_intercap_sequence(
             mesh_rel,
         ],
     }
+    output.update(
+        precompute_sequence_features(
+            canonical_feature_positions,
+            canonical_feature_rotations,
+            torch.from_numpy(trans).float(),
+            obj_trans=obj_trans_t,
+            obj_rot=obj_rot_t,
+            lhand_contact=lhand_contact,
+            rhand_contact=rhand_contact,
+            obj_contact=obj_contact,
+            has_object=True,
+        )
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(output, out_path)
@@ -524,7 +573,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_betas", type=int, default=16)
     parser.add_argument("--source_fps", type=int, default=30)
     parser.add_argument("--target_fps", type=int, default=30)
-    parser.add_argument("--gender", type=str, default="neutral")
+    parser.add_argument(
+        "--gender",
+        type=str,
+        default="neutral",
+        help="Deprecated compatibility option; canonical output is always neutral",
+    )
     parser.add_argument("--subjects", nargs="*", default=None)
     parser.add_argument("--object_ids", nargs="*", default=None)
     parser.add_argument("--max_sequences", type=int, default=None)
@@ -532,7 +586,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--no_floor_align", action="store_true")
     parser.add_argument("--no_y_up_flip", action="store_true", help="Disable InterCap Y-up flip")
-    parser.add_argument("--no_body_mesh_y_bridge", action="store_true", help="Disable InterCap raw body mesh to SMPL-H y bridge")
+    parser.add_argument("--no_body_mesh_y_bridge", action="store_true", help="Disable InterCap raw body mesh to canonical SMPL-X y bridge")
     parser.add_argument("--body_bridge_sample_count", type=int, default=16, help="Frames sampled to estimate the InterCap y bridge")
     return parser.parse_args()
 

@@ -608,7 +608,7 @@ def main() -> int:
                 sort_desc=True,
                 eval_imu_noise=False,
                 eval_imu_noise_seed=None,
-                **spec,
+                feedback_kwargs=spec,
             )
             records, trajectories = collect_mode_records(pred_cache, sample_cache)
             mode_records[mode] = records

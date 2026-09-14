@@ -567,6 +567,7 @@ def build_model_input_dict(batch, cfg, device, add_noise=True):
         'obj_name': batch.get('obj_name'),
         'obj_points_canonical': obj_points_canonical,
         'seq_file': batch.get('seq_file'),
+        'body_model_type': batch.get('body_model_type'),
         'window_start': batch.get('window_start'),
         'window_end': batch.get('window_end'),
     }

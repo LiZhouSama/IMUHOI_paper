@@ -23,6 +23,7 @@ except Exception:
     SummaryWriter = None
 
 from dataset.dataset_IMUHOI import IMUDataset
+from utils.dataset_config import configure_canonical_body_model_for_datasets
 from utils.utils import (
     build_model_input_dict,
     flatten_lstm_parameters,
@@ -114,6 +115,7 @@ def create_dataloaders(cfg, project_root=None):
     train_datasets = getattr(cfg, "train_datasets", None)
     if train_datasets is None:
         train_datasets = list(cfg.datasets.keys())
+    configure_canonical_body_model_for_datasets(cfg, train_datasets)
 
     train_paths = []
     test_paths = []
@@ -165,6 +167,7 @@ def create_dataloaders(cfg, project_root=None):
         full_sequence=bool(train_full_sequence),
         obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
         resolve_bimanual_contact_conflicts=resolve_bimanual_contact_conflicts,
+        require_canonical_skeleton=bool(getattr(cfg, "require_canonical_skeleton", False)),
     )
 
     train_loader = DataLoader(
@@ -188,6 +191,7 @@ def create_dataloaders(cfg, project_root=None):
             full_sequence=bool(test_full_sequence),
             obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
             resolve_bimanual_contact_conflicts=resolve_bimanual_contact_conflicts,
+            require_canonical_skeleton=bool(getattr(cfg, "require_canonical_skeleton", False)),
         )
         if len(test_dataset) > 0:
             test_loader = DataLoader(

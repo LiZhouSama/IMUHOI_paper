@@ -13,6 +13,7 @@ import os
 import sys
 
 import numpy as np
+import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -32,6 +33,7 @@ from utils.human_pose import (  # noqa: E402
     normalize_gender,
     resolve_body_model_path,
 )
+from utils.dataset_config import resolve_evaluation_body_model_path  # noqa: E402
 
 SUPPORT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "datasets", "smpl_models"
@@ -175,3 +177,39 @@ def test_clamp_num_betas_respects_the_file():
     assert clamp_num_betas(smplh, 64) == 16
     # a path that cannot be read must not raise, so callers keep working
     assert clamp_num_betas("does_not_exist.npz", 16) == 16
+
+
+def test_evaluation_body_model_resolves_from_dataset_or_samples():
+    config = {
+        "body_model_path": "fallback.npz",
+        "body_model_paths": {
+            "smplh": "smplh.npz",
+            "smplx": "smplx.npz",
+        },
+    }
+    assert resolve_evaluation_body_model_path(
+        config,
+        {},
+        [{"body_model_type": "smplx"}],
+    ) == ("smplx.npz", "smplx", "sample.body_model_type")
+    assert resolve_evaluation_body_model_path(
+        config,
+        {"body_model_type": "smplh"},
+        [{"body_model_type": "smplh"}],
+    ) == ("smplh.npz", "smplh", "dataset.body_model_type")
+    assert resolve_evaluation_body_model_path(
+        config,
+        {},
+        [{"body_model_type": "smplx"}],
+        explicit_path="override.npz",
+    ) == ("override.npz", None, "cli")
+
+    with pytest.raises(ValueError, match="cannot mix body-model families"):
+        resolve_evaluation_body_model_path(
+            config,
+            {},
+            [
+                {"body_model_type": "smplx"},
+                {"body_model_type": "smplh"},
+            ],
+        )

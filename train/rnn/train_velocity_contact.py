@@ -200,10 +200,13 @@ def build_velocity_contact_optimizer_and_scheduler(model, cfg):
         })
         active_names.append(group_name)
 
+    # foreach: same update, multi-tensor kernels.  See create_optimizer in
+    # train/rnn/train_utils.py for the measurement.
     optimizer = torch.optim.AdamW(
         parameter_groups,
         lr=base_lr,
         weight_decay=weight_decay,
+        foreach=True,
     )
     gamma = float(getattr(cfg, "vc_group_lr_gamma", getattr(cfg, "gamma", 0.2)))
     endpoint_stage = _vc_endpoint_finetune_stage(target)

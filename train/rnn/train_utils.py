@@ -2,6 +2,7 @@
 训练专用工具函数
 """
 from __future__ import annotations
+from contextlib import nullcontext
 import os
 import argparse
 import random
@@ -12,7 +13,7 @@ from easydict import EasyDict as edict
 from datetime import datetime
 import torch
 from torch import optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, RandomSampler
 try:
     from torch.utils.tensorboard.writer import SummaryWriter
 except Exception:
@@ -24,6 +25,8 @@ try:  # torch>=2.3 unified AMP namespace; torch.cuda.amp.* is deprecated.
         return _AmpGradScaler("cuda", enabled=enabled)
 
     def autocast(enabled: bool, dtype: torch.dtype):
+        if not enabled and not torch.cuda.is_available():
+            return nullcontext()
         return _AmpAutocast("cuda", enabled=enabled, dtype=dtype)
 except ImportError:
     from torch.cuda.amp.grad_scaler import GradScaler as _AmpGradScaler
@@ -33,10 +36,13 @@ except ImportError:
         return _AmpGradScaler(enabled=enabled)
 
     def autocast(enabled: bool, dtype: torch.dtype):
+        if not enabled and not torch.cuda.is_available():
+            return nullcontext()
         return _AmpAutocast(enabled=enabled, dtype=dtype)
 from tqdm import tqdm
 
 # 从 utils 导入共用函数
+from utils.dataset_config import configure_canonical_body_model_for_datasets
 from utils.utils import (
     setup_seed,
     setup_device,
@@ -276,6 +282,7 @@ def create_dataloaders(cfg, project_root=None):
     train_datasets = getattr(cfg, 'train_datasets', None)
     if train_datasets is None:
         train_datasets = list(cfg.datasets.keys())
+    configure_canonical_body_model_for_datasets(cfg, train_datasets)
     
     train_paths = []
     test_paths = []
@@ -318,6 +325,7 @@ def create_dataloaders(cfg, project_root=None):
         simulate_imu_noise=bool(getattr(cfg, 'simulate_imu_noise', False)),
         simulate_imu_noise_seed=int(getattr(cfg, 'simulate_imu_noise_seed', 42)),
         resolve_bimanual_contact_conflicts=resolve_bimanual_contact_conflicts,
+        require_canonical_skeleton=bool(getattr(cfg, "require_canonical_skeleton", False)),
         random_window=True,
     )
     
@@ -332,17 +340,51 @@ def create_dataloaders(cfg, project_root=None):
         not in {"0", "false", "no", "off"}
     )
 
+    # Pinned staging buffers let the H2D copy overlap compute and measured
+    # +25%/+9%/+17% epoch throughput at batch 200/400/800 on this box.  They
+    # are page-locked, so the process needs RLIMIT_MEMLOCK above the batch
+    # payload (27.8 MiB per 200 windows here, and the loader keeps a few in
+    # flight).  WSL's /init shim caps that at 64 MiB unless it is raised, and
+    # exceeding it segfaults the pin thread rather than failing cleanly -- hence
+    # the switch, so a machine without the raised limit can turn it off.
+    pin_memory = bool(getattr(cfg, "dataloader_pin_memory", True))
+
+    # IMUDataset.__len__ is the sequence count and __getitem__ draws one random
+    # window from that sequence, so an epoch shows each sequence exactly once.
+    # The corpus actually holds 572k distinct 60-frame windows (122 per sequence
+    # on average), and at one draw per sequence a 300-epoch run only visits each
+    # of them ~2.5 times.  Drawing k windows per sequence raises the coverage
+    # without touching the step count: pair k with a k-times larger batch and the
+    # schedule, learning rate and epoch budget all stay valid while every step
+    # averages over k times as many windows.
+    windows_per_sequence = max(1, int(getattr(cfg, "windows_per_sequence", 1)))
+    train_sampler = None
+    if windows_per_sequence > 1:
+        train_sampler = RandomSampler(
+            train_dataset,
+            replacement=True,
+            num_samples=windows_per_sequence * len(train_dataset),
+        )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg.batch_size,
-        shuffle=True,
+        # sampler and shuffle are mutually exclusive; RandomSampler already
+        # randomises, so shuffle only applies when no sampler is used.
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=cfg.num_workers,
-        pin_memory=False,
+        pin_memory=pin_memory,
         drop_last=True,
         persistent_workers=persistent_workers,
     )
     
     print(f"训练数据集大小: {len(train_dataset)}")
+    if train_sampler is not None:
+        print(
+            f"每序列采样窗口数: {windows_per_sequence}"
+            f"（每epoch {len(train_sampler)} 个窗口, {len(train_loader)} 步）"
+        )
     
     test_loader = None
     if test_paths:
@@ -355,6 +397,7 @@ def create_dataloaders(cfg, project_root=None):
             simulate_imu_noise=bool(getattr(cfg, 'simulate_imu_noise', False)),
             simulate_imu_noise_seed=int(getattr(cfg, 'simulate_imu_noise_seed', 42)),
             resolve_bimanual_contact_conflicts=resolve_bimanual_contact_conflicts,
+            require_canonical_skeleton=bool(getattr(cfg, "require_canonical_skeleton", False)),
             random_window=not bool(getattr(cfg, "deterministic_test_windows", False)),
         )
         if len(test_dataset) > 0:
@@ -363,7 +406,7 @@ def create_dataloaders(cfg, project_root=None):
                 batch_size=cfg.batch_size,
                 shuffle=False,
                 num_workers=cfg.num_workers,
-                pin_memory=False,
+                pin_memory=pin_memory,
                 drop_last=False,
                 persistent_workers=persistent_workers,
             )
@@ -406,7 +449,13 @@ def build_optimizer_and_scheduler(model, cfg):
         lr = lr * len(cfg.gpus)
         print(f"多GPU训练，学习率调整为: {lr}")
     
-    optimizer = optim.AdamW(trainable_params, lr=lr, weight_decay=cfg.weight_decay)
+    # foreach batches the per-parameter elementwise ops into multi-tensor
+    # kernels.  It is numerically the same update, but this model is a pile of
+    # small tensors, so the step drops from 11.5 ms to 1.0 ms (~10% of a
+    # training step at batch 200).  Newer PyTorch defaults it on; 1.13 does not.
+    optimizer = optim.AdamW(
+        trainable_params, lr=lr, weight_decay=cfg.weight_decay, foreach=True
+    )
     scheduler = optim.lr_scheduler.MultiStepLR(
         optimizer, 
         milestones=cfg.milestones, 
@@ -565,6 +614,23 @@ def resolve_resume_checkpoint(resume_dir):
         if os.path.isfile(path):
             return path
     raise FileNotFoundError(f"resume_dir contains no last.pt, final.pt, or best.pt: {resume_dir}")
+
+
+def should_stop_early(epoch, last_improvement_epoch, patience_epochs, min_epochs, has_test_loader=True):
+    """Early-stopping rule shared by every RNN training stage.
+
+    Stop when the model-selection score on the test split has not improved for
+    ``patience_epochs`` epochs, never before ``min_epochs``.  ``patience_epochs``
+    <= 0 disables it.  Callers must size ``min_epochs`` past the first lr
+    milestone: with MultiStepLR the score usually drops again right after a
+    decay, so a patience window that closes before the first decay would stop a
+    run that was about to improve.
+    """
+    if not has_test_loader or patience_epochs <= 0:
+        return False
+    if epoch < min_epochs:
+        return False
+    return (epoch - last_improvement_epoch) >= patience_epochs
 
 
 class BaseTrainer:
@@ -801,6 +867,10 @@ class BaseTrainer:
                 self.writer.close()
             return self.model
         
+        patience_epochs = int(getattr(self.cfg, "early_stopping_patience_epochs", 0) or 0)
+        min_epochs = int(getattr(self.cfg, "early_stopping_min_epochs", 0) or 0)
+        last_improvement_epoch = self.start_epoch
+        stopped_early_at = None
         for epoch in range(self.start_epoch, max_epoch):
             train_loss, train_components = self.train_epoch(epoch)
             
@@ -815,6 +885,7 @@ class BaseTrainer:
                     
                     if test_loss < self.best_loss:
                         self.best_loss = test_loss
+                        last_improvement_epoch = epoch
                         save_path = os.path.join(self.cfg.save_dir, 'best.pt')
                         save_checkpoint(
                             self.model, self.optimizer, epoch, save_path, test_loss,
@@ -851,18 +922,26 @@ class BaseTrainer:
                 scheduler=self.scheduler,
                 scaler=self.scaler,
             )
-        
+            if should_stop_early(epoch, last_improvement_epoch, patience_epochs, min_epochs, self.test_loader is not None):
+                stopped_early_at = epoch
+                print(
+                    f"Early stopping at epoch {epoch}: no test-metric improvement since epoch "
+                    f"{last_improvement_epoch} (patience {patience_epochs} epochs, best {self.best_loss:.4f})"
+                )
+                break
+
         # 保存最终模型
         final_path = os.path.join(self.cfg.save_dir, 'final.pt')
         save_checkpoint(
             self.model,
             self.optimizer,
-            max_epoch - 1,
+            max_epoch - 1 if stopped_early_at is None else stopped_early_at,
             final_path,
             train_loss,
             {
                 'best_loss': self.best_loss,
                 'n_iter': self.n_iter,
+                'stopped_early_at': stopped_early_at,
             },
             scheduler=self.scheduler,
             scaler=self.scaler,

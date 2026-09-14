@@ -25,11 +25,15 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from utils.human_pose import (
+    CANONICAL_BODY_MODEL_GENDER,
     BodyModelRegistry,
     body_model_type_of,
     build_smpl24_joint_positions,
+    canonical_skeleton_metadata,
     ensure_smpl24_local_rotations,
+    infer_body_model_type_from_pose_width,
     local_rotations_to_global,
+    normalize_body_model_type,
     select_hand_anchor_positions,
 )
 from configs import (
@@ -61,6 +65,130 @@ _INTERCAP_OBJECT_MESH_RE = re.compile(r"^(\d+)_second_obj\.(?:ply|obj)$", re.IGN
 # geometry used by the RNN data loader.  The preprocessor still stores the
 # raw labels so this heuristic remains reversible for later experiments.
 _PALM_BONE_VARIATION_EPS = 1e-6
+_OMOMO_CANONICAL_BODY_MODEL_TYPE = "smplx"
+_BODY_MODEL_TYPE_FIELDS = (
+    "surface_model_type",
+    "body_model_type",
+    "model_type",
+    "model",
+    "smpl_type",
+)
+_FULL_POSE_FIELDS = ("poses", "pose", "full_pose")
+
+
+def _infer_body_model_type_without_subject_shape(seq_data, registry):
+    """Infer only the model family; never consume source gender or betas."""
+    for field in _BODY_MODEL_TYPE_FIELDS:
+        value = seq_data.get(field)
+        if isinstance(value, np.ndarray) and value.ndim == 0:
+            value = value.item()
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", "ignore")
+        if isinstance(value, str):
+            model_type = normalize_body_model_type(value)
+            if model_type is not None:
+                return model_type
+
+    for field in _FULL_POSE_FIELDS:
+        value = seq_data.get(field)
+        if value is None:
+            continue
+        value = np.asarray(value)
+        if value.ndim == 0:
+            continue
+        model_type = infer_body_model_type_from_pose_width(value.shape[-1])
+        if model_type is not None:
+            return model_type
+
+    rest_offsets = seq_data.get("rest_offsets")
+    if rest_offsets is not None:
+        neutral_candidates = tuple(
+            model_type
+            for model_type in ("smplx", "smplh", "smpl")
+            if CANONICAL_BODY_MODEL_GENDER
+            in registry.available_genders(model_type)
+        )
+        if neutral_candidates:
+            zero_betas = np.zeros(int(registry.num_betas), dtype=np.float32)
+            # Subject-shaped offsets need not fall within the registry's strict
+            # reconstruction tolerance when compared to a zero-shape skeleton.
+            # Family identification only needs the nearest neutral template.
+            model_type = registry.match_type_by_rest_offsets(
+                rest_offsets,
+                betas=zero_betas,
+                gender=CANONICAL_BODY_MODEL_GENDER,
+                candidates=neutral_candidates,
+                tolerance_m=float("inf"),
+            )
+            if model_type is not None:
+                return model_type
+
+    return normalize_body_model_type(registry.default_type) or "smplh"
+
+
+def _resolve_omomo_canonical_body_model(body_models, seq_data):
+    """Resolve OMOMO's SMPL-X neutral model without gender fallback."""
+    if not isinstance(body_models, BodyModelRegistry):
+        raise TypeError(
+            "OMOMO canonical preprocessing requires BodyModelRegistry so the "
+            "neutral model path can be verified without gender fallback."
+        )
+
+    model_type = _infer_body_model_type_without_subject_shape(seq_data, body_models)
+    if model_type != _OMOMO_CANONICAL_BODY_MODEL_TYPE:
+        raise ValueError(
+            "OMOMO must use the SMPL-X family, but shape-independent family "
+            f"detection resolved {model_type!r}."
+        )
+    if CANONICAL_BODY_MODEL_GENDER not in body_models.available_genders(model_type):
+        raise FileNotFoundError(
+            f"OMOMO requires a neutral {model_type} model under "
+            f"{body_models.support_dir}; gender fallback is disabled."
+        )
+
+    get_canonical = getattr(body_models, "get_canonical", None)
+    if callable(get_canonical):
+        body_model = get_canonical(model_type)
+    else:
+        body_model = body_models.get(model_type, CANONICAL_BODY_MODEL_GENDER)
+    loaded_type = body_model_type_of(body_model)
+    if loaded_type is not None and loaded_type != model_type:
+        raise ValueError(
+            f"Expected a {model_type} body model, got {loaded_type}."
+        )
+    return body_model, model_type
+
+
+def _body_model_num_betas(body_model, default=16):
+    value = getattr(body_model, "num_betas", default)
+    if isinstance(value, torch.Tensor):
+        value = value.item()
+    value = int(value)
+    if value <= 0:
+        raise ValueError(f"BodyModel num_betas must be positive, got {value}")
+    return value
+
+
+def _forward_canonical_body_model(body_model, root_orient, pose_body, trans):
+    """Run the neutral BodyModel with explicit, asserted zero betas."""
+    batch_size = int(root_orient.shape[0])
+    if int(pose_body.shape[0]) != batch_size or int(trans.shape[0]) != batch_size:
+        raise ValueError("BodyModel inputs must have the same batch dimension")
+    betas = torch.zeros(
+        batch_size,
+        _body_model_num_betas(body_model),
+        device=root_orient.device,
+        dtype=root_orient.dtype,
+    )
+    if torch.count_nonzero(betas).item() != 0:
+        raise AssertionError("Canonical BodyModel betas must be exactly zero")
+    return body_model(
+        root_orient=root_orient,
+        pose_body=pose_body,
+        trans=trans,
+        betas=betas,
+    )
+
 
 _PAHOI_OBJECT_ALIASES = {
     "cup noodles": "noodles_cup",
@@ -1560,51 +1688,28 @@ def process_sequence(
     """处理单个序列并保存为pt文件"""
 
     seq_name = str(seq_data['seq_name'])
-    subject_gender = str(seq_data['gender']).lower()
-    # Resolve the body model family from the sequence itself.  OMOMO is SMPL-X
-    # (its rest_offsets reproduce SMPL-X shaped bones to 0.2 mm) while AMASS is
-    # SMPL-H; the two families' root joints differ by 12.7 cm, so running the
-    # wrong one displaces the whole body relative to the object trajectory.
-    body_model_type = None
-    if isinstance(bm, BodyModelRegistry):
-        bm, body_model_type = bm.for_sequence(seq_data, gender=subject_gender)
-    elif isinstance(bm, dict):
-        bm = bm.get(subject_gender, bm.get("neutral") or next(iter(bm.values())))
-    if body_model_type is None:
-        body_model_type = body_model_type_of(bm) or "smplh"
+    # OMOMO is represented in one canonical space: SMPL-X neutral with zero
+    # betas. Source gender/betas are deliberately neither read nor propagated.
+    bm, body_model_type = _resolve_omomo_canonical_body_model(bm, seq_data)
+    canonical_num_betas = _body_model_num_betas(bm)
 
     root_orient_np = np.asarray(seq_data['root_orient'], dtype=np.float32).reshape(-1, 3)
     pose_body_np = np.asarray(seq_data['pose_body'], dtype=np.float32).reshape(-1, 63)
     trans_np = np.asarray(seq_data['trans'], dtype=np.float32).reshape(-1, 3)
     sequence_length = root_orient_np.shape[0]
-    betas_np = np.asarray(
-        seq_data.get('betas', np.zeros((1, 16), dtype=np.float32)), dtype=np.float32
-    )
-    if betas_np.ndim == 1:
-        betas_np = betas_np[None, :]
-    betas_np = betas_np.reshape(betas_np.shape[0], -1)
-    if betas_np.shape[0] == 1 and sequence_length > 1:
-        betas_np = np.repeat(betas_np, sequence_length, axis=0)
-    elif betas_np.shape[0] < sequence_length:
-        betas_np = np.pad(
-            betas_np,
-            ((0, sequence_length - betas_np.shape[0]), (0, 0)),
-            mode="edge",
-        )
-    else:
-        betas_np = betas_np[:sequence_length]
-    if betas_np.shape[1] < 16:
-        betas_np = np.pad(betas_np, ((0, 0), (0, 16 - betas_np.shape[1])))
-    else:
-        betas_np = betas_np[:, :16]
 
-    smpl_init_input = {
-        "root_orient": torch.zeros(sequence_length, 3, device=device),
-        "pose_body": torch.zeros(sequence_length, 63, device=device),
-        "trans": torch.zeros(sequence_length, 3, device=device),
-        "betas": torch.from_numpy(betas_np).to(device=device),
-    }
-    Jtr_0 = np.asarray(bm(**smpl_init_input).Jtr[:, 0, :].cpu(), dtype=np.float32)
+    zero_root_orient = torch.zeros(sequence_length, 3, device=device)
+    zero_pose_body = torch.zeros(sequence_length, 63, device=device)
+    zero_trans = torch.zeros(sequence_length, 3, device=device)
+    canonical_rest_pose = _forward_canonical_body_model(
+        bm,
+        zero_root_orient,
+        zero_pose_body,
+        zero_trans,
+    )
+    Jtr_0 = np.asarray(
+        canonical_rest_pose.Jtr[:, 0, :].cpu(), dtype=np.float32
+    )
 
     if output_name is None:
         output_name = f"{seq_key}.pt"
@@ -1642,15 +1747,13 @@ def process_sequence(
     pose_body_torch = torch.from_numpy(pose_body_np).to(device).float()
     trans_torch = torch.from_numpy(trans_np).to(device).float()
 
-    smpl_input = {
-        "root_orient": root_orient_torch,
-        "pose_body": pose_body_torch,
-        "trans": trans_torch,
-        "betas": torch.from_numpy(betas_np).to(device=device),
-    }
-
-    # 使用SMPL模型获取全局姿态
-    body_pose_world = bm(**smpl_input)
+    # The same neutral zero-beta model used for Jtr_0 produces every joint.
+    body_pose_world = _forward_canonical_body_model(
+        bm,
+        root_orient_torch,
+        pose_body_torch,
+        trans_torch,
+    )
 
     pose_aa = torch.tensor(bdata_poses, device=device, dtype=torch.float32).reshape(
         bdata_poses.shape[0], -1, 3
@@ -1810,12 +1913,13 @@ def process_sequence(
             obj_data["obj_points_canonical"] = canonical_points.half().cpu()
 
     # 组装输出数据
+    canonical_metadata = canonical_skeleton_metadata(body_model_type)
     data = {
         "seq_name": seq_name,
-        "gender": subject_gender,
-        # Which family produced the GT joints, so downstream code and audits do
-        # not have to re-derive it.
-        "body_model_type": body_model_type,
+        **canonical_metadata,
+        "canonical_body_model_type": body_model_type,
+        "canonical_num_betas": canonical_num_betas,
+        "canonical_joint_space": "neutral_zero_betas",
         # "head_global_trans": head_global_trans.cpu(),
         "pose": pose_aa.reshape(pose_aa.shape[0], -1).cpu(),   # [T, 72]
         "position_global_full_gt_world": position_global_full_gt_world.float(), # [T, 24, 3]
@@ -1832,7 +1936,9 @@ def process_sequence(
             trans_torch,
             obj_trans=obj_data.get("obj_trans") if obj_data else None,
             obj_rot=obj_data.get("obj_rot") if obj_data else None,
-            human_imu=seq_data.get("human_imu_real"),
+            # Always synthesize human IMU from the canonical joints above;
+            # source IMU may encode subject-specific shape.
+            human_imu=None,
             obj_imu=seq_data.get("obj_imu_real"),
             lhand_contact=obj_data.get("lhand_contact") if obj_data else None,
             rhand_contact=obj_data.get("rhand_contact") if obj_data else None,
@@ -2295,18 +2401,22 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
 
-    # 处理常规数据集（带有物体交互的数据）
-    # Body models are resolved per sequence: OMOMO is SMPL-X, AMASS is SMPL-H.
-    print("准备身体模型（按序列自动甄别 SMPL-H / SMPL-X）...")
+    # OMOMO family detection remains auditable, but every sequence is evaluated
+    # with the verified SMPL-X neutral template and explicit zero betas.
+    print("准备 canonical SMPL-X neutral 身体模型（zero betas）...")
     body_models = BodyModelRegistry(
         args.support_dir,
         device=device,
         num_betas=16,
         default_type=args.body_model_type,
+        default_gender=CANONICAL_BODY_MODEL_GENDER,
     )
-    if not any(body_models.has(model_type) for model_type in ("smplh", "smplx")):
+    if CANONICAL_BODY_MODEL_GENDER not in body_models.available_genders(
+        _OMOMO_CANONICAL_BODY_MODEL_TYPE
+    ):
         raise FileNotFoundError(
-            f"No SMPL-H or SMPL-X models found under {args.support_dir}"
+            f"SMPL-X neutral model not found under {args.support_dir}; "
+            "gender fallback is disabled for canonical OMOMO preprocessing."
         )
 
     # 处理AMASS数据集
@@ -2473,11 +2583,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--body-model-type",
         type=str,
-        default="smplh",
+        default="smplx",
         choices=("smplh", "smplx", "smpl"),
         help=(
-            "序列没有任何可甄别线索时使用的模型族。OMOMO 会通过 rest_offsets "
-            "自动识别为 smplx，此项只影响回退。"
+            "序列没有可甄别线索时使用的模型族。OMOMO 的 canonical family "
+            "必须为 smplx；所有实例固定为 neutral、zero betas。"
         ),
     )
     parser.add_argument("--obj_mesh_dir", type=str, default="datasets/OMOMO/captured_objects",

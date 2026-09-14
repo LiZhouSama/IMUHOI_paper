@@ -18,7 +18,6 @@ from scipy.spatial.transform import Rotation as R
 from human_body_prior.body_model.body_model import BodyModel
 import pytorch3d.transforms as transforms
 from utils.human_pose import (
-    GenderedBodyModelLoader,
     build_smpl24_joint_positions,
     ensure_smpl24_local_rotations,
     local_rotations_to_global,
@@ -50,6 +49,11 @@ except ModuleNotFoundError:
     )
 
 DEFAULT_CHUNK_LEN = 1500      # 视显存/机型可调
+CANONICAL_BODY_MODEL_TYPE = "smplh"
+CANONICAL_BODY_MODEL_GENDER = "neutral"
+CANONICAL_BETAS = "zero"
+CANONICAL_SKELETON_VERSION = 1
+CANONICAL_BODY_MODEL_RELATIVE_PATH = os.path.join("smplh", "neutral", "model.npz")
 
 R_Y_UP = np.array(
     [[1.0, 0.0, 0.0],
@@ -63,16 +67,46 @@ def iter_slices(T: int, chunk_len: int):
         e = min(s + chunk_len, T)
         yield s, e
 
-def npz_get(npz_file: np.lib.npyio.NpzFile, key: str, default=None):
-    return npz_file[key] if key in npz_file.files else default
-
-
-class BodyModelLoader(GenderedBodyModelLoader):
-    """BEHAVE ships SMPL-H fits (156-dim poses, 10 betas); the family is still
-    re-confirmed per sequence through :meth:`resolve`."""
+class BodyModelLoader:
+    """Load the single canonical neutral, zero-shape SMPL-H model."""
 
     def __init__(self, support_dir: str, device: torch.device, num_betas: int = 16) -> None:
-        super().__init__(support_dir, device=device, num_betas=num_betas, default_type="smplh")
+        self.model_path = os.path.join(support_dir, CANONICAL_BODY_MODEL_RELATIVE_PATH)
+        if not os.path.isfile(self.model_path):
+            raise FileNotFoundError(
+                "Canonical SMPL-H model not found; expected "
+                f"{self.model_path}"
+            )
+        self._model = BodyModel(bm_fname=self.model_path, num_betas=int(num_betas))
+        self._model.eval()
+        for parameter in self._model.parameters():
+            parameter.requires_grad_(False)
+        self._model = self._model.to(device)
+        self._num_betas = int(num_betas)
+
+    @property
+    def num_betas(self) -> int:
+        return self._num_betas
+
+    @property
+    def model_type(self) -> str:
+        return CANONICAL_BODY_MODEL_TYPE
+
+    def get(self, gender=None, model_type=None) -> BodyModel:
+        if model_type is not None and str(model_type).lower() != CANONICAL_BODY_MODEL_TYPE:
+            raise ValueError(f"BEHAVE preprocessing only supports {CANONICAL_BODY_MODEL_TYPE}")
+        return self._model
+
+    def resolve(self, seq_data=None, gender=None, model_type=None) -> Tuple[BodyModel, str]:
+        return self.get(gender=gender, model_type=model_type), CANONICAL_BODY_MODEL_TYPE
+
+
+def canonical_body_model_metadata() -> Dict[str, object]:
+    return {
+        "canonical_body_model_gender": CANONICAL_BODY_MODEL_GENDER,
+        "canonical_betas": CANONICAL_BETAS,
+        "canonical_skeleton_version": CANONICAL_SKELETON_VERSION,
+    }
 
 
 def infer_object_name(seq_name: str, object_names: List[str]) -> str:
@@ -110,36 +144,17 @@ def resolve_object_mesh(object_name: str, objects_root: str) -> str:
     return mesh_path
 
 
-def pad_betas(betas: np.ndarray, target_dim: int, target_frames: int) -> np.ndarray:
-    betas = np.asarray(betas, dtype=np.float32)
-    if betas.ndim == 1:
-        betas = betas[None, :]
-    if betas.shape[0] == 1 and target_frames > 1:
-        betas = np.repeat(betas, repeats=target_frames, axis=0)
-    if betas.shape[0] < target_frames:
-        betas = np.pad(betas, ((0, target_frames - betas.shape[0]), (0, 0)), mode='edge')
-    else:
-        betas = betas[:target_frames]
-    if betas.shape[1] < target_dim:
-        betas = np.concatenate([
-            betas,
-            np.zeros((betas.shape[0], target_dim - betas.shape[1]), dtype=betas.dtype)
-        ], axis=1)
-    elif betas.shape[1] > target_dim:
-        betas = betas[:, :target_dim]
-    return betas
-
-
-def build_smpl_input(root_orient: np.ndarray, pose_body: np.ndarray, trans: np.ndarray,
-                     betas: np.ndarray, device: torch.device) -> Dict[str, torch.Tensor]:
-    smpl_input: Dict[str, torch.Tensor] = {
+def build_smpl_input(
+    root_orient: np.ndarray,
+    pose_body: np.ndarray,
+    trans: np.ndarray,
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    return {
         "root_orient": torch.tensor(root_orient, dtype=torch.float32, device=device),
         "pose_body": torch.tensor(pose_body, dtype=torch.float32, device=device),
-        "trans": torch.tensor(trans, dtype=torch.float32, device=device)
+        "trans": torch.tensor(trans, dtype=torch.float32, device=device),
     }
-    if betas.size > 0:
-        smpl_input["betas"] = torch.tensor(betas, dtype=torch.float32, device=device)
-    return smpl_input
 
 
 def compute_rotation_features_chunk(
@@ -195,12 +210,11 @@ def compute_foot_floor_offset(
     root_orient: np.ndarray,
     pose_body: np.ndarray,
     trans: np.ndarray,
-    betas: np.ndarray,
     device: torch.device,
 ) -> float:
     """计算整个序列中双脚关节的最低y坐标，用于地面对齐"""
     T = root_orient.shape[0]
-    smpl_input = build_smpl_input(root_orient, pose_body, trans, betas, device)
+    smpl_input = build_smpl_input(root_orient, pose_body, trans, device)
     
     foot_min_y: Optional[float] = None
     with torch.no_grad():
@@ -251,12 +265,6 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
     trans_first_frame = trans[0].copy()
     trans_norm = trans - trans_first_frame
 
-    betas_raw = npz_get(smpl_data, 'betas', np.zeros((1, bm_loader.num_betas), dtype=np.float32))
-    betas = pad_betas(betas_raw, bm_loader.num_betas, T)
-
-    gender_raw = npz_get(smpl_data, 'gender', 'neutral')
-    gender = str(gender_raw)
-
     object_angles = obj_data['angles'][:T].astype(np.float32)
     object_trans = obj_data['trans'][:T].astype(np.float32)
     object_name = infer_object_name(seq_name, object_names)
@@ -271,11 +279,7 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
         sample_count=int(max(1, obj_points_count)),
         device="cpu",
     )
-    # BEHAVE fits are SMPL-H (156-dim poses); confirm from the sequence rather
-    # than assuming, so a re-released SMPL-X variant would not silently pass.
-    bm, body_model_type = bm_loader.resolve(
-        {"poses": poses, "betas": betas_raw, "gender": gender}, gender=gender
-    )
+    bm, body_model_type = bm_loader.resolve(model_type=CANONICAL_BODY_MODEL_TYPE)
     smpl_init_input = {
             "root_orient": torch.zeros_like(torch.from_numpy(poses[:, :3].reshape(-1, 3)).to(device).float()),
             "pose_body": torch.zeros_like(torch.from_numpy(poses[:, 3:66].reshape(-1, 63)).to(device).float()),
@@ -304,7 +308,7 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
     
     # ---------- 计算双脚最低点偏移 ----------
     foot_floor_y = compute_foot_floor_offset(
-        bm, poses[:, :3], poses[:, 3:66], trans_norm, betas, device
+        bm, poses[:, :3], poses[:, 3:66], trans_norm, device
     )
     # 修正 trans 和 object_trans，使双脚最低点对齐到 y=0
     trans_norm[:, 1] -= foot_floor_y
@@ -333,8 +337,9 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
             object_angles_slice = object_angles[s:e].astype(np.float32)
             object_trans_slice  = object_trans_norm[s:e].astype(np.float32)
 
-            betas_chunk = pad_betas(betas_raw, bm_loader.num_betas, e - s)
-            smpl_input = build_smpl_input(root_orient_slice, pose_body_slice, trans_slice, betas_chunk, device)
+            smpl_input = build_smpl_input(
+                root_orient_slice, pose_body_slice, trans_slice, device
+            )
 
             # 你的 forward_smpl_in_batches（本 chunk joints）
             pos_chunk, _ = forward_smpl_in_batches(bm, smpl_input, batch_size=smpl_batch)
@@ -426,8 +431,9 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
 
     output = {
         "seq_name": seq_name,
-        "gender": gender,
+        "gender": CANONICAL_BODY_MODEL_GENDER,
         "body_model_type": body_model_type,
+        **canonical_body_model_metadata(),
         "pose": pose,
         "position_global_full_gt_world": position_global,
         "rotation_global": rotation_global,
@@ -436,7 +442,6 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
         "obj_imu_real": obj_imu_tensor,
         "lfoot_contact": lfoot_contact,
         "rfoot_contact": rfoot_contact,
-        "betas": torch.from_numpy(betas_raw).float(),
         "obj_name": object_name,
         "obj_mesh_name": mesh_basename,
         "obj_points_canonical": canonical_points.half().cpu(),

@@ -15,6 +15,7 @@ from .velocity_contact import (
 )
 from .human_pose import HumanPoseModule
 from .object_trans import ObjectTransModule
+from .object_trans_v3 import V3ObjectTransModule
 from .object_trans_legacy import LegacyObjectTransModule
 from .object_trans_IMUHOI import (
     IMUHOIObjectTransModule,
@@ -203,19 +204,21 @@ class IMUHOIModel(nn.Module):
             from model.rnn.object_trans_v2 import V2ObjectTransModule
 
             self.object_trans_module = V2ObjectTransModule(cfg)
+        elif self.object_trans_arch == "v3":
+            self.object_trans_module = V3ObjectTransModule(cfg)
         else:
             raise ValueError(
-                "object_trans_arch must be 'current', 'v2', 'legacy', 'imuhoi', "
+                "object_trans_arch must be 'current', 'v2', 'v3', 'legacy', 'imuhoi', "
                 "'imuhoi_4heads', "
                 "'legacy_mesh', or 'mergeHeads_obs', "
                 f"got {self.object_trans_arch!r}"
             )
         self.lb_prior_predictor = None
         if bool(getattr(cfg, "enable_ot_lb_prior", False)):
-            if self.object_trans_arch in {"current", "v2"}:
+            if self.object_trans_arch in {"current", "v2", "v3"}:
                 self.lb_prior_predictor = FrozenLBPriorPredictor(cfg)
             elif self.object_trans_arch != "mergeheads_obs":
-                raise ValueError("l_b VQ/Diffusion prior supports object_trans_arch=current or v2 only")
+                raise ValueError("l_b VQ/Diffusion prior supports object_trans_arch=current, v2, or v3 only")
 
     def _predict_lb_prior(self, hp_out, vc_out, obj_imu):
         predictor = getattr(self, "lb_prior_predictor", None)
@@ -256,6 +259,12 @@ class IMUHOIModel(nn.Module):
             contact_prob,
             contact_threshold=float(getattr(self.cfg, "lb_stats_contact_threshold", 0.5)),
             min_contact_frames=int(getattr(self.cfg, "lb_stats_min_frames", 10)),
+            # Long sequences: statistics measured from the model's own history
+            # feed back into the bone predictor; a bounded window limits how
+            # much accumulated error the prior can carry (default keeps the
+            # historical 2048-frame cap).
+            max_history_frames=int(getattr(self.cfg, "lb_stats_max_history_frames", 2048)),
+            tail_frames=int(getattr(self.cfg, "lb_stats_tail_frames", 0)),
         )
 
     def _apply_vc_segment_contact_if_enabled(
@@ -400,7 +409,11 @@ class IMUHOIModel(nn.Module):
 
             joints_local = None
             if hasattr(hp_module, "_compute_fk_joints_batched"):
-                joints_local = hp_module._compute_fk_joints_batched(refined_pose, orientation_mat.clone())
+                joints_local = hp_module._compute_fk_joints_batched(
+                    refined_pose,
+                    orientation_mat.clone(),
+                    data_dict.get("body_model_type"),
+                )
             if isinstance(joints_local, torch.Tensor):
                 results["pred_joints_local"] = joints_local
                 joints_global = joints_local + refined_root.unsqueeze(2)
@@ -472,6 +485,7 @@ class IMUHOIModel(nn.Module):
             'human_imu': human_imu,
             'v_init': data_dict["v_init"],
             'p_init': data_dict["p_init"],
+            'body_model_type': data_dict.get('body_model_type'),
         }
         if self.no_trans:
             hp_input_dict['trans_gt'] = data_dict["trans_gt"]
@@ -544,6 +558,7 @@ class IMUHOIModel(nn.Module):
             "human_imu": data_dict["human_imu"],
             "v_init": data_dict["v_init"],
             "p_init": data_dict["p_init"],
+            "body_model_type": data_dict.get("body_model_type"),
         }
         if self.no_trans:
             hp_input_dict["trans_gt"] = data_dict["trans_gt"]
@@ -868,6 +883,17 @@ class IMUHOIModel(nn.Module):
                     ot_obj_trans_init = obj_prefix[:, 0]
                 else:
                     ot_obj_trans_init = window_data["obj_trans_init"]
+                ot_extra_kwargs = {}
+                segment_state_keys = getattr(
+                    self.object_trans_module, "SEGMENT_STATE_OUTPUT_KEYS", None
+                )
+                if segment_state_keys and isinstance(prefix, dict):
+                    # Segment-latching OTs publish their latch state; hand it
+                    # back so the window continues the segment instead of
+                    # re-deriving it from the published trajectory.
+                    ot_extra_kwargs["known_segment_state_prefix"] = {
+                        key: prefix.get(key) for key in segment_state_keys
+                    }
                 ot_out = self.object_trans_module.forward(
                     self._resolve_ot_hand_positions(hp_context),
                     vc_context["pred_hand_contact_prob"],
@@ -884,6 +910,7 @@ class IMUHOIModel(nn.Module):
                     known_obj_trans_prefix=obj_prefix,
                     known_gating_weights_prefix=gate_prefix,
                     feedback_control=feedback_control,
+                    **ot_extra_kwargs,
                 )
                 results.update(ot_out)
                 if refine_human:

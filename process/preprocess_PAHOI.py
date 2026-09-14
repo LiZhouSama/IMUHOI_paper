@@ -20,10 +20,13 @@ import torch
 from scipy.spatial.transform import Rotation
 from tqdm import tqdm
 from utils.human_pose import (
+    CANONICAL_BODY_MODEL_GENDER,
     GenderedBodyModelLoader,
     build_smpl24_joint_positions,
+    canonical_skeleton_metadata,
     ensure_smpl24_local_rotations,
     local_rotations_to_global,
+    normalize_body_model_type,
 )
 
 from human_body_prior.body_model.body_model import BodyModel
@@ -103,36 +106,34 @@ def scalar_to_str(value, default: str = "") -> str:
     return str(arr.reshape(-1)[0])
 
 
-def pad_betas(betas: np.ndarray, target_dim: int, target_frames: int) -> np.ndarray:
-    betas = np.asarray(betas, dtype=np.float32)
-    if betas.ndim == 3:
-        betas = betas[:, 0, :]
-    elif betas.ndim == 1:
-        betas = betas[None, :]
-    betas = betas.reshape(betas.shape[0], -1)
-
-    if betas.shape[0] == 1 and target_frames > 1:
-        betas = np.repeat(betas, target_frames, axis=0)
-    elif betas.shape[0] < target_frames:
-        betas = np.pad(betas, ((0, target_frames - betas.shape[0]), (0, 0)), mode="edge")
-    elif betas.shape[0] > target_frames:
-        betas = betas[:target_frames]
-
-    if betas.shape[1] < target_dim:
-        pad = np.zeros((betas.shape[0], target_dim - betas.shape[1]), dtype=np.float32)
-        betas = np.concatenate([betas, pad], axis=1)
-    elif betas.shape[1] > target_dim:
-        betas = betas[:, :target_dim]
-    return betas.astype(np.float32)
-
-
 class BodyModelLoader(GenderedBodyModelLoader):
-    """PAHOI captures are SMPL-X fits (``surface_model_type='smplx'``, 165-dim
-    poses, SMPL-X shape space), so the family defaults to SMPL-X here and is
-    still re-confirmed per sequence via :meth:`resolve`."""
+    """Load only the neutral, zero-shape SMPL-X canonical body model."""
 
     def __init__(self, support_dir: str, device: torch.device, num_betas: int = 16) -> None:
         super().__init__(support_dir, device=device, num_betas=num_betas, default_type="smplx")
+
+    @staticmethod
+    def _require_smplx(model_type: Optional[str]) -> str:
+        resolved = normalize_body_model_type(model_type) if model_type is not None else "smplx"
+        if resolved != "smplx":
+            raise ValueError(f"PAHOI canonical preprocessing requires SMPL-X, got {model_type!r}")
+        return resolved
+
+    def get(self, gender=None, model_type=None):
+        """Ignore source gender and return the unique neutral SMPL-X instance."""
+        self._require_smplx(model_type)
+        return self.registry.get_canonical("smplx")
+
+    def resolve(self, seq_data=None, gender=None, model_type=None):
+        """Validate the source family while fixing the canonical model to neutral SMPL-X."""
+        if model_type is None and seq_data is not None:
+            model_type = self.registry.infer_type(
+                seq_data,
+                gender=CANONICAL_BODY_MODEL_GENDER,
+            )
+        resolved = self._require_smplx(model_type)
+        self._model_type = resolved
+        return self.get(model_type=resolved), resolved
 
 
 def collect_pahoi_sequences(dataset_root: str) -> List[PAHOISequence]:
@@ -438,16 +439,21 @@ def load_pahoi_human_sequence(
     seq: PAHOISequence,
     num_betas: int,
 ) -> Dict[str, object]:
+    # Keep `num_betas` in the public helper signature for compatibility with
+    # existing callers. Source shape coefficients are intentionally not loaded:
+    # all saved geometry is generated with the canonical zero-betas model.
+    del num_betas
     with np.load(seq.concat_npz_path, allow_pickle=True) as concat_data:
         poses = np.asarray(concat_data["poses"], dtype=np.float32)
         trans = np.asarray(concat_data["trans"], dtype=np.float32)
-        gender = scalar_to_str(concat_data["gender"], default="neutral")
         mocap_frame_rate = int(np.asarray(concat_data["mocap_frame_rate"]).item())
         if "surface_model_type" in concat_data:
-            surface_model_type = scalar_to_str(concat_data["surface_model_type"], default="smplx")
+            source_model_type = scalar_to_str(
+                concat_data["surface_model_type"],
+                default="smplx",
+            )
         else:
-            surface_model_type = "smplx"
-        concat_betas = np.asarray(concat_data["betas"], dtype=np.float32)
+            source_model_type = "smplx"
 
     if poses.ndim == 3:
         poses = poses[:, 0, :]
@@ -455,34 +461,28 @@ def load_pahoi_human_sequence(
     trans = trans.reshape(trans.shape[0], -1, 3)[:, 0, :]
     if poses.shape[1] < 66:
         raise ValueError(f"{seq.seq_name} pose dim {poses.shape[1]} is smaller than required 66")
-
-    betas_source = concat_betas
-    if seq.raw_npz_path is not None:
-        with np.load(seq.raw_npz_path, allow_pickle=True) as raw_data:
-            if "betas" in raw_data:
-                betas_source = np.asarray(raw_data["betas"], dtype=np.float32)
-    betas = pad_betas(betas_source, num_betas, poses.shape[0])
+    if normalize_body_model_type(source_model_type) != "smplx":
+        raise ValueError(
+            f"{seq.seq_name} declares {source_model_type!r}, but PAHOI requires SMPL-X poses"
+        )
 
     return {
         "seq_name": seq.seq_name,
         "subject_id": seq.subject_id,
-        "gender": gender,
+        "gender": CANONICAL_BODY_MODEL_GENDER,
         "mocap_frame_rate": mocap_frame_rate,
-        "surface_model_type": surface_model_type,
+        "surface_model_type": "smplx",
         "poses": poses.astype(np.float32),
         "root_orient": poses[:, :3].astype(np.float32),
         "pose_body": poses[:, 3:66].astype(np.float32),
         "trans": trans.astype(np.float32),
-        "betas": betas,
     }
-
 
 def compute_motion_features(
     bm: BodyModel,
     root_orient: np.ndarray,
     pose_body: np.ndarray,
     trans: np.ndarray,
-    betas: np.ndarray,
     device: torch.device,
     chunk_len: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -495,7 +495,12 @@ def compute_motion_features(
             root_t = torch.tensor(root_orient[start:end], dtype=torch.float32, device=device)
             body_t = torch.tensor(pose_body[start:end], dtype=torch.float32, device=device)
             trans_t = torch.tensor(trans[start:end], dtype=torch.float32, device=device)
-            betas_t = torch.tensor(betas[start:end], dtype=torch.float32, device=device)
+            betas_t = torch.zeros(
+                end - start,
+                int(bm.num_betas),
+                dtype=torch.float32,
+                device=device,
+            )
 
             body_out = bm(
                 root_orient=root_t,
@@ -629,20 +634,18 @@ def process_pahoi_sequence(
     root_orient = human["root_orient"][:T].astype(np.float32)
     pose_body = human["pose_body"][:T].astype(np.float32)
     trans = human["trans"][:T].astype(np.float32).copy()
-    betas = human["betas"][:T].astype(np.float32)
     obj_trans = obj_trans[:T].astype(np.float32).copy()
     obj_rot = obj_rot[:T].astype(np.float32)
     source_frame_indices = np.arange(T, dtype=np.int64)
 
-    # `human` carries `surface_model_type` straight from the capture, so the
-    # family is taken from the data rather than assumed.
-    bm, body_model_type = bm_loader.resolve(human, gender=human["gender"])
+    # The source family was validated while loading; the canonical loader can
+    # only return the neutral SMPL-X instance.
+    bm, body_model_type = bm_loader.resolve(human)
     position_global, rotation_local, rotation_global = compute_motion_features(
         bm=bm,
         root_orient=root_orient,
         pose_body=pose_body,
         trans=trans,
-        betas=betas,
         device=device,
         chunk_len=max(1, int(chunk_len)),
     )
@@ -733,9 +736,8 @@ def process_pahoi_sequence(
         "seq_name": seq.seq_name,
         "dataset": "PAHOI",
         "subject_id": seq.subject_id,
-        "gender": human["gender"],
-        "surface_model_type": human["surface_model_type"],
-        "body_model_type": body_model_type,
+        "surface_model_type": "smplx",
+        **canonical_skeleton_metadata(body_model_type),
         "source_mocap_frame_rate": human["mocap_frame_rate"],
         "mocap_frame_rate": human["mocap_frame_rate"],
         "source_frame_indices": torch.from_numpy(source_frame_indices).long(),
@@ -751,7 +753,6 @@ def process_pahoi_sequence(
         "obj_imu_real": None,
         "lfoot_contact": lfoot_contact.cpu().float(),
         "rfoot_contact": rfoot_contact.cpu().float(),
-        "betas": torch.from_numpy(betas).float(),
         "obj_name": object_label,
         "obj_mesh_name": mesh_name,
         "obj_mesh_path": os.path.relpath(mesh_path, Path.cwd()),

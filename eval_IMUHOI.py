@@ -48,10 +48,10 @@ from utils.dataset_config import (
     get_dataset_configs,
     get_full_sequence_test_path,
     resolve_dataset_path,
+    resolve_evaluation_body_model_path,
 )
 from utils.utils import (
     load_config,
-    load_smpl_model,
     build_model_input_dict,
 )
 from utils.human_pose import (
@@ -70,6 +70,8 @@ from configs import (
 
 OBJECT_TRANS_ARCH_CHOICES = (
     "current",
+    "v2",
+    "v3",
     "legacy",
     "legacy_mesh",
     "mergeHeads_obs",
@@ -416,7 +418,6 @@ def _build_published_object_candidates(
 
 def evaluate_model(
     model: IMUHOIModel,
-    smpl_model,
     data_loader: DataLoader,
     config: edict,
     device: torch.device,
@@ -435,6 +436,12 @@ def evaluate_model(
     sequence_records: Optional[list] = None,
 ):
     """评估模型"""
+    residual_predictor = None
+    residual_checkpoint = getattr(config, "hoi_contact_residual_checkpoint", None)
+    if residual_checkpoint and evaluate_objects:
+        from model.rnn.contact_residual_runtime import ContactResidualPredictor
+        residual_predictor = ContactResidualPredictor(residual_checkpoint, device=device)
+        print(f"Published-object contact residual: {residual_checkpoint}")
     metrics = {
         "mpjpe": [],
         "mpjre_angle": [],
@@ -606,134 +613,90 @@ def evaluate_model(
                     continue
                 human_imu_seq = human_imu_seq[:T]
 
-                pose_batch = batch_device.get("pose")
+                gt_joints_batch = batch_device.get("position_global")
+                pred_joints_batch = pred_dict.get("pred_joints_global")
                 trans_batch = batch_device.get("trans")
-                if pose_batch is None or trans_batch is None:
-                    continue
+                if not (
+                    isinstance(gt_joints_batch, torch.Tensor)
+                    and isinstance(pred_joints_batch, torch.Tensor)
+                    and isinstance(trans_batch, torch.Tensor)
+                ):
+                    raise KeyError(
+                        "Direct canonical evaluation requires batch['position_global'], "
+                        "batch['trans'], and prediction['pred_joints_global']."
+                    )
 
-                gt_pose_seq = pose_batch[sample_idx, :T]
+                T = min(
+                    T,
+                    int(gt_joints_batch.shape[1]),
+                    int(pred_joints_batch.shape[1]),
+                    int(trans_batch.shape[1]),
+                )
+                if T <= 0:
+                    continue
+                human_imu_seq = human_imu_seq[:T]
+                gt_joints_all = gt_joints_batch[sample_idx, :T]
+                pred_joints_all = pred_joints_batch[sample_idx, :T]
+                if (
+                    gt_joints_all.dim() != 3
+                    or pred_joints_all.dim() != 3
+                    or gt_joints_all.shape[-1] != 3
+                    or pred_joints_all.shape[-1] != 3
+                ):
+                    raise ValueError(
+                        "Canonical joint tensors must have shape [T,J,3]: "
+                        f"GT={tuple(gt_joints_all.shape)}, pred={tuple(pred_joints_all.shape)}"
+                    )
+                gt_joints_smpl24 = _to_smpl24_joint_positions(gt_joints_all)
                 gt_trans_seq = trans_batch[sample_idx, :T]
 
-                if gt_pose_seq.shape[-1] < 6:
-                    continue
-
-                gt_root_axis = gt_pose_seq[:, :3]
-                gt_body_axis = gt_pose_seq[:, 3:3 + 63]
-                if gt_body_axis.shape[-1] < 63:
-                    pad = torch.zeros(T, 63 - gt_body_axis.shape[-1], device=device, dtype=gt_body_axis.dtype)
-                    gt_body_axis = torch.cat([gt_body_axis, pad], dim=-1)
-                else:
-                    gt_body_axis = gt_body_axis[:, :63]
-                gt_body_axis = gt_body_axis.view(T, 21, 3)
-
-                try:
-                    gt_smpl_out = smpl_model(
-                        root_orient=gt_root_axis,
-                        pose_body=gt_body_axis.reshape(T, -1),
-                        trans=gt_trans_seq,
-                    )
-                except Exception as exc:
-                    print(f"SMPL forward failed for GT: {exc}")
-                    continue
-
-                gt_joints_all = gt_smpl_out.Jtr
-                gt_joints_smpl24 = _to_smpl24_joint_positions(gt_joints_all)
-
-                # ?定使用的trans
                 if no_trans:
                     pred_trans = gt_trans_seq
                 else:
                     pred_root_trans_all = pred_dict.get("root_trans_pred")
-                    pred_trans = pred_root_trans_all[sample_idx] if pred_root_trans_all is not None else gt_trans_seq
+                    pred_trans = (
+                        pred_root_trans_all[sample_idx, :T]
+                        if isinstance(pred_root_trans_all, torch.Tensor)
+                        else gt_trans_seq
+                    )
 
-                human_module = _get_human_pose_module(model)
-                pred_joints_all = None
-                pred_body_axis = None
-
-                pred_full_pose_rotmat_all = pred_dict.get("pred_full_pose_rotmat")
-                pred_full_pose_rotmat_seq = (
-                    pred_full_pose_rotmat_all[sample_idx]
-                    if isinstance(pred_full_pose_rotmat_all, torch.Tensor)
-                    else None
-                )
-
-                if pred_full_pose_rotmat_seq is not None and pred_trans is not None:
-                    try:
-                        full_glb = pred_full_pose_rotmat_seq
-                        if full_glb.dim() != 4 or full_glb.shape[0] != T:
-                            raise ValueError(
-                                f"Invalid pred_full_pose_rotmat shape: {tuple(full_glb.shape)}, expected [{T}, J, 3, 3]"
+                # Preserve the existing local-axis MPJRE definition without
+                # reconstructing either prediction or GT through a second BodyModel.
+                gt_body_axis = None
+                pose_batch = batch_device.get("pose")
+                if isinstance(pose_batch, torch.Tensor):
+                    gt_pose_seq = pose_batch[sample_idx, :T]
+                    if gt_pose_seq.shape[-1] >= 6:
+                        gt_body_axis = gt_pose_seq[:, 3:3 + 63]
+                        if gt_body_axis.shape[-1] < 63:
+                            gt_body_axis = torch.cat(
+                                (
+                                    gt_body_axis,
+                                    gt_body_axis.new_zeros(T, 63 - gt_body_axis.shape[-1]),
+                                ),
+                                dim=-1,
                             )
+                        gt_body_axis = gt_body_axis[:, :63].reshape(T, 21, 3)
 
+                pred_body_axis = None
+                pred_full_pose_rotmat_all = pred_dict.get("pred_full_pose_rotmat")
+                if isinstance(pred_full_pose_rotmat_all, torch.Tensor):
+                    full_glb = pred_full_pose_rotmat_all[sample_idx, :T]
+                    if full_glb.dim() == 4 and full_glb.shape[-2:] == (3, 3):
+                        human_module = _get_human_pose_module(model)
                         if human_module is not None and hasattr(human_module, "_global2local"):
                             parents = human_module.smpl_parents.tolist()
                             local_rot = human_module._global2local(full_glb, parents)
                         else:
-                            default_parents = [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19, 20, 21]
+                            default_parents = [
+                                -1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8,
+                                9, 9, 9, 12, 13, 14, 16, 17, 18, 19, 20, 21,
+                            ]
                             local_rot = _global_to_local_rotmat(full_glb, default_parents)
-
-                        pose_axis_full = t3d.matrix_to_axis_angle(local_rot.reshape(-1, 3, 3)).reshape(
-                            T, full_glb.shape[1], 3
-                        )
-                        pred_root_axis = pose_axis_full[:, 0, :]
+                        pose_axis_full = t3d.matrix_to_axis_angle(
+                            local_rot.reshape(-1, 3, 3)
+                        ).reshape(T, full_glb.shape[1], 3)
                         pred_body_axis = pose_axis_full[:, 1:22, :]
-                        pred_smpl_out = smpl_model(
-                            root_orient=pred_root_axis,
-                            pose_body=pred_body_axis.reshape(T, -1),
-                            trans=pred_trans,
-                        )
-                        pred_joints_all = pred_smpl_out.Jtr
-                    except Exception as exc:
-                        print(f"Predicted SMPL reconstruction from pred_full_pose_rotmat failed: {exc}")
-
-                p_pred_all = pred_dict.get("p_pred")
-                p_pred_seq = p_pred_all[sample_idx] if isinstance(p_pred_all, torch.Tensor) else None
-                if (
-                    pred_joints_all is None
-                    and p_pred_seq is not None
-                    and pred_trans is not None
-                    and human_module is not None
-                    and hasattr(human_module, "_reduced_glb_6d_to_full_glb_mat")
-                    and hasattr(human_module, "_global2local")
-                    and hasattr(human_module, "smpl_parents")
-                ):
-                    try:
-                        reduced_pose = p_pred_seq.reshape(T, len(_REDUCED_POSE_NAMES), 6)
-                        orientation_6d = human_imu_seq[:, :, -6:]
-                        orientation_mat = t3d.rotation_6d_to_matrix(orientation_6d.reshape(-1, 6)).reshape(
-                            T, human_imu_seq.shape[1], 3, 3
-                        )
-                        orientation_subset = orientation_mat[:, :len(_SENSOR_ROT_INDICES), :, :]
-                        full_glb = human_module._reduced_glb_6d_to_full_glb_mat(
-                            reduced_pose,
-                            orientation_subset.reshape(T, len(_SENSOR_ROT_INDICES), 3, 3),
-                        )
-                        parents = human_module.smpl_parents.tolist()
-                        local_rot = human_module._global2local(full_glb, parents)
-                        pose_axis_full = t3d.matrix_to_axis_angle(local_rot.reshape(-1, 3, 3)).reshape(
-                            T, full_glb.shape[1], 3
-                        )
-                        pred_root_axis = pose_axis_full[:, 0, :]
-                        pred_body_axis = pose_axis_full[:, 1:22, :]
-                        pred_smpl_out = smpl_model(
-                            root_orient=pred_root_axis,
-                            pose_body=pred_body_axis.reshape(T, -1),
-                            trans=pred_trans,
-                        )
-                        pred_joints_all = pred_smpl_out.Jtr
-                    except Exception as exc:
-                        print(f"Predicted SMPL reconstruction from p_pred failed: {exc}")
-
-                if pred_joints_all is None:
-                    pred_joints_global_all = pred_dict.get("pred_joints_global")
-                    if isinstance(pred_joints_global_all, torch.Tensor):
-                        try:
-                            pred_joints_all = pred_joints_global_all[sample_idx]
-                        except Exception:
-                            pred_joints_all = None
-
-                if pred_joints_all is None:
-                    continue
 
                 # --- MPJPE ---
                 pred_joints_eval = pred_joints_all[:, :num_eval_joints, :]
@@ -837,6 +800,41 @@ def evaluate_model(
                     _sample_prediction_tensor("pred_static_obj_trans"),
                     _sample_prediction_tensor("gating_weights"),
                 )
+
+                if residual_predictor is not None and pred_obj_trans_fusion_refine is not None:
+                    # Correct AFTER publication; never feed this position back
+                    # to OT, VC, or human refinement, and never re-fuse it again.
+                    uncorrected = pred_obj_trans_fusion_refine
+                    residual_record = {
+                        key: value[sample_idx, :T]
+                        for key, value in pred_dict.items()
+                        if isinstance(value, torch.Tensor) and value.dim() >= 2
+                    }
+                    residual_record.update(
+                        gt_human_imu=data_dict["human_imu"][sample_idx, :T],
+                        gt_obj_imu=data_dict["obj_imu"][sample_idx, :T],
+                        pred_obj_trans_published=uncorrected,
+                        pred_palm_glb_pos=pred_hand_pos_refined,
+                    )
+                    residual_predictor.reset()
+                    pred_obj_trans_fusion_refine = residual_predictor.predict(residual_record)
+                    if gt_obj_trans_seq is not None:
+                        base_obj_err = torch.linalg.norm(uncorrected - gt_obj_trans_seq, dim=-1).mean().item() * 100.0
+                        metrics.setdefault("obj_trans_err_published_uncorrected", []).append(base_obj_err)
+                    base_hoi = compute_hoi_error_at_gt_contact(
+                        uncorrected, gt_obj_trans_seq, pred_hand_pos_refined,
+                        select_hand_anchor_positions(gt_joints_smpl24),
+                        gt_lhand_contact_seq, gt_rhand_contact_seq,
+                    )
+                    metrics.setdefault("hoi_err_published_uncorrected", []).append(base_hoi)
+                    if T >= 3:
+                        for key, trajectory in (
+                            ("obj_jitter_published_uncorrected", uncorrected),
+                            ("obj_jitter_published", pred_obj_trans_fusion_refine),
+                        ):
+                            acceleration = trajectory[2:] - 2 * trajectory[1:-1] + trajectory[:-2]
+                            value = torch.linalg.norm(acceleration, dim=-1).mean().item() * 1000.0
+                            metrics.setdefault(key, []).append(value)
 
                 pred_obj_trans_fk = pred_dict.get("pred_obj_trans_fk")
                 pred_obj_trans_fk = pred_obj_trans_fk[sample_idx] if pred_obj_trans_fk is not None else None
@@ -1317,7 +1315,12 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate IMUHOI Model")
     parser.add_argument("--config", type=str, default="configs/IMUHOI_train_rnn.yaml", help="配置文件??")
     parser.add_argument("--dataset", type=str, default="omomo", help="数据集名称（默?：omomo?")
-    parser.add_argument("--smpl_model_path", type=str, default="datasets/smpl_models/smplh/male/model.npz", help="SMPL模型??")
+    parser.add_argument(
+        "--smpl_model_path",
+        type=str,
+        default=None,
+        help="已弃用并忽略：评测直接使用模型与数据集的canonical joints",
+    )
     parser.add_argument("--num_workers", type=int, default=12, help="DataLoader workers")
     parser.add_argument("--no_trans", action="store_true", help="使用noTrans模式")
     parser.add_argument("--no_objects", action="store_true", help="跳过物体相关指标")
@@ -1333,7 +1336,8 @@ def main():
         choices=OBJECT_TRANS_ARCH_CHOICES,
         default=None,
         help=(
-            "ObjectTrans架构；imuhoi为EgoIMU原?三?融合?"
+            "ObjectTrans架构；v2为固定VC权重，v3为不确定性感知的分层FK融合；"
+            "imuhoi为EgoIMU原?三?融合?"
             "imuhoi_4heads为?加静?头的四?融合?"
         ),
     )
@@ -1405,6 +1409,8 @@ def main():
         help="禁用ObjectTrans人体refine，保留HumanPose输出",
     )
     args = parser.parse_args()
+    if args.smpl_model_path:
+        print("Warning: ignoring deprecated --smpl_model_path; no eval BodyModel is loaded.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -1434,6 +1440,7 @@ def main():
         return
 
     all_results = {}
+    model_body_models = {}
     effective_ot_state_feedback = None
     for dataset_name, dataset_cfg in dataset_runs:
         print(f"\n=== Evaluating dataset: {dataset_name} ===")
@@ -1491,15 +1498,55 @@ def main():
         model_arch = str(getattr(config, "model_arch", "rnn")).lower()
         has_velocity_contact_ckpt, has_object_trans_ckpt = _object_contact_capabilities(module_paths)
 
-        if args.smpl_model_path:
-            config.body_model_path = args.smpl_model_path
+        data_dir_default = get_full_sequence_test_path(dataset_cfg)
+        if data_dir_default is None:
+            print(f"[Eval] Skipping '{dataset_name}' (no dataset directory configured).")
+            continue
 
-        smpl_model_path = config.get("body_model_path", "datasets/smpl_models/smplh/neutral/model.npz")
         try:
-            smpl_model = load_smpl_model(smpl_model_path, device)
-        except FileNotFoundError as exc:
+            data_path = resolve_dataset_path(data_dir_default, PROJECT_ROOT)
+        except ValueError as exc:
             print(f"[Eval] Skipping '{dataset_name}': {exc}")
             continue
+
+        if not data_path.exists():
+            print(f"[Eval] Skipping '{dataset_name}' (data not found at {data_path}).")
+            continue
+
+        print(f"Loading test dataset from: {data_path}")
+
+        test_window = config.test.get("window", config.train.get("window", 60))
+        test_dataset = IMUDataset(
+            data_dir=str(data_path),
+            window_size=test_window,
+            debug=config.get("debug", False),
+            simulate_imu_noise=bool(args.simulate_imu_noise),
+            simulate_imu_noise_seed=args.simulate_imu_noise_seed,
+            min_obj_contact_frames=0,
+            full_sequence=True,
+            resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", False),
+            require_canonical_skeleton=bool(getattr(config, "require_canonical_skeleton", False)),
+        )
+
+        if len(test_dataset) == 0:
+            print(f"[Eval] Skipping '{dataset_name}' (dataset is empty).")
+            continue
+
+        model_body_path, model_body_type, model_body_source = resolve_evaluation_body_model_path(
+            config, dataset_cfg, test_dataset.sequence_info,
+        )
+        config.body_model_path = model_body_path
+        model_body_models[dataset_name] = {
+            "path": model_body_path,
+            "type": model_body_type,
+            "source": model_body_source,
+            "loaded_by_evaluator": False,
+        }
+        print(
+            "Model canonical BodyModel: "
+            f"{model_body_type} from {model_body_source} ({model_body_path})"
+        )
+        print("Joint metrics: model pred_joints_global vs dataset canonical position_global")
 
         model = load_model(
             config,
@@ -1530,39 +1577,6 @@ def main():
                     "仅评? VC 产生? contact ? obj_vel/IMU object baseline?"
                 )
 
-        data_dir_default = get_full_sequence_test_path(dataset_cfg)
-        if data_dir_default is None:
-            print(f"[Eval] Skipping '{dataset_name}' (no dataset directory configured).")
-            continue
-
-        try:
-            data_path = resolve_dataset_path(data_dir_default, PROJECT_ROOT)
-        except ValueError as exc:
-            print(f"[Eval] Skipping '{dataset_name}': {exc}")
-            continue
-
-        if not data_path.exists():
-            print(f"[Eval] Skipping '{dataset_name}' (data not found at {data_path}).")
-            continue
-
-        print(f"Loading test dataset from: {data_path}")
-
-        test_window = config.test.get("window", config.train.get("window", 60))
-        test_dataset = IMUDataset(
-            data_dir=str(data_path),
-            window_size=test_window,
-            debug=config.get("debug", False),
-            simulate_imu_noise=bool(args.simulate_imu_noise),
-            simulate_imu_noise_seed=args.simulate_imu_noise_seed,
-            min_obj_contact_frames=0,
-            full_sequence=True,
-            resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", False),
-        )
-
-        if len(test_dataset) == 0:
-            print(f"[Eval] Skipping '{dataset_name}' (dataset is empty).")
-            continue
-
         test_loader = DataLoader(
             test_dataset,
             batch_size=1,
@@ -1580,7 +1594,6 @@ def main():
         eval_start_time = time.time()
         results = evaluate_model(
             model,
-            smpl_model,
             test_loader,
             config,
             device,
@@ -1671,6 +1684,8 @@ def main():
             "velocity_contact_arch": args.velocity_contact_arch or getattr(load_config(args.config), "velocity_contact_arch", "current"),
             "object_trans_arch": args.object_trans_arch or getattr(load_config(args.config), "object_trans_arch", "current"),
             "seed": seed,
+            "joint_metric_source": "pred_joints_global_vs_canonical_position_global",
+            "model_body_models": model_body_models,
             "results": all_results,
         }
         output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")

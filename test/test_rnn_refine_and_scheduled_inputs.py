@@ -40,8 +40,24 @@ from train.rnn.loss.object_trans_loss import ObjectTransLoss
 from train.rnn.loss.velocity_contact_loss import VelocityContactLoss
 from train.rnn.scheduled_inputs import prediction_mix_probability, sample_mix_tensor
 from train.rnn.train_object_trans import Stage3JointTrainer, _resolve_pretrained_ckpt
+from train.rnn import train_object_trans as stage3_training
+from train.rnn import train_utils
 from train.rnn.train_velocity_contact import _resolve_hp_ckpt
 from utils.utils import build_model_input_dict
+
+
+def test_disabled_bfloat16_autocast_does_not_initialize_cuda(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    def unexpected_cuda_autocast(*args, **kwargs):
+        raise AssertionError("Disabled CPU AMP must not initialize CUDA autocast")
+
+    monkeypatch.setattr(train_utils, "_AmpAutocast", unexpected_cuda_autocast)
+    inputs = torch.tensor([1.0, 2.0], requires_grad=True)
+    with train_utils.autocast(enabled=False, dtype=torch.bfloat16):
+        loss = inputs.square().sum()
+    loss.backward()
+    torch.testing.assert_close(inputs.grad, torch.tensor([2.0, 4.0]))
 
 
 def test_prediction_mix_probability_and_sample_mask_shape():
@@ -345,6 +361,7 @@ def test_build_model_input_dict_preserves_object_metadata_fields():
         "obj_trans": torch.randn(batch_size, seq_len, 3),
         "obj_scale": torch.ones(batch_size, seq_len),
         "obj_points_canonical": torch.randn(batch_size, 5, 3),
+        "body_model_type": ["smplx", "smplh"],
     }
 
     out = build_model_input_dict(batch, cfg, torch.device("cpu"), add_noise=False)
@@ -352,6 +369,7 @@ def test_build_model_input_dict_preserves_object_metadata_fields():
     assert out["obj_trans_gt"].shape == (batch_size, seq_len, 3)
     assert out["obj_scale_gt"].shape == (batch_size, seq_len)
     assert out["obj_points_canonical"].shape == (batch_size, 5, 3)
+    assert out["body_model_type"] == ["smplx", "smplh"]
 
 
 def test_stage3_joint_trains_vc_immediately():
@@ -385,6 +403,87 @@ def test_stage3_joint_trains_vc_immediately():
     assert all(not p.requires_grad for p in trainer.hp_model.parameters())
     assert all(p.requires_grad for p in trainer.vc_model.parameters())
     assert any(p.requires_grad for p in trainer.ot_model.parameters())
+
+
+def test_stage3_joint_checkpoint_round_trip_preserves_next_update(tmp_path):
+    cfg = SimpleNamespace(
+        device="cpu", object_trans_arch="legacy_mesh", use_multi_gpu=False,
+        lr=1e-3, weight_decay=0.0, milestones=[1], gamma=0.1,
+        use_tensorboard=False, debug=True, no_trans=False, loss_weights={},
+        save_dir=str(tmp_path), resume_dir=None, amp_enabled=False,
+    )
+    trainer = Stage3JointTrainer(
+        cfg, nn.Linear(2, 2), nn.Linear(2, 2), nn.Linear(2, 2),
+        train_loader=[], joint_train=True,
+    )
+    inputs = torch.tensor([[0.25, 0.75]])
+
+    def update(current):
+        current.optimizer.zero_grad()
+        loss = current.ot_model(inputs).square().mean() + current.vc_model(inputs).square().mean()
+        loss.backward()
+        current.optimizer.step()
+
+    update(trainer)
+    trainer.scheduler.step()
+    trainer.n_iter = 8
+    trainer.best_loss = 0.75
+    torch.save({"ot_stage": 299}, tmp_path / "last.pt")
+    trainer._save_models(3, 0.8, "last", {"best_loss": 0.75, "n_iter": 8})
+    expected_random = torch.rand(4)
+    assert torch.load(tmp_path / "last.pt")["ot_stage"] == 299
+    assert (tmp_path / "last_object_trans.pt").is_file()
+    assert (tmp_path / "last_velocity_contact.pt").is_file()
+
+    cfg.resume_dir = str(tmp_path)
+    restored = Stage3JointTrainer(
+        cfg, nn.Linear(2, 2), nn.Linear(2, 2), nn.Linear(2, 2),
+        train_loader=[], joint_train=True,
+    )
+    torch.testing.assert_close(torch.rand(4), expected_random)
+    assert restored.start_epoch == 4
+    assert restored.n_iter == 8
+    assert restored.best_loss == 0.75
+    assert restored.scheduler.state_dict() == trainer.scheduler.state_dict()
+    assert restored.optimizer.param_groups[0]["lr"] == trainer.optimizer.param_groups[0]["lr"]
+    update(trainer)
+    update(restored)
+    for original_model, restored_model in (
+        (trainer.ot_model, restored.ot_model), (trainer.vc_model, restored.vc_model),
+    ):
+        for original, resumed in zip(original_model.parameters(), restored_model.parameters()):
+            torch.testing.assert_close(original, resumed, rtol=0, atol=0)
+
+
+def test_auto_joint_resume_and_amp_override_are_phase_specific(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(
+        save_dir=str(tmp_path), resume_dir=str(tmp_path), joint_train_epochs=100,
+        joint_train_milestones=[10, 20], eval_interval=5, joint_train_eval_interval=1,
+        amp_enabled=True, joint_train_amp_enabled=False, object_trans_arch="legacy_mesh",
+    )
+    trainer = SimpleNamespace(
+        vc_model=nn.Linear(2, 2), hp_model=nn.Linear(2, 2), ot_model=nn.Linear(2, 2),
+        device=torch.device("cpu"), joint_checkpoint_selection_keys=(), lb_prior_model=None,
+    )
+    captured = []
+    monkeypatch.setattr(stage3_training, "_load_object_trans_best_for_joint", lambda *args: None)
+    monkeypatch.setattr(stage3_training, "save_config_snapshot", lambda *args, **kwargs: None)
+
+    def build_trainer(joint_cfg, *args, **kwargs):
+        captured.append(joint_cfg)
+        return SimpleNamespace(train=lambda: None)
+
+    monkeypatch.setattr(stage3_training, "Stage3JointTrainer", build_trainer)
+    stage3_training._run_auto_joint_train(cfg, trainer, [], [], 0.002)
+    assert captured[-1].resume_dir is None
+    (tmp_path / "last_joint.pt").touch()
+    stage3_training._run_auto_joint_train(cfg, trainer, [], [], 0.002)
+    assert captured[-1].resume_dir == str(tmp_path)
+    assert captured[-1].amp_enabled is False
+    assert captured[-1].epochs == 100
+    assert captured[-1].lr == 0.0002
+    assert captured[-1].milestones == [10, 20]
+    assert cfg.amp_enabled is True
 
 
 def test_joint_checkpoint_selection_uses_only_hoi_and_obj_trans():

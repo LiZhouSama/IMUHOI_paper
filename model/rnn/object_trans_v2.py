@@ -4,11 +4,11 @@ import math
 import torch
 
 from .base import RNNWithInit
-from .object_trans import ObjectTransModule
+from .object_trans import ObjectTransModule as BaseObjectTransModule
 from utils.object_fusion import build_contact_fusion_weights
 
 
-class V2ObjectTransModule(ObjectTransModule):
+class V2ObjectTransModule(BaseObjectTransModule):
     """Current ObjectTrans pipeline without a trainable fusion head."""
 
     ARCH_VERSION = 2
@@ -51,7 +51,7 @@ class V2ObjectTransModule(ObjectTransModule):
 
     @staticmethod
     def empty_output(batch_size: int, seq_len: int, device: torch.device):
-        output = ObjectTransModule.empty_output(batch_size, seq_len, device)
+        output = BaseObjectTransModule.empty_output(batch_size, seq_len, device)
         output.pop("gate_logits", None)
         output["gating_is_fixed"] = True
         return output

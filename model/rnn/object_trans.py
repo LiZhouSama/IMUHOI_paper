@@ -99,10 +99,92 @@ class ObjectTransModule(nn.Module):
         # correction through the final projection.
         nn.init.zeros_(self.feedback_embed[-1].weight)
         nn.init.zeros_(self.feedback_embed[-1].bias)
+        # State trust (object_trans_state_trust): the published object feeds
+        # back into this predictor (init geometry + feedback features), so a
+        # drifted state corrupts the grasp offset on long streams.  Instead of
+        # blindly distrusting the state, the module (a) runs a state-free
+        # prior FK head, (b) measures the consistency between that prior and
+        # the current state (innovation, bimanual agreement, gap/rest ages,
+        # IMU rest flag), (c) predicts a supervised per-frame confidence c_t
+        # from those signals, and (d) scales the state-derived inputs by c_t.
+        self.state_trust_enabled = bool(getattr(cfg, "object_trans_state_trust", False))
+        if self.state_trust_enabled:
+            if not self._state_feedback_enabled():
+                raise ValueError("object_trans_state_trust requires object_trans_state_feedback")
+            self.prior_head = RNNWithInit(
+                n_input=n_prediction_input,
+                n_output=8,  # left dir(3)+len(1), right dir(3)+len(1); no state, no init geometry
+                n_hidden=predictor_hidden,
+                n_init=3 + self.LB_QUANTILE_DIM,  # initial contact state + l_b prior quantiles only
+                n_rnn_layer=predictor_layers,
+                bidirectional=False,
+                dropout=predictor_dropout,
+            )
+            with torch.no_grad():
+                self.prior_head.linear2.bias[3] = length_bias
+                self.prior_head.linear2.bias[7] = length_bias
+            self.consistency_feature_dim = 15
+            consistency_hidden = int(getattr(cfg, "object_trans_consistency_hidden_dim", 64))
+            self.consistency_embed = nn.Sequential(
+                nn.LayerNorm(self.consistency_feature_dim),
+                nn.Linear(self.consistency_feature_dim, consistency_hidden),
+                nn.GELU(),
+                nn.Linear(consistency_hidden, n_prediction_input),
+            )
+            nn.init.zeros_(self.consistency_embed[-1].weight)
+            nn.init.zeros_(self.consistency_embed[-1].bias)
+            self.confidence_head = nn.Sequential(
+                nn.LayerNorm(self.consistency_feature_dim),
+                nn.Linear(self.consistency_feature_dim, 32),
+                nn.GELU(),
+                nn.Linear(32, 1),
+            )
+            # Ages are counted inside the current window (online windows restart
+            # every frame), so normalise by the window length.
+            self.state_trust_age_norm = float(getattr(cfg, "object_trans_state_trust_age_norm", 60.0))
+            self.state_trust_contact_threshold = float(
+                getattr(cfg, "object_trans_state_trust_contact_threshold", 0.5)
+            )
+            # Diagnostics: override the learned confidence with a constant at
+            # inference (None = use the head).  1.0 disables the gating and the
+            # init-geometry mixing while keeping the prior head and the
+            # consistency features as predictor inputs.
+            force = getattr(cfg, "object_trans_state_trust_force_confidence", None)
+            self.state_trust_force_confidence = None if force is None else float(force)
         self.register_buffer(
             "object_trans_arch_version",
             torch.tensor(self.ARCH_VERSION, dtype=torch.int64),
             persistent=True,
+        )
+        # Object-static hard gate.  On the OMOMO test split 38% of the object
+        # error growth happens on frames where the object is not moving (false
+        # contacts dragging it, and the IMU branch leaking through a soft static
+        # weight).  The object IMU detects "static" with 0.995 precision from a
+        # short causal window, so those frames can be pinned to the previous
+        # position instead of being softly fused.
+        #   none  : original soft fusion
+        #   imu   : rotation change and acceleration over the last k frames
+        #   pmove : VC object-motion probability below a threshold
+        #   both  : either signal
+        self.static_gate_mode = str(
+            getattr(cfg, "object_trans_static_gate", "none") or "none"
+        ).strip().lower()
+        if self.static_gate_mode not in {"none", "imu", "pmove", "both"}:
+            raise ValueError(
+                "object_trans_static_gate must be none, imu, pmove or both; "
+                f"got {self.static_gate_mode!r}"
+            )
+        self.static_gate_pmove_threshold = float(
+            getattr(cfg, "object_trans_static_gate_pmove_threshold", 0.5)
+        )
+        self.static_gate_imu_window = max(
+            int(getattr(cfg, "object_trans_static_gate_imu_window", 5)), 1
+        )
+        self.static_gate_imu_angle_deg = float(
+            getattr(cfg, "object_trans_static_gate_imu_angle_deg", 0.6)
+        )
+        self.static_gate_imu_acc = float(
+            getattr(cfg, "object_trans_static_gate_imu_acc", 0.35)
         )
 
         n_refine_input = self.refine_pose_dim + 22
@@ -125,6 +207,51 @@ class ObjectTransModule(nn.Module):
     @staticmethod
     def _softplus_positive(x: torch.Tensor) -> torch.Tensor:
         return F.softplus(x) + ObjectTransModule.LENGTH_EPS
+
+    def _compute_static_gate(self, obj_imu, obj_rotm, pred_hand_contact_prob):
+        """Causal per-frame object-static flag [B, T] (bool), or None if disabled."""
+        mode = getattr(self, "static_gate_mode", "none")
+        if mode == "none":
+            return None
+        batch_size, seq_len = obj_rotm.shape[:2]
+        device = obj_rotm.device
+        flags = torch.zeros(batch_size, seq_len, device=device, dtype=torch.bool)
+        if mode in {"imu", "both"}:
+            flags = flags | self._imu_rest_flags(obj_imu, obj_rotm)
+        if mode in {"pmove", "both"}:
+            flags = flags | (
+                pred_hand_contact_prob[..., 2] < self.static_gate_pmove_threshold
+            )
+        return flags
+
+    def _imu_rest_flags(self, obj_imu, obj_rotm):
+        """Causal object-at-rest flag [B, T] from the object IMU alone.
+
+        Rotation change over the last k frames below ``static_gate_imu_angle_deg``
+        and max |acc| over the same causal window below ``static_gate_imu_acc``
+        (0.995+ precision on OMOMO/BEHAVE, ~0.55 recall).
+        """
+        batch_size, seq_len = obj_rotm.shape[:2]
+        device = obj_rotm.device
+        k = self.static_gate_imu_window
+        index = torch.arange(seq_len, device=device)
+        ref = (index - k).clamp_min(0)
+        rel = obj_rotm.transpose(-1, -2) @ obj_rotm[:, ref]
+        cos = ((rel.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) * 0.5).clamp(-1.0, 1.0)
+        angle_deg = torch.rad2deg(torch.acos(cos))
+        acc_norm = obj_imu[..., :3].norm(dim=-1)
+        # max |acc| over the causal window [t-k, t]
+        padded = torch.cat((acc_norm[:, :1].expand(-1, k), acc_norm), dim=1)
+        acc_max = padded.unfold(1, k + 1, 1).max(dim=-1).values
+        return (angle_deg < self.static_gate_imu_angle_deg) & (acc_max < self.static_gate_imu_acc)
+
+    def _apply_static_gate(self, weights, context, time_index):
+        """Pin the fusion to the static branch on gated frames."""
+        gate = context.get("static_gate")
+        if gate is None:
+            return weights
+        static_onehot = weights.new_tensor((0.0, 0.0, 0.0, 1.0)).expand_as(weights)
+        return torch.where(gate[:, time_index].unsqueeze(-1), static_onehot, weights)
 
     def _state_feedback_enabled(self) -> bool:
         value = getattr(self.cfg, "object_trans_state_feedback", False)
@@ -498,6 +625,7 @@ class ObjectTransModule(nn.Module):
             raise ValueError(f"obj_trans_init must have shape [{batch_size},3], got {tuple(obj_trans_init.shape)}")
         l_oe0, l_lb0 = self._compute_init_dir_len(lhand_position[:, 0], obj_rotm[:, 0], obj_trans_init)
         r_oe0, r_lb0 = self._compute_init_dir_len(rhand_position[:, 0], obj_rotm[:, 0], obj_trans_init)
+        raw_lb_prior_quantiles = lb_prior_quantiles
         lb_prior_quantiles = self._prepare_lb_prior_quantiles(
             lb_prior_quantiles,
             l_lb0,
@@ -530,6 +658,42 @@ class ObjectTransModule(nn.Module):
             rhand_imu,
             lb_prior_feature,
         )
+
+        static_gate = self._compute_static_gate(obj_imu, obj_rotm, pred_hand_contact_prob)
+
+        l_oe0_init, l_lb0_init, r_oe0_init, r_lb0_init = l_oe0, l_lb0, r_oe0, r_lb0
+        state_trust = None
+        if self.state_trust_enabled:
+            prior_lb = self._state_free_lb_prior(raw_lb_prior_quantiles, batch_size, device, dtype)
+            prior_input = torch.cat(
+                (
+                    prediction_input[..., : -self.LB_QUANTILE_DIM],
+                    prior_lb.flatten(1).unsqueeze(1).expand(batch_size, seq_len, self.LB_QUANTILE_DIM),
+                ),
+                dim=-1,
+            )
+            state_trust = self._prepare_state_trust(
+                prior_input,
+                prior_lb,
+                obj_imu,
+                obj_rotm,
+                lhand_position,
+                rhand_position,
+                pred_hand_contact_prob,
+                contact_init_vec,
+            )
+            # Confidence at the window start decides how much of the init
+            # geometry comes from the (possibly drifted) object state and how
+            # much from the state-free prior.
+            z0 = self._consistency_features_at(state_trust, 0, obj_trans_init, obj_rotm[:, 0])
+            c0 = torch.sigmoid(self.confidence_head(z0))  # [B,1]
+            if self.state_trust_force_confidence is not None:
+                c0 = torch.full_like(c0, self.state_trust_force_confidence)
+            l_oe0_init = c0 * l_oe0 + (1.0 - c0) * state_trust["prior_l_dir"][:, 0]
+            r_oe0_init = c0 * r_oe0 + (1.0 - c0) * state_trust["prior_r_dir"][:, 0]
+            l_lb0_init = c0 * l_lb0 + (1.0 - c0) * state_trust["prior_l_len"][:, 0].unsqueeze(-1)
+            r_lb0_init = c0 * r_lb0 + (1.0 - c0) * state_trust["prior_r_len"][:, 0].unsqueeze(-1)
+            state_trust["init_confidence"] = c0.squeeze(-1)
 
         feedback_mode = "normal"
         feedback_prev_obj_trans = None
@@ -616,17 +780,19 @@ class ObjectTransModule(nn.Module):
             "obj_vel_input": obj_vel_input,
             "pred_hand_contact_prob": pred_hand_contact_prob,
             "prediction_input": prediction_input,
+            "static_gate": static_gate,
             "prediction_init": torch.cat(
                 (
-                    l_oe0,
-                    l_lb0,
-                    r_oe0,
-                    r_lb0,
+                    l_oe0_init,
+                    l_lb0_init,
+                    r_oe0_init,
+                    r_lb0_init,
                     contact_init_vec,
                     lb_prior_quantiles.flatten(1),
                 ),
                 dim=-1,
             ),
+            "state_trust": state_trust,
             "obj_trans_init": obj_trans_init,
             "l_oe0": l_oe0,
             "r_oe0": r_oe0,
@@ -685,8 +851,14 @@ class ObjectTransModule(nn.Module):
         min_contact_frames: int = 10,
         quantiles=(0.1, 0.5, 0.9),
         max_history_frames: int = 2048,
+        tail_frames: int = 0,
     ):
         """Estimate per-hand l_b quantiles from the causal prediction history.
+
+        ``tail_frames`` > 0 restricts the statistics to the most recent frames
+        (a trailing window), so that on long streams the prior cannot carry
+        errors accumulated over the whole history; ``max_history_frames`` only
+        bounds the cost by uniform striding and keeps early segments.
 
         Frames whose predicted contact probability exceeds ``contact_threshold``
         contribute ``||pred_obj_trans - hand||``.  Hands with fewer than
@@ -716,6 +888,10 @@ class ObjectTransModule(nn.Module):
         lengths = (pred_obj_trans.unsqueeze(2) - hand_positions).norm(dim=-1)  # [B,T,2]
         contact = contact_prob[..., :2] > float(contact_threshold)
         seq_len = lengths.shape[1]
+        if int(tail_frames) > 0 and seq_len > int(tail_frames):
+            lengths = lengths[:, -int(tail_frames):]
+            contact = contact[:, -int(tail_frames):]
+            seq_len = lengths.shape[1]
         if seq_len > int(max_history_frames):
             # Uniform stride keeps early contact segments represented while
             # bounding the per-step quantile cost on long streams.
@@ -741,6 +917,98 @@ class ObjectTransModule(nn.Module):
         if not bool(torch.isfinite(output).any().item()):
             return None
         return output
+
+    def _state_free_lb_prior(self, value, batch_size, device, dtype):
+        """l_b prior for the state-free head: statistics when given, else a constant.
+
+        ``_prepare_lb_prior_quantiles`` falls back to the window's init geometry
+        (hand -> *estimated* object length), which would leak the object state
+        into the prior head; here missing/non-finite hands fall back to the
+        length-init constant instead.
+        """
+        neutral = torch.full((batch_size, 2, 3), self.object_trans_length_init, device=device, dtype=dtype)
+        if value is None:
+            return neutral
+        if not isinstance(value, torch.Tensor):
+            value = torch.as_tensor(value, device=device, dtype=dtype)
+        value = value.to(device=device, dtype=dtype)
+        if value.shape != (batch_size, 2, 3):
+            return neutral
+        finite = torch.isfinite(value).all(dim=-1, keepdim=True)
+        value = torch.where(finite, value.clamp_min(0.0), neutral)
+        return torch.cummax(value, dim=-1).values
+
+    def _prepare_state_trust(
+        self,
+        prediction_input,
+        lb_prior_quantiles,
+        obj_imu,
+        obj_rotm,
+        lhand_position,
+        rhand_position,
+        pred_hand_contact_prob,
+        contact_init_vec,
+    ):
+        """State-free prior FK, IMU rest flag and causal ages for the window."""
+        batch_size, seq_len = obj_rotm.shape[:2]
+        prior_init = torch.cat((contact_init_vec, lb_prior_quantiles.flatten(1)), dim=-1)
+        prior_out, _ = self.prior_head.forward_with_state(prediction_input, x_init=prior_init)
+        prior_out = prior_out.to(obj_rotm.dtype)
+        l_dir = self._unit_vector(prior_out[..., 0:3])
+        r_dir = self._unit_vector(prior_out[..., 4:7])
+        l_len = self._softplus_positive(prior_out[..., 3])
+        r_len = self._softplus_positive(prior_out[..., 7])
+        l_pos = lhand_position + torch.einsum("btij,btj->bti", obj_rotm, l_dir) * l_len.unsqueeze(-1)
+        r_pos = rhand_position + torch.einsum("btij,btj->bti", obj_rotm, r_dir) * r_len.unsqueeze(-1)
+        rest = self._imu_rest_flags(obj_imu, obj_rotm)  # [B,T] bool
+        contact_any = pred_hand_contact_prob[..., :2].max(dim=-1).values > self.state_trust_contact_threshold
+        rest_age = torch.zeros(batch_size, seq_len, device=obj_rotm.device, dtype=obj_rotm.dtype)
+        gap_age = torch.zeros_like(rest_age)
+        rest_run = torch.zeros(batch_size, device=obj_rotm.device, dtype=obj_rotm.dtype)
+        gap_run = torch.zeros_like(rest_run)
+        for t in range(seq_len):
+            rest_run = torch.where(rest[:, t], rest_run + 1.0, torch.zeros_like(rest_run))
+            gap_run = torch.where(contact_any[:, t], torch.zeros_like(gap_run), gap_run + 1.0)
+            rest_age[:, t] = rest_run
+            gap_age[:, t] = gap_run
+        return {
+            "prior_l_pos": l_pos,
+            "prior_r_pos": r_pos,
+            "prior_l_dir": l_dir,
+            "prior_r_dir": r_dir,
+            "prior_l_len": l_len,
+            "prior_r_len": r_len,
+            "rest_flag": rest,
+            "rest_age": rest_age,
+            "gap_age": gap_age,
+        }
+
+    def _consistency_features_at(self, state_trust, time_index, prev_pos, obj_rotm):
+        """15-dim consistency signal between the state and the state-free prior.
+
+        [innov_l(3), innov_r(3), |innov_l|, |innov_r|, bimanual(3), |bimanual|,
+         gap_age, rest_age, rest_flag], innovations expressed in the object frame.
+        """
+        l_pos = state_trust["prior_l_pos"][:, time_index]
+        r_pos = state_trust["prior_r_pos"][:, time_index]
+        innov_l = self._object_frame_vector(obj_rotm, l_pos - prev_pos)
+        innov_r = self._object_frame_vector(obj_rotm, r_pos - prev_pos)
+        bimanual = self._object_frame_vector(obj_rotm, l_pos - r_pos)
+        norm = self.state_trust_age_norm
+        return torch.cat(
+            (
+                innov_l,
+                innov_r,
+                innov_l.norm(dim=-1, keepdim=True),
+                innov_r.norm(dim=-1, keepdim=True),
+                bimanual,
+                bimanual.norm(dim=-1, keepdim=True),
+                (state_trust["gap_age"][:, time_index] / norm).clamp(max=2.0).unsqueeze(-1),
+                (state_trust["rest_age"][:, time_index] / norm).clamp(max=2.0).unsqueeze(-1),
+                state_trust["rest_flag"][:, time_index].to(prev_pos.dtype).unsqueeze(-1),
+            ),
+            dim=-1,
+        )
 
     def _init_scan_state(self, context):
         batch_size = context["batch_size"]
@@ -811,10 +1079,24 @@ class ObjectTransModule(nn.Module):
         lhand_position = context["lhand_position"][:, time_index]
         rhand_position = context["rhand_position"][:, time_index]
         step_input = context["prediction_input"][:, time_index]
+        state_confidence = None
+        state_confidence_logit = None
         if self._state_feedback_enabled():
-            step_input = step_input + self.feedback_embed(
+            feedback = self.feedback_embed(
                 self._feedback_features(obj_rotm, lhand_position, rhand_position, step_state)
             )
+            state_trust = context.get("state_trust")
+            if state_trust is not None:
+                z = self._consistency_features_at(
+                    state_trust, time_index, step_state["prev_obj_trans"], obj_rotm
+                )
+                state_confidence_logit = self.confidence_head(z).squeeze(-1)
+                state_confidence = torch.sigmoid(state_confidence_logit)
+                if self.state_trust_force_confidence is not None:
+                    state_confidence = torch.full_like(state_confidence, self.state_trust_force_confidence)
+                feedback = state_confidence.unsqueeze(-1).to(feedback.dtype) * feedback
+                step_input = step_input + self.consistency_embed(z).to(step_input.dtype)
+            step_input = step_input + feedback
 
         if prediction_out is None:
             prediction_out, rnn_state = self.object_trans_head.step(step_input, state["rnn_state"])
@@ -824,6 +1106,7 @@ class ObjectTransModule(nn.Module):
             prediction_out,
             context["pred_hand_contact_prob"][:, time_index],
         )
+        weights = self._apply_static_gate(weights, context, time_index)
         l_dir = self._unit_vector(l_fk_out[:, :3])
         r_dir = self._unit_vector(r_fk_out[:, :3])
         l_len = self._softplus_positive(l_fk_out[:, 3])
@@ -895,6 +1178,13 @@ class ObjectTransModule(nn.Module):
         }
         if gate_logits is not None:
             frame_output["gate_logits"] = gate_logits
+        if state_confidence is not None:
+            frame_output["state_confidence"] = state_confidence
+            frame_output["state_confidence_logit"] = state_confidence_logit
+            # The state this frame was conditioned on (fused position of the
+            # previous frame, or the window init): the confidence target in
+            # training compares it with the GT object of the previous frame.
+            frame_output["ot_state_prev_obj_trans"] = step_state["prev_obj_trans"]
         return frame_output, next_state
 
     def _scan_predictor(
@@ -995,7 +1285,26 @@ class ObjectTransModule(nn.Module):
             "lb_prior_quantiles": context["lb_prior_quantiles"],
             "gating_contact_prob": context["pred_hand_contact_prob"],
             "gating_smoothing_applied": False,
+            # The hands this module consumed (stage-1 palms or the GT/pred mix
+            # during training); the metric-aligned HOI loss needs them.
+            "ot_hand_positions": context["hand_positions"],
         }
+        state_trust = context.get("state_trust")
+        if state_trust is not None:
+            results.update(
+                {
+                    "prior_lhand_obj_trans": state_trust["prior_l_pos"],
+                    "prior_rhand_obj_trans": state_trust["prior_r_pos"],
+                    "prior_lhand_obj_direction": state_trust["prior_l_dir"],
+                    "prior_rhand_obj_direction": state_trust["prior_r_dir"],
+                    "prior_lhand_lb": state_trust["prior_l_len"],
+                    "prior_rhand_lb": state_trust["prior_r_len"],
+                    "state_trust_rest_flag": state_trust["rest_flag"],
+                    "state_trust_rest_age": state_trust["rest_age"],
+                    "state_trust_gap_age": state_trust["gap_age"],
+                    "state_trust_init_confidence": state_trust["init_confidence"],
+                }
+            )
         if sample_mask is not None:
             mask = sample_mask.view(batch_size, 1, 1)
             init_mask = sample_mask.view(batch_size, 1)
@@ -1011,8 +1320,11 @@ class ObjectTransModule(nn.Module):
                 "pred_rhand_obj_trans",
                 "pred_imu_obj_trans",
                 "pred_static_obj_trans",
+                "prior_lhand_obj_trans",
+                "prior_rhand_obj_trans",
             ):
-                results[key] = results[key] * mask
+                if key in results:
+                    results[key] = results[key] * mask
             results["pred_lhand_lb"] = results["pred_lhand_lb"] * init_mask
             results["pred_rhand_lb"] = results["pred_rhand_lb"] * init_mask
             results["init_lhand_oe_ho"] = results["init_lhand_oe_ho"] * init_mask

@@ -19,6 +19,7 @@ from tqdm import tqdm
 
 from configs import _REDUCED_POSE_NAMES, _SENSOR_POS_INDICES, _SENSOR_VEL_NAMES
 from utils.rotation_conversions import matrix_to_rotation_6d
+from utils.dataset_config import configure_canonical_body_model_for_datasets
 
 try:
     from torch.utils.tensorboard.writer import SummaryWriter
@@ -143,6 +144,7 @@ def create_dataloaders(cfg, project_root=None):
         project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
     train_datasets = getattr(cfg, "train_datasets", None) or list(cfg.datasets.keys())
+    configure_canonical_body_model_for_datasets(cfg, train_datasets)
     train_paths = []
     test_paths = []
     for ds_name in train_datasets:
@@ -171,6 +173,7 @@ def create_dataloaders(cfg, project_root=None):
         debug=cfg.debug,
         simulate_imu_noise=False,
         resolve_bimanual_contact_conflicts=resolve_bimanual_contact_conflicts,
+        require_canonical_skeleton=bool(getattr(cfg, "require_canonical_skeleton", False)),
     )
     train_loader = DataLoader(
         train_dataset,
@@ -189,6 +192,7 @@ def create_dataloaders(cfg, project_root=None):
             window_size=cfg.test.window,
             debug=cfg.debug,
             resolve_bimanual_contact_conflicts=resolve_bimanual_contact_conflicts,
+            require_canonical_skeleton=bool(getattr(cfg, "require_canonical_skeleton", False)),
         )
         if len(test_dataset) > 0:
             test_loader = DataLoader(

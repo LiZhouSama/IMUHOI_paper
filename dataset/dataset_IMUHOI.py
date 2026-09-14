@@ -279,6 +279,9 @@ def compute_obj_direction_supervision(position_global, obj_trans, obj_rot,
     
     return result
 
+class CanonicalSkeletonMismatchError(ValueError):
+    """Raised when a neutral canonical run is pointed at legacy shaped data."""
+
 class IMUDataset(Dataset):
     def __init__(
         self,
@@ -294,6 +297,7 @@ class IMUDataset(Dataset):
         obj_points_sample_count=256,
         resolve_bimanual_contact_conflicts=False,
         random_window=True,
+        require_canonical_skeleton=False,
     ):
         """
         IMU数据集 - 每个epoch为每个序列随机采样一个窗口
@@ -308,6 +312,7 @@ class IMUDataset(Dataset):
             simulate_imu_noise_seed: 基础种子；结合序列路径生成序列级固定噪声
             resolve_bimanual_contact_conflicts: 是否后处理双手同时接触段，清掉骨长变化更大的手部接触标签
             random_window: 窗口模式下是否随机选起点；验证集可关闭以获得可重复曲线
+            require_canonical_skeleton: 是否拒绝非 neutral/zero-betas canonical 数据
         """
         # 支持单个目录或多个目录
         if isinstance(data_dir, str):
@@ -327,6 +332,7 @@ class IMUDataset(Dataset):
         self.obj_points_sample_count = int(max(1, obj_points_sample_count))
         self.resolve_bimanual_contact_conflicts = bool(resolve_bimanual_contact_conflicts)
         self.random_window = bool(random_window)
+        self.require_canonical_skeleton = bool(require_canonical_skeleton)
 
         # 查找所有目录中的序列文件，或使用显式传入的序列文件列表
         self.sequence_files = []
@@ -394,6 +400,25 @@ class IMUDataset(Dataset):
                 seq_data = torch.load(file_path)
                 seq_name = os.path.basename(file_path).replace(".pt", "")
 
+                if self.require_canonical_skeleton:
+                    canonical_gender = str(
+                        seq_data.get("canonical_body_model_gender", "")
+                    ).strip().lower()
+                    canonical_betas = str(seq_data.get("canonical_betas", "")).strip().lower()
+                    canonical_version = int(seq_data.get("canonical_skeleton_version", 0) or 0)
+                    stored_gender = str(seq_data.get("gender", "")).strip().lower()
+                    if (
+                        canonical_gender != "neutral"
+                        or canonical_betas != "zero"
+                        or canonical_version < 1
+                        or stored_gender != "neutral"
+                    ):
+                        raise CanonicalSkeletonMismatchError(
+                            "Dataset was not generated with the neutral, zero-betas canonical "
+                            f"skeleton contract: {file_path}. Re-run preprocessing; got "
+                            f"gender={stored_gender!r}, canonical_gender={canonical_gender!r}, "
+                            f"canonical_betas={canonical_betas!r}, version={canonical_version}."
+                        )
                 # 判定是否有物体：显式 has_object 优先，其次根据 obj_trans 是否存在
                 has_object_flag = seq_data.get("has_object", None)
                 if has_object_flag is None:
@@ -465,8 +490,14 @@ class IMUDataset(Dataset):
                     "seq_name": seq_name,
                     "seq_len": seq_len,
                     "has_object": has_object_flag,
+                    "body_model_type": str(seq_data.get("body_model_type") or ""),
+                    "canonical_body_model_gender": str(seq_data.get("canonical_body_model_gender") or ""),
+                    "canonical_betas": str(seq_data.get("canonical_betas") or ""),
+                    "canonical_skeleton_version": int(seq_data.get("canonical_skeleton_version", 0) or 0),
                 })
 
+            except CanonicalSkeletonMismatchError:
+                raise
             except Exception as e:
                 print(f"处理文件 {file_path} 时出错: {e}")
                 import traceback
@@ -900,6 +931,9 @@ class IMUDataset(Dataset):
                 # model can run FK in the same skeleton.  Empty for .pt files
                 # written before the field existed; the model falls back then.
                 "body_model_type": str(seq_data.get("body_model_type") or ""),
+                "canonical_body_model_gender": str(seq_data.get("canonical_body_model_gender") or ""),
+                "canonical_betas": str(seq_data.get("canonical_betas") or ""),
+                "canonical_skeleton_version": int(seq_data.get("canonical_skeleton_version", 0) or 0),
                 "window_start": int(start_idx),
                 "window_end": int(end_idx),
 

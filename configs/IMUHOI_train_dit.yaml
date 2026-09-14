@@ -7,9 +7,13 @@ save_dir: "outputs/IMUHOI_DiT"
 # OMOMO/PAHOI 是 SMPL-X 拟合，AMASS/BEHAVE/HODome/IMHD 是 SMPL-H。
 # body_model_path 作为未声明族的样本的回退。
 body_model_paths:
-  smplh: datasets/smpl_models/smplh/male/model.npz
-  smplx: datasets/smpl_models/smplx/SMPLX_MALE.npz
-body_model_path: datasets/smpl_models/smplx/SMPLX_MALE.npz
+  smplh: datasets/smpl_models/smplh/neutral/model.npz
+  smplx: datasets/smpl_models/smplx/SMPLX_NEUTRAL.npz
+body_model_path: datasets/smpl_models/smplx/SMPLX_NEUTRAL.npz
+canonical_body_model_gender: neutral
+canonical_betas: zero
+canonical_skeleton_version: 1
+require_canonical_skeleton: true
 use_tensorboard: True
 use_multi_gpu: True
 device: "cuda:0"
@@ -94,22 +98,26 @@ train_datasets: ["omomo"]  # 可选: behave, imhd, omomo, amass
 # ============ 数据集路径 ============
 datasets:
   amass:
+    body_model_type: "smplh"
     train_path: "process/processed_amass_data_0703/train"
     test_path: "process/processed_amass_data_0703/test"
     debug_path: "process/processed_amass_data_0703/debug"
     object_geo_root: null
   omomo:
+    body_model_type: "smplx"
     train_path: "process/processed_split_data_OMOMO_bps/train"
     test_path: "process/processed_split_data_OMOMO_bps/test"
     debug_path: "process/processed_split_data_OMOMO_bps/debug"
     object_geo_root: "datasets/OMOMO/captured_objects"
   imhd:
+    body_model_type: "smplh"
     train_path: "process/processed_seg_data_IMHD/train"
     test_path: "process/processed_seg_data_IMHD/test"
     debug_path: "process/processed_seg_data_IMHD/debug"
     full_sequence_test_path: "process/processed_split_data_IMHD/test"
     object_geo_root: "datasets/IMHD/IMHD Dataset/object_templates"
   behave:
+    body_model_type: "smplh"
     train_path: "process/processed_seg_data_BEHAVE/train"
     test_path: "process/processed_seg_data_BEHAVE/test"
     debug_path: "process/processed_seg_data_BEHAVE/debug"
@@ -155,8 +163,9 @@ test:
 
 # ============ 预训练模块路径（可选）============
 # 取消注释以使用预训练权重
+# Canonical skeleton v1 changes every position-derived target; legacy checkpoints must not be reused.
 pretrained_modules:
-  human_pose: "outputs/IMUHOI_DiT/human_pose_04011146/best.pt"
-  interaction: "outputs/IMUHOI_DiT/interaction_04222310/best.pt"
+  human_pose: null
+  interaction: null
 
   # imuhoi_mix: "outputs/IMUHOI_DiT/imuhoi_mix_03241600/best.pt"

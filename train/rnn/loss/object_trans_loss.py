@@ -9,6 +9,38 @@ from utils.object_fusion import build_contact_fusion_weights
 from configs import FRAME_RATE, _REDUCED_POSE_NAMES
 
 
+def resolve_object_trans_loss_weights(cfg):
+    """Merge the arch-scoped ObjectTrans weights over the shared ``loss_weights``.
+
+    ``loss_weights`` is shared by every stage and every ObjectTrans architecture,
+    but the weights each architecture wants are not the same: ``current`` fuses
+    through a *learned* four-way gate and is trained with the metric-aligned
+    ``hoi_fused`` term, while v2/v3 drive the fusion with weights that are a fixed
+    function of the contact probabilities and gain nothing from it.  Only the block
+    named by ``cfg.object_trans_arch`` is applied, so changing one architecture's
+    recipe never moves another's.  Architectures without a block keep the shared
+    weights unchanged.
+    """
+    weights = dict(getattr(cfg, "loss_weights", None) or {})
+    per_arch = getattr(cfg, "object_trans_arch_loss_weights", None) or {}
+    if not isinstance(per_arch, dict):
+        raise ValueError(
+            "object_trans_arch_loss_weights must map an ObjectTrans arch name to a "
+            f"weight block, got {type(per_arch).__name__}"
+        )
+    arch = str(getattr(cfg, "object_trans_arch", "current") or "current").strip().lower()
+    overrides = per_arch.get(arch)
+    if overrides is None:
+        return weights
+    if not isinstance(overrides, dict):
+        raise ValueError(
+            f"object_trans_arch_loss_weights[{arch!r}] must be a mapping of weights, "
+            f"got {type(overrides).__name__}"
+        )
+    weights.update(dict(overrides))
+    return weights
+
+
 def _masked_mse(pred, target, mask, zero):
     """带mask的MSE损失"""
     if mask is None:
@@ -35,6 +67,9 @@ class ObjectTransLoss:
     # 训练阶段使用的损失键
     LOSS_KEYS = {
         'obj_trans',
+        'prior_hoi_l',
+        'prior_hoi_r',
+        'state_conf',
         'lhand_obj_direction',
         'rhand_obj_direction',
         'lhand_lb',
@@ -43,6 +78,8 @@ class ObjectTransLoss:
         'rhand_lb_cons',
         'hoi_error_l',
         'hoi_error_r',
+        'hoi_fused_l',
+        'hoi_fused_r',
         'obj_vel_cons',
         'refine_pose',
         'refine_root_trans',
@@ -52,6 +89,9 @@ class ObjectTransLoss:
     # 测试阶段记录/上报的损失键
     TEST_LOSS_KEYS = {
         'obj_trans',
+        'prior_hoi_l',
+        'prior_hoi_r',
+        'state_conf',
         'lhand_obj_direction',
         'rhand_obj_direction',
         'lhand_lb',
@@ -60,6 +100,8 @@ class ObjectTransLoss:
         'rhand_lb_cons',
         'hoi_error_l',
         'hoi_error_r',
+        'hoi_fused_l',
+        'hoi_fused_r',
         'refine_pose',
         'refine_root_trans',
     }
@@ -77,7 +119,20 @@ class ObjectTransLoss:
         'rhand_lb_cons',
         'hoi_error_l',
         'hoi_error_r',
+        'hoi_fused_l',
+        'hoi_fused_r',
     }
+    # Zero unless the config asks for them: the official HOI metric compares the
+    # *fused* object relative to the hand OT consumed, on GT contact frames.
+    # ``hoi_error_*`` only supervises the FK branch's bone, so a fusion that
+    # leans on the IMU/static branches is never told what the metric wants.
+    _ZERO_DEFAULT_WEIGHT_KEYS = (
+        'gate_weak', 'hoi_fused_l', 'hoi_fused_r',
+        # state-trust terms (object_trans_state_trust): the state-free prior
+        # FK's metric-aligned error and the BCE of the per-frame state
+        # confidence against "state within state_conf_threshold of GT".
+        'prior_hoi_l', 'prior_hoi_r', 'state_conf',
+    )
     
     def __init__(self, weights=None):
         """
@@ -85,6 +140,7 @@ class ObjectTransLoss:
             weights: dict, 各损失项的权重，默认为1.0
         """
         self.weights = weights or {}
+        self.state_conf_threshold = float((weights or {}).get('state_conf_threshold', 0.10))
 
     @staticmethod
     def _build_gate_weak_target(contact_prob, eps=1e-6):
@@ -326,11 +382,53 @@ class ObjectTransLoss:
                     diff_r = torch.norm(vec_pred_r - vec_gt_r, dim=-1)
                     losses['hoi_error_r'] = _masked_mean(diff_r, mask_r, zero)
 
+            # Metric-aligned HOI: fused object minus the hand OT consumed, against
+            # GT object minus GT palm, on GT contact frames (metres, L2 per frame).
+            hands_in = pred_dict.get('ot_hand_positions')
+            fused = pred_dict.get('pred_obj_trans')
+            if (
+                isinstance(hands_in, torch.Tensor)
+                and isinstance(fused, torch.Tensor)
+                and hands_in.shape == (bs, seq, 2, 3)
+                and fused.shape == (bs, seq, 3)
+            ):
+                hands_in = hands_in.to(device=device, dtype=fused.dtype)
+                rel_gt_l = obj_trans_gt - lhand_pos_gt
+                rel_gt_r = obj_trans_gt - rhand_pos_gt
+                diff_fused_l = torch.norm((fused - hands_in[:, :, 0]) - rel_gt_l, dim=-1)
+                diff_fused_r = torch.norm((fused - hands_in[:, :, 1]) - rel_gt_r, dim=-1)
+                losses['hoi_fused_l'] = _masked_mean(diff_fused_l, mask_l, zero)
+                losses['hoi_fused_r'] = _masked_mean(diff_fused_r, mask_r, zero)
+                # State-free prior FK (state trust): same metric-aligned target.
+                prior_l = pred_dict.get('prior_lhand_obj_trans')
+                prior_r = pred_dict.get('prior_rhand_obj_trans')
+                if isinstance(prior_l, torch.Tensor) and prior_l.shape == (bs, seq, 3):
+                    diff_prior_l = torch.norm((prior_l - hands_in[:, :, 0]) - rel_gt_l, dim=-1)
+                    losses['prior_hoi_l'] = _masked_mean(diff_prior_l, mask_l, zero)
+                if isinstance(prior_r, torch.Tensor) and prior_r.shape == (bs, seq, 3):
+                    diff_prior_r = torch.norm((prior_r - hands_in[:, :, 1]) - rel_gt_r, dim=-1)
+                    losses['prior_hoi_r'] = _masked_mean(diff_prior_r, mask_r, zero)
+        # State confidence (state trust): the state used at frame t is the fused
+        # object of frame t-1 (window init at t=0); it is "trustworthy" when it
+        # lies within state_conf_threshold metres of the GT object at t-1.
+        conf_logit = pred_dict.get('state_confidence_logit')
+        state_prev = pred_dict.get('ot_state_prev_obj_trans')
+        if (
+            isinstance(conf_logit, torch.Tensor)
+            and isinstance(state_prev, torch.Tensor)
+            and conf_logit.shape == (bs, seq)
+            and state_prev.shape == (bs, seq, 3)
+        ):
+            gt_prev = torch.cat((obj_trans_gt[:, :1], obj_trans_gt[:, :-1]), dim=1)
+            state_err = torch.norm(state_prev.to(obj_trans_gt.dtype) - gt_prev, dim=-1)
+            target = (state_err < self.state_conf_threshold).to(conf_logit.dtype)
+            losses['state_conf'] = F.binary_cross_entropy_with_logits(conf_logit.float(), target.float())
+
         # 加权求和
         total_loss = zero.clone()
         weighted_losses = {}
         for key, loss in losses.items():
-            default_weight = 0.0 if key == 'gate_weak' else 1.0
+            default_weight = 0.0 if key in self._ZERO_DEFAULT_WEIGHT_KEYS else 1.0
             weight = self.weights.get(key, default_weight)
             weighted_losses[key] = loss * weight
             total_loss = total_loss + weighted_losses[key]

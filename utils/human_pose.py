@@ -1,6 +1,7 @@
 """Shared helpers for human pose modules."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Iterable, Optional, Sequence
 
 import torch
@@ -28,6 +29,9 @@ SMPLX_PALM_JOINT_INDICES = (28, 43)  # SMPL-X: L/R middle1 (jaw/eyes occupy 22..
 SMPL_NATIVE_JOINT_COUNT = 24
 SMPLH_NATIVE_JOINT_COUNT = 52
 SMPLX_NATIVE_JOINT_COUNT = 55
+CANONICAL_BODY_MODEL_GENDER = 'neutral'
+CANONICAL_BETAS = 'zero'
+CANONICAL_SKELETON_VERSION = 1
 # Native joint layouts are not interchangeable: SMPL-X inserts jaw/eye joints at
 # 22..24 before the hand chains, so reusing the SMPL-H indices on SMPL-X output
 # silently returns two left-hand joints instead of the left and right palms.
@@ -367,6 +371,25 @@ def infer_body_model_type_from_pose_width(pose_width) -> Optional[str]:
     return BODY_MODEL_TYPE_BY_POSE_WIDTH.get(int(pose_width))
 
 
+def is_neutral_body_model_path(path) -> bool:
+    """Return whether a standard SMPL-family path names a neutral template."""
+    normalized = str(path).replace("\\", "/").lower()
+    name = normalized.rsplit("/", 1)[-1]
+    return "/neutral/" in normalized or "_neutral." in name
+
+
+def canonical_skeleton_metadata(model_type: str) -> dict:
+    resolved = normalize_body_model_type(model_type)
+    if resolved is None:
+        raise ValueError(f"Unsupported canonical body-model family: {model_type!r}")
+    return {
+        "body_model_type": resolved,
+        "gender": CANONICAL_BODY_MODEL_GENDER,
+        "canonical_body_model_gender": CANONICAL_BODY_MODEL_GENDER,
+        "canonical_betas": CANONICAL_BETAS,
+        "canonical_skeleton_version": CANONICAL_SKELETON_VERSION,
+    }
+
 def load_body_models_from_cfg(cfg, num_betas: int = 16):
     """Load every body model a config declares, keyed by family.
 
@@ -382,8 +405,39 @@ def load_body_models_from_cfg(cfg, num_betas: int = 16):
     models = {}
     default_type = None
 
-    single_path = getattr(cfg, "body_model_path", None)
-    mapping = getattr(cfg, "body_model_paths", None) or {}
+    if isinstance(cfg, Mapping):
+        canonical_contract = bool(cfg.get("require_canonical_skeleton", False))
+        canonical_contract = canonical_contract or "canonical_body_model_gender" in cfg
+        canonical_contract = canonical_contract or "canonical_betas" in cfg
+        canonical_gender_value = cfg.get(
+            "canonical_body_model_gender", CANONICAL_BODY_MODEL_GENDER
+        )
+        canonical_betas_value = cfg.get("canonical_betas", CANONICAL_BETAS)
+        single_path = cfg.get("body_model_path")
+        mapping = cfg.get("body_model_paths") or {}
+    else:
+        canonical_contract = bool(getattr(cfg, "require_canonical_skeleton", False))
+        canonical_contract = canonical_contract or hasattr(cfg, "canonical_body_model_gender")
+        canonical_contract = canonical_contract or hasattr(cfg, "canonical_betas")
+        canonical_gender_value = getattr(
+            cfg, "canonical_body_model_gender", CANONICAL_BODY_MODEL_GENDER
+        )
+        canonical_betas_value = getattr(cfg, "canonical_betas", CANONICAL_BETAS)
+        single_path = getattr(cfg, "body_model_path", None)
+        mapping = getattr(cfg, "body_model_paths", None) or {}
+    canonical_gender = str(canonical_gender_value).strip().lower()
+    canonical_betas = str(canonical_betas_value).strip().lower()
+    if canonical_contract and canonical_gender != CANONICAL_BODY_MODEL_GENDER:
+        raise ValueError(
+            "Training/inference body models must use the neutral canonical template; "
+            f"got canonical_body_model_gender={canonical_gender!r}."
+        )
+    if canonical_contract and canonical_betas != CANONICAL_BETAS:
+        raise ValueError(
+            "Training/inference body models must use zero canonical betas; "
+            f"got canonical_betas={canonical_betas!r}."
+        )
+
     if not isinstance(mapping, dict):
         raise ValueError(
             f"body_model_paths must be a mapping of family -> path, got {type(mapping).__name__}"
@@ -395,6 +449,10 @@ def load_body_models_from_cfg(cfg, num_betas: int = 16):
             raise ValueError(f"body_model_paths has an unsupported family: {raw_type!r}")
         if not path:
             continue
+        if canonical_contract and not is_neutral_body_model_path(path):
+            raise ValueError(
+                f"body_model_paths[{raw_type!r}] must point to a neutral model: {path}"
+            )
         model = load_body_model(str(path), num_betas=num_betas)
         found = body_model_type_of(model)
         if found is not None and found != model_type:
@@ -404,6 +462,8 @@ def load_body_models_from_cfg(cfg, num_betas: int = 16):
         models[model_type] = model
 
     if single_path:
+        if canonical_contract and not is_neutral_body_model_path(single_path):
+            raise ValueError(f"body_model_path must point to a neutral model: {single_path}")
         model = load_body_model(str(single_path), num_betas=num_betas)
         default_type = body_model_type_of(model)
         if default_type is None:
@@ -513,6 +573,18 @@ class BodyModelRegistry:
             model = model.to(self.device)
         self._models[key] = model
         return model
+
+    def get_canonical(self, model_type=None):
+        """Return the requested family's neutral model without gender fallback."""
+        resolved_type = normalize_body_model_type(model_type) or self.default_type
+        neutral_path = resolve_body_model_path(
+            self.support_dir, resolved_type, CANONICAL_BODY_MODEL_GENDER
+        )
+        if neutral_path is None:
+            raise FileNotFoundError(
+                f"Canonical neutral {resolved_type} model not found under {self.support_dir}"
+            )
+        return self.get(resolved_type, CANONICAL_BODY_MODEL_GENDER)
 
     def rest_joints(self, model_type, gender, betas=None) -> torch.Tensor:
         """Shaped rest-pose joints ``[N, 3]`` for one (family, gender, betas)."""

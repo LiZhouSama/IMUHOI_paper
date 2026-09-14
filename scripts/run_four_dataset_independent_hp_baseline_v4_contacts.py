@@ -27,10 +27,10 @@ DEFAULT_ROOT = PROJECT_ROOT / (
 DATASETS = ("behave", "imhd", "pahoi", "hodome")
 PIPELINES = (("baseline", "imuhoi"), ("v4", "v4"))
 BODY_MODEL_PATHS = {
-    "behave": "datasets/smpl_models/smplh/male/model.npz",
-    "imhd": "datasets/smpl_models/smplh/male/model.npz",
-    "pahoi": "datasets/smpl_models/smplx/SMPLX_MALE.npz",
-    "hodome": "datasets/smpl_models/smplh/male/model.npz",
+    "behave": "datasets/smpl_models/smplh/neutral/model.npz",
+    "imhd": "datasets/smpl_models/smplh/neutral/model.npz",
+    "pahoi": "datasets/smpl_models/smplx/SMPLX_NEUTRAL.npz",
+    "hodome": "datasets/smpl_models/smplh/neutral/model.npz",
 }
 CONTACT_METRICS = (
     "contact_f1_lhand",

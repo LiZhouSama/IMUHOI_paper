@@ -8,14 +8,33 @@ from configs import _SENSOR_POS_INDICES
 from model.rnn.velocity_contact_v4 import DEFAULT_ANTICIPATION_HORIZON
 
 
+# bfloat16 keeps ~8 mantissa bits, so ``sigmoid`` rounds to exactly 1.0 once the
+# logit passes ~8 (and to 0.0 symmetrically).  ``binary_cross_entropy`` then sees
+# a saturated probability: the loss is capped at 100, but ``d/dp`` is 1/(1-p),
+# which is ~1e12 at p == 1.  One confidently wrong frame is enough to push that
+# through ``clip_grad_norm_`` and poison the next forward with non-finite
+# activations -- which is what killed VC-v4 at epoch 170, long after it had
+# converged enough to saturate.  Clamping into the open interval bounds the
+# gradient at 1/eps and is a no-op everywhere else.
+_BCE_PROBABILITY_EPS = 1e-6
+
+
 def _binary_cross_entropy_probability(input_tensor, target, reduction="mean"):
     """BCE on probabilities, made safe when the caller uses CUDA AMP."""
     if input_tensor.device.type == "cuda":
         with torch.autocast(device_type="cuda", enabled=False):
             return F.binary_cross_entropy(
-                input_tensor.float(), target.float(), reduction=reduction
+                input_tensor.float().clamp(
+                    _BCE_PROBABILITY_EPS, 1.0 - _BCE_PROBABILITY_EPS
+                ),
+                target.float(),
+                reduction=reduction,
             )
-    return F.binary_cross_entropy(input_tensor, target, reduction=reduction)
+    return F.binary_cross_entropy(
+        input_tensor.clamp(_BCE_PROBABILITY_EPS, 1.0 - _BCE_PROBABILITY_EPS),
+        target,
+        reduction=reduction,
+    )
 
 
 class VelocityContactLoss:
@@ -126,22 +145,22 @@ class VelocityContactLoss:
     @staticmethod
     def _soft_order_penalty(start_prob, end_prob, has_object_mask, zero):
         """Penalize the soft-expected start time exceeding the end time."""
-        bs, seq = start_prob.shape[:2]
-        t = torch.arange(seq, device=start_prob.device, dtype=start_prob.dtype).view(1, seq)
+        batch_size, seq_len = start_prob.shape[:2]
+        frame_indices = torch.arange(
+            seq_len, device=start_prob.device, dtype=start_prob.dtype
+        ).view(1, seq_len)
         start_mass = start_prob.sum(dim=1)
         end_mass = end_prob.sum(dim=1)
         valid_mask = (start_mass > 1e-3) & (end_mass > 1e-3)
-        if not valid_mask.any():
-            return zero.clone()
-        start_time = (start_prob[valid_mask] * t).sum(dim=1) / start_mass[valid_mask]
-        end_time = (end_prob[valid_mask] * t).sum(dim=1) / end_mass[valid_mask]
-        order_loss = F.relu(start_time - end_time)
+        start_time = (start_prob * frame_indices).sum(dim=1) / start_mass.clamp_min(1e-3)
+        end_time = (end_prob * frame_indices).sum(dim=1) / end_mass.clamp_min(1e-3)
+        order_loss = torch.where(valid_mask, F.relu(start_time - end_time), 0.0)
+        weights = valid_mask.to(dtype=order_loss.dtype)
         if has_object_mask is not None:
-            mask_flat = has_object_mask.view(bs)[valid_mask]
-            if mask_flat.numel() > 0 and mask_flat.sum() > 0:
-                return (order_loss * mask_flat).sum() / mask_flat.sum()
-            return zero.clone()
-        return order_loss.mean()
+            weights = weights * has_object_mask.view(batch_size)
+        weight_sum = weights.sum()
+        denominator = torch.where(weight_sum > 0, weight_sum, 1.0)
+        return torch.where(weight_sum > 0, (order_loss * weights).sum() / denominator, zero)
 
     def compute_loss(self, pred_dict, batch, device, active_loss_keys=None):
         human_imu = batch['human_imu'].to(device)

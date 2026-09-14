@@ -14,6 +14,8 @@ try:
 except ImportError:
     from preprocess import find_unheld_object_displacement_interval
 
+from utils.human_pose import normalize_body_model_type
+
 
 def _sequence_length(data: Dict[str, Any]) -> int:
     for key in [
@@ -108,10 +110,22 @@ def process_pt_file(input_path: str, output_dir: str, min_len: int, max_len: int
                     downsample: bool = False, downsample_factor: int = 2,
                     drop_unheld_object_motion: bool = True,
                     unheld_object_displacement_threshold_m: float = 0.10,
-                    skipped_records: Optional[List[Dict[str, Any]]] = None) -> int:
+                    skipped_records: Optional[List[Dict[str, Any]]] = None,
+                    body_model_type: Optional[str] = None) -> int:
     """处理单个pt文件，返回生成的分割数量"""
     # 加载数据
     data = torch.load(input_path, map_location='cpu')
+    if body_model_type is not None:
+        requested_type = normalize_body_model_type(body_model_type)
+        if requested_type is None:
+            raise ValueError(f"不支持的body_model_type: {body_model_type!r}")
+        saved_type = normalize_body_model_type(data.get("body_model_type"))
+        if data.get("body_model_type") and saved_type != requested_type:
+            raise ValueError(
+                f"{os.path.basename(input_path)}的body_model_type为"
+                f"{data.get('body_model_type')!r}，与请求的{requested_type!r}不一致"
+            )
+        data["body_model_type"] = requested_type
     seq_name = data.get('seq_name', os.path.splitext(os.path.basename(input_path))[0])
     
     # 降采样（如果需要）
@@ -214,6 +228,12 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="随机种子，用于可重复性"
     )
+    parser.add_argument(
+        "--body-model-type",
+        choices=("smpl", "smplh", "smplx"),
+        default=None,
+        help="校验并写入每个片段的body_model_type",
+    )
     drop_group = parser.add_mutually_exclusive_group()
     drop_group.add_argument(
         "--drop-object-displacement-without-hand-contact",
@@ -273,6 +293,7 @@ def main() -> None:
                 args.drop_unheld_object_motion,
                 args.unheld_object_displacement_threshold_m,
                 skipped_records,
+                args.body_model_type,
             )
             total_segments += num_segments
         except Exception as e:
@@ -284,6 +305,12 @@ def main() -> None:
         "source_files": len(pt_files),
         "saved_segments": int(total_segments),
         "skipped_segments_count": len(skipped_records),
+        "min_len": int(args.min_len),
+        "max_len": int(args.max_len),
+        "seed": int(args.seed),
+        "downsample": bool(args.downsample),
+        "downsample_factor": int(args.downsample_factor),
+        "body_model_type": args.body_model_type,
         "drop_object_displacement_without_hand_contact": bool(
             args.drop_unheld_object_motion
         ),

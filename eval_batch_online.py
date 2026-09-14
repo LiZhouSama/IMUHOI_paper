@@ -38,8 +38,12 @@ from model.rnn.online import (
     resolve_online_window,
     slice_time_dict,
 )
-from utils.utils import apply_eval_imu_noise_to_sequence, build_model_input_dict, load_config, load_smpl_model
-from utils.dataset_config import get_full_sequence_test_path, resolve_dataset_path
+from utils.utils import apply_eval_imu_noise_to_sequence, build_model_input_dict, load_config
+from utils.dataset_config import (
+    get_full_sequence_test_path,
+    resolve_dataset_path,
+    resolve_evaluation_body_model_path,
+)
 
 
 TEMPORAL_SAMPLE_KEYS = {
@@ -252,6 +256,7 @@ def _run_batched_online_group(
     compute_fk: bool,
     refine_human: bool,
     desc: str,
+    feedback_kwargs: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     if not samples:
         return []
@@ -323,6 +328,9 @@ def _run_batched_online_group(
             online_window=online_window,
             online_lookahead=online_lookahead,
             online_progress_callback=_update_progress,
+            # Diagnostics only: feedback_mode / feedback_perturbation /
+            # feedback_injection_frame for the ObjectTrans state loop.
+            **(feedback_kwargs or {}),
         )
     finally:
         frame_progress.close()
@@ -355,6 +363,7 @@ def _batched_online_predict_dataset(
     sort_desc: bool,
     eval_imu_noise: bool,
     eval_imu_noise_seed: Optional[int],
+    feedback_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
     order = list(range(len(dataset)))
     order.sort(key=lambda idx: int(dataset.sequence_info[idx]["seq_len"]), reverse=sort_desc)
@@ -404,6 +413,7 @@ def _batched_online_predict_dataset(
             compute_fk=compute_fk,
             refine_human=refine_human,
             desc=f"OnlineFrames {offset // online_batch_size + 1}",
+            feedback_kwargs=feedback_kwargs,
         )
         for key, output in zip(keys, outputs):
             pred_cache[key] = output
@@ -420,6 +430,8 @@ def _format_metric(results: Dict[str, float], key: str) -> str:
 
 OBJECT_TRANS_ARCH_CHOICES = (
     "current",
+    "v2",
+    "v3",
     "legacy",
     "legacy_mesh",
     "mergeHeads_obs",
@@ -447,7 +459,12 @@ def _make_parser() -> argparse.ArgumentParser:
         default=None,
         help="Evaluate an explicit PT sequence path; repeat to select multiple files.",
     )
-    parser.add_argument("--smpl_model_path", type=str, default="datasets/smpl_models/smplh/male/model.npz")
+    parser.add_argument(
+        "--smpl_model_path",
+        type=str,
+        default=None,
+        help="Deprecated and ignored: joint metrics use model/dataset canonical joints directly.",
+    )
     parser.add_argument("--num_workers", type=int, default=12, help="Kept for dataset parity; metric pass uses cached samples.")
     parser.add_argument(
         "--online_batch_size",
@@ -485,10 +502,11 @@ def _make_parser() -> argparse.ArgumentParser:
         "--object-trans-arch",
         type=_normalize_object_trans_arch,
         choices=OBJECT_TRANS_ARCH_CHOICES,
-        default='current',
+        default=None,
         help=(
             "ObjectTrans架构（不区分大小写）；legacy为无prior多head，"
             "legacy_mesh为ObsEncoder多head，mergeHeads_obs为共享head+ObsEncoder，"
+            "v2为固定VC权重，v3为不确定性感知的分层FK融合，"
             "imuhoi为EgoIMU原始三路融合，"
             "imuhoi_4heads为增加静止头的四路融合。"
         ),
@@ -561,6 +579,8 @@ def _make_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _make_parser().parse_args()
+    if args.smpl_model_path:
+        print("Warning: ignoring deprecated --smpl_model_path; no eval BodyModel is loaded.")
     if args.online_batch_size < 1:
         raise ValueError("--online_batch_size must be >= 1")
 
@@ -595,6 +615,7 @@ def main() -> int:
 
     all_results = {}
     all_sequence_records = {}
+    model_body_models = {}
     resolved_ot_state_feedback = None
     resolved_ot_arch = None
     for dataset_name, dataset_cfg in dataset_runs:
@@ -652,15 +673,6 @@ def main() -> int:
         module_paths = _filter_pipeline_module_paths(module_paths)
         has_velocity_contact_ckpt, has_object_trans_ckpt = _object_contact_capabilities(module_paths)
 
-        if args.smpl_model_path:
-            config.body_model_path = args.smpl_model_path
-        smpl_model_path = config.get("body_model_path", "datasets/smpl_models/smplh/neutral/model.npz")
-        try:
-            smpl_model = load_smpl_model(smpl_model_path, device)
-        except FileNotFoundError as exc:
-            print(f"[BatchEval] Skipping '{dataset_name}': {exc}")
-            continue
-
         data_dir_default = get_full_sequence_test_path(dataset_cfg)
         if data_dir_default is None:
             print(f"[BatchEval] Skipping '{dataset_name}' (no dataset directory configured).")
@@ -688,10 +700,27 @@ def main() -> int:
             min_obj_contact_frames=0,
             full_sequence=True,
             resolve_bimanual_contact_conflicts=config.get("resolve_bimanual_contact_conflicts", False),
+            require_canonical_skeleton=bool(getattr(config, "require_canonical_skeleton", False)),
         )
         if len(test_dataset) == 0:
             print(f"[BatchEval] Skipping '{dataset_name}' (dataset is empty).")
             continue
+
+        model_body_path, model_body_type, model_body_source = resolve_evaluation_body_model_path(
+            config, dataset_cfg, test_dataset.sequence_info,
+        )
+        config.body_model_path = model_body_path
+        model_body_models[dataset_name] = {
+            "path": model_body_path,
+            "type": model_body_type,
+            "source": model_body_source,
+            "loaded_by_evaluator": False,
+        }
+        print(
+            "Model canonical BodyModel: "
+            f"{model_body_type} from {model_body_source} ({model_body_path})"
+        )
+        print("Joint metrics: model pred_joints_global vs dataset canonical position_global")
 
         model = load_model(
             config,
@@ -756,7 +785,6 @@ def main() -> int:
         sequence_records = [] if args.sequence_records_json else None
         results = evaluate_model(
             metric_model,
-            smpl_model,
             metric_loader,
             config,
             device,
@@ -845,6 +873,8 @@ def main() -> int:
             ),
             "eval_imu_noise": bool(args.eval_imu_noise),
             "eval_imu_noise_seed": args.eval_imu_noise_seed if args.eval_imu_noise else None,
+            "joint_metric_source": "pred_joints_global_vs_canonical_position_global",
+            "model_body_models": model_body_models,
             "results": all_results,
         }
         output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -882,6 +912,8 @@ def main() -> int:
                 "velocity_contact_checkpoint": args.vc_ckpt,
                 "object_trans_checkpoint": args.ot_ckpt,
                 "sequence_paths": args.sequence_path,
+                "joint_metric_source": "pred_joints_global_vs_canonical_position_global",
+                "model_body_models": model_body_models,
             },
             "aggregate_results": all_results,
             "datasets": all_sequence_records,

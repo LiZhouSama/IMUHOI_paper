@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--body-model",
-        default="datasets/smpl_models/smplh/male/model.npz",
+        default="datasets/smpl_models/smplh/neutral/model.npz",
         help="Path to the SMPL-H body model required for mesh reconstruction.",
     )
     parser.add_argument(

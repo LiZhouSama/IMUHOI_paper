@@ -22,6 +22,7 @@ from .velocity_contact_v4 import V4VelocityContactModule
 from .human_pose import HumanPoseModule
 from .object_trans import ObjectTransModule
 from .object_trans_v2 import V2ObjectTransModule
+from .object_trans_v3 import V3ObjectTransModule
 from .object_trans_legacy import LegacyObjectTransModule
 from .object_trans_legacy_mesh import LegacyMeshObjectTransModule
 from .object_trans_mergeHeads_obsEncoder import (
@@ -39,6 +40,7 @@ def build_object_trans_module(cfg, object_trans_arch=None, *args, **kwargs):
     modules = {
         "current": ObjectTransModule,
         "v2": V2ObjectTransModule,
+        "v3": V3ObjectTransModule,
         "legacy": LegacyObjectTransModule,
         "legacy_mesh": LegacyMeshObjectTransModule,
         "mergeheads_obs": MergeHeadsObsObjectTransModule,
@@ -70,6 +72,7 @@ __all__ = [
     'HumanPoseModule',
     'ObjectTransModule',
     'V2ObjectTransModule',
+    'V3ObjectTransModule',
     'build_object_trans_module',
     'MergeHeadsObsObjectTransModule',
     'LBVQAutoEncoder',

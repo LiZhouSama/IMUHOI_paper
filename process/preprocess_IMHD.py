@@ -22,7 +22,6 @@ from scipy.spatial.transform import Rotation as R
 from human_body_prior.body_model.body_model import BodyModel
 import pytorch3d.transforms as transforms
 from utils.human_pose import (
-    GenderedBodyModelLoader,
     build_smpl24_joint_positions,
     ensure_smpl24_local_rotations,
     local_rotations_to_global,
@@ -54,6 +53,11 @@ except ModuleNotFoundError:
     )
 
 DEFAULT_CHUNK_LEN = 4000
+CANONICAL_BODY_MODEL_TYPE = "smplh"
+CANONICAL_BODY_MODEL_GENDER = "neutral"
+CANONICAL_BETAS = "zero"
+CANONICAL_SKELETON_VERSION = 1
+CANONICAL_BODY_MODEL_RELATIVE_PATH = os.path.join("smplh", "neutral", "model.npz")
 
 ROT_Z90 = np.array(
     [[0.0, -1.0, 0.0],
@@ -135,12 +139,46 @@ def iter_slices(total: int, chunk_len: int) -> Iterable[Tuple[int, int]]:
         yield start, end
 
 
-class BodyModelLoader(GenderedBodyModelLoader):
-    """IMHD ships its own SMPL-H body models; the family is still re-confirmed
-    per sequence through :meth:`resolve`."""
+class BodyModelLoader:
+    """Load the single canonical neutral, zero-shape SMPL-H model."""
 
     def __init__(self, support_dir: str, device: torch.device, num_betas: int = 16) -> None:
-        super().__init__(support_dir, device=device, num_betas=num_betas, default_type="smplh")
+        self.model_path = os.path.join(support_dir, CANONICAL_BODY_MODEL_RELATIVE_PATH)
+        if not os.path.isfile(self.model_path):
+            raise FileNotFoundError(
+                "Canonical SMPL-H model not found; expected "
+                f"{self.model_path}"
+            )
+        self._model = BodyModel(bm_fname=self.model_path, num_betas=int(num_betas))
+        self._model.eval()
+        for parameter in self._model.parameters():
+            parameter.requires_grad_(False)
+        self._model = self._model.to(device)
+        self._num_betas = int(num_betas)
+
+    @property
+    def num_betas(self) -> int:
+        return self._num_betas
+
+    @property
+    def model_type(self) -> str:
+        return CANONICAL_BODY_MODEL_TYPE
+
+    def get(self, gender=None, model_type=None) -> BodyModel:
+        if model_type is not None and str(model_type).lower() != CANONICAL_BODY_MODEL_TYPE:
+            raise ValueError(f"IMHD preprocessing only supports {CANONICAL_BODY_MODEL_TYPE}")
+        return self._model
+
+    def resolve(self, seq_data=None, gender=None, model_type=None) -> Tuple[BodyModel, str]:
+        return self.get(gender=gender, model_type=model_type), CANONICAL_BODY_MODEL_TYPE
+
+
+def canonical_body_model_metadata() -> Dict[str, object]:
+    return {
+        "canonical_body_model_gender": CANONICAL_BODY_MODEL_GENDER,
+        "canonical_betas": CANONICAL_BETAS,
+        "canonical_skeleton_version": CANONICAL_SKELETON_VERSION,
+    }
 
 
 def infer_object_name(seq_name: str, object_names: List[str]) -> str:
@@ -176,43 +214,17 @@ def resolve_object_mesh(object_name: str, objects_root: str) -> str:
     return mesh_path
 
 
-def pad_betas(betas: np.ndarray, target_dim: int, target_frames: int) -> np.ndarray:
-    betas = np.asarray(betas, dtype=np.float32)
-    if betas.ndim == 1:
-        betas = betas[None, :]
-    if betas.shape[0] == 0:
-        betas = np.zeros((target_frames, target_dim), dtype=np.float32)
-    if betas.shape[0] == 1 and target_frames > 1:
-        betas = np.repeat(betas, repeats=target_frames, axis=0)
-    elif betas.shape[0] < target_frames:
-        betas = np.pad(betas, ((0, target_frames - betas.shape[0]), (0, 0)), mode="edge")
-    elif betas.shape[0] > target_frames:
-        betas = betas[:target_frames]
-    if betas.shape[1] < target_dim:
-        betas = np.concatenate(
-            [betas, np.zeros((betas.shape[0], target_dim - betas.shape[1]), dtype=betas.dtype)],
-            axis=1,
-        )
-    elif betas.shape[1] > target_dim:
-        betas = betas[:, :target_dim]
-    return betas
-
-
 def build_smpl_input(
     root_orient: np.ndarray,
     pose_body: np.ndarray,
     trans: np.ndarray,
-    betas: np.ndarray,
     device: torch.device,
 ) -> Dict[str, torch.Tensor]:
-    smpl_input: Dict[str, torch.Tensor] = {
+    return {
         "root_orient": torch.tensor(root_orient, dtype=torch.float32, device=device),
         "pose_body": torch.tensor(pose_body, dtype=torch.float32, device=device),
         "trans": torch.tensor(trans, dtype=torch.float32, device=device),
     }
-    if betas.size > 0:
-        smpl_input["betas"] = torch.tensor(betas, dtype=torch.float32, device=device)
-    return smpl_input
 
 
 def compute_rotation_features_chunk(
@@ -293,12 +305,11 @@ def compute_body_up_vector(
     root_orient: np.ndarray,
     pose_body: np.ndarray,
     trans: np.ndarray,
-    betas: np.ndarray,
     device: torch.device,
     batch_size: int = 256,
 ) -> np.ndarray:
     """Estimate the sequence-level body-up direction from feet center to head."""
-    smpl_input = build_smpl_input(root_orient, pose_body, trans, betas, device)
+    smpl_input = build_smpl_input(root_orient, pose_body, trans, device)
     directions: List[torch.Tensor] = []
     total_frames = root_orient.shape[0]
     with torch.no_grad():
@@ -327,7 +338,6 @@ def compute_up_alignment_rotation(
     root_orient: np.ndarray,
     pose_body: np.ndarray,
     trans: np.ndarray,
-    betas: np.ndarray,
     device: torch.device,
     batch_size: int = 256,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
@@ -336,7 +346,6 @@ def compute_up_alignment_rotation(
         root_orient,
         pose_body,
         trans,
-        betas,
         device,
         batch_size=batch_size,
     )
@@ -376,13 +385,12 @@ def compute_foot_floor_offset(
     root_orient: np.ndarray,
     pose_body: np.ndarray,
     trans: np.ndarray,
-    betas: np.ndarray,
     device: torch.device,
     batch_size: int = 256,
 ) -> float:
     """计算整个序列中双脚关节的最低y坐标，用于地面对齐"""
     T = root_orient.shape[0]
-    smpl_input = build_smpl_input(root_orient, pose_body, trans, betas, device)
+    smpl_input = build_smpl_input(root_orient, pose_body, trans, device)
     
     foot_min_y: Optional[float] = None
     with torch.no_grad():
@@ -479,7 +487,6 @@ def load_imhd_sequence(pkl_files: List[str]) -> Tuple[Dict[str, np.ndarray], Opt
         "objectRot": [],
         "objectTrans": [],
         "smplPose": [],
-        "smplShape": [],
         "smplTrans": [],
     }
     obj_imu_ori_chunks: List[np.ndarray] = []
@@ -565,8 +572,6 @@ def process_imhd_sequence(
     pose_body = data_np["smplPose"][:T, 3:].astype(np.float32)
     trans = data_np["smplTrans"][:T].astype(np.float32)
 
-    betas_raw = data_np["smplShape"][:T].astype(np.float32)
-
     object_angles = data_np["objectRot"][:T].astype(np.float32)
     object_trans = data_np["objectTrans"][:T].astype(np.float32)
 
@@ -575,7 +580,6 @@ def process_imhd_sequence(
         trans -= root_offset
         object_trans -= root_offset
 
-    gender = None
     object_name = infer_object_name(entry.seq_name, object_names)
     mesh_path = resolve_object_mesh(object_name, objects_root)
     mesh_dir = os.path.dirname(mesh_path)
@@ -585,10 +589,7 @@ def process_imhd_sequence(
         sample_count=int(max(1, obj_points_count)),
         device="cpu",
     )
-    # IMHD's gt_*.pkl stores root_orient/pose_body already split, so there is
-    # no pose-width signal to detect from; the dataset ships its own SMPL-H
-    # models, so the family is stated explicitly.
-    bm, body_model_type = bm_loader.resolve(gender=gender, model_type="smplh")
+    bm, body_model_type = bm_loader.resolve(model_type=CANONICAL_BODY_MODEL_TYPE)
 
     smpl_init_input = {
             "root_orient": torch.zeros_like(torch.from_numpy(root_orient.reshape(-1, 3)).to(device).float()),
@@ -604,13 +605,11 @@ def process_imhd_sequence(
     object_trans = rotate_world_vectors(object_trans, ROT_Z90)
 
     # ---------- 在地面对齐前将序列级身体上方向对齐到 +Y ----------
-    betas_for_floor = pad_betas(betas_raw, bm_loader.num_betas, T)
     up_alignment_rot, body_up_before, aligned_body_up, up_alignment_cos = compute_up_alignment_rotation(
         bm,
         root_orient,
         pose_body,
         trans,
-        betas_for_floor,
         device,
         batch_size=smpl_batch,
     )
@@ -652,7 +651,7 @@ def process_imhd_sequence(
 
     # ---------- 计算双脚最低点偏移 ----------
     foot_floor_y = compute_foot_floor_offset(
-        bm, root_orient, pose_body, trans, betas_for_floor, device, batch_size=smpl_batch
+        bm, root_orient, pose_body, trans, device, batch_size=smpl_batch
     )
     # 修正 trans 和 object_trans，使双脚最低点对齐到 y=0
     trans[:, 1] -= foot_floor_y
@@ -672,12 +671,10 @@ def process_imhd_sequence(
 
     with torch.no_grad():
         for start, end in iter_slices(T, DEFAULT_CHUNK_LEN):
-            betas_chunk = pad_betas(betas_raw[start:end], bm_loader.num_betas, end - start)
             smpl_input = build_smpl_input(
                 root_orient[start:end],
                 pose_body[start:end],
                 trans[start:end],
-                betas_chunk,
                 device,
             )
 
@@ -775,8 +772,9 @@ def process_imhd_sequence(
 
     output = {
         "seq_name": entry.seq_name,
-        "gender": gender,
+        "gender": CANONICAL_BODY_MODEL_GENDER,
         "body_model_type": body_model_type,
+        **canonical_body_model_metadata(),
         "pose": pose,
         "position_global_full_gt_world": position_global,
         "rotation_global": rotation_global,
@@ -785,7 +783,6 @@ def process_imhd_sequence(
         "obj_imu_real": obj_imu_tensor,
         "lfoot_contact": lfoot_contact,
         "rfoot_contact": rfoot_contact,
-        "betas": torch.from_numpy(betas_raw).float(),
         "obj_name": object_name,
         "obj_mesh_name": mesh_basename,
         "obj_points_canonical": canonical_points.half().cpu(),

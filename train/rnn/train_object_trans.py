@@ -37,6 +37,7 @@ from model.rnn.object_trans_IMUHOI_4heads import (
 )
 from model.rnn.object_trans_legacy_mesh import LegacyMeshObjectTransModule
 from model.rnn.object_trans_v2 import V2ObjectTransModule
+from model.rnn import V3ObjectTransModule
 from model.rnn.object_trans_mergeHeads_obsEncoder import (
     ObjectTransModule as MergeHeadsObsObjectTransModule,
 )
@@ -47,6 +48,7 @@ from train.rnn.loss import (
     V2VelocityContactLoss,
     ObjectTransLoss,
     IMUHOIObjectTransLoss,
+    resolve_object_trans_loss_weights,
 )
 from train.rnn.scheduled_inputs import (
     build_gt_human_pose_outputs,
@@ -57,6 +59,7 @@ from train.rnn.scheduled_inputs import (
     sample_mix_tensor,
 )
 from train.rnn.train_utils import (
+    should_stop_early as _should_stop_early,
     get_base_args,
     merge_config,
     setup_seed,
@@ -88,6 +91,7 @@ except Exception:
 OBJECT_TRANS_ARCH_CHOICES = (
     'current',
     'v2',
+    'v3',
     'legacy',
     'legacy_mesh',
     'mergeHeads_obs',
@@ -132,7 +136,8 @@ def get_args():
         choices=OBJECT_TRANS_ARCH_CHOICES,
         default=None,
         help=(
-            'ObjectTrans架构；legacy为四路无prior多head，IMUHOI为EgoIMU'
+            'ObjectTrans架构；v2为固定VC权重，v3为不确定性感知的分层FK融合；'
+            'legacy为四路无prior多head，IMUHOI为EgoIMU'
             '原始三路融合，IMUHOI_4heads为增加静止头的四路融合，'
             'legacy_mesh为ObsEncoder多head，'
             'mergeHeads_obs为共享head+ObsEncoder'
@@ -217,6 +222,10 @@ class Stage3JointTrainer:
         "hoi_error_r",
         "obj_trans",
     )
+    # Added to the selection score only when the config gives them weight, so
+    # the metric-aligned HOI terms steer checkpoint choice exactly when they
+    # steer training.
+    OPTIONAL_JOINT_SELECTION_KEYS = ("hoi_fused_l", "hoi_fused_r")
 
     def __init__(
         self,
@@ -235,6 +244,17 @@ class Stage3JointTrainer:
         self.imuhoi_arch = is_imuhoi_object_trans_arch(
             getattr(cfg, "object_trans_arch", "current")
         )
+        self.joint_checkpoint_selection_keys = self.JOINT_CHECKPOINT_SELECTION_KEYS
+        loss_weight_cfg = resolve_object_trans_loss_weights(cfg)
+        optional_keys = tuple(
+            key
+            for key in self.OPTIONAL_JOINT_SELECTION_KEYS
+            if float(loss_weight_cfg.get(key, 0.0) or 0.0) > 0.0
+        )
+        if optional_keys:
+            self.joint_checkpoint_selection_keys = (
+                self.JOINT_CHECKPOINT_SELECTION_KEYS + optional_keys
+            )
         self.vc_model = vc_model.to(self.device)
         self.hp_model = hp_model.to(self.device)
         self.ot_model = ot_model.to(self.device)
@@ -244,7 +264,13 @@ class Stage3JointTrainer:
 
         self.train_loader = train_loader
         self.test_loader = test_loader
-        self.resume_path = resolve_resume_checkpoint(getattr(cfg, "resume_dir", None))
+        resume_dir = getattr(cfg, "resume_dir", None)
+        if joint_train and resume_dir:
+            self.resume_path = os.path.join(resume_dir, "last_joint.pt")
+            if not os.path.isfile(self.resume_path):
+                raise FileNotFoundError(f"Joint resume checkpoint not found: {self.resume_path}")
+        else:
+            self.resume_path = resolve_resume_checkpoint(resume_dir)
         self.resume_checkpoint = None
         self.start_epoch = 0
         self.best_loss = float('inf')
@@ -280,7 +306,7 @@ class Stage3JointTrainer:
         self.lb_stats_enabled = (
             self.lb_prior_model is None
             and bool(getattr(cfg, "object_trans_lb_stats", True))
-            and str(getattr(cfg, "object_trans_arch", "current")).strip().lower() in {"current", "v2"}
+            and str(getattr(cfg, "object_trans_arch", "current")).strip().lower() in {"current", "v2", "v3"}
         )
         self.lb_stats_min_frames = int(getattr(cfg, "lb_stats_min_frames", 10))
         self.lb_stats_noise_std = float(getattr(cfg, "lb_stats_noise_std", 0.02))
@@ -295,7 +321,7 @@ class Stage3JointTrainer:
         if joint_train:
             print(
                 "联合训练checkpoint选择（按配置权重）: "
-                + " + ".join(self.JOINT_CHECKPOINT_SELECTION_KEYS)
+                + " + ".join(self.joint_checkpoint_selection_keys)
             )
             if self.imuhoi_arch:
                 print(
@@ -356,7 +382,11 @@ class Stage3JointTrainer:
                 }
             )
 
-        self.optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
+        # foreach: same update, multi-tensor kernels.  See create_optimizer
+        # in train/rnn/train_utils.py for the measurement.
+        self.optimizer = torch.optim.AdamW(
+            param_groups, weight_decay=cfg.weight_decay, foreach=True
+        )
         self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
             self.optimizer, milestones=cfg.milestones, gamma=cfg.gamma
         )
@@ -381,8 +411,9 @@ class Stage3JointTrainer:
             else:
                 print(f"VelocityContact可训练参数数量: {vc_params}, lr={base_lr}")
 
-        # 损失函数
+        # 损失函数。VC/HP 用共享权重；OT 额外套上本架构的权重块。
         loss_weights = getattr(cfg, 'loss_weights', {})
+        ot_loss_weights = resolve_object_trans_loss_weights(cfg)
         if self.imuhoi_arch:
             imuhoi_weights = getattr(
                 cfg,
@@ -424,7 +455,7 @@ class Stage3JointTrainer:
             else:
                 self.vc_loss_fn = None
             self.hp_loss_fn = None
-            self.ot_loss_fn = ObjectTransLoss(weights=loss_weights)
+            self.ot_loss_fn = ObjectTransLoss(weights=ot_loss_weights)
 
         # TensorBoard
         self.writer = None
@@ -499,7 +530,7 @@ class Stage3JointTrainer:
     def _resolve_resume_best_loss(self, checkpoint):
         if self.joint_train:
             saved_keys = checkpoint.get("checkpoint_selection_keys")
-            expected_keys = list(self.JOINT_CHECKPOINT_SELECTION_KEYS)
+            expected_keys = list(self.joint_checkpoint_selection_keys)
             if saved_keys != expected_keys:
                 print(
                     "警告：resume joint checkpoint 的选择标准与当前配置不一致；"
@@ -523,7 +554,7 @@ class Stage3JointTrainer:
 
     @classmethod
     def _joint_checkpoint_selection_loss(cls, weighted_losses):
-        """Return the weighted three-term score used only by joint training."""
+        """Return the legacy weighted score used by current/v2 training."""
         missing = [
             key
             for key in cls.JOINT_CHECKPOINT_SELECTION_KEYS
@@ -535,8 +566,101 @@ class Stage3JointTrainer:
                 + ", ".join(missing)
             )
         return torch.stack(
-            [weighted_losses[key] for key in cls.JOINT_CHECKPOINT_SELECTION_KEYS]
+            [
+                weighted_losses[key]
+                for key in cls.JOINT_CHECKPOINT_SELECTION_KEYS
+            ]
         ).sum()
+
+    def _configured_joint_checkpoint_selection_loss(self, weighted_losses):
+        """Return the deployment score configured for this OT architecture."""
+        missing = [
+            key
+            for key in self.joint_checkpoint_selection_keys
+            if key not in weighted_losses
+        ]
+        if missing:
+            raise KeyError(
+                "Joint checkpoint selection is missing loss components: "
+                + ", ".join(missing)
+            )
+        return torch.stack(
+            [
+                weighted_losses[key]
+                for key in self.joint_checkpoint_selection_keys
+            ]
+        ).sum()
+
+    def _build_rest_state_perturbation(self, batch, data_dict, training):
+        """Observable mid-window state corruption for the state-trust confidence.
+
+        With probability ``object_trans_rest_perturb_prob`` a window gets its
+        ObjectTrans feedback state shifted by N(0, ``object_trans_rest_perturb_std``)
+        at one random frame where the GT object is at rest (|v| below
+        ``object_trans_rest_perturb_vel`` m/s).  The shift persists through the
+        state until the model corrects it, which is exactly the long-horizon
+        failure (a drifted resting object met by a hand), and it is visible to
+        the consistency features, so the confidence head gets informative
+        negatives beyond the window-init corruption.  Returns a
+        ``feedback_control`` dict (mode "perturb") or None.
+        """
+        from configs import FRAME_RATE
+
+        std = float(getattr(self.cfg, "object_trans_rest_perturb_std", 0.0) or 0.0)
+        prob = float(getattr(self.cfg, "object_trans_rest_perturb_prob", 0.5))
+        vel_thr = float(getattr(self.cfg, "object_trans_rest_perturb_vel", 0.02))
+        if not training or std <= 0.0 or prob <= 0.0 or batch is None:
+            return None
+        obj_trans = batch.get("obj_trans")
+        if not isinstance(obj_trans, torch.Tensor) or obj_trans.dim() != 3 or obj_trans.shape[1] < 12:
+            return None
+        obj_trans = obj_trans.to(self.device)
+        batch_size, seq_len = obj_trans.shape[:2]
+        speed = (obj_trans[:, 1:] - obj_trans[:, :-1]).norm(dim=-1) * FRAME_RATE  # [B,T-1]
+        rest = torch.cat((speed[:, :1], speed), dim=1) < vel_thr                   # [B,T]
+        rest[:, :5] = False
+        rest[:, -5:] = False
+        has_object = data_dict.get("has_object")
+        if isinstance(has_object, torch.Tensor):
+            rest = rest & has_object.to(rest.device).view(batch_size, 1).bool()
+        select = (torch.rand(batch_size, device=obj_trans.device) < prob) & rest.any(dim=1)
+        if not bool(select.any()):
+            return None
+        # one random rest frame per selected window
+        scores = torch.rand(batch_size, seq_len, device=obj_trans.device) * rest.float()
+        inject = scores.argmax(dim=1)
+        injection_mask = torch.zeros(batch_size, seq_len, device=obj_trans.device, dtype=torch.bool)
+        injection_mask[torch.arange(batch_size, device=obj_trans.device), inject] = select
+        perturbation = torch.zeros(batch_size, seq_len, 3, device=obj_trans.device, dtype=obj_trans.dtype)
+        perturbation[injection_mask] = torch.randn(int(injection_mask.sum()), 3, device=obj_trans.device, dtype=obj_trans.dtype) * std
+        return {"mode": "perturb", "perturbation": perturbation, "injection_mask": injection_mask}
+
+    def _perturb_object_init(self, obj_trans_init, contact_init, has_object):
+        """Noisy object init for windows that start inside a contact segment.
+
+        Training windows start from the ground-truth object position, so a
+        window that begins mid-segment gets an exact hand->object bone for
+        free and the head never learns to distrust it.  Online inference hands
+        later windows its own published position instead, whose error grows
+        with the accumulated hand drift.  With probability
+        ``object_trans_init_noise_prob`` the init of such a window is offset by
+        Gaussian noise (``object_trans_init_noise_std`` metres).  Windows that
+        start without contact are left alone: a wrong static hold before the
+        first contact cannot be corrected by any branch and would only teach
+        the motion heads to hallucinate.
+        """
+        std = float(getattr(self.cfg, "object_trans_init_noise_std", 0.0) or 0.0)
+        prob = float(getattr(self.cfg, "object_trans_init_noise_prob", 0.5))
+        if std <= 0.0 or prob <= 0.0 or not isinstance(obj_trans_init, torch.Tensor):
+            return obj_trans_init
+        batch_size = obj_trans_init.shape[0]
+        select = torch.rand(batch_size, device=obj_trans_init.device) < prob
+        if isinstance(contact_init, torch.Tensor) and contact_init.shape[0] == batch_size:
+            select = select & (contact_init[..., :2] > 0.5).any(dim=-1)
+        if isinstance(has_object, torch.Tensor) and has_object.shape[0] == batch_size:
+            select = select & has_object.to(device=select.device, dtype=torch.bool)
+        noise = torch.randn_like(obj_trans_init) * std
+        return obj_trans_init + noise * select.to(obj_trans_init.dtype).unsqueeze(-1)
 
     def forward_all(self, data_dict, batch=None, epoch: int = 0, training: bool = True):
         """完整的前向传播"""
@@ -659,11 +783,19 @@ class Stage3JointTrainer:
                 drop_prob=self.lb_stats_drop_prob,
             )
 
+        obj_trans_init = data_dict['obj_trans_init']
+        feedback_control = None
+        if training and batch is not None:
+            obj_trans_init = self._perturb_object_init(
+                obj_trans_init, data_dict.get('contact_init'), data_dict.get('has_object')
+            )
+            feedback_control = self._build_rest_state_perturbation(batch, data_dict, training)
+
         ot_out = call_model_inference(
             self.ot_model,
             hand_positions,
             contact_prob,
-            data_dict['obj_trans_init'],
+            obj_trans_init,
             obj_imu=data_dict['obj_imu'],
             human_imu=data_dict['human_imu'],
             obj_vel_input=obj_vel_input,
@@ -678,6 +810,7 @@ class Stage3JointTrainer:
                 else getattr(self.cfg, "enable_ot_refine", False)
             ),
             inference_mode="offline",
+            **({"feedback_control": feedback_control} if feedback_control is not None else {}),
         )
 
         results = {}
@@ -848,14 +981,14 @@ class Stage3JointTrainer:
                             ot_out, batch, self.device
                         )
                         report_keys = set(self.ot_loss_fn.TEST_LOSS_KEYS).union(
-                            self.JOINT_CHECKPOINT_SELECTION_KEYS
+                            self.joint_checkpoint_selection_keys
                         )
                         ot_losses = {
                             key: value
                             for key, value in ot_weighted_losses.items()
                             if key in report_keys
                         }
-                        combined_loss = self._joint_checkpoint_selection_loss(
+                        combined_loss = self._configured_joint_checkpoint_selection_loss(
                             ot_weighted_losses
                         )
                     else:
@@ -895,12 +1028,22 @@ class Stage3JointTrainer:
                 self.writer.close()
             return
 
+        # Evaluation cadence follows the config (``eval_interval``; the joint
+        # phase passes ``joint_train_eval_interval``).  Early stopping: stop when
+        # the checkpoint-selection score on the test split has not improved for
+        # ``early_stopping_patience_epochs`` epochs (0 = off), never before
+        # ``early_stopping_min_epochs``.
+        eval_interval = max(1, int(getattr(self.cfg, "eval_interval", 10) or 10))
+        patience_epochs = int(getattr(self.cfg, "early_stopping_patience_epochs", 0) or 0)
+        min_epochs = int(getattr(self.cfg, "early_stopping_min_epochs", 0) or 0)
+        last_improvement_epoch = self.start_epoch
+        stopped_early_at = None
         for epoch in range(self.start_epoch, max_epoch):
             train_loss, train_components = self.train_epoch(epoch)
 
             print(f'\rEpoch {epoch}, Train Loss: {train_loss:.4f}', end='')
 
-            if epoch % 10 == 0 and self.test_loader is not None:
+            if epoch % eval_interval == 0 and self.test_loader is not None:
                 test_loss, test_components = self.evaluate(epoch)
 
                 if test_loss is not None:
@@ -908,6 +1051,7 @@ class Stage3JointTrainer:
 
                     if test_loss < self.best_loss:
                         self.best_loss = test_loss
+                        last_improvement_epoch = epoch
                         self._save_models(
                             epoch,
                             test_loss,
@@ -958,20 +1102,33 @@ class Stage3JointTrainer:
                     'n_iter': self.n_iter,
                 },
             )
+            if self.should_stop_early(epoch, last_improvement_epoch, patience_epochs, min_epochs, self.test_loader is not None):
+                stopped_early_at = epoch
+                print(
+                    f"Early stopping at epoch {epoch}: no test-metric improvement since epoch "
+                    f"{last_improvement_epoch} (patience {patience_epochs} epochs, best {self.best_loss:.4f})"
+                )
+                break
 
         # 保存最终模型
         self._save_models(
-            max_epoch - 1,
+            max_epoch - 1 if stopped_early_at is None else stopped_early_at,
             train_loss,
             'final',
             {
                 'best_loss': self.best_loss,
                 'n_iter': self.n_iter,
+                'stopped_early_at': stopped_early_at,
             },
         )
 
         if self.writer is not None:
             self.writer.close()
+
+    @staticmethod
+    def should_stop_early(epoch, last_improvement_epoch, patience_epochs, min_epochs, has_test_loader=True):
+        """Early-stopping rule shared by every stage (implementation in train_utils)."""
+        return _should_stop_early(epoch, last_improvement_epoch, patience_epochs, min_epochs, has_test_loader)
 
     def _write_checkpoint(self, path, checkpoint):
         tmp_path = f"{path}.tmp"
@@ -1023,7 +1180,7 @@ class Stage3JointTrainer:
             extra.update(
                 {
                     'checkpoint_selection_keys': list(
-                        self.JOINT_CHECKPOINT_SELECTION_KEYS
+                        self.joint_checkpoint_selection_keys
                     ),
                     'checkpoint_selection_uses_weighted_losses': True,
                 }
@@ -1031,6 +1188,10 @@ class Stage3JointTrainer:
         checkpoint = self._build_joint_checkpoint(epoch, loss, extra=extra)
 
         if self.joint_train:
+            self._write_checkpoint(
+                os.path.join(self.cfg.save_dir, f'{prefix}_joint.pt'),
+                checkpoint,
+            )
             # joint阶段与OT阶段共用目录，但不覆盖OT的best.pt/last.pt/final.pt。
             ot_path = os.path.join(self.cfg.save_dir, f'{prefix}_object_trans.pt')
             self._save_module_checkpoint(
@@ -1100,11 +1261,26 @@ def _run_auto_joint_train(cfg, trainer, train_loader, test_loader, base_lr):
     joint_cfg.joint_train = True
     joint_cfg.epochs = joint_epochs
     joint_cfg.milestones = joint_milestones
+    # Early stopping is phase-specific: the OT phase decays the lr only at
+    # epoch 100 (milestones), so its patience window must reach past the first
+    # milestone; the joint phase decays every 10 epochs.
+    if getattr(cfg, "joint_train_early_stopping_patience_epochs", None) is not None:
+        joint_cfg.early_stopping_patience_epochs = int(cfg.joint_train_early_stopping_patience_epochs)
+    if getattr(cfg, "joint_train_early_stopping_min_epochs", None) is not None:
+        joint_cfg.early_stopping_min_epochs = int(cfg.joint_train_early_stopping_min_epochs)
     joint_cfg.eval_interval = max(
         1, int(getattr(cfg, "joint_train_eval_interval", cfg.eval_interval))
     )
     joint_cfg.lr = float(base_lr) * 0.1
-    joint_cfg.resume_dir = None
+    joint_amp_enabled = getattr(cfg, "joint_train_amp_enabled", None)
+    if joint_amp_enabled is not None:
+        joint_cfg.amp_enabled = bool(joint_amp_enabled)
+    joint_cfg.resume_dir = (
+        cfg.save_dir
+        if getattr(cfg, "resume_dir", None)
+        and os.path.isfile(os.path.join(cfg.save_dir, "last_joint.pt"))
+        else None
+    )
 
     best_ot_path = os.path.join(cfg.save_dir, "best.pt")
     _load_object_trans_best_for_joint(trainer.ot_model, best_ot_path, trainer.device)
@@ -1114,7 +1290,7 @@ def _run_auto_joint_train(cfg, trainer, train_loader, test_loader, base_lr):
             "joint_train_auto_started_from": best_ot_path,
             "joint_train_lr_source": "lr * 0.1",
             "joint_checkpoint_selection_keys": list(
-                Stage3JointTrainer.JOINT_CHECKPOINT_SELECTION_KEYS
+                trainer.joint_checkpoint_selection_keys
             ),
             "joint_checkpoint_selection_uses_weighted_losses": True,
         },
@@ -1187,8 +1363,8 @@ def main():
         print("mergeHeads_obs使用内置ObsEncoder；已关闭外部l_b VQ/Diffusion prior。")
         enable_lb_prior = False
         cfg.enable_ot_lb_prior = False
-    if enable_lb_prior and cfg.object_trans_arch not in {'current', 'v2'}:
-        raise ValueError("l_b VQ/Diffusion prior supports object_trans_arch=current or v2 only")
+    if enable_lb_prior and cfg.object_trans_arch not in {'current', 'v2', 'v3'}:
+        raise ValueError("l_b VQ/Diffusion prior supports object_trans_arch=current, v2, or v3 only")
     if enable_lb_prior:
         if prior_cfg is None:
             raise ValueError("enable_ot_lb_prior=true requires an lb_vq_prior config block")
@@ -1204,6 +1380,8 @@ def main():
         module_name = 'object_trans_legacy'
     elif cfg.object_trans_arch == 'v2':
         module_name = 'object_trans_v2'
+    elif cfg.object_trans_arch == 'v3':
+        module_name = 'object_trans_v3'
     elif cfg.object_trans_arch == 'imuhoi':
         module_name = 'object_trans_IMUHOI'
     elif cfg.object_trans_arch == 'imuhoi_4heads':
@@ -1310,6 +1488,8 @@ def main():
         ot_model_cls = MergeHeadsObsObjectTransModule
     elif cfg.object_trans_arch == 'v2':
         ot_model_cls = V2ObjectTransModule
+    elif cfg.object_trans_arch == 'v3':
+        ot_model_cls = V3ObjectTransModule
     else:
         ot_model_cls = ObjectTransModule
     ot_model = ot_model_cls(cfg)

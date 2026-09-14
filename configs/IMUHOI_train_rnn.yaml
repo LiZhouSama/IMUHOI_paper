@@ -7,9 +7,18 @@ save_dir: "outputs/IMUHOI++/RNN"
 # OMOMO/PAHOI 是 SMPL-X 拟合，AMASS/BEHAVE/HODome/IMHD 是 SMPL-H。
 # body_model_path 作为未声明族的样本的回退。
 body_model_paths:
-  smplh: datasets/smpl_models/smplh/male/model.npz
-  smplx: datasets/smpl_models/smplx/SMPLX_MALE.npz
-body_model_path: datasets/smpl_models/smplx/SMPLX_MALE.npz
+  smplh: datasets/smpl_models/smplh/neutral/model.npz
+  smplx: datasets/smpl_models/smplx/SMPLX_NEUTRAL.npz
+body_model_path: datasets/smpl_models/smplx/SMPLX_NEUTRAL.npz
+canonical_body_model_gender: neutral
+canonical_betas: zero
+canonical_skeleton_version: 1
+require_canonical_skeleton: true
+# Pinned DataLoader staging buffers (+9-25% epoch throughput here).  They are
+# page-locked, so the process needs RLIMIT_MEMLOCK raised above the batch
+# payload; on WSL the /init shim caps it at 64 MiB and overrunning it segfaults
+# the pin thread.  Set false on a host where that limit cannot be raised.
+dataloader_pin_memory: true
 use_tensorboard: true
 use_multi_gpu: false
 device: "cuda:0"
@@ -52,14 +61,43 @@ v4_heading_normalize: true
 v4_anticipation_horizon: 15
 
 hidden_dim_multiplier: 1
+# `current` = one shared predictor with a *learned* four-way gate, trained with
+# the metric-aligned fused HOI loss (see object_trans_arch_loss_weights below).
+# Canonical OMOMO, 1173 seqs, window 60 / lookahead 10, shared HP, VC-v4,
+# joint 300+100 epochs at batch 200 x 1 window per sequence:
+#   arch      loss                    obj published   HOI    jitter
+#   current   baseline                    13.94       9.86    8.43
+#   v3        baseline                    13.89       9.99    8.79
+#   v3        + static gate both          13.72       9.93    8.90
+#   current   + hoi_fused  (default)      13.72       9.44    7.38
+# Measured on VC-v4; velocity_contact_arch keeps its own default here, so pass
+# --velocity_contact_arch v4 to reproduce those rows.
+# See docs/cano_ot_v3_vs_current_and_mesh_20260908.md.
+object_trans_arch: "current"  # current | v2 | v3 | legacy | legacy_mesh | mergeHeads_obs | imuhoi*
 object_trans_hidden_dim: 192
 object_trans_num_layers: 2
 object_trans_dropout: 0.2
 object_trans_length_init: 0.4
-# OT-v2 默认关闭状态反馈，使窗口内 LSTM 一次性向量化前向；物体位置融合仍按
-# previous position 做因果递推。需要反馈消融时用 CLI 显式覆盖为 fused。
-object_trans_state_feedback: false
+# v3 使用上一融合状态的物体局部反馈；可用 CLI 覆盖为 none 做消融。
+object_trans_state_feedback: true
 object_trans_feedback_hidden_dim: 64
+# v3 = v2 的逐帧骨向量回归 + 可观测的 R_obj^T·R_forearm 特征 + 学习的软锁存：
+# head 每帧给出骨向量提议和门控 alpha，有效骨向量 = EMA(提议)，接触 onset 时重置。
+# alpha=1 即 v2；alpha 小即段内锁存；由 head 逐帧决定（如再抓握时打开）。
+object_trans_v3_gate_floor: 0.05        # lowest per-frame tracking rate of the soft latch (1.0 = plain v2)
+object_trans_v3_gate_init_bias: 1.0     # gate logit bias at init (alpha ~ 0.73)
+object_trans_v3_contact_on_threshold: 0.15
+object_trans_v3_contact_off_threshold: 0.075
+object_trans_v3_online_carry_segment_state: true
+# Object-static hard gate shared by every ObjectTrans arch (none | imu | pmove | both)
+object_trans_static_gate: none
+object_trans_static_gate_pmove_threshold: 0.5
+object_trans_static_gate_imu_window: 5
+object_trans_static_gate_imu_angle_deg: 0.6
+object_trans_static_gate_imu_acc: 0.35
+# Noisy object init for training windows that start inside a contact segment (0 = off)
+object_trans_init_noise_std: 0.0
+object_trans_init_noise_prob: 0.5
 mesh_downsample_points: 256
 enable_ot_refine: true
 enable_ot_lb_prior: false
@@ -168,7 +206,16 @@ deterministic_test_windows: true
 eval_interval: 5
 # joint_train阶段单独设置评估间隔（epoch）
 joint_train_eval_interval: 1
-batch_size: 200
+# batch_size x windows_per_sequence are raised together on purpose: k=4 draws
+# four windows per sequence per epoch and batch 800 keeps 23 optimizer steps per
+# epoch, exactly what batch 200 with k=1 produced.  Step count, milestones and
+# the epoch budget therefore stay valid and lr does NOT need rescaling -- each
+# step just averages over 4x as many windows (measured 4.50 s/epoch vs 1.98 s,
+# and each distinct window is visited ~9.9x over 300 epochs instead of ~2.5x).
+batch_size: 800
+windows_per_sequence: 4
+# Reference run at batch 200 / k=1 / lr 0.002 (canonical OMOMO, 300 epochs):
+#   MPJPE 3.0162 cm, MPJRE 5.3398 deg, root_trans_err 6.6466 cm.
 lr: 0.002 # jt:0.0002
 weight_decay: 0.0001
 gradient_clip: 1.0
@@ -190,7 +237,10 @@ vc_endpoint_finetune_lr_scale: 0.2
 vc_endpoint_finetune_lr_milestones: [50, 90]  # 相对endpoint微调阶段
 vc_group_lr_gamma: 0.2
 seed: 42
-num_workers: 4
+# 4 workers segfault inside libtorch_cpu at batch 800 (reproduced twice, same
+# faulting address, with and without persistent workers); 2 survives and is only
+# ~6% slower than 4 was at the smaller batch.  Under investigation.
+num_workers: 2
 
 # ============ 特征维度 ============
 num_human_imus: 6
@@ -224,47 +274,77 @@ contact_endpoint_init_thresholds: [0.15, 0.15, 0.5]  # 第0帧左手/右手/物�
 train_datasets: ["omomo"]  # 可选: behave, imhd, omomo, pahoi, hodome
 
 # ============ 数据集路径 ============
+# process/IMUHOI++cano 是 neutral / zero-betas canonical 语料，只产出 full
+# 变体（不按"物体位移但无手接触"丢弃序列），所以非 _full 的别名指向同一批目录。
 datasets:
   omomo:
-    train_path: "process/IMUHOI++/processed_split_data_OMOMO_smplx/train"
-    test_path:  "process/IMUHOI++/processed_split_data_OMOMO_smplx/test"
-    debug_path: "process/IMUHOI++/processed_split_data_OMOMO_smplx/debug"
+    body_model_type: "smplx"
+    train_path: "process/IMUHOI++cano/processed_split_data_OMOMO_full/train"
+    test_path:  "process/IMUHOI++cano/processed_split_data_OMOMO_full/test"
+    debug_path: "process/IMUHOI++cano/processed_split_data_OMOMO_full/train"
     object_geo_root: "datasets/OMOMO/captured_objects"
   omomo_full:
-    train_path: "process/IMUHOI++/processed_split_data_OMOMO_smplx_full/train"
-    test_path:  "process/IMUHOI++/processed_split_data_OMOMO_smplx_full/test"
-    debug_path: "process/IMUHOI++/processed_split_data_OMOMO_smplx_full/train"
-    full_sequence_test_path: "process/IMUHOI++/processed_split_data_OMOMO_smplx_full/test"
+    body_model_type: "smplx"
+    train_path: "process/IMUHOI++cano/processed_split_data_OMOMO_full/train"
+    test_path:  "process/IMUHOI++cano/processed_split_data_OMOMO_full/test"
+    debug_path: "process/IMUHOI++cano/processed_split_data_OMOMO_full/train"
+    full_sequence_test_path: "process/IMUHOI++cano/processed_split_data_OMOMO_full/test"
     object_geo_root: "datasets/OMOMO/captured_objects"
   imhd:
-    train_path: "process/IMUHOI++/processed_seg_data_IMHD/train"
-    test_path: "process/IMUHOI++/processed_seg_data_IMHD/test"
-    debug_path: "process/IMUHOI++/processed_seg_data_IMHD/train"
-    full_sequence_test_path: "process/IMUHOI++/processed_split_data_IMHD/test"
+    body_model_type: "smplh"
+    train_path: "process/IMUHOI++cano/processed_seg_data_IMHD_full/train"
+    test_path: "process/IMUHOI++cano/processed_seg_data_IMHD_full/test"
+    debug_path: "process/IMUHOI++cano/processed_seg_data_IMHD_full/train"
+    full_sequence_test_path: "process/IMUHOI++cano/processed_split_data_IMHD/test"
+    object_geo_root: "datasets/IMHD/IMHD Dataset/object_templates"
+  imhd_full:
+    body_model_type: "smplh"
+    train_path: "process/IMUHOI++cano/processed_seg_data_IMHD_full/train"
+    test_path: "process/IMUHOI++cano/processed_seg_data_IMHD_full/test"
+    debug_path: "process/IMUHOI++cano/processed_seg_data_IMHD_full/train"
+    full_sequence_test_path: "process/IMUHOI++cano/processed_split_data_IMHD/test"
     object_geo_root: "datasets/IMHD/IMHD Dataset/object_templates"
   behave:
-    train_path: "process/IMUHOI++/processed_seg_data_BEHAVE/train"
-    test_path: "process/IMUHOI++/processed_seg_data_BEHAVE/test"
-    debug_path: "process/IMUHOI++/processed_seg_data_BEHAVE/train"
-    full_sequence_test_path: "process/IMUHOI++/processed_split_data_BEHAVE/test"
+    body_model_type: "smplh"
+    train_path: "process/IMUHOI++cano/processed_seg_data_BEHAVE_full/train"
+    test_path: "process/IMUHOI++cano/processed_seg_data_BEHAVE_full/test"
+    debug_path: "process/IMUHOI++cano/processed_seg_data_BEHAVE_full/train"
+    full_sequence_test_path: "process/IMUHOI++cano/processed_split_data_BEHAVE/test"
+    object_geo_root: "datasets/BEHAVE/objects"
+  behave_full:
+    body_model_type: "smplh"
+    train_path: "process/IMUHOI++cano/processed_seg_data_BEHAVE_full/train"
+    test_path: "process/IMUHOI++cano/processed_seg_data_BEHAVE_full/test"
+    debug_path: "process/IMUHOI++cano/processed_seg_data_BEHAVE_full/train"
+    full_sequence_test_path: "process/IMUHOI++cano/processed_split_data_BEHAVE/test"
     object_geo_root: "datasets/BEHAVE/objects"
   pahoi:
-    train_path:              "process/IMUHOI++/processed_split_data_PAHOI_smplx/train"
-    test_path:               "process/IMUHOI++/processed_split_data_PAHOI_smplx/test"
-    debug_path:              "process/IMUHOI++/processed_split_data_PAHOI_smplx/train"
-    full_sequence_test_path: "process/IMUHOI++/processed_split_data_PAHOI_smplx/test"
+    body_model_type: "smplx"
+    train_path:              "process/IMUHOI++cano/processed_split_data_PAHOI_full/train"
+    test_path:               "process/IMUHOI++cano/processed_split_data_PAHOI_full/test"
+    debug_path:              "process/IMUHOI++cano/processed_split_data_PAHOI_full/train"
+    full_sequence_test_path: "process/IMUHOI++cano/processed_split_data_PAHOI_full/test"
     object_geo_root: "datasets/PAHOI/Object_mesh"
   pahoi_full:
-    train_path:              "process/IMUHOI++/processed_split_data_PAHOI_smplx_full/train"
-    test_path:               "process/IMUHOI++/processed_split_data_PAHOI_smplx_full/test"
-    debug_path:              "process/IMUHOI++/processed_split_data_PAHOI_smplx_full/train"
-    full_sequence_test_path: "process/IMUHOI++/processed_split_data_PAHOI_smplx_full/test"
+    body_model_type: "smplx"
+    train_path:              "process/IMUHOI++cano/processed_split_data_PAHOI_full/train"
+    test_path:               "process/IMUHOI++cano/processed_split_data_PAHOI_full/test"
+    debug_path:              "process/IMUHOI++cano/processed_split_data_PAHOI_full/train"
+    full_sequence_test_path: "process/IMUHOI++cano/processed_split_data_PAHOI_full/test"
     object_geo_root: "datasets/PAHOI/Object_mesh"
   hodome:
-    train_path: "process/IMUHOI++/processed_seg_data_HODOME/train"
-    test_path: "process/IMUHOI++/processed_seg_data_HODOME/test"
-    debug_path: "process/IMUHOI++/processed_seg_data_HODOME/train"
-    full_sequence_test_path: "process/IMUHOI++/processed_split_data_HODOME/test"
+    body_model_type: "smplh"
+    train_path: "process/IMUHOI++cano/processed_seg_data_HODOME_full/train"
+    test_path: "process/IMUHOI++cano/processed_seg_data_HODOME_full/test"
+    debug_path: "process/IMUHOI++cano/processed_seg_data_HODOME_full/train"
+    full_sequence_test_path: "process/IMUHOI++cano/processed_split_data_HODOME/test"
+    object_geo_root: "datasets/HODome/scaned_object"
+  hodome_full:
+    body_model_type: "smplh"
+    train_path: "process/IMUHOI++cano/processed_seg_data_HODOME_full/train"
+    test_path: "process/IMUHOI++cano/processed_seg_data_HODOME_full/test"
+    debug_path: "process/IMUHOI++cano/processed_seg_data_HODOME_full/train"
+    full_sequence_test_path: "process/IMUHOI++cano/processed_split_data_HODOME/test"
     object_geo_root: "datasets/HODome/scaned_object"
 
 # ============ 损失权重 ============
@@ -304,7 +384,7 @@ loss_weights:
   endpoint_focal_gamma: 2.0
 
   # Stage 3: ObjectTransModule
-  obj_trans: 10
+  obj_trans: 5
   lhand_obj_direction: 1
   rhand_obj_direction: 1
   lhand_lb: 10
@@ -322,6 +402,22 @@ loss_weights:
   refine_pose: 100
   refine_root_trans: 10
 
+# ObjectTrans 的损失权重按架构生效：下面每个块只在 object_trans_arch 选中它时
+# 覆盖上面 loss_weights 的同名项，其它架构完全不受影响。没有块的架构（v2/v3/
+# legacy/...）沿用上面的共享权重，行为与本节新增前逐位一致。
+object_trans_arch_loss_weights:
+  # "cur_hoi": 正式指标是"融合输出相对 OT 消费的手"在 GT 接触帧上的相对向量，
+  # 直接监督它（hoi_fused）并把绝对位置项降权，学习门控会把接触帧的 FK 权重
+  # 从 0.88 降到 0.75，融合输出转而贴合真值相对向量：HOI 9.86 -> 9.44、
+  # jitter 8.43 -> 7.38、obj 13.94 -> 13.72。上面的 hoi_error_* 只监督 FK 分支
+  # 自己的骨向量，从不监督融合结果，所以单靠它做不到这一点。
+  current:
+    obj_trans: 1.0
+    hoi_fused_l: 10.0
+    hoi_fused_r: 10.0
+  # v3 的融合权重是接触概率的固定函数，hoi_fused 推不动它（v3+门控 9.93 ->
+  # v3+门控+hoi_fused 10.03），因此保持共享权重（obj_trans 5、hoi_fused 0）。
+
 # ============ 窗口配置 ============
 train:
   window: 60
@@ -333,9 +429,11 @@ test:
 # ============ 预训练模块路径（可选）============
 # 注意：boundary_bidirectional=false 与 OT arch v6 之后，旧 VC/OT checkpoint
 # 不兼容；HumanPose 的速度量纲与足接触监督也已改变。需依次重训 Stage1/2/3。
+# Canonical skeleton v1 changes every position-derived target; legacy checkpoints must not be reused.
 pretrained_modules:
   # Root-velocity units and foot-contact supervision changed; retrain Stage 1
   # instead of silently loading a checkpoint trained with the old semantics.
-  human_pose:       "outputs/IMUHOI++/RNN/per_dataset_baseline_v3_independent_hp_20260819/hp/omomo/human_pose_08191605_hp_omomo_parallel_independent_20260819/best.pt"
-  velocity_contact: "outputs/IMUHOI++/RNN/per_dataset_baseline_v3_independent_hp_20260819/v3/omomo/velocity_contact_v3_08191905_v3_omomo_parallel_independenthp_20260819/best.pt"
-  object_trans:     "outputs/IMUHOI++/RNN/per_dataset_baseline_v3_independent_hp_20260819/v3/omomo/object_trans_vc_v3_08191924_v3_omomo_parallel_independenthp_20260819/best.pt"
+  human_pose: null
+  velocity_contact: null
+  # OT-v3 changes checkpoint shapes/semantics and must be trained from scratch.
+  object_trans: null

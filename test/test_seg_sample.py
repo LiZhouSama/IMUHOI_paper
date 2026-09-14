@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 from process.seg_sample import (
@@ -91,3 +92,40 @@ def test_process_pt_file_drops_only_bad_segment_without_filling_index(
     assert (output_dir / "sample_seg001.pt").exists()
     assert len(skipped_records) == 1
     assert skipped_records[0]["candidate_segment_index"] == 0
+
+
+def test_process_pt_file_writes_requested_body_model_type(tmp_path, monkeypatch):
+    monkeypatch.setattr("random.randint", lambda _minimum, _maximum: 6)
+    input_path = tmp_path / "source.pt"
+    output_dir = tmp_path / "segments"
+    torch.save(_sample_sequence(length=6), input_path)
+
+    saved_count = process_pt_file(
+        str(input_path),
+        str(output_dir),
+        min_len=6,
+        max_len=6,
+        drop_unheld_object_motion=False,
+        body_model_type="smplh",
+    )
+
+    segment = torch.load(output_dir / "sample_seg000.pt", map_location="cpu")
+    assert saved_count == 1
+    assert segment["body_model_type"] == "smplh"
+
+
+def test_process_pt_file_rejects_conflicting_body_model_type(tmp_path):
+    data = _sample_sequence(length=6)
+    data["body_model_type"] = "smplx"
+    input_path = tmp_path / "source.pt"
+    torch.save(data, input_path)
+
+    with pytest.raises(ValueError, match="body_model_type"):
+        process_pt_file(
+            str(input_path),
+            str(tmp_path / "segments"),
+            min_len=6,
+            max_len=6,
+            drop_unheld_object_motion=False,
+            body_model_type="smplh",
+        )

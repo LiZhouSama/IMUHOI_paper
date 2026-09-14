@@ -17,13 +17,17 @@ from tqdm import tqdm
 from human_body_prior.body_model.body_model import BodyModel
 import pytorch3d.transforms as transforms
 from utils.human_pose import (
-    GenderedBodyModelLoader,
     build_smpl24_joint_positions,
     ensure_smpl24_local_rotations,
     local_rotations_to_global,
 )
 
 _OBJECT_MESH_CENTROID_CACHE: Dict[Tuple[str, str], np.ndarray] = {}
+CANONICAL_BODY_MODEL_TYPE = "smplh"
+CANONICAL_BODY_MODEL_GENDER = "neutral"
+CANONICAL_BETAS = "zero"
+CANONICAL_SKELETON_VERSION = 1
+CANONICAL_BODY_MODEL_RELATIVE_PATH = os.path.join("smplh", "neutral", "model.npz")
 
 try:
     from preprocess import (
@@ -58,15 +62,6 @@ except ModuleNotFoundError:
 def iter_slices(total: int, chunk_len: int) -> Iterable[Tuple[int, int]]:
     for start in range(0, total, chunk_len):
         yield start, min(start + chunk_len, total)
-
-
-def scalar_to_str(value, default: str = "") -> str:
-    arr = np.asarray(value)
-    if arr.shape == ():
-        return str(arr.item())
-    if arr.size == 0:
-        return default
-    return str(arr.reshape(-1)[0])
 
 
 def subject_from_sequence(seq_name: str) -> str:
@@ -119,35 +114,46 @@ def build_downsample_indices(total_frames: int, source_fps: int, target_fps: int
     return np.arange(0, total_frames, step, dtype=np.int64)
 
 
-def pad_betas(betas: np.ndarray, target_dim: int, target_frames: int) -> np.ndarray:
-    betas = np.asarray(betas, dtype=np.float32)
-    if betas.ndim == 3:
-        betas = betas[:, 0, :]
-    elif betas.ndim == 1:
-        betas = betas[None, :]
-    betas = betas.reshape(betas.shape[0], -1)
-
-    if betas.shape[0] == 1 and target_frames > 1:
-        betas = np.repeat(betas, target_frames, axis=0)
-    elif betas.shape[0] < target_frames:
-        betas = np.pad(betas, ((0, target_frames - betas.shape[0]), (0, 0)), mode="edge")
-    elif betas.shape[0] > target_frames:
-        betas = betas[:target_frames]
-
-    if betas.shape[1] < target_dim:
-        pad = np.zeros((betas.shape[0], target_dim - betas.shape[1]), dtype=np.float32)
-        betas = np.concatenate([betas, pad], axis=1)
-    elif betas.shape[1] > target_dim:
-        betas = betas[:, :target_dim]
-    return betas.astype(np.float32)
-
-
-class BodyModelLoader(GenderedBodyModelLoader):
-    """HODome declares ``model='smplh'`` and ships 156-dim poses; the family is
-    still re-confirmed per sequence through :meth:`resolve`."""
+class BodyModelLoader:
+    """Load the single canonical neutral, zero-shape SMPL-H model."""
 
     def __init__(self, support_dir: str, device: torch.device, num_betas: int = 16) -> None:
-        super().__init__(support_dir, device=device, num_betas=num_betas, default_type="smplh")
+        self.model_path = os.path.join(support_dir, CANONICAL_BODY_MODEL_RELATIVE_PATH)
+        if not os.path.isfile(self.model_path):
+            raise FileNotFoundError(
+                "Canonical SMPL-H model not found; expected "
+                f"{self.model_path}"
+            )
+        self._model = BodyModel(bm_fname=self.model_path, num_betas=int(num_betas))
+        self._model.eval()
+        for parameter in self._model.parameters():
+            parameter.requires_grad_(False)
+        self._model = self._model.to(device)
+        self._num_betas = int(num_betas)
+
+    @property
+    def num_betas(self) -> int:
+        return self._num_betas
+
+    @property
+    def model_type(self) -> str:
+        return CANONICAL_BODY_MODEL_TYPE
+
+    def get(self, gender=None, model_type=None) -> BodyModel:
+        if model_type is not None and str(model_type).lower() != CANONICAL_BODY_MODEL_TYPE:
+            raise ValueError(f"HODome preprocessing only supports {CANONICAL_BODY_MODEL_TYPE}")
+        return self._model
+
+    def resolve(self, seq_data=None, gender=None, model_type=None) -> Tuple[BodyModel, str]:
+        return self.get(gender=gender, model_type=model_type), CANONICAL_BODY_MODEL_TYPE
+
+
+def canonical_body_model_metadata() -> Dict[str, object]:
+    return {
+        "canonical_body_model_gender": CANONICAL_BODY_MODEL_GENDER,
+        "canonical_betas": CANONICAL_BETAS,
+        "canonical_skeleton_version": CANONICAL_SKELETON_VERSION,
+    }
 
 
 def collect_hodome_pairs(mocap_ground_dir: str) -> List[Tuple[str, Path, Path]]:
@@ -167,7 +173,6 @@ def load_hodome_npz_pair(
     seq_name: str,
     human_path: Path,
     object_path: Path,
-    num_betas: int,
     target_fps: int = 30,
     max_frames: Optional[int] = None,
 ) -> Dict[str, np.ndarray]:
@@ -205,22 +210,18 @@ def load_hodome_npz_pair(
     trans = trans[source_frame_indices]
     obj_rot = obj_rot[source_frame_indices]
     obj_trans = obj_trans[source_frame_indices]
-    raw_betas = pad_betas(np.asarray(human["betas"], dtype=np.float32), num_betas, raw_T)
-    betas = raw_betas[source_frame_indices]
-
     if poses.shape[1] < 66:
         raise ValueError(f"Sequence {seq_name} has pose dim {poses.shape[1]}, expected at least 66")
 
     return {
         "seq_name": seq_name,
-        "gender": scalar_to_str(human["gender"], default="neutral"),
+        "gender": CANONICAL_BODY_MODEL_GENDER,
         "source_mocap_frame_rate": source_fps,
         "mocap_frame_rate": int(target_fps),
         "source_frame_indices": source_frame_indices.astype(np.int64),
         "root_orient": root_orient.astype(np.float32),
         "pose_body": poses[:, 3:66].astype(np.float32),
         "trans": trans.astype(np.float32),
-        "betas": betas,
         "obj_rot": obj_rot.astype(np.float32),
         "obj_trans": obj_trans.astype(np.float32),
         "obj_name": object_from_sequence(seq_name),
@@ -232,7 +233,6 @@ def compute_motion_features(
     root_orient: np.ndarray,
     pose_body: np.ndarray,
     trans: np.ndarray,
-    betas: np.ndarray,
     device: torch.device,
     chunk_len: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -245,18 +245,15 @@ def compute_motion_features(
             root_chunk = root_orient[start:end].astype(np.float32)
             body_chunk = pose_body[start:end].astype(np.float32)
             trans_chunk = trans[start:end].astype(np.float32)
-            betas_chunk = betas[start:end].astype(np.float32)
 
             root_t = torch.tensor(root_chunk, dtype=torch.float32, device=device)
             body_t = torch.tensor(body_chunk, dtype=torch.float32, device=device)
             trans_t = torch.tensor(trans_chunk, dtype=torch.float32, device=device)
-            betas_t = torch.tensor(betas_chunk, dtype=torch.float32, device=device)
 
             body_out = bm(
                 root_orient=root_t,
                 pose_body=body_t,
                 trans=trans_t,
-                betas=betas_t,
             )
             position_chunks.append(
                 build_smpl24_joint_positions(body_out.Jtr).detach().cpu().float()
@@ -277,7 +274,7 @@ def compute_motion_features(
             local_chunks.append(pose_aa.detach().cpu().float())
             global_chunks.append(rotation_global.detach().cpu().float())
 
-            del body_out, root_t, body_t, trans_t, betas_t, pose_aa, local_rot_mat
+            del body_out, root_t, body_t, trans_t, pose_aa, local_rot_mat
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
@@ -332,12 +329,10 @@ def process_hodome_sequence(
         seq_name,
         human_path,
         object_path,
-        num_betas=bm_loader.num_betas,
         target_fps=target_fps,
         max_frames=max_frames,
     )
-    # `seq` carries the capture's own `model` field plus the raw pose width.
-    bm, body_model_type = bm_loader.resolve(seq, gender=seq["gender"])
+    bm, body_model_type = bm_loader.resolve(model_type=CANONICAL_BODY_MODEL_TYPE)
     T = seq["root_orient"].shape[0]
 
     position_global, rotation_local, rotation_global = compute_motion_features(
@@ -345,7 +340,6 @@ def process_hodome_sequence(
         root_orient=seq["root_orient"],
         pose_body=seq["pose_body"],
         trans=seq["trans"],
-        betas=seq["betas"],
         device=device,
         chunk_len=chunk_len,
     )
@@ -426,8 +420,9 @@ def process_hodome_sequence(
     output = {
         "seq_name": seq_name,
         "dataset": "HODome",
-        "gender": seq["gender"],
+        "gender": CANONICAL_BODY_MODEL_GENDER,
         "body_model_type": body_model_type,
+        **canonical_body_model_metadata(),
         "source_mocap_frame_rate": seq["source_mocap_frame_rate"],
         "mocap_frame_rate": seq["mocap_frame_rate"],
         "source_frame_indices": torch.from_numpy(seq["source_frame_indices"]).long(),
@@ -439,7 +434,6 @@ def process_hodome_sequence(
         "obj_imu_real": None,
         "lfoot_contact": lfoot_contact.cpu().float(),
         "rfoot_contact": rfoot_contact.cpu().float(),
-        "betas": torch.from_numpy(seq["betas"]).float(),
         "obj_name": seq["obj_name"],
         "obj_mesh_name": mesh_name,
         "obj_points_canonical": canonical_points.half().cpu(),

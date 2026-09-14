@@ -153,11 +153,20 @@ class HumanPoseModule(nn.Module):
                 [0.0, -0.018, 0.0], dtype=torch.float32
             )
             # The floor clamp compares against joints 7/8, which are ankles, not
-            # soles: the datasets place the mesh sole at y=0, and the lower ankle
-            # then sits 0.0765 m above it (std 0.0062 over OMOMO, because the
-            # `amin` picks whichever foot is flat). Clamping ankles at y=0 would
-            # sink the root by that offset on every supported frame.
-            self.floor_height = 0.07
+            # soles, so clamping them at y=0 would sink the root by the ankle's
+            # own height on every supported frame.  Under the canonical neutral
+            # zero-betas skeleton every dataset is grounded on the lowest foot
+            # joint (7/8/10/11) instead of the mesh sole, and the per-sequence
+            # minimum of min(y7, y8) is then 0.024/0.039/0.011/0.000/0.000 m at
+            # worst over OMOMO/PAHOI/BEHAVE/IMHD/HODome.  Because the correction
+            # is a cummax -- once lifted, never released -- a threshold above
+            # those minima injects a permanent root lift on ground-truth motion:
+            # the old 0.0765 calibration (measured on shaped, gendered GT) costs
+            # 1.6-2.2 cm on ~90% of the SMPL-H sequences.  0.03 keeps the clamp
+            # useful while firing on <7% of OMOMO/PAHOI/BEHAVE/IMHD sequences
+            # for <0.05 cm; HODome still fires on 14% of its sequences (0.41 cm)
+            # because some of its poses legitimately rest an ankle on the floor.
+            self.floor_height = 0.03
             self.prevent_floor_penetration = True
 
         # SMPL相关
