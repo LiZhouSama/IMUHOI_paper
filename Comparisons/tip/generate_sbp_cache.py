@@ -12,11 +12,11 @@ from Comparisons.tip.sbp_cache import generate_cache_for_file, iter_processed_fi
 
 
 DEFAULT_DATA_ROOTS = [
-    "process/processed_seg_data_BEHAVE_bps",
-    "process/processed_seg_data_HODOME_bps",
-    "process/processed_seg_data_IMHD_bps",
-    "process/processed_seg_data_PAHOI_bps",
-    "process/processed_split_data_OMOMO_bps",
+    "process/processed_seg_data_BEHAVE",
+    "process/processed_seg_data_HODOME",
+    "process/processed_seg_data_IMHD",
+    "process/processed_seg_data_PAHOI",
+    "process/processed_split_data_OMOMO_bps_fixed",
 ]
 DEFAULT_CACHE_ROOT = "Comparisons/tip/sbp_cache"
 
@@ -76,4 +76,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

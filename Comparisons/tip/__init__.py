@@ -1,4 +1,3 @@
-from .model import TIPHOIModel
+from .model import TIPHOIModel, TIPReferenceHOIModel
 
-__all__ = ["TIPHOIModel"]
-
+__all__ = ["TIPHOIModel", "TIPReferenceHOIModel"]

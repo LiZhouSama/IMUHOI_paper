@@ -1,10 +1,14 @@
-"""GlobalPose-style PL/IK/VR network with object-position extension."""
+"""GlobalPose-style PL/IK/VR network with an object-motion extension."""
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
 from utils.rotation_conversions import rotation_6d_to_matrix
+from Comparisons.common.geometry import (
+    from_to_rotation_matrix,
+    r6d_columns_to_rotation_matrix,
+)
 from Comparisons.common.modules import BatchRNN, BatchRNNWithInit
 
 
@@ -21,15 +25,32 @@ class GlobalPoseHOIModel(nn.Module):
     def __init__(
         self,
         human_input_dim: int = 84,
+        # The released GlobalPose object extension concatenates 9 object IMU
+        # channels to the 243-D VR state.  Keep 12 as the constructor default
+        # for checkpoints produced by the older comparison wrapper.
         obj_imu_dim: int = 12,
         hidden_size: int = 512,
         dropout: float = 0.4,
+        object_bidirectional: bool = False,
+        object_with_init: bool = True,
+        human_condition_on_object: bool = False,
     ):
         super().__init__()
         self.human_input_dim = human_input_dim
         self.obj_imu_dim = obj_imu_dim
+        self.object_with_init = bool(object_with_init)
+        # The reference ObjectVRNet is a causal RNNWithInit.  The plain
+        # BatchRNN branch is retained only for strict legacy-checkpoint loading.
+        self.object_bidirectional = (
+            bool(object_bidirectional) if not self.object_with_init else False
+        )
+        self.human_condition_on_object = bool(human_condition_on_object)
         self.plnet = BatchRNNWithInit(
-            input_size=human_input_dim + obj_imu_dim,
+            input_size=(
+                human_input_dim + obj_imu_dim
+                if self.human_condition_on_object
+                else human_input_dim
+            ),
             output_size=18,
             hidden_size=hidden_size,
             init_size=18,
@@ -55,55 +76,121 @@ class GlobalPoseHOIModel(nn.Module):
             input_linear=False,
         )
         self.vrnet = BatchRNNWithInit(
-            input_size=243 + obj_imu_dim,
+            input_size=(
+                243 + obj_imu_dim if self.human_condition_on_object else 243
+            ),
             output_size=9,
             hidden_size=hidden_size,
             init_size=9,
             num_layers=3,
             dropout=dropout,
         )
-        self.obj_head = BatchRNN(
-            n_input=243 + obj_imu_dim,
-            n_output=3,
-            n_hidden=256,
-            n_layers=2,
-            bidirectional=True,
-            dropout=0.2,
-        )
+        if self.object_with_init:
+            self.obj_head = BatchRNNWithInit(
+                input_size=243 + obj_imu_dim,
+                output_size=3,
+                hidden_size=256,
+                init_size=3,
+                num_layers=2,
+                dropout=0.2,
+            )
+        else:
+            self.obj_head = BatchRNN(
+                n_input=243 + obj_imu_dim,
+                n_output=3,
+                n_hidden=256,
+                n_layers=2,
+                bidirectional=self.object_bidirectional,
+                dropout=0.2,
+            )
 
     @staticmethod
     def _normalize(x: torch.Tensor) -> torch.Tensor:
         return x / x.norm(dim=-1, keepdim=True).clamp_min(1e-8)
 
-    def forward(self, x: torch.Tensor, obj_imu: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        obj_imu: torch.Tensor,
+        apply_gravity_correction: bool = True,
+        column_r6d: bool = True,
+        pl_init: torch.Tensor | None = None,
+        vr_init: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         """Forward on already-adapted GlobalPose inputs.
 
         Args:
             x: [B, T, 84] GlobalPose PL-stage input.
-            obj_imu: [B, T, 12] object IMU extension.
+            obj_imu: [B, T, ``obj_imu_dim``] object IMU extension.
         """
-        model_input = torch.cat([x, obj_imu], dim=-1)
-        pl = self.plnet(model_input)
+        object_input = torch.cat([x, obj_imu], dim=-1)
+        model_input = object_input if self.human_condition_on_object else x
+        pl = self.plnet(model_input, init=pl_init)
 
-        r_rb = x[:, :, 36:81]
+        r_rb = x[:, :, 36:81].reshape(*x.shape[:2], 5, 3, 3)
         g_r0 = x[:, :, 81:84]
         p_rb = pl[:, :, :15]
         g_r1 = self._normalize(pl[:, :, 15:18])
+        cascade_g_r1 = g_r1.detach() if apply_gravity_correction else g_r1
+        if apply_gravity_correction:
+            r_rb = from_to_rotation_matrix(g_r0, cascade_g_r1).unsqueeze(2).matmul(r_rb)
 
-        ik1_in = torch.cat([r_rb, g_r1, p_rb], dim=-1)
+        ik1_in = torch.cat(
+            [r_rb.flatten(2), cascade_g_r1, p_rb],
+            dim=-1,
+        )
         ik1, _ = self.iknet1(ik1_in)
         p_rj = ik1[:, :, :69]
         g_r2 = self._normalize(ik1[:, :, 69:72])
+        cascade_g_r2 = g_r2.detach() if apply_gravity_correction else g_r2
+        if apply_gravity_correction:
+            r_rb = from_to_rotation_matrix(cascade_g_r1, cascade_g_r2).unsqueeze(2).matmul(r_rb)
 
-        ik2_in = torch.cat([r_rb, g_r2, p_rj], dim=-1)
+        ik2_in = torch.cat(
+            [
+                r_rb.flatten(2),
+                cascade_g_r2,
+                p_rj,
+            ],
+            dim=-1,
+        )
         rrj_6d, _ = self.iknet2(ik2_in)
-        rrj_mat = rotation_6d_to_matrix(rrj_6d.reshape(-1, 6)).reshape(x.shape[0], x.shape[1], 15 * 9)
+        decoder = r6d_columns_to_rotation_matrix if column_r6d else rotation_6d_to_matrix
+        rrj_mat = decoder(rrj_6d.reshape(-1, 6)).reshape(
+            x.shape[0], x.shape[1], 15 * 9
+        )
 
+        root_correction = from_to_rotation_matrix(cascade_g_r2, g_r0)
         aw_rb = x[:, :, :36]
-        vr_features = torch.cat([rrj_mat, p_rj, aw_rb, g_r2], dim=-1)
-        vr_input = torch.cat([vr_features, obj_imu], dim=-1)
-        vr = self.vrnet(vr_input)
-        obj_trans, _ = self.obj_head(vr_input)
+        if apply_gravity_correction:
+            aw_rb = torch.einsum(
+                "btsi,btij->btsj", aw_rb.reshape(*x.shape[:2], 12, 3), root_correction
+            ).flatten(2)
+        vr_features = torch.cat(
+            [
+                rrj_mat.detach() if apply_gravity_correction else rrj_mat,
+                p_rj.detach() if apply_gravity_correction else p_rj,
+                aw_rb,
+                cascade_g_r2,
+            ],
+            dim=-1,
+        )
+        object_vr_input = torch.cat([vr_features, obj_imu], dim=-1)
+        human_vr_input = (
+            object_vr_input if self.human_condition_on_object else vr_features
+        )
+        vr = self.vrnet(human_vr_input, init=vr_init)
+        if self.object_with_init:
+            obj_init = torch.zeros(
+                x.shape[0], 3, device=x.device, dtype=x.dtype
+            )
+            obj_trans = self.obj_head(object_vr_input, init=obj_init)
+        else:
+            obj_trans, _ = self.obj_head(object_vr_input)
+        if not apply_gravity_correction:
+            root_correction = torch.eye(
+                3, device=x.device, dtype=x.dtype
+            ).view(1, 1, 3, 3).expand(*x.shape[:2], 3, 3)
 
         return {
             "human": torch.cat([pl, ik1, rrj_6d, vr], dim=-1),
@@ -111,5 +198,6 @@ class GlobalPoseHOIModel(nn.Module):
             "ik1": ik1,
             "ik2": rrj_6d,
             "vr": vr,
+            "root_correction": root_correction,
             "obj_trans": obj_trans,
         }

@@ -33,15 +33,25 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from configs import FRAME_RATE
-from dataset.dataset_IMUHOI import IMUDataset
+from Comparisons.common.dataset import IMUDataset
 from Comparisons.common.adapters import (
     ROOT_LAST_ORDER_FROM_IMUHOI,
     _root_last_global_imu,
     adapt_batch,
+    measured_root_last_global_imu,
     tensor_to_device,
 )
-from Comparisons.common.geometry import rotation_angular_velocity
+from Comparisons.common.geometry import (
+    r6d_columns_to_rotation_matrix,
+    rotation_angular_velocity,
+)
+from Comparisons.eval_comparison import (
+    _checkpoint_globalpose_variant,
+    _checkpoint_state,
+    _map_globalpose_reference_state,
+)
 from Comparisons.globalpose import GlobalPoseHOIModel
+from utils.dataset_config import get_full_sequence_test_path
 from utils.rotation_conversions import rotation_6d_to_matrix
 from utils.utils import setup_seed
 
@@ -99,6 +109,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--debug", action="store_true", help="Use dataset debug mode and cap sequence count")
     parser.add_argument("--include_object_points", action="store_true")
+    parser.add_argument(
+        "--globalpose_variant",
+        "--globalpose-variant",
+        choices=("legacy", "official"),
+        default=None,
+        help="Override checkpoint protocol detection; official uses the 9-D object path.",
+    )
+    parser.add_argument(
+        "--globalpose_init_mode",
+        "--globalpose-init-mode",
+        choices=("reference", "deploy"),
+        default="reference",
+        help="RNN initialization used by the neural inference export.",
+    )
+    parser.add_argument(
+        "--simulate_imu_noise",
+        "--simulate-imu-noise",
+        action="store_true",
+        help="Use the same deterministic IMU noise protocol as eval_comparison.py.",
+    )
+    parser.add_argument(
+        "--simulate_imu_noise_seed",
+        "--simulate-imu-noise-seed",
+        type=int,
+        default=42,
+    )
     return parser.parse_args()
 
 
@@ -122,22 +158,37 @@ def resolve_data_dirs(args: argparse.Namespace, cfg: edict) -> list[str]:
         raise KeyError(f"Dataset {args.dataset!r} not found in config. Available: {available}")
 
     ds_cfg = cfg.datasets[args.dataset]
-    path_key = "debug_path" if args.split == "debug" else f"{args.split}_path"
-    if not hasattr(ds_cfg, path_key):
-        raise KeyError(f"Dataset {args.dataset!r} does not define {path_key}")
-    data_path = Path(getattr(ds_cfg, path_key))
+    if args.split == "test":
+        relative = get_full_sequence_test_path(ds_cfg)
+        if relative is None:
+            raise KeyError(
+                f"Dataset {args.dataset!r} does not define full_sequence_test_path"
+            )
+        data_path = Path(relative)
+    else:
+        path_key = "debug_path" if args.split == "debug" else f"{args.split}_path"
+        if not hasattr(ds_cfg, path_key):
+            raise KeyError(f"Dataset {args.dataset!r} does not define {path_key}")
+        data_path = Path(getattr(ds_cfg, path_key))
     if not data_path.is_absolute():
         data_path = PROJECT_ROOT / data_path
     return [str(data_path.resolve())]
 
 
-def load_model(args: argparse.Namespace, device: torch.device) -> GlobalPoseHOIModel:
-    model = GlobalPoseHOIModel().to(device)
+def load_model(
+    args: argparse.Namespace, device: torch.device
+) -> tuple[GlobalPoseHOIModel, int, str, str, bool]:
     if args.checkpoint is None:
         if not args.allow_random_weights:
             raise ValueError("--checkpoint is required unless --allow_random_weights is set")
         print("WARNING: exporting with random GlobalPoseHOI weights; this is only useful for smoke tests.")
-        return model
+        model = GlobalPoseHOIModel(
+            obj_imu_dim=9,
+            object_bidirectional=False,
+            object_with_init=True,
+            human_condition_on_object=False,
+        ).to(device)
+        return model, 2, "velocity", "official", True
 
     checkpoint_path = Path(args.checkpoint)
     if not checkpoint_path.is_absolute():
@@ -149,16 +200,89 @@ def load_model(args: argparse.Namespace, device: torch.device) -> GlobalPoseHOIM
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     except TypeError:
         checkpoint = torch.load(checkpoint_path, map_location=device)
-    state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-    if not isinstance(state_dict, dict):
-        raise TypeError(f"Unsupported checkpoint format: {checkpoint_path}")
-    state_dict = {
-        key[7:] if key.startswith("module.") else key: value
-        for key, value in state_dict.items()
-    }
-    model.load_state_dict(state_dict, strict=True)
+    if isinstance(checkpoint, dict) and checkpoint.get("method"):
+        checkpoint_method = str(checkpoint["method"]).lower()
+        if checkpoint_method != "globalpose":
+            raise ValueError(
+                f"Checkpoint method is {checkpoint_method!r}, not 'globalpose'"
+            )
+    metadata = checkpoint if isinstance(checkpoint, dict) else {}
+    variant = _checkpoint_globalpose_variant(args, checkpoint)
+    model_kwargs = metadata.get("model_kwargs", {})
+    state_dict = _checkpoint_state(checkpoint)
+    if variant == "official":
+        state_dict = _map_globalpose_reference_state(state_dict)
+    if "comparison_protocol_version" in metadata:
+        protocol_version = int(metadata["comparison_protocol_version"])
+    else:
+        protocol_version = 1
+        if (
+            "plnet.rnn.weight_ih_l0" in state_dict
+            and int(state_dict["plnet.rnn.weight_ih_l0"].shape[1]) == 84
+        ) or any(key.startswith("obj_head.init_net.") for key in state_dict):
+            protocol_version = 2
+    if "object_head_causal" in metadata:
+        object_bidirectional = not bool(metadata["object_head_causal"])
+    else:
+        object_bidirectional = bool(
+            model_kwargs.get("object_bidirectional", protocol_version < 2)
+        )
+    human_condition_on_object = bool(
+        model_kwargs.get("human_condition_on_object", protocol_version < 2)
+    )
+    object_with_init = bool(
+        model_kwargs.get("object_with_init", protocol_version >= 2)
+    )
+    if any(key.startswith("obj_head.init_net.") for key in state_dict):
+        object_with_init = True
+    elif any(key.startswith("obj_head.linear1.") for key in state_dict):
+        object_with_init = False
+    obj_imu_dim = 9 if variant == "official" else 12
+    model = GlobalPoseHOIModel(
+        obj_imu_dim=obj_imu_dim,
+        object_bidirectional=object_bidirectional,
+        object_with_init=object_with_init,
+        human_condition_on_object=human_condition_on_object,
+    ).to(device)
+    model_keys = set(model.state_dict())
+    object_keys = {key for key in model_keys if key.startswith("obj_head.")}
+    object_parameters_initialized = bool(object_keys.intersection(state_dict))
+    if variant == "official" and not object_parameters_initialized:
+        human_keys = model_keys - object_keys
+        missing = sorted(human_keys - set(state_dict))
+        unexpected = sorted(set(state_dict) - model_keys)
+        shape_errors = sorted(
+            key
+            for key in human_keys.intersection(state_dict)
+            if tuple(state_dict[key].shape) != tuple(model.state_dict()[key].shape)
+        )
+        if missing or unexpected or shape_errors:
+            raise RuntimeError(
+                "GlobalPose human checkpoint is incompatible "
+                f"(missing={missing[:3]}, unexpected={unexpected[:3]}, "
+                f"shape_errors={shape_errors[:3]})"
+            )
+        model.load_state_dict(state_dict, strict=False)
+    else:
+        model.load_state_dict(state_dict, strict=True)
     print(f"Loaded GlobalPoseHOI checkpoint: {checkpoint_path}")
-    return model
+    object_output_mode = str(
+        checkpoint.get(
+            "object_output_mode",
+            "velocity" if protocol_version >= 2 else "absolute",
+        )
+        if isinstance(checkpoint, dict)
+        else "absolute"
+    )
+    model.globalpose_variant = variant
+    model.object_parameters_initialized = object_parameters_initialized
+    return (
+        model,
+        protocol_version,
+        object_output_mode,
+        variant,
+        object_parameters_initialized,
+    )
 
 
 def create_loader(args: argparse.Namespace, cfg: edict, data_dirs: list[str]) -> DataLoader:
@@ -173,7 +297,9 @@ def create_loader(args: argparse.Namespace, cfg: edict, data_dirs: list[str]) ->
         debug=bool(args.debug),
         full_sequence=not bool(args.windowed),
         obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
-        simulate_imu_noise=False,
+        simulate_imu_noise=bool(args.simulate_imu_noise),
+        simulate_imu_noise_seed=int(args.simulate_imu_noise_seed),
+        imu_protocol="globalpose_reference",
         resolve_bimanual_contact_conflicts=bool(getattr(cfg, "resolve_bimanual_contact_conflicts", False)),
     )
     if len(dataset) == 0:
@@ -241,13 +367,21 @@ def build_export_record(
     args: argparse.Namespace,
     cfg_path: Path,
     checkpoint_path: str | None,
+    protocol_version: int,
+    object_output_mode: str,
+    sensor_signal_source: str,
 ) -> dict[str, Any]:
     seq_name = str(batch_scalar(batch, "seq_name", "unknown"))
     seq_path = str(batch_scalar(batch, "seq_path", ""))
     window_start = int(batch_scalar(batch, "window_start", 0))
     window_end = int(batch_scalar(batch, "window_end", adapted["x"].shape[1]))
 
-    ik2_rotmat = rotation_6d_to_matrix(output["ik2"].reshape(-1, 6)).reshape(
+    decoder = (
+        r6d_columns_to_rotation_matrix
+        if protocol_version >= 2
+        else rotation_6d_to_matrix
+    )
+    ik2_rotmat = decoder(output["ik2"].reshape(-1, 6)).reshape(
         output["ik2"].shape[0], output["ik2"].shape[1], 15, 3, 3
     )
     stationary_prob = output["vr"][..., 4:].sigmoid()
@@ -271,13 +405,17 @@ def build_export_record(
             "cfg": str(cfg_path),
             "checkpoint": checkpoint_path,
             "fps": float(args.fps),
+            "comparison_protocol_version": int(protocol_version),
+            "object_output_mode": object_output_mode,
+            "sensor_signal_source": sensor_signal_source,
             "root_last_order_from_imuhoi": list(ROOT_LAST_ORDER_FROM_IMUHOI),
             "has_object": bool(batch_scalar(batch, "has_object", False)),
             "obj_name": str(batch_scalar(batch, "obj_name", "")),
         },
         "inputs": {
             **split_globalpose_input(adapted["x"]),
-            "obj_imu_12d": tensor_to_cpu(adapted["obj_imu"]),
+            "obj_imu": tensor_to_cpu(adapted["obj_imu"]),
+            "obj_imu_dim": int(adapted["obj_imu"].shape[-1]),
             "sensor_acc_world": tensor_to_cpu(sensor_acc_world),
             "sensor_ang_vel_world": tensor_to_cpu(sensor_w_world),
             "sensor_rot_world": tensor_to_cpu(sensor_rot_world),
@@ -293,10 +431,12 @@ def build_export_record(
             "g_r1": tensor_to_cpu(normalize_vector(output["pl"][..., 15:18])),
             "g_r2": tensor_to_cpu(normalize_vector(output["ik1"][..., 69:72])),
             "obj_trans": tensor_to_cpu(output["obj_trans"]),
+            "obj_motion": tensor_to_cpu(output["obj_trans"]),
         },
         "targets": {
             "globalpose_target": tensor_to_cpu(adapted["target"]),
             "obj_trans": tensor_to_cpu(adapted["obj_trans"]),
+            "obj_velocity": tensor_to_cpu(adapted["obj_vel_target"]),
             "has_object": tensor_to_cpu(adapted["has_object"], squeeze_batch=False),
         },
         "raw": raw,
@@ -336,7 +476,13 @@ def main() -> None:
     device_name = args.device or getattr(cfg, "device", "cuda:0")
     device = torch.device(device_name if torch.cuda.is_available() else "cpu")
     loader = create_loader(args, cfg, data_dirs)
-    model = load_model(args, device)
+    (
+        model,
+        protocol_version,
+        object_output_mode,
+        globalpose_variant,
+        object_parameters_initialized,
+    ) = load_model(args, device)
     model.eval()
 
     output_dir = Path(args.output_dir)
@@ -363,6 +509,15 @@ def main() -> None:
         "full_sequence": not bool(args.windowed),
         "window_size": int(args.window_size or getattr(cfg.test if args.split != "train" else cfg.train, "window", 120)),
         "fps": float(args.fps),
+        "comparison_protocol_version": protocol_version,
+        "globalpose_variant": globalpose_variant,
+        "globalpose_init_mode": args.globalpose_init_mode,
+        "object_parameters_initialized": object_parameters_initialized,
+        "object_output_mode": object_output_mode,
+        "simulate_imu_noise": bool(args.simulate_imu_noise),
+        "simulate_imu_noise_seed": (
+            int(args.simulate_imu_noise_seed) if args.simulate_imu_noise else None
+        ),
         "files": [],
     }
 
@@ -377,10 +532,33 @@ def main() -> None:
             processed += 1
 
             batch = tensor_to_device(batch, device)
-            adapted = adapt_batch(batch, method="globalpose", fps=float(args.fps))
-            sensor_acc_world, sensor_rot_world = _root_last_global_imu(batch, fps=float(args.fps))
+            adapted = adapt_batch(
+                batch,
+                method="globalpose",
+                fps=float(args.fps),
+                protocol_version=protocol_version,
+                globalpose_obj_imu_dim=int(model.obj_imu_dim),
+                globalpose_init_mode=(
+                    args.globalpose_init_mode if protocol_version >= 2 else "deploy"
+                ),
+            )
+            if protocol_version >= 2:
+                sensor_acc_world, sensor_rot_world = measured_root_last_global_imu(batch)
+                sensor_signal_source = "measured_human_imu"
+            else:
+                sensor_acc_world, sensor_rot_world = _root_last_global_imu(
+                    batch, fps=float(args.fps)
+                )
+                sensor_signal_source = "legacy_gt_synthesized"
             sensor_w_world = rotation_angular_velocity(sensor_rot_world, dt=1.0 / float(args.fps))
-            output = model(adapted["x"], adapted["obj_imu"])
+            output = model(
+                adapted["x"],
+                adapted["obj_imu"],
+                apply_gravity_correction=protocol_version >= 2,
+                column_r6d=protocol_version >= 2,
+                pl_init=adapted["pl_init"] if protocol_version >= 2 else None,
+                vr_init=adapted["vr_init"] if protocol_version >= 2 else None,
+            )
 
             seq_name = str(batch_scalar(batch, "seq_name", f"batch_{batch_idx}"))
             seq_path = str(batch_scalar(batch, "seq_path", ""))
@@ -401,6 +579,9 @@ def main() -> None:
                 args=args,
                 cfg_path=cfg_path,
                 checkpoint_path=checkpoint_path,
+                protocol_version=protocol_version,
+                object_output_mode=object_output_mode,
+                sensor_signal_source=sensor_signal_source,
             )
             torch.save(record, out_path)
             manifest["files"].append(record_summary(out_path, record))

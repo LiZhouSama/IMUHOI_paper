@@ -1,0 +1,66 @@
+% Generated from Comparisons.eval_comparison reports.
+% Ours (Fusion) is intentionally left as -- because it was not run.
+\newcommand{\cw}{0.88cm}
+\newcommand{\mw}{1.5cm}
+\newcolumntype{C}{>{\centering\arraybackslash}m{\cw}}
+\newcolumntype{L}{>{\raggedright\arraybackslash}m{\mw}}
+
+\begin{table*}[t]
+\centering
+\caption{Comparison of object-centric performance on five HOI datasets. Numbers are lower-is-better. Best in \textbf{bold}.}
+\vspace{-3mm}
+\label{tab:sota_object_metrics}
+\setlength{\tabcolsep}{2pt}
+\renewcommand{\arraystretch}{1.06}
+\scriptsize
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{L*{15}{C}}
+\toprule
+& \multicolumn{3}{c}{OMOMO} & \multicolumn{3}{c}{$IMHD^{2}$} & \multicolumn{3}{c}{BEHAVE} & \multicolumn{3}{c}{HODOME} & \multicolumn{3}{c}{PAHOI} \\
+\cmidrule(lr){2-4}
+\cmidrule(lr){5-7}
+\cmidrule(lr){8-10}
+\cmidrule(lr){11-13}
+\cmidrule(lr){14-16}
+\textbf{Methods} & Obj Err & HOI Err & Jitter & Obj Err & HOI Err & Jitter & Obj Err & HOI Err & Jitter & Obj Err & HOI Err & Jitter & Obj Err & HOI Err & Jitter \\
+\midrule
+DIP* & 36.59 & 76.57 & 2.09 & 511.30 & 516.57 & 10.61 & 150.13 & 175.46 & 2.76 & \textbf{210.60} & 277.91 & 2.64 & \textbf{24.27} & 63.05 & 1.56 \\
+TIP* & 56.21 & 50.97 & \textbf{1.24} & 527.71 & 511.55 & 4.57 & 191.43 & 216.26 & \textbf{1.52} & 236.98 & \textbf{231.97} & 1.61 & 57.57 & 45.46 & \textbf{1.01} \\
+TransPose* & 33.17 & \textbf{37.08} & 1.63 & \textbf{387.92} & \textbf{390.52} & 7.55 & 170.45 & 185.04 & 2.47 & 283.20 & 298.85 & 2.11 & 33.53 & 44.11 & 1.28 \\
+GlobalPose* & \textbf{29.29} & 46.04 & 1.44 & 399.03 & 403.24 & \textbf{4.32} & \textbf{120.57} & \textbf{140.08} & 1.73 & 235.87 & 276.67 & \textbf{1.46} & 38.03 & \textbf{42.31} & 1.01 \\
+\textbf{Ours (Fusion)} & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+\bottomrule
+\end{tabular}%
+}
+\vspace{-0.6em}
+\end{table*}
+
+\begin{table*}[t]
+\centering
+\caption{Comparison of human motion estimation performance on five HOI datasets. Numbers are lower-is-better. Best in \textbf{bold}.}
+\vspace{-3mm}
+\label{tab:sota_human_metrics}
+\setlength{\tabcolsep}{2pt}
+\renewcommand{\arraystretch}{1.06}
+\scriptsize
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{L*{15}{C}}
+\toprule
+& \multicolumn{3}{c}{OMOMO} & \multicolumn{3}{c}{$IMHD^{2}$} & \multicolumn{3}{c}{BEHAVE} & \multicolumn{3}{c}{HODOME} & \multicolumn{3}{c}{PAHOI} \\
+\cmidrule(lr){2-4}
+\cmidrule(lr){5-7}
+\cmidrule(lr){8-10}
+\cmidrule(lr){11-13}
+\cmidrule(lr){14-16}
+\textbf{Methods} & Ang Err & Pos Err & Jitter & Ang Err & Pos Err & Jitter & Ang Err & Pos Err & Jitter & Ang Err & Pos Err & Jitter & Ang Err & Pos Err & Jitter \\
+\midrule
+DIP* & \textbf{3.21} & \textbf{3.42} & 4.23 & 12.88 & 10.10 & \textbf{5.68} & 8.61 & 8.87 & 8.11 & 11.43 & 10.14 & 4.29 & 8.90 & 9.01 & 5.49 \\
+TIP* & 7.22 & 10.74 & 5.86 & 14.50 & 17.68 & 13.30 & 11.69 & 14.36 & 10.89 & 12.82 & 14.54 & 4.13 & 9.09 & 11.72 & 5.49 \\
+TransPose* & 5.64 & 4.77 & 9.30 & 13.01 & 11.74 & 16.41 & 9.21 & 8.23 & 19.41 & 11.64 & 10.78 & 7.74 & 8.50 & 8.89 & 9.28 \\
+GlobalPose* & 6.55 & 6.67 & \textbf{2.61} & \textbf{11.58} & \textbf{8.56} & 6.26 & \textbf{7.84} & \textbf{6.50} & \textbf{5.23} & \textbf{9.67} & \textbf{6.32} & \textbf{1.93} & \textbf{6.42} & \textbf{6.85} & \textbf{2.39} \\
+\textbf{Ours (Fusion)} & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+\bottomrule
+\end{tabular}%
+}
+\vspace{-0.6em}
+\end{table*}

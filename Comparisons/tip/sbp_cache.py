@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -25,7 +26,7 @@ TIP_SBP_LINKS = (
     (0, "root"),    # pelvis/root
 )
 TIP_SBP_DIM = len(TIP_SBP_LINKS) * 4
-TIP_SBP_VERSION = "tip_rot_center_v1"
+TIP_SBP_VERSION = "tip_rot_center_v2_world_omega"
 V_THRES = 0.15
 
 
@@ -66,10 +67,16 @@ def cache_path_for_source(source_path: str | os.PathLike, cache_root: str | os.P
     return Path(cache_root).joinpath(*_source_relative_parts(source_path))
 
 
-def _angular_velocity_from_pair(rot_prev: np.ndarray, rot_next: np.ndarray, dt: float) -> np.ndarray:
+def _angular_velocity_from_pair(
+    rot_prev: np.ndarray,
+    rot_next: np.ndarray,
+    dt: float,
+) -> np.ndarray:
+    """Central-difference angular velocity expressed in world coordinates."""
     d_rot = rot_prev.T @ rot_next
     aa = matrix_to_axis_angle(torch.from_numpy(d_rot).float()).numpy()
-    return aa / (2.0 * dt)
+    omega_local = aa / (2.0 * dt)
+    return rot_next @ omega_local
 
 
 def _link_sbp_sequence(
@@ -91,8 +98,10 @@ def _link_sbp_sequence(
     for t in range(2, seq_len - 2):
         velocity = (position[t + 1] - position[t - 1]) / (2.0 * dt)
         omega = _angular_velocity_from_pair(rotation[t - 1], rotation[t + 1], dt)
-        cur_rot = rotation[t]
-        candidates = grid @ cur_rot.T
+        # The reference implementation evaluates the central difference at q2
+        # and rotates candidate offsets by that same right-end orientation.
+        candidate_rot = rotation[t + 1]
+        candidates = grid @ candidate_rot.T
 
         w1, w2, w3 = omega
         wx = np.array(
@@ -103,7 +112,10 @@ def _link_sbp_sequence(
         if prev_solution is None:
             smooth_term = 0.0
         else:
-            smooth_term = np.linalg.norm(candidates - (prev_solution - velocity * dt)[None, :], axis=1)
+            smooth_term = np.linalg.norm(
+                candidates - (prev_solution - velocity * (2.0 * dt))[None, :],
+                axis=1,
+            )
         residues = np.linalg.norm(candidate_vel, axis=1) + 0.2 * smooth_term + 0.02 * grid_norm
         best = int(np.argmin(residues))
         if residues[best] < threshold:
@@ -161,13 +173,26 @@ def generate_cache_for_file(
     cache_path = cache_path_for_source(source_path, cache_root)
     if cache_path.exists() and not overwrite:
         try:
-            cached = torch.load(cache_path, map_location="cpu")
-            frames = int(cached["tip_sbp"].shape[0]) if isinstance(cached, dict) and "tip_sbp" in cached else -1
+            try:
+                cached = torch.load(cache_path, map_location="cpu", weights_only=False)
+            except TypeError:
+                cached = torch.load(cache_path, map_location="cpu")
+            cache_is_current = (
+                isinstance(cached, dict)
+                and cached.get("version") == TIP_SBP_VERSION
+                and abs(float(cached.get("fps", -1.0)) - float(fps)) < 1e-6
+                and "tip_sbp" in cached
+            )
+            if cache_is_current:
+                frames = int(cached["tip_sbp"].shape[0])
+                return "skip", frames, str(cache_path)
         except Exception:
-            frames = -1
-        return "skip", frames, str(cache_path)
+            pass
 
-    seq_data = torch.load(source_path, map_location="cpu")
+    try:
+        seq_data = torch.load(source_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        seq_data = torch.load(source_path, map_location="cpu")
     tip_sbp = compute_tip_sbp_from_sequence(seq_data, fps=fps)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -213,6 +238,18 @@ def _lookup_cache_file(source_path, seq_file: str | None, cache_root: str | os.P
     return None
 
 
+@lru_cache(maxsize=8192)
+def _load_cached_sbp(cache_file: str) -> tuple[str | None, torch.Tensor]:
+    """Load each sidecar once per training process."""
+    try:
+        cached = torch.load(cache_file, map_location="cpu", weights_only=False)
+    except TypeError:
+        cached = torch.load(cache_file, map_location="cpu")
+    if isinstance(cached, dict):
+        return cached.get("version"), cached["tip_sbp"]
+    return None, cached
+
+
 def attach_tip_sbp_from_cache(
     batch: dict,
     cache_root: str | os.PathLike | None,
@@ -246,9 +283,18 @@ def attach_tip_sbp_from_cache(
 
         start = int(starts[i].item() if torch.is_tensor(starts) else starts[i])
         end = int(ends[i].item() if torch.is_tensor(ends) else ends[i])
-        cached = torch.load(cache_file, map_location="cpu")
-        sbp = cached["tip_sbp"] if isinstance(cached, dict) else cached
-        sbp = sbp[start:end].to(device=device, dtype=dtype)
+        version, cached_sbp = _load_cached_sbp(str(cache_file.resolve()))
+        if version != TIP_SBP_VERSION:
+            sbp_batch.append(
+                torch.full(
+                    (seq_len, TIP_SBP_DIM),
+                    float("nan"),
+                    dtype=dtype,
+                    device=device,
+                )
+            )
+            continue
+        sbp = cached_sbp[start:end].to(device=device, dtype=dtype)
         if sbp.shape[0] != seq_len:
             fixed = torch.full((seq_len, TIP_SBP_DIM), float("nan"), dtype=dtype, device=device)
             fixed[: min(seq_len, sbp.shape[0])] = sbp[:seq_len]
@@ -258,4 +304,3 @@ def attach_tip_sbp_from_cache(
     batch = dict(batch)
     batch["tip_sbp"] = torch.stack(sbp_batch, dim=0)
     return batch
-
