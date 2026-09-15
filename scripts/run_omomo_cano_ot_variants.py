@@ -160,6 +160,76 @@ VARIANTS = {
             "object_trans_state_trust": True,
         },
     },
+    # ---- 2026-09-14: event-anchored grasp latent (OT structure) -------------
+    # The hand->object bone becomes a segment state: anchored at contact
+    # onsets by fusing the observed geometry with a state-free posture prior,
+    # propagated by learned increments, released to the prior.  The published
+    # object enters the grasp geometry only at onsets (model/rnn/grasp_state.py).
+    "cur_hoi_eag": {
+        "arch": "current",
+        "label": "cur_hoi + event-anchored grasp latent (onset anchoring, learned increments, release), no corruption",
+        "overrides": {
+            "loss_weights": {**HOI_ALIGNED["loss_weights"], "prior_hoi_l": 5.0, "prior_hoi_r": 5.0},
+            "object_trans_grasp_latent": True,
+        },
+    },
+    "cur_hoi_eag_mild": {
+        "arch": "current",
+        "label": "cur_hoi_eag + mild window-init corruption (0.10 m on 25% of windows) so the onset fusion sees wrong states",
+        "overrides": {
+            "loss_weights": {**HOI_ALIGNED["loss_weights"], "prior_hoi_l": 5.0, "prior_hoi_r": 5.0},
+            "object_trans_grasp_latent": True,
+            "object_trans_init_noise_std": 0.10,
+            "object_trans_init_noise_prob": 0.25,
+        },
+    },
+    # 2026-09-15: the integrating latent random-walks on streams longer than
+    # the training window (OMOMO FK HOI 8.1 -> 12.8 cm over a segment vs
+    # 7.6 -> 10.0 for the baseline); residual mode keeps the onset anchor
+    # constant and predicts a bounded, non-integrated deviation from it.
+    "cur_hoi_eag_res": {
+        "arch": "current",
+        "label": "cur_hoi_eag with anchored bounded residual (no integration; bone = onset anchor + 0.10 m * tanh)",
+        "overrides": {
+            "loss_weights": {**HOI_ALIGNED["loss_weights"], "prior_hoi_l": 5.0, "prior_hoi_r": 5.0},
+            "object_trans_grasp_latent": True,
+            "object_trans_grasp_increment_mode": "residual",
+            "object_trans_grasp_residual_bound": 0.10,
+        },
+    },
+    # ---- 2026-09-15: rollout-aligned (online-protocol-aligned) training ----
+    # 90-frame data windows; the first 60 frames are predicted without grad
+    # (the model's own rollout), the next window is trained conditioned on
+    # that published prefix (train/rnn/ot_history_training.py), so the trust
+    # decision (observed geometry vs prior, feedback vs FK) sees real drift
+    # instead of GT-initialised windows.  Same 800x4 + joint + early-stopping
+    # protocol as cur_hoi_p800 / cur_hoi_eag.
+    "cur_hoi_p800_hist": {
+        "arch": "current",
+        "label": "cur_hoi_p800 + rollout-aligned training (data window 90, own-rollout prefix 60)",
+        "overrides": {**HOI_ALIGNED, "train_data_window": 90, "ot_history_training_window": 60},
+    },
+    "cur_hoi_eag_hist": {
+        "arch": "current",
+        "label": "cur_hoi_eag + rollout-aligned training (data window 90, own-rollout prefix 60)",
+        "overrides": {
+            "loss_weights": {**HOI_ALIGNED["loss_weights"], "prior_hoi_l": 5.0, "prior_hoi_r": 5.0},
+            "object_trans_grasp_latent": True,
+            "train_data_window": 90,
+            "ot_history_training_window": 60,
+        },
+    },
+    "cur_hoi_eag_modes": {
+        "arch": "current",
+        # residual mode lost on both datasets (OMOMO 11.20, BEHAVE 38.3), so
+        # the modes variant scales the INTEGRATED increment of cur_hoi_eag.
+        "label": "cur_hoi_eag + contact modes (per-hand rigidity scaling the increment, supervised by GT bone speed)",
+        "overrides": {
+            "loss_weights": {**HOI_ALIGNED["loss_weights"], "prior_hoi_l": 5.0, "prior_hoi_r": 5.0, "grasp_mode": 1.0},
+            "object_trans_grasp_latent": True,
+            "object_trans_grasp_modes": True,
+        },
+    },
 }
 
 METRICS = (
@@ -236,6 +306,17 @@ def find_ot_resume_dir(root: Path, suffix: str):
     return None
 
 
+def checkpoint_epoch(path: Path):
+    """Epoch stored in a trainer checkpoint (None if unreadable)."""
+    try:
+        import torch  # local import: the orchestrator itself does not need torch otherwise
+        payload = torch.load(path, map_location="cpu")
+    except Exception:  # noqa: BLE001
+        return None
+    epoch = payload.get("epoch") if isinstance(payload, dict) else None
+    return int(epoch) if isinstance(epoch, (int, float)) else None
+
+
 def read_metrics(eval_json: Path) -> dict:
     payload = json.loads(eval_json.read_text(encoding="utf-8"))
     results = payload.get("results", payload)
@@ -289,6 +370,8 @@ def main() -> int:
     parser.add_argument("--joint_early_stopping_patience_epochs", type=int, default=None, help="joint phase override (default: same as OT phase)")
     parser.add_argument("--joint_early_stopping_min_epochs", type=int, default=None, help="joint phase override (default: same as OT phase)")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--max_attempts", type=int, default=3,
+                        help="retry a crashed ObjectTrans/joint stage from its last.pt this many times (transient CUDA faults)")
     parser.add_argument("--dry_run", action="store_true")
     args = parser.parse_args()
 
@@ -433,26 +516,45 @@ def main() -> int:
                         velocity_contact_arch=VC_ARCH, config=str(variant_cfg), status="running", phase="object_trans_joint_train")
         try:
             joint = find_joint_checkpoints(pipeline_root, suffix)
-            if joint is None:
+            attempt = 0
+            while joint is None:
+                attempt += 1
+                if attempt > max(1, int(args.max_attempts)):
+                    raise RuntimeError(f"{name}: ObjectTrans stage failed {attempt - 1} times")
                 cmd = [str(SAGE_PYTHON), str(PROJECT_ROOT / "train/rnn/train_object_trans.py"), "--cfg", str(variant_cfg),
                        "--save_dir", str(pipeline_root), "--run_suffix", suffix, "--seed", str(args.seed),
                        "--train_datasets", "omomo", "--num_workers", str(args.num_workers), "--simulate_imu_noise",
                        "--epochs", str(args.ot_epochs), "--joint_train", "--velocity_contact_arch", VC_ARCH,
                        "--object_trans_arch", arch, "--hp_ckpt", str(HP_CKPT), "--vc_ckpt", str(VC_CKPT)]
-                resume_dir = find_ot_resume_dir(pipeline_root, suffix) if args.resume else None
+                # Resume from last.pt when asked to, or after a crash (transient
+                # CUDA faults under concurrent GPU jobs).
+                resume_dir = find_ot_resume_dir(pipeline_root, suffix) if (args.resume or attempt > 1) else None
                 if resume_dir is not None:
                     cmd += ["--resume_dir", str(resume_dir)]
+                    if (resume_dir / "final.pt").is_file():
+                        # The ObjectTrans phase already ended (early stop or budget)
+                        # but the joint phase did not finish: cap --epochs at the
+                        # resumed epoch so the trainer skips straight to joint.
+                        last_epoch = checkpoint_epoch(resume_dir / "last.pt")
+                        if last_epoch is not None:
+                            cmd[cmd.index("--epochs") + 1] = str(last_epoch + 1)
                     update_pipeline(
-                        name, resume_dir=str(resume_dir),
+                        name, resume_dir=str(resume_dir), attempt=attempt,
                         joint_restarted=not (resume_dir / "last_joint.pt").is_file(),
                         joint_amp_enabled=config.get("joint_train_amp_enabled", config.get("amp_enabled", True)),
                     )
                 if spec["overrides"].get("object_trans_state_feedback") is False:
                     cmd += ["--object_trans_state_feedback", "none"]
-                run_stage(cmd, pipeline_root / "object_trans_joint_train.log")
+                log_path = pipeline_root / (
+                    "object_trans_joint_train.log" if attempt == 1 else f"object_trans_joint_train_attempt{attempt}.log"
+                )
+                try:
+                    run_stage(cmd, log_path)
+                except RuntimeError as exc:
+                    log(f"{name}: attempt {attempt} failed ({exc})")
+                    if attempt >= max(1, int(args.max_attempts)):
+                        raise
                 joint = find_joint_checkpoints(pipeline_root, suffix)
-                if joint is None:
-                    raise FileNotFoundError(f"{name}: no joint checkpoints produced")
             joint_vc, joint_ot = joint
             update_pipeline(name, phase="eval", joint_vc_ckpt=str(joint_vc), joint_ot_ckpt=str(joint_ot))
             eval_json = pipeline_root / "eval_batch_online.json"

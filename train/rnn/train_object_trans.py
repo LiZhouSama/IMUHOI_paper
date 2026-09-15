@@ -82,6 +82,7 @@ from train.rnn.train_utils import (
     resolve_amp_settings,
 )
 from torch.nn.utils import clip_grad_norm_
+from train.rnn.ot_history_training import forward_with_ot_history
 try:
     from torch.utils.tensorboard.writer import SummaryWriter
 except Exception:
@@ -791,11 +792,7 @@ class Stage3JointTrainer:
             )
             feedback_control = self._build_rest_state_perturbation(batch, data_dict, training)
 
-        ot_out = call_model_inference(
-            self.ot_model,
-            hand_positions,
-            contact_prob,
-            obj_trans_init,
+        ot_kwargs = dict(
             obj_imu=data_dict['obj_imu'],
             human_imu=data_dict['human_imu'],
             obj_vel_input=obj_vel_input,
@@ -804,14 +801,21 @@ class Stage3JointTrainer:
             human_pose_input=human_pose_input,
             root_trans_input=root_trans_input,
             lb_prior_quantiles=lb_prior_quantiles,
-            enable_refine=(
-                False
-                if self.imuhoi_arch
-                else getattr(self.cfg, "enable_ot_refine", False)
-            ),
-            inference_mode="offline",
-            **({"feedback_control": feedback_control} if feedback_control is not None else {}),
+            enable_refine=False if self.imuhoi_arch else getattr(self.cfg, "enable_ot_refine", False),
         )
+        if feedback_control is not None:
+            ot_kwargs['feedback_control'] = feedback_control
+        history_window = int(getattr(self.cfg, 'ot_history_training_window', 0)) if training else 0
+        if history_window:
+            ot_out = forward_with_ot_history(self.ot_model, hand_positions, contact_prob, obj_trans_init, history_window, **ot_kwargs)
+        else:
+            ot_out = call_model_inference(
+                self.ot_model,
+            hand_positions,
+            contact_prob,
+            obj_trans_init,
+                inference_mode="offline", **ot_kwargs,
+            )
 
         results = {}
         results.update(vc_out)

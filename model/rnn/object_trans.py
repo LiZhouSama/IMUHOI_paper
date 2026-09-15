@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_axis_angle
 
 from .base import RNN, RNNWithInit
+from .bimanual_grasp import BimanualGrasp
+from .grasp_state import GraspLatent
 from .online import (
     append_stream_data,
     infer_batch_seq,
@@ -53,6 +55,13 @@ class ObjectTransModule(nn.Module):
         self.num_human_imus = getattr(cfg, "num_human_imus", len(_SENSOR_NAMES))
         hidden_dim_multiplier = getattr(cfg, "hidden_dim_multiplier", 1)
 
+        self.bigrasp_enabled = bool(getattr(cfg, "object_trans_bigrasp", False))
+        if self.bigrasp_enabled:
+            if str(getattr(cfg, "object_trans_arch", "current")) != "current":
+                raise ValueError("bigrasp is supported only by object_trans_arch=current")
+            self.bigrasp = BimanualGrasp(hidden_dim=int(getattr(cfg, "bigrasp_hidden_dim", 96)))
+            self.SEGMENT_STATE_OUTPUT_KEYS = ("bigrasp_vector", "bigrasp_active")
+
         self.refine_pose_dim = len(_REDUCED_POSE_NAMES) * 6
 
         # The predictor keeps every non-redundant feature formerly consumed by
@@ -87,7 +96,35 @@ class ObjectTransModule(nn.Module):
             self.object_trans_head.linear2.bias[3] = length_bias
             self.object_trans_head.linear2.bias[7] = length_bias
         self.n_prediction_input = n_prediction_input
-        self.feedback_feature_dim = 13
+        # Event-anchored grasp latent (object_trans_grasp_latent): the bone is
+        # a segment state anchored at contact onsets and propagated by learned
+        # increments, so the published object enters the grasp geometry only
+        # at onsets (model/rnn/grasp_state.py).
+        self.grasp_latent_enabled = bool(getattr(cfg, "object_trans_grasp_latent", False))
+        if self.grasp_latent_enabled:
+            if not self._state_feedback_enabled():
+                raise ValueError("object_trans_grasp_latent requires object_trans_state_feedback")
+            if self.bigrasp_enabled or bool(getattr(cfg, "object_trans_state_trust", False)):
+                raise ValueError("object_trans_grasp_latent cannot be combined with bigrasp or state trust")
+            self.grasp_latent = GraspLatent(
+                n_prediction_input=n_prediction_input,
+                hidden_dim=predictor_hidden,
+                n_layers=predictor_layers,
+                dropout=predictor_dropout,
+                lb_quantile_dim=self.LB_QUANTILE_DIM,
+                length_init=self.object_trans_length_init,
+                on_threshold=float(getattr(cfg, "object_trans_grasp_on_threshold", 0.5)),
+                off_threshold=float(getattr(cfg, "object_trans_grasp_off_threshold", 0.25)),
+                age_norm=float(getattr(cfg, "object_trans_grasp_age_norm", 60.0)),
+                increment_scale=float(getattr(cfg, "object_trans_grasp_increment_scale", 0.1)),
+                fusion_hidden=int(getattr(cfg, "object_trans_grasp_fusion_hidden", 32)),
+                fusion_bias=float(getattr(cfg, "object_trans_grasp_fusion_bias", 3.0)),
+                modes=bool(getattr(cfg, "object_trans_grasp_modes", False)),
+                increment_mode=str(getattr(cfg, "object_trans_grasp_increment_mode", "integrate")),
+                residual_bound=float(getattr(cfg, "object_trans_grasp_residual_bound", 0.10)),
+            )
+            self.SEGMENT_STATE_OUTPUT_KEYS = tuple(getattr(self, "SEGMENT_STATE_OUTPUT_KEYS", ())) + GraspLatent.STATE_KEYS
+        self.feedback_feature_dim = GraspLatent.FEEDBACK_FEATURE_DIM if self.grasp_latent_enabled else 13
         feedback_hidden_dim = int(getattr(cfg, "object_trans_feedback_hidden_dim", 64))
         self.feedback_embed = nn.Sequential(
             nn.LayerNorm(self.feedback_feature_dim),
@@ -661,6 +698,12 @@ class ObjectTransModule(nn.Module):
 
         static_gate = self._compute_static_gate(obj_imu, obj_rotm, pred_hand_contact_prob)
 
+        bigrasp = None
+        if self.bigrasp_enabled:
+            if not isinstance(root_trans_input, torch.Tensor) or root_trans_input.shape != (batch_size, seq_len, 3):
+                raise ValueError("bigrasp requires root_trans_input with shape [B,T,3]")
+            bigrasp = self.bigrasp(hand_positions, root_trans_input.to(hand_positions), human_imu, obj_imu, pred_hand_contact_prob)
+
         l_oe0_init, l_lb0_init, r_oe0_init, r_lb0_init = l_oe0, l_lb0, r_oe0, r_lb0
         state_trust = None
         if self.state_trust_enabled:
@@ -694,6 +737,42 @@ class ObjectTransModule(nn.Module):
             l_lb0_init = c0 * l_lb0 + (1.0 - c0) * state_trust["prior_l_len"][:, 0].unsqueeze(-1)
             r_lb0_init = c0 * r_lb0 + (1.0 - c0) * state_trust["prior_r_len"][:, 0].unsqueeze(-1)
             state_trust["init_confidence"] = c0.squeeze(-1)
+
+        grasp = None
+        if self.grasp_latent_enabled:
+            prior_lb = self._state_free_lb_prior(raw_lb_prior_quantiles, batch_size, device, dtype)
+            prior_input = torch.cat(
+                (
+                    prediction_input[..., : -self.LB_QUANTILE_DIM],
+                    prior_lb.flatten(1).unsqueeze(1).expand(batch_size, seq_len, self.LB_QUANTILE_DIM),
+                ),
+                dim=-1,
+            )
+            prior_init = torch.cat((contact_init_vec, prior_lb.flatten(1)), dim=-1)
+            prior_bone, prior_pos = self.grasp_latent.prior(prior_input, prior_init, obj_rotm, hand_positions)
+            rest_flag = self._imu_rest_flags(obj_imu, obj_rotm)
+            rest_age, gap_age = self.grasp_latent.causal_ages(rest_flag, pred_hand_contact_prob)
+            # Window-init geometry (object frame) is the observed bone at t=0.
+            observed0 = torch.stack((l_oe0 * l_lb0, r_oe0 * r_lb0), dim=1)
+            latent0, active0, age0, alpha0 = self.grasp_latent.initial_state(
+                observed0, prior_bone[:, 0], rest_flag[:, 0], rest_age[:, 0], gap_age[:, 0], pred_hand_contact_prob[:, 0]
+            )
+            grasp = {
+                "prior_bone": prior_bone,
+                "prior_pos": prior_pos,
+                "rest_flag": rest_flag,
+                "rest_age": rest_age,
+                "gap_age": gap_age,
+                "latent0": latent0,
+                "active0": active0,
+                "age0": age0,
+                "alpha0": alpha0,
+            }
+            # The predictor's initial state reads the anchored latent instead
+            # of the raw init geometry (identical while alpha ~ 1).
+            directions0, lengths0 = GraspLatent.split_latent(latent0)
+            l_oe0_init, r_oe0_init = directions0[:, 0], directions0[:, 1]
+            l_lb0_init, r_lb0_init = lengths0[:, 0:1], lengths0[:, 1:2]
 
         feedback_mode = "normal"
         feedback_prev_obj_trans = None
@@ -793,6 +872,9 @@ class ObjectTransModule(nn.Module):
                 dim=-1,
             ),
             "state_trust": state_trust,
+            "grasp": grasp,
+            "contact_init": contact_init_vec,
+            "bigrasp": bigrasp,
             "obj_trans_init": obj_trans_init,
             "l_oe0": l_oe0,
             "r_oe0": r_oe0,
@@ -1010,10 +1092,53 @@ class ObjectTransModule(nn.Module):
             dim=-1,
         )
 
+    def _grasp_prediction_init(self, context, latent0):
+        """Predictor init vector rebuilt from a (possibly published) grasp latent."""
+        directions0, lengths0 = GraspLatent.split_latent(latent0)
+        return torch.cat(
+            (
+                directions0[:, 0],
+                lengths0[:, 0:1],
+                directions0[:, 1],
+                lengths0[:, 1:2],
+                context["contact_init"],
+                context["lb_prior_quantiles"].flatten(1),
+            ),
+            dim=-1,
+        )
+
+    def _attach_known_grasp_state(self, context, known_segment_state_prefix, known_obj_trans_prefix_mask):
+        """Teacher-force the grasp latent from the published window prefix.
+
+        Frames covered by the prefix reuse the published latent / active flags /
+        ages, and a valid prefix at t=0 also replaces the window-init anchoring
+        (which would otherwise re-read the published object every window).
+        """
+        if not isinstance(known_segment_state_prefix, dict):
+            return
+        known = {}
+        for key in GraspLatent.STATE_KEYS:
+            values, valid = self._prepare_known_sequence(
+                known_segment_state_prefix.get(key), context["batch_size"], context["seq_len"],
+                GraspLatent.STATE_DIMS[key], context["device"], context["dtype"], known_obj_trans_prefix_mask,
+            )
+            known[key] = values
+            known["mask"] = valid if "mask" not in known else known["mask"] & valid
+        context["grasp_known"] = known
+        valid0 = known["mask"][:, 0]
+        if not bool(valid0.any()):
+            return
+        grasp = context["grasp"]
+        latent0 = torch.where(valid0[:, None, None], known["grasp_latent"][:, 0].view(-1, 2, 3), grasp["latent0"])
+        active0 = torch.where(valid0[:, None], known["grasp_active"][:, 0] > 0.5, grasp["active0"])
+        age0 = torch.where(valid0[:, None], known["grasp_age"][:, 0], grasp["age0"])
+        grasp.update({"latent0": latent0, "active0": active0, "age0": age0})
+        context["prediction_init"] = self._grasp_prediction_init(context, latent0)
+
     def _init_scan_state(self, context):
         batch_size = context["batch_size"]
         obj_trans_init = context["obj_trans_init"]
-        return {
+        state = {
             "rnn_state": self.object_trans_head.initial_state(context["prediction_init"]),
             "prev_obj_trans": obj_trans_init,
             "prev_prev_obj_trans": torch.zeros_like(obj_trans_init),
@@ -1023,12 +1148,30 @@ class ObjectTransModule(nn.Module):
             "lb_prior_quantiles": context["lb_prior_quantiles"],
             "frames_seen": 0,
         }
+        if self.bigrasp_enabled:
+            state["bigrasp_vector"] = torch.zeros_like(obj_trans_init)
+            state["bigrasp_active"] = torch.zeros(batch_size, device=obj_trans_init.device, dtype=torch.bool)
+        if self.grasp_latent_enabled:
+            grasp = context["grasp"]
+            state["grasp_latent"] = grasp["latent0"]
+            state["grasp_active"] = grasp["active0"]
+            state["grasp_age"] = grasp["age0"]
+        return state
 
     @staticmethod
     def _object_frame_vector(obj_rotm, vector):
         return torch.bmm(obj_rotm.transpose(-1, -2), vector.unsqueeze(-1)).squeeze(-1)
 
     def _feedback_features(self, obj_rotm, lhand_position, rhand_position, state):
+        if self.grasp_latent_enabled:
+            # Latent-based feedback: no published-object geometry per frame.
+            return self.grasp_latent.feedback_features(
+                state["grasp_latent"],
+                state["grasp_active"],
+                state["grasp_age"],
+                self._object_frame_vector(obj_rotm, state["prev_obj_delta"]),
+                state["prev_gating_weights"],
+            )
         prev_pos = state["prev_obj_trans"]
         return torch.cat(
             (
@@ -1107,10 +1250,54 @@ class ObjectTransModule(nn.Module):
             context["pred_hand_contact_prob"][:, time_index],
         )
         weights = self._apply_static_gate(weights, context, time_index)
-        l_dir = self._unit_vector(l_fk_out[:, :3])
-        r_dir = self._unit_vector(r_fk_out[:, :3])
-        l_len = self._softplus_positive(l_fk_out[:, 3])
-        r_len = self._softplus_positive(r_fk_out[:, 3])
+        grasp_output = {}
+        if self.grasp_latent_enabled:
+            grasp_ctx = context["grasp"]
+            hidden = rnn_state[0][-1].to(obj_rotm.dtype)  # top-layer LSTM state after this frame
+            state_pos = step_state["prev_obj_trans"]
+            observed = torch.stack(
+                (
+                    self._object_frame_vector(obj_rotm, state_pos - lhand_position),
+                    self._object_frame_vector(obj_rotm, state_pos - rhand_position),
+                ),
+                dim=1,
+            )
+            update = self.grasp_latent.step(
+                hidden, step_state["grasp_latent"], step_state["grasp_active"], step_state["grasp_age"],
+                context["pred_hand_contact_prob"][:, time_index], observed, grasp_ctx["prior_bone"][:, time_index],
+                grasp_ctx["rest_flag"][:, time_index], grasp_ctx["rest_age"][:, time_index], grasp_ctx["gap_age"][:, time_index],
+            )
+            grasp_latent, grasp_active, grasp_age = update["latent"], update["active"], update["age"]
+            grasp_bone = update["bone"]
+            known = context.get("grasp_known")
+            if known is not None:
+                # Published latents are authoritative on prefix frames.
+                valid = known["mask"][:, time_index]
+                known_latent = known["grasp_latent"][:, time_index].view(-1, 2, 3)
+                # residual mode: bone = anchor + residual, so shift the bone with the anchor
+                grasp_bone = torch.where(valid[:, None, None], known_latent + (grasp_bone - grasp_latent), grasp_bone)
+                grasp_latent = torch.where(valid[:, None, None], known_latent, grasp_latent)
+                grasp_active = torch.where(valid[:, None], known["grasp_active"][:, time_index] > 0.5, grasp_active)
+                grasp_age = torch.where(valid[:, None], known["grasp_age"][:, time_index], grasp_age)
+            directions, lengths = GraspLatent.split_latent(grasp_bone)
+            l_dir, r_dir = directions[:, 0], directions[:, 1]
+            l_len, r_len = lengths[:, 0], lengths[:, 1]
+            grasp_output = {
+                "grasp_latent": grasp_latent.flatten(1),
+                "grasp_active": grasp_active.to(grasp_latent.dtype),
+                "grasp_age": grasp_age,
+                "grasp_alpha": update["alpha"],
+                "grasp_onset": update["onset"].to(grasp_latent.dtype),
+                "grasp_delta": update["delta"].flatten(1),
+            }
+            if update["rigid"] is not None:
+                grasp_output["grasp_rigid_prob"] = update["rigid"]
+                grasp_output["grasp_rigid_logit"] = update["rigid_logit"]
+        else:
+            l_dir = self._unit_vector(l_fk_out[:, :3])
+            r_dir = self._unit_vector(r_fk_out[:, :3])
+            l_len = self._softplus_positive(l_fk_out[:, 3])
+            r_len = self._softplus_positive(r_fk_out[:, 3])
         l_dir_world = torch.bmm(obj_rotm, l_dir.unsqueeze(-1)).squeeze(-1)
         r_dir_world = torch.bmm(obj_rotm, r_dir.unsqueeze(-1)).squeeze(-1)
         l_pos_fk = lhand_position + l_dir_world * l_len.unsqueeze(-1)
@@ -1119,6 +1306,43 @@ class ObjectTransModule(nn.Module):
         previous_pos = step_state["prev_obj_trans"]
         imu_integrated_pos = previous_pos + context["obj_vel_input"][:, time_index] / FRAME_RATE
         static_pos = previous_pos
+        bigrasp_output = {}
+        if self.bigrasp_enabled:
+            encoded = context["bigrasp"]
+            hidden = encoded["hidden"][:, time_index]
+            proposal = encoded["proposal"][:, time_index]
+            vector, active, rate = self.bigrasp.update(
+                hidden, proposal, step_state["bigrasp_vector"], step_state["bigrasp_active"],
+                context["pred_hand_contact_prob"][:, time_index],
+            )
+            world_vector = torch.bmm(obj_rotm, vector.unsqueeze(-1)).squeeze(-1)
+            pair_pos = (lhand_position + rhand_position) * 0.5 + world_vector
+            candidates = torch.stack((l_pos_fk, r_pos_fk, imu_integrated_pos, static_pos, pair_pos), dim=1)
+            pair_weights, quality_logits = self.bigrasp.quality(
+                hidden, candidates, previous_pos, obj_rotm, weights,
+                context["pred_hand_contact_prob"][:, time_index], active,
+            )
+            if context.get("static_gate") is not None:
+                static_weights = pair_weights.new_tensor((0.0, 0.0, 0.0, 1.0, 0.0))
+                pair_weights = torch.where(context["static_gate"][:, time_index, None], static_weights, pair_weights)
+            effective_hands, weights = self.bigrasp.publication_candidates(candidates, pair_weights)
+            l_pos_fk, r_pos_fk = effective_hands.unbind(dim=1)
+            effective_bones = torch.stack((l_pos_fk - lhand_position, r_pos_fk - rhand_position), dim=1)
+            effective_lengths = effective_bones.norm(dim=-1)
+            local_directions = torch.einsum("bji,bhj->bhi", obj_rotm, effective_bones) / effective_lengths.clamp_min(1e-8).unsqueeze(-1)
+            l_dir, r_dir = local_directions.unbind(dim=1)
+            l_len, r_len = effective_lengths.unbind(dim=1)
+            bigrasp_output = {
+                "bigrasp_vector": vector,
+                "bigrasp_active": active.to(vector.dtype).unsqueeze(-1),
+                "bigrasp_update_rate": rate,
+                "bigrasp_proposal_world": torch.bmm(obj_rotm, proposal.unsqueeze(-1)).squeeze(-1),
+                "bigrasp_vector_world": world_vector,
+                "bigrasp_candidates": candidates,
+                "bigrasp_weights": pair_weights,
+                "bigrasp_quality_logits": quality_logits,
+                "pred_bimanual_obj_trans": pair_pos,
+            }
         fused_model_pos = (
             weights[:, 0:1] * l_pos_fk
             + weights[:, 1:2] * r_pos_fk
@@ -1178,6 +1402,22 @@ class ObjectTransModule(nn.Module):
         }
         if gate_logits is not None:
             frame_output["gate_logits"] = gate_logits
+        if self.bigrasp_enabled:
+            next_state["bigrasp_vector"] = vector
+            next_state["bigrasp_active"] = active
+            known = context.get("bigrasp_known")
+            if known is not None:
+                valid = known["mask"][:, time_index]
+                next_state["bigrasp_vector"] = torch.where(valid[:, None], known["bigrasp_vector"][:, time_index], vector)
+                next_state["bigrasp_active"] = torch.where(valid, known["bigrasp_active"][:, time_index, 0] > 0.5, active)
+                bigrasp_output["bigrasp_vector"] = next_state["bigrasp_vector"]
+                bigrasp_output["bigrasp_active"] = next_state["bigrasp_active"].to(vector.dtype).unsqueeze(-1)
+            frame_output.update(bigrasp_output)
+        if self.grasp_latent_enabled:
+            next_state["grasp_latent"] = grasp_latent
+            next_state["grasp_active"] = grasp_active
+            next_state["grasp_age"] = grasp_age
+            frame_output.update(grasp_output)
         if state_confidence is not None:
             frame_output["state_confidence"] = state_confidence
             frame_output["state_confidence_logit"] = state_confidence_logit
@@ -1199,6 +1439,7 @@ class ObjectTransModule(nn.Module):
             not self._state_feedback_enabled()
             and not isinstance(known_obj_trans_prefix, torch.Tensor)
             and not isinstance(known_gating_weights_prefix, torch.Tensor)
+            and context.get("bigrasp_known") is None
         )
         if use_vectorized_fast_path:
             # The no-feedback training baseline has no recurrent dependence in
@@ -1305,6 +1546,19 @@ class ObjectTransModule(nn.Module):
                     "state_trust_init_confidence": state_trust["init_confidence"],
                 }
             )
+        grasp = context.get("grasp")
+        if grasp is not None:
+            results.update(
+                {
+                    "prior_lhand_obj_trans": grasp["prior_pos"][:, :, 0],
+                    "prior_rhand_obj_trans": grasp["prior_pos"][:, :, 1],
+                    "grasp_prior_bone": grasp["prior_bone"],
+                    "grasp_rest_flag": grasp["rest_flag"],
+                    "grasp_rest_age": grasp["rest_age"],
+                    "grasp_gap_age": grasp["gap_age"],
+                    "grasp_init_alpha": grasp["alpha0"],
+                }
+            )
         if sample_mask is not None:
             mask = sample_mask.view(batch_size, 1, 1)
             init_mask = sample_mask.view(batch_size, 1)
@@ -1397,6 +1651,7 @@ class ObjectTransModule(nn.Module):
         known_gating_weights_prefix: torch.Tensor = None,
         compute_refine: bool = True,
         feedback_control=None,
+        known_segment_state_prefix=None,
     ):
         """Run a causal OT scan from the supplied window initializers."""
         context = self._prepare_prediction_context(
@@ -1413,6 +1668,18 @@ class ObjectTransModule(nn.Module):
             lb_prior_quantiles=lb_prior_quantiles,
             feedback_control=feedback_control,
         )
+        if self.bigrasp_enabled and isinstance(known_segment_state_prefix, dict):
+            known = {}
+            for key, feature_dim in (("bigrasp_vector", 3), ("bigrasp_active", 1)):
+                values, valid = self._prepare_known_sequence(
+                    known_segment_state_prefix.get(key), context["batch_size"], context["seq_len"], feature_dim,
+                    context["device"], context["dtype"], known_obj_trans_prefix_mask,
+                )
+                known[key] = values
+                known["mask"] = valid if "mask" not in known else known["mask"] & valid
+            context["bigrasp_known"] = known
+        if self.grasp_latent_enabled:
+            self._attach_known_grasp_state(context, known_segment_state_prefix, known_obj_trans_prefix_mask)
         prediction, _ = self._scan_predictor(
             context,
             known_obj_trans_prefix=known_obj_trans_prefix,
@@ -1480,12 +1747,18 @@ class ObjectTransModule(nn.Module):
                 step_obj_trans_init = prefix[:, 0]
             else:
                 step_obj_trans_init = obj_trans_init
+            segment_kwargs = {}
+            if self.bigrasp_enabled:
+                segment_kwargs["known_segment_state_prefix"] = {key: prefix_context.get(key) for key in self.SEGMENT_STATE_OUTPUT_KEYS}
+            if self.grasp_latent_enabled:
+                segment_kwargs["known_segment_state_prefix"] = {key: prefix_context.get(key) for key in GraspLatent.STATE_KEYS}
             window_out = self.forward(
                 hand_positions[:, start:end],
                 pred_hand_contact_prob[:, start:end],
                 step_obj_trans_init,
                 known_obj_trans_prefix=prefix,
                 known_gating_weights_prefix=prefix_weights,
+                **segment_kwargs,
                 **_slice_kwargs(start, end),
             )
             latest = take_latest_frame(window_out, batch_size, end - start)

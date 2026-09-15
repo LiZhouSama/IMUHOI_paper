@@ -67,9 +67,14 @@ class ObjectTransLoss:
     # 训练阶段使用的损失键
     LOSS_KEYS = {
         'obj_trans',
+        'bigrasp_common',
+        'bigrasp_proposal',
+        'bigrasp_delta',
+        'bigrasp_quality',
         'prior_hoi_l',
         'prior_hoi_r',
         'state_conf',
+        'grasp_mode',
         'lhand_obj_direction',
         'rhand_obj_direction',
         'lhand_lb',
@@ -89,9 +94,14 @@ class ObjectTransLoss:
     # 测试阶段记录/上报的损失键
     TEST_LOSS_KEYS = {
         'obj_trans',
+        'bigrasp_common',
+        'bigrasp_proposal',
+        'bigrasp_delta',
+        'bigrasp_quality',
         'prior_hoi_l',
         'prior_hoi_r',
         'state_conf',
+        'grasp_mode',
         'lhand_obj_direction',
         'rhand_obj_direction',
         'lhand_lb',
@@ -128,10 +138,14 @@ class ObjectTransLoss:
     # leans on the IMU/static branches is never told what the metric wants.
     _ZERO_DEFAULT_WEIGHT_KEYS = (
         'gate_weak', 'hoi_fused_l', 'hoi_fused_r',
+        'bigrasp_common', 'bigrasp_proposal', 'bigrasp_delta', 'bigrasp_quality',
         # state-trust terms (object_trans_state_trust): the state-free prior
         # FK's metric-aligned error and the BCE of the per-frame state
         # confidence against "state within state_conf_threshold of GT".
         'prior_hoi_l', 'prior_hoi_r', 'state_conf',
+        # grasp-latent contact modes (object_trans_grasp_modes): BCE of the
+        # per-hand rigidity against "GT bone speed below grasp_mode_speed_threshold".
+        'grasp_mode',
     )
     
     def __init__(self, weights=None):
@@ -141,6 +155,8 @@ class ObjectTransLoss:
         """
         self.weights = weights or {}
         self.state_conf_threshold = float((weights or {}).get('state_conf_threshold', 0.10))
+        self.grasp_mode_speed_threshold = float((weights or {}).get('grasp_mode_speed_threshold', 0.05))
+        self.bigrasp_quality_temperature = max(float(self.weights.get('bigrasp_quality_temperature', 0.05)), 1e-6)
 
     @staticmethod
     def _build_gate_weak_target(contact_prob, eps=1e-6):
@@ -255,6 +271,11 @@ class ObjectTransLoss:
             return total_loss, losses, weighted_losses
         
         obj_mask = has_object_mask
+        loss_mask = pred_dict.get('ot_loss_mask')
+        if isinstance(loss_mask, torch.Tensor):
+            if loss_mask.shape != obj_mask.shape:
+                raise ValueError("ot_loss_mask must have shape [B,T]")
+            obj_mask = obj_mask & loss_mask.to(device=device, dtype=torch.bool)
         
         # 计算各项损失
         if 'pred_obj_trans' in pred_dict:
@@ -408,6 +429,29 @@ class ObjectTransLoss:
                 if isinstance(prior_r, torch.Tensor) and prior_r.shape == (bs, seq, 3):
                     diff_prior_r = torch.norm((prior_r - hands_in[:, :, 1]) - rel_gt_r, dim=-1)
                     losses['prior_hoi_r'] = _masked_mean(diff_prior_r, mask_r, zero)
+
+            common_vector = pred_dict.get('bigrasp_vector_world')
+            if isinstance(common_vector, torch.Tensor):
+                both_mask = mask_l & mask_r
+                target_vector = obj_trans_gt - hand_pos_gt.mean(dim=2)
+                losses['bigrasp_common'] = _masked_mean((common_vector - target_vector).norm(dim=-1), both_mask, zero)
+                proposal_vector = pred_dict['bigrasp_proposal_world']
+                losses['bigrasp_proposal'] = _masked_mean((proposal_vector - target_vector).norm(dim=-1), both_mask, zero)
+                if seq > 1:
+                    pred_delta = common_vector[:, 1:] - common_vector[:, :-1]
+                    target_delta = target_vector[:, 1:] - target_vector[:, :-1]
+                    losses['bigrasp_delta'] = _masked_mean(
+                        ((pred_delta - target_delta) * FRAME_RATE).norm(dim=-1), both_mask[:, 1:] & both_mask[:, :-1], zero,
+                    )
+                candidates = pred_dict['bigrasp_candidates'].detach()
+                contact = torch.stack((mask_l, mask_r), dim=-1).to(candidates.dtype)
+                relative_target = obj_trans_gt.unsqueeze(2) - hand_pos_gt
+                relative_prediction = candidates.unsqueeze(3) - hands_in.detach().unsqueeze(2)
+                candidate_error = (relative_prediction - relative_target.unsqueeze(2)).norm(dim=-1)
+                candidate_error = (candidate_error * contact.unsqueeze(2)).sum(dim=-1) / contact.sum(dim=-1).clamp_min(1).unsqueeze(-1)
+                target_quality = torch.softmax(-candidate_error / self.bigrasp_quality_temperature, dim=-1).detach()
+                quality_kl = F.kl_div(F.log_softmax(pred_dict['bigrasp_quality_logits'].float(), dim=-1), target_quality.float(), reduction='none').sum(dim=-1)
+                losses['bigrasp_quality'] = _masked_mean(quality_kl, both_mask, zero)
         # State confidence (state trust): the state used at frame t is the fused
         # object of frame t-1 (window init at t=0); it is "trustworthy" when it
         # lies within state_conf_threshold metres of the GT object at t-1.
@@ -423,6 +467,37 @@ class ObjectTransLoss:
             state_err = torch.norm(state_prev.to(obj_trans_gt.dtype) - gt_prev, dim=-1)
             target = (state_err < self.state_conf_threshold).to(conf_logit.dtype)
             losses['state_conf'] = F.binary_cross_entropy_with_logits(conf_logit.float(), target.float())
+
+        # Grasp-latent contact modes: the predicted per-hand rigidity P(rigid)
+        # is supervised by whether the GT object-frame bone (dir * length) moves
+        # slower than grasp_mode_speed_threshold m/s between consecutive GT
+        # contact frames (rigid grasp) or faster (sliding / re-settling).
+        # BCE on the logits: F.binary_cross_entropy on probabilities is
+        # rejected under autocast (bf16/fp16 mixed precision).
+        rigid_prob = pred_dict.get('grasp_rigid_logit')
+        if (
+            isinstance(rigid_prob, torch.Tensor)
+            and rigid_prob.shape == (bs, seq, 2)
+            and seq > 1
+            and position_global_gt is not None
+            and lhand_dir_gt is not None
+            and rhand_dir_gt is not None
+        ):
+            hand_pos_gt = select_hand_anchor_positions(position_global_gt)
+            bones_gt = torch.stack(
+                (
+                    lhand_dir_gt * torch.norm(obj_trans_gt - hand_pos_gt[:, :, 0, :], dim=-1, keepdim=True),
+                    rhand_dir_gt * torch.norm(obj_trans_gt - hand_pos_gt[:, :, 1, :], dim=-1, keepdim=True),
+                ),
+                dim=2,
+            )  # [B,T,2,3]
+            bone_speed = (bones_gt[:, 1:] - bones_gt[:, :-1]).norm(dim=-1) * FRAME_RATE  # [B,T-1,2]
+            rigid_target = (bone_speed < self.grasp_mode_speed_threshold).to(rigid_prob.dtype)
+            contact_gt = torch.stack((lhand_contact_gt, rhand_contact_gt), dim=-1)  # [B,T,2]
+            mode_mask = contact_gt[:, 1:] & contact_gt[:, :-1] & obj_mask[:, 1:].unsqueeze(-1)
+            if mode_mask.any():
+                bce = F.binary_cross_entropy_with_logits(rigid_prob[:, 1:].float(), rigid_target.float(), reduction='none')
+                losses['grasp_mode'] = bce[mode_mask].mean()
 
         # 加权求和
         total_loss = zero.clone()

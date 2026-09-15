@@ -81,3 +81,11 @@ class BimanualGrasp(nn.Module):
     @staticmethod
     def feedback_weights(weights):
         return torch.cat((weights[..., :2] + weights[..., 4:5] * 0.5, weights[..., 2:4]), dim=-1)
+
+    @classmethod
+    def publication_candidates(cls, candidates, weights):
+        """Expand the midpoint candidate equally into the two hand branches."""
+        effective_weights = cls.feedback_weights(weights)
+        share = 0.5 * weights[..., 4:5] / effective_weights[..., :2].clamp_min(1e-8)
+        hands = candidates[..., :2, :] + share.unsqueeze(-1) * (candidates[..., 4:5, :] - candidates[..., :2, :])
+        return hands, effective_weights

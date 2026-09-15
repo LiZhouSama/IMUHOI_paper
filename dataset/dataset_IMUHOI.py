@@ -279,6 +279,24 @@ def compute_obj_direction_supervision(position_global, obj_trans, obj_rot,
     
     return result
 
+def _compact_tensor_storage(value, memo=None):
+    """Copy oversized tensor views without dropping fields or changing values."""
+    memo = {} if memo is None else memo
+    if isinstance(value, torch.Tensor):
+        identity = id(value)
+        if identity not in memo:
+            oversized = value.layout == torch.strided and value.storage().size() > value.numel()
+            memo[identity] = value.clone() if oversized else value
+        return memo[identity]
+    if isinstance(value, dict):
+        return {key: _compact_tensor_storage(child, memo) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_compact_tensor_storage(child, memo) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_compact_tensor_storage(child, memo) for child in value)
+    return value
+
+
 class CanonicalSkeletonMismatchError(ValueError):
     """Raised when a neutral canonical run is pointed at legacy shaped data."""
 
@@ -390,6 +408,8 @@ class IMUDataset(Dataset):
         # filesystem), so it is opt-in for environments that explicitly need
         # it rather than a correctness requirement.
         share_memory_enabled = os.environ.get("IMUHOI_ENABLE_SHARED_MEMORY", "0") == "1"
+        compact_storage = os.environ.get("IMUHOI_COMPACT_PRELOAD", "0") == "1"
+        strict_loading = os.environ.get("IMUHOI_STRICT_LOADING", "0") == "1"
         print(
             "共享内存策略: "
             + ("enabled (IMUHOI_ENABLE_SHARED_MEMORY=1)" if share_memory_enabled else "disabled（只读预加载，避免fd/shm耗尽）")
@@ -398,6 +418,8 @@ class IMUDataset(Dataset):
             try:
                 # 加载序列数据
                 seq_data = torch.load(file_path)
+                if compact_storage:
+                    seq_data = _compact_tensor_storage(seq_data)
                 seq_name = os.path.basename(file_path).replace(".pt", "")
 
                 if self.require_canonical_skeleton:
@@ -499,6 +521,8 @@ class IMUDataset(Dataset):
             except CanonicalSkeletonMismatchError:
                 raise
             except Exception as e:
+                if strict_loading:
+                    raise RuntimeError(f"Dataset loading aborted at {file_path}") from e
                 print(f"处理文件 {file_path} 时出错: {e}")
                 import traceback
                 traceback.print_exc() # 打印更详细的错误追踪

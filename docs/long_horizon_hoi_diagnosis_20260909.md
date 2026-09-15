@@ -677,3 +677,129 @@ OMOMO 训练时同样两个变体在 BEHAVE 上只有 −3.5 / −7.3，同域�
 
 ## 11. 待补数字
 
+
+## 12. OT 结构实验：事件锚定的抓握潜变量（2026-09-14 启动）
+
+用户批准了 §9 之后提出的三个结构方向并要求逐步验证（OMOMO 与 BEHAVE 各自训练/测试，每步与 current 基线对比）。
+方向二"显式双手闭环"由另一会话在同一工作树里实现（`object_trans_bigrasp`，`model/rnn/bimanual_grasp.py`），本节只覆盖
+方向一（事件锚定抓握状态）与方向三（接触模式动力学），代码与之隔离（`object_trans_grasp_latent` 与 bigrasp / state trust 互斥）。
+
+### 12.1 设计（`model/rnn/grasp_state.py::GraspLatent`，挂钩在 `model/rnn/object_trans.py`）
+
+把"手→物体"骨向量从逐帧回归量改成**段状态** g_h（物体系，每只手一个）：
+
+| 事件 | 更新规则 |
+|---|---|
+| 起点（该手 VC 接触概率上穿 0.5，滞回下穿 0.25 释放） | g ← α·b_obs + (1−α)·b_prior，其中 b_obs = Rᵀ(p_{t−1} − h_t) 是观测几何（物体状态正确时精确，漂移时继承漂移），b_prior 来自与预测器同输入但**不含任何物体状态**的姿态先验头；α = sigmoid(MLP(z))，z 为 15 维一致性特征（b_obs、b_prior、二者之差及模长、IMU 静止标志与时长、无接触时长、该手接触概率、另一只手是否已在持物），偏置 +3 使初始 α≈0.95 |
+| 段内 | g_t = g_{t−1} + 0.1·Linear(LSTM 顶层隐状态)，增量头零初始化 ⇒ 初始等价于硬 latch，训练后学到慢的非刚性再稳定 |
+| 释放 | 潜变量丢弃，空闲手的 FK 提议跟随先验 |
+| 模式（`object_trans_grasp_modes`） | 每手 P(rigid)=sigmoid(Linear(隐状态)) 把增量缩放为 (1−P)·Δ；用 GT 物体系骨向量的帧间速度 < 0.05 m/s 作标签做 BCE（损失键 `grasp_mode`） |
+
+FK 提议 P_h = h_t + R_t g_t 只依赖潜变量与当前手，反馈特征改为 [g_L, g_R, active, age, Rᵀ·Δp_{t−1}, 上一帧门控]（17 维），
+**发布的物体位置只在起点进入抓握几何**；潜变量 / active / age 逐帧发布（`SEGMENT_STATE_OUTPUT_KEYS`），在线窗口从已发布前缀
+teacher-force，且前缀在 t=0 有效时替换窗口初值锚定（否则每个在线窗口都会重新读取发布物体）。四路门控、IMU/静止分支不变。
+先验头用 `prior_hoi_l/r`（权重 5）监督。测试：`test/test_rnn_ot_grasp_latent.py`（8 项：基线不变、互斥、滞回与释放到先验、
+初值锚定混合、**段内扰动物体状态骨不变**、先验与状态无关、在线前缀延续段状态且不重复起点、模式损失）。
+
+### 12.2 变体与协议
+
+| 变体 | 说明 |
+|---|---|
+| `cur_hoi_eag` | cur_hoi 配方 + 抓握潜变量，无污染训练 |
+| `cur_hoi_eag_mild` | + 窗口初值污染 0.10 m / 25%（让 α 见到错误状态） |
+| `cur_hoi_eag_modes` | + 接触模式（`grasp_mode` 权重 1.0），待前两者结果后再跑 |
+
+- OMOMO：`outputs/IMUHOI++/RNN_cano/omomo_cano_ot_eag_20260914/`，800×4 + 早停（OT 40/120，joint 30/30），两变体并行；
+  基线 `cur_hoi_p800`（obj 13.80 / HOI 9.20 / jitter 7.42）。
+- BEHAVE：`outputs/IMUHOI++/RNN_cano/behave_full_trust_20260911/{cur_hoi_eag,cur_hoi_eag_mild}`，复用 09-11 的 HP/VC
+  （`--skip_hp/--skip_vc`），同缩放日程；基线 final HOI 40.20 / obj 46.61，trust_perturb final 24.22。
+  注意：首次误启动（run_tag 日期不匹配导致重训 HP）40 s 后被杀，junk 目录已删，但 `hp/human_pose.log` 被覆盖（checkpoint 完好）。
+- `scripts/run_omomo_cano_ot_variants.py` 新增 `--max_attempts`（崩溃后从 last.pt 续跑），与 BEHAVE 编排器一致。
+
+### 12.3 结果（2026-09-15 01:40 更新；BEHAVE eag_mild 训练中，modes 待重跑）
+
+运行事故：09-14 19:10 与 19:2x 两次 Claude 会话崩溃把 nohup 子进程一并杀掉（第二次已改用 `setsid` 启动，编排器存活），
+`cur_hoi_eag` 的 last.pt 在崩溃时写坏（用 epoch 15 的 best.pt 替换后续训），`cur_hoi_eag_mild` 在三任务并发时遇到一次
+`numel: integer multiplication overflow` GPU 故障后重试。三任务并发把显存压到剩 1.5 GB、内存换页，因此 BEHAVE 改为串行、
+由 `chain_eag_20260914.sh` 在 OMOMO 结束后启动。`cur_hoi_eag_modes` 三次尝试都在第一步失败：`F.binary_cross_entropy`
+在 autocast 下被拒绝，已改成对 logit 的 `binary_cross_entropy_with_logits`（模型新增输出 `grasp_rigid_logit`），待重跑。
+
+**OMOMO（在线协议，1173 序列，joint best）**
+
+| 变体 | obj (cm) | HOI (cm) | jitter | OT 早停 (best@) | joint 早停 (best@) |
+|---|---|---|---|---|---|
+| cur_hoi_p800（基线） | 13.80 | **9.20** | 7.42 | 140 (100) | 46 (16) |
+| cur_hoi_eag | 14.50 | 10.66 | 8.51 | 155 (115) | 56 (26) |
+| cur_hoi_eag_mild | **13.44** | 10.55 | **7.02** | 120 (35) | 43 (13) |
+| cur_hoi_eag_res（锚点+有界残差） | 14.91 | 11.20 | 7.65 | 120 (80) | 56 (26) |
+
+OT 阶段模型选择损失曲线：EAG 起点远好（epoch 0：3.84 vs 9.97，硬 latch 初始化即给出合理骨），但 epoch 15 后被基线反超并停在
+2.81（基线 2.48）。joint best 的分项测试损失：骨 FK 误差 `hoi_error_l/r` 0.68/0.65（基线 0.58/0.56），方向 MSE 0.043/0.034
+（基线 0.026/0.023），骨长 0.030/0.028（基线 0.019/0.016），`hoi_fused` 0.64/0.65（基线 0.60/0.59）——**潜变量式骨估计在
+60 帧窗口协议下比"逐帧回归 + 物体状态反馈"差约 1 cm**，与 v3 硬 latch 起点吃亏的历史一致，学到的增量没有补回来。
+先验头 HOI 0.66（eag）/0.93（mild），仍是 ~20 cm 级的弱先验。mild 的物体误差与抖动反而最好（13.44 / 7.02），说明污染让
+门控更少信 FK。
+
+**BEHAVE（同域全流程，整段序列；`cur_hoi_eag` OT 早停 460 (best 96)，joint 早停 183 (best 84)）**
+
+| 变体 | ckpt | obj (cm) | HOI (cm) | jitter | MPJPE | root |
+|---|---|---|---|---|---|---|
+| cur_hoi_p800 | final | 46.61 | 40.20 | 4.95 | 3.70 | 18.07 |
+| cur_hoi_p800 | best | 53.93 | 49.16 | 4.07 | 3.71 | 18.10 |
+| cur_hoi_trust_perturb | final | 35.80 | 24.22 | 6.01 | 3.72 | 18.06 |
+| **cur_hoi_eag** | **final** | **41.70** | **33.93** | 8.64 | 3.69 | 18.05 |
+| cur_hoi_eag | best | 46.11 | 37.90 | 7.99 | 3.69 | 18.10 |
+| cur_hoi_eag_mild | final | **39.86** | **30.16** | 8.65 | 3.71 | 18.22 |
+| cur_hoi_eag_mild | best | 55.95 | 48.75 | 7.05 | 3.74 | 18.70 |
+| cur_hoi_eag_res | final | 47.21 | 38.33 | 8.25 | 3.69 | 18.08 |
+| cur_hoi_eag_res | best | 46.67 | 37.25 | 8.26 | 3.69 | 18.07 |
+
+（eag_mild：OT 早停 460 (best 80)，joint 早停 144 (best 45)；其 OMOMO 选出的 best 检查点在整段序列上是 48.75，final 才是 30.16——
+长视野数字必须看 final，与 §7.2.10 的结论一致。）
+
+结论（截至目前）：
+0. EAG + 轻污染（0.10 m / 25% 窗口）final HOI 30.16：比同样污染强度的 trust_mild（37.34）好 7.2，比无污染 EAG 好 3.8，
+   比基线好 10.0；即结构与轻污染训练是叠加的，而 trust 模块对轻污染几乎没反应。
+1. 结构本身有长视野收益：不用任何污染训练，final-vs-final HOI −6.3、obj −4.9（best-vs-best −11.3），超过 trust_noaug（−2.6）、
+   trust_mild（−2.9）和 trust0.2（−7.9）的量级下限，人体侧完全相同。这与"物体状态只在起点进入抓握几何"的机制一致。
+2. 但不及 trust_perturb（−16.0），且 OMOMO 代价 +1.4 HOI，比 trust_mild 的 +0.6 更贵：**逐帧的物体状态反馈在 OMOMO 上是有益
+   信息**（融合后的物体含 IMU/VC 速度信息，比手更准），EAG 从结构上放弃了它。
+3. 抖动升高（BEHAVE 4.9 → 8.6，OMOMO 7.4 → 8.5），增量头在逐帧改骨向量。
+4. **诊断（dump：`omomo_cano_ot_eag_20260914/dumps/`，`scripts/diag/eag_dump_breakdown.py`，GT 接触手-帧按"距起点帧数"分箱，
+   每只手 FK 提议的 HOI 误差，cm）**：
+
+   | 距 GT 起点 | p800 FK | eag FK（激活） | eag 先验 |
+   |---|---|---|---|
+   | 1–15 | 7.60 | 8.09 | 11.7 |
+   | 16–30 | 8.03 | 9.33 | 11.3 |
+   | 31–60 | 8.41 | 10.52 | 11.2 |
+   | 61–120 | 8.88 | 11.62 | 11.2 |
+   | 121+ | 10.04 | 12.82 | 12.1 |
+
+   潜变量在段内**漂移两倍于基线**（+4.7 vs +2.4 cm），60 帧以后甚至不如不积分的先验头（11.2）。原因是训练/测试视野不匹配：
+   增量头只在 60 帧窗口内受监督，而在线协议里潜变量经已发布前缀跨窗口无限延续（基线的 LSTM 每个窗口从初值重新初始化，
+   没有任何超过 60 帧的状态），积分误差随段龄随机游走；FK 抖动也随之升高（起点帧 60 mm/f²）。非激活手→先验提议只占
+   GT 接触手-帧的 6.2%，对整体 HOI 贡献约 0.08 cm，不是主因。
+5. **修正（`object_trans_grasp_increment_mode: residual`）**：状态改为**锚点**（起点融合后段内恒定），骨 = 锚点 +
+   bound·tanh(Linear(隐状态))（bound 0.10 m），即"锁存 + 有界的非积分残差"：长视野漂移被结构性封顶，非刚性再稳定由每帧
+   输入回归而非累加；模式头改为缩放残差。变体 `cur_hoi_eag_res`（OMOMO + BEHAVE）。
+   **结果（09-15）：两边都更差**——OMOMO HOI 11.20（eag 10.66，基线 9.20），BEHAVE final 38.33（eag 33.93）。joint best 的骨 FK
+   误差 0.75/0.73（eag 0.68/0.65，基线 0.58/0.56）。即积分增量并不只是"随机游走"，它在段内确实跟踪了有用的量（手漂移的补偿 /
+   抓握再稳定），有界残差表达不了；"段内漂移大"的表象是因为潜变量拿不到基线那条**逐帧物体状态反馈**里隐含的信息：融合物体
+   ≈ FK + IMU 速度积分，反馈 Rᵀ(p_{t−1} − h_t) 等价于把物体速度积分进骨向量。EAG 结构上放弃了这条信息，所以每个 EAG 变体在 OMOMO
+   都付出 1.4–2 cm；而这条信息正是 BEHAVE 上失控的回路。结论：60 帧 GT 初始化窗口的训练无法学会"何时该信物体状态"，硬编码不信
+   （EAG）付 OMOMO 代价，污染训练教出权衡但不是结构；剩下的原则性出路是**在线协议对齐训练**（用模型自身 rollout 的前缀训练），
+   让信任决策从真实漂移中学到——trainer 已有 `ot_history_training_window` 机制（两窗口：前一窗口 detached 自滚动，后一窗口训练）。
+   逐帧分解证实了这一点（`dumps/eag_breakdown_res.txt`，GT 接触手-帧的 FK 骨 HOI，按距起点帧数）：
+
+   | 距 GT 起点 | p800 | eag（积分） | eag_res（恒定锚点+有界残差） | 无状态先验 |
+   |---|---|---|---|---|
+   | 1–15 | 7.60 | 9.47 | 9.88 | 12.7 |
+   | 31–60 | 8.41 | 10.69 | 11.90 | 11.4 |
+   | 61–120 | 8.88 | 11.71 | 12.98 | 11.4 |
+   | 121+ | 10.04 | 12.89 | 12.79 | 12.3 |
+
+   锚点在段内完全不动的 eag_res 增长幅度与 eag 相同（+3.1 vs +3.4），所以段内增长**不是积分游走，而是手的漂移**（段内掌心
+   局部漂移 3.6 → 12.5 cm）：物体系里固定的骨无法补偿漂移的手，基线靠逐帧物体状态反馈跟上了手（只 +2.4）。eag_res 的门控
+   转而更多依赖静止分支（w_static 0.09–0.12，eag 0.04）。
+

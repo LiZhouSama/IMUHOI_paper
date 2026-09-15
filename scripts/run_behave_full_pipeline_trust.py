@@ -55,6 +55,7 @@ VC_ARCH = "v4"
 # experiments can be read side by side.
 HOI_ALIGNED = {"obj_trans": 1.0, "hoi_fused_l": 10.0, "hoi_fused_r": 10.0}
 TRUST_LOSSES = {**HOI_ALIGNED, "prior_hoi_l": 5.0, "prior_hoi_r": 5.0, "state_conf": 1.0}
+EAG_LOSSES = {**HOI_ALIGNED, "prior_hoi_l": 5.0, "prior_hoi_r": 5.0}
 VARIANTS = {
     "cur_hoi_p800": {
         "label": "baseline: cur_hoi recipe (HOI-aligned fused loss), no state trust",
@@ -91,6 +92,47 @@ VARIANTS = {
             "object_trans_init_noise_prob": 0.5,
             "object_trans_rest_perturb_std": 0.20,
             "object_trans_rest_perturb_prob": 0.5,
+        },
+    },
+    # ---- 2026-09-14: event-anchored grasp latent (OT structure), see
+    # scripts/run_omomo_cano_ot_variants.py for the recipe rationale.
+    "cur_hoi_eag": {
+        "label": "event-anchored grasp latent (onset anchoring, learned increments, release), no corruption",
+        "overrides": {"loss_weights": dict(EAG_LOSSES), "object_trans_grasp_latent": True},
+    },
+    "cur_hoi_eag_mild": {
+        "label": "grasp latent + mild window-init corruption (0.10 m on 25% of windows)",
+        "overrides": {
+            "loss_weights": dict(EAG_LOSSES),
+            "object_trans_grasp_latent": True,
+            "object_trans_init_noise_std": 0.10,
+            "object_trans_init_noise_prob": 0.25,
+        },
+    },
+    "cur_hoi_eag_res": {
+        "label": "grasp latent with anchored bounded residual (no integration; bone = onset anchor + 0.10 m * tanh)",
+        "overrides": {
+            "loss_weights": dict(EAG_LOSSES),
+            "object_trans_grasp_latent": True,
+            "object_trans_grasp_increment_mode": "residual",
+            "object_trans_grasp_residual_bound": 0.10,
+        },
+    },
+    "cur_hoi_p800_hist": {
+        "label": "baseline + rollout-aligned training (data window 90, own-rollout prefix 60)",
+        "overrides": {"loss_weights": dict(HOI_ALIGNED), "train_data_window": 90, "ot_history_training_window": 60},
+    },
+    "cur_hoi_eag_hist": {
+        "label": "grasp latent + rollout-aligned training (data window 90, own-rollout prefix 60)",
+        "overrides": {"loss_weights": dict(EAG_LOSSES), "object_trans_grasp_latent": True,
+                      "train_data_window": 90, "ot_history_training_window": 60},
+    },
+    "cur_hoi_eag_modes": {
+        "label": "grasp latent + contact modes (per-hand rigidity scaling the increment, supervised by GT bone speed)",
+        "overrides": {
+            "loss_weights": {**EAG_LOSSES, "grasp_mode": 1.0},
+            "object_trans_grasp_latent": True,
+            "object_trans_grasp_modes": True,
         },
     },
 }
