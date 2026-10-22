@@ -694,7 +694,7 @@ class VelocityContactTrainer(BaseTrainer):
                     batch,
                     self.cfg,
                     self.device,
-                    add_noise=False,
+                    add_noise=bool(getattr(self.cfg, "validation_add_imu_noise", False)),
                 )
                 pred_dict = self.model_forward(
                     data_dict,

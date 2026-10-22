@@ -29,6 +29,7 @@ VELOCITY_CONTACT_ARCH_CHOICES = (
     "v2",
     "v3",
     "v4",
+    "v5",
     "imuhoi",
     "imuhoi_cond",
     "imuhoi_cond_bi",
@@ -68,6 +69,10 @@ def build_velocity_contact_module(cfg, velocity_contact_arch=None):
         from .velocity_contact_v4 import V4VelocityContactModule
 
         return V4VelocityContactModule(cfg)
+    if arch == "v5":
+        from .velocity_contact_v5 import V5VelocityContactModule
+
+        return V5VelocityContactModule(cfg)
     if arch == "imuhoi":
         from .velocity_contact_IMUHOI import IMUHOIVelocityContactModule
 

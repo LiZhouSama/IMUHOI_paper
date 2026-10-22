@@ -7,11 +7,14 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_axis_angle
+from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_axis_angle, matrix_to_rotation_6d
 
 from .base import RNN, RNNWithInit
 from .bimanual_grasp import BimanualGrasp
+from .bimanual_closure import BimanualClosure
 from .grasp_state import GraspLatent
+from .known_prefix_scan import KnownPrefixScan
+from utils.object_fusion import build_contact_fusion_weights
 from .online import (
     append_stream_data,
     infer_batch_seq,
@@ -27,7 +30,7 @@ from .online import (
 from configs import FRAME_RATE, _REDUCED_POSE_NAMES, _SENSOR_NAMES
 
 
-class ObjectTransModule(nn.Module):
+class ObjectTransModule(KnownPrefixScan, nn.Module):
     """
     物体位置预测模块
     基于手部位置、接触概率和物体IMU预测物体位置
@@ -37,8 +40,12 @@ class ObjectTransModule(nn.Module):
     # per-frame lengths), and hands without usable statistics fall back to the
     # init geometry instead of rejecting the prior tensor.
     ARCH_VERSION = 6
+    # forward() accepts fast_known_prefix / scan_end (see _scan_predictor).
+    SUPPORTS_FAST_KNOWN_PREFIX = True
     LENGTH_EPS = 1e-4
     LB_QUANTILE_DIM = 6  # two hands x (q10, q50, q90)
+    # per hand: B 6D, per-frame delta of B 6D, B(0)^T B(t) 6D, its angle
+    FOREARM_OBJ_FEATURE_DIM = 19
     _LEGACY_HEAD_PREFIXES = (
         "lhand_fk_head.",
         "rhand_fk_head.",
@@ -61,6 +68,13 @@ class ObjectTransModule(nn.Module):
                 raise ValueError("bigrasp is supported only by object_trans_arch=current")
             self.bigrasp = BimanualGrasp(hidden_dim=int(getattr(cfg, "bigrasp_hidden_dim", 96)))
             self.SEGMENT_STATE_OUTPUT_KEYS = ("bigrasp_vector", "bigrasp_active")
+        # Explicit bimanual closure (object_trans_bimanual_closure): a fifth,
+        # state-free fusion candidate in the hand-pair frame plus closure-aware
+        # gating (model/rnn/bimanual_closure.py); built once the predictor
+        # hidden size is known (below).
+        self.bimanual_closure_enabled = bool(getattr(cfg, "object_trans_bimanual_closure", False))
+        if self.bimanual_closure_enabled and self.bigrasp_enabled:
+            raise ValueError("object_trans_bimanual_closure cannot be combined with object_trans_bigrasp")
 
         self.refine_pose_dim = len(_REDUCED_POSE_NAMES) * 6
 
@@ -69,8 +83,18 @@ class ObjectTransModule(nn.Module):
         # both hands and the fusion decision.  The l_b prior quantiles are a
         # per-window constant broadcast to every frame so the LSTM cannot wash
         # them out the way an init-state-only injection would.
+        # Forearm-vs-object rotation (object_trans_forearm_obj_rotation).  A rigid
+        # grip implies bone_h(t) = -q_h + B_h(t) v_h with B_h = R_obj^T R_forearm,h,
+        # so B drives the in-segment bone change (GT bone moves 8.9 cm inside a
+        # bimanual segment while the forearm turns 45 deg against the object).  The
+        # predictor could not form B: its forearm IMU orientation is ROOT-relative
+        # and the root orientation was not part of the input.  A 5-fold CV probe
+        # (scripts/diag/forearm_obj_rotation_probe.py) puts the predictable part of
+        # that change at 8.73 -> 7.94 cm once B is available.
+        self.forearm_obj_rotation_enabled = bool(getattr(cfg, "object_trans_forearm_obj_rotation", False))
+        forearm_feature_dim = 2 * self.FOREARM_OBJ_FEATURE_DIM if self.forearm_obj_rotation_enabled else 0
         n_prediction_input = (
-            self.obj_imu_dim + 3 + 3 + 3 + 2 * (3 + self.imu_dim) + self.LB_QUANTILE_DIM
+            self.obj_imu_dim + 3 + 3 + 3 + 2 * (3 + self.imu_dim) + forearm_feature_dim + self.LB_QUANTILE_DIM
         )
         predictor_hidden = int(getattr(cfg, "object_trans_hidden_dim", 128)) * hidden_dim_multiplier
         predictor_layers = int(getattr(cfg, "object_trans_num_layers", 2))
@@ -80,8 +104,9 @@ class ObjectTransModule(nn.Module):
             n_output=12,  # left FK (4), right FK (4), four-way gate logits (4)
             n_hidden=predictor_hidden,
             # left/right initial geometry + initial contact state + the frozen
-            # diffusion output [left/right, q10/q50/q90].
-            n_init=17,
+            # diffusion output [left/right, q10/q50/q90] (+ both B_h(0) when the
+            # forearm-vs-object rotation is enabled).
+            n_init=17 + (12 if self.forearm_obj_rotation_enabled else 0),
             n_rnn_layer=predictor_layers,
             bidirectional=False,
             dropout=predictor_dropout,
@@ -95,6 +120,13 @@ class ObjectTransModule(nn.Module):
         with torch.no_grad():
             self.object_trans_head.linear2.bias[3] = length_bias
             self.object_trans_head.linear2.bias[7] = length_bias
+        if self.bimanual_closure_enabled:
+            self.bimanual_closure = BimanualClosure(
+                predictor_hidden=predictor_hidden,
+                hidden_dim=int(getattr(cfg, "bimanual_closure_hidden_dim", 96)),
+                min_contact=float(getattr(cfg, "bimanual_closure_min_contact", 0.2)),
+                gate_bias=float(getattr(cfg, "bimanual_closure_gate_bias", -2.0)),
+            )
         self.n_prediction_input = n_prediction_input
         # Event-anchored grasp latent (object_trans_grasp_latent): the bone is
         # a segment state anchored at contact onsets and propagated by learned
@@ -124,6 +156,26 @@ class ObjectTransModule(nn.Module):
                 residual_bound=float(getattr(cfg, "object_trans_grasp_residual_bound", 0.10)),
             )
             self.SEGMENT_STATE_OUTPUT_KEYS = tuple(getattr(self, "SEGMENT_STATE_OUTPUT_KEYS", ())) + GraspLatent.STATE_KEYS
+        # What the per-frame state feedback reads (object_trans_feedback_source):
+        #   published : the fused/published object of the previous frame (default).
+        #   anchor    : a second, feedback-only recursion fused with the FIXED
+        #               contact-driven weights of ObjectTrans v2
+        #               ([p_L, p_R, p_move*P(no hand|move), 1-p_move] from VC), so
+        #               during contact it sits on the FK candidates and never
+        #               inherits the IMU-integration drift of the published
+        #               state.  The published output keeps the learned gate; the
+        #               anchor is published as ``pred_anchor_obj_trans`` and handed
+        #               back as a known prefix by the online protocol.
+        self._prefix_state = None  # scan state seen by the batched known prefix (anchor feedback)
+        self.feedback_source = str(getattr(cfg, "object_trans_feedback_source", "published") or "published").strip().lower()
+        if self.feedback_source not in ("published", "anchor"):
+            raise ValueError(f"object_trans_feedback_source must be 'published' or 'anchor', got {self.feedback_source!r}")
+        if self.feedback_source == "anchor":
+            if not self._state_feedback_enabled():
+                raise ValueError("object_trans_feedback_source=anchor requires object_trans_state_feedback")
+            if self.grasp_latent_enabled or bool(getattr(cfg, "object_trans_state_trust", False)):
+                raise ValueError("object_trans_feedback_source=anchor is not combined with the grasp latent or state trust")
+            self.SEGMENT_STATE_OUTPUT_KEYS = tuple(getattr(self, "SEGMENT_STATE_OUTPUT_KEYS", ())) + ("pred_anchor_obj_trans",)
         self.feedback_feature_dim = GraspLatent.FEEDBACK_FEATURE_DIM if self.grasp_latent_enabled else 13
         feedback_hidden_dim = int(getattr(cfg, "object_trans_feedback_hidden_dim", 64))
         self.feedback_embed = nn.Sequential(
@@ -220,8 +272,28 @@ class ObjectTransModule(nn.Module):
         self.static_gate_imu_angle_deg = float(
             getattr(cfg, "object_trans_static_gate_imu_angle_deg", 0.6)
         )
+        # Built from a Python tuple, these cost a host-to-device copy per call;
+        # inside the per-frame scan that was milliseconds per frame.
+        self.register_buffer(
+            "_static_branch_onehot", torch.tensor((0.0, 0.0, 0.0, 1.0)), persistent=False
+        )
+        self.register_buffer(
+            "_static_branch_onehot5",
+            torch.tensor((0.0, 0.0, 0.0, 1.0, 0.0)),
+            persistent=False,
+        )
         self.static_gate_imu_acc = float(
             getattr(cfg, "object_trans_static_gate_imu_acc", 0.35)
+        )
+        # Inference-only prior.  The IMU-integration branch is the fusion's
+        # "object moving without hand contact" candidate; an unheld object
+        # slides or rolls on its support (GT: 6% OMOMO / 13% BEHAVE of its
+        # path is vertical), so that branch keeps the previous height (y-up).
+        self.nocontact_lock_vertical = bool(
+            getattr(cfg, "object_trans_nocontact_lock_vertical", False)
+        )
+        self.register_buffer(
+            "_horizontal_axes", torch.tensor((1.0, 0.0, 1.0)), persistent=False
         )
 
         n_refine_input = self.refine_pose_dim + 22
@@ -282,12 +354,21 @@ class ObjectTransModule(nn.Module):
         acc_max = padded.unfold(1, k + 1, 1).max(dim=-1).values
         return (angle_deg < self.static_gate_imu_angle_deg) & (acc_max < self.static_gate_imu_acc)
 
+    def _imu_branch_displacement(self, context, time_index):
+        """Per-frame displacement [B,3] of the IMU-integration candidate."""
+        displacement = context["obj_vel_input"][:, time_index] / FRAME_RATE
+        if self.nocontact_lock_vertical and not self.training:
+            displacement = displacement * self._horizontal_axes.to(displacement.dtype)
+        return displacement
+
     def _apply_static_gate(self, weights, context, time_index):
         """Pin the fusion to the static branch on gated frames."""
         gate = context.get("static_gate")
         if gate is None:
             return weights
-        static_onehot = weights.new_tensor((0.0, 0.0, 0.0, 1.0)).expand_as(weights)
+        static_onehot = self._static_branch_onehot.to(
+            device=weights.device, dtype=weights.dtype
+        ).expand_as(weights)
         return torch.where(gate[:, time_index].unsqueeze(-1), static_onehot, weights)
 
     def _state_feedback_enabled(self) -> bool:
@@ -334,6 +415,51 @@ class ObjectTransModule(nn.Module):
                 f"use the checkpoint generated with the same ObjectTrans v{self.ARCH_VERSION} config."
             )
 
+    def _forearm_object_rotation(self, human_imu, obj_rotm):
+        """B_h(t) = R_obj(t)^T R_forearm,h(t) for both hands: [B,T,2,3,3].
+
+        The human IMU stores world root orientation in slot 0 and ROOT-relative
+        orientations elsewhere (dataset/dataset_IMUHOI.py::_build_human_imu_root),
+        so the forearm has to be taken back to the world frame first.  B is
+        invariant to a global rotation of the scene.
+        """
+        batch_size, seq_len = obj_rotm.shape[:2]
+        to_matrix = lambda x: rotation_6d_to_matrix(x.reshape(-1, 6)).reshape(batch_size, seq_len, 3, 3)  # noqa: E731
+        root_rotm = to_matrix(human_imu[:, :, 0, 3:9])
+        arms = []
+        for name in ("LeftForeArm", "RightForeArm"):
+            arm_rel = to_matrix(human_imu[:, :, _SENSOR_NAMES.index(name), 3:9])
+            arms.append(obj_rotm.transpose(-1, -2) @ (root_rotm @ arm_rel))
+        return torch.stack(arms, dim=2)
+
+    def _forearm_object_features(self, human_imu, obj_rotm):
+        """Per-frame forearm-vs-object rotation features [B,T,2*19] and B_h(0) 6D [B,12].
+
+        Per hand: B 6D, the per-frame relative rotation B(t-1)^T B(t) 6D, the
+        rotation since the window start B(0)^T B(t) 6D and its angle (rad).  All
+        of it is causal and observable (object IMU + root/forearm IMUs).
+        """
+        rot = self._forearm_object_rotation(human_imu, obj_rotm)  # [B,T,2,3,3]
+        b6 = matrix_to_rotation_6d(rot)
+        previous = torch.cat((rot[:, :1], rot[:, :-1]), dim=1)
+        step = matrix_to_rotation_6d(previous.transpose(-1, -2) @ rot)
+        since_start = rot[:, :1].transpose(-1, -2) @ rot
+        rel = matrix_to_rotation_6d(since_start)
+        # atan2(sin, cos) from the antisymmetric part: acos() loses all precision
+        # near 0 rad, which is exactly where a fresh window starts.
+        sin_axis = torch.stack(
+            (
+                since_start[..., 2, 1] - since_start[..., 1, 2],
+                since_start[..., 0, 2] - since_start[..., 2, 0],
+                since_start[..., 1, 0] - since_start[..., 0, 1],
+            ),
+            dim=-1,
+        ) * 0.5
+        cos = (since_start.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) * 0.5
+        angle = torch.atan2(sin_axis.norm(dim=-1), cos).unsqueeze(-1)
+        features = torch.cat((b6, step, rel, angle), dim=-1)  # [B,T,2,19]
+        return features.flatten(2), b6[:, 0].flatten(1)
+
     def _build_prediction_inputs(
         self,
         obj_imu,
@@ -345,21 +471,24 @@ class ObjectTransModule(nn.Module):
         rhand_position,
         rhand_imu,
         lb_prior_feature,
+        forearm_feature=None,
     ):
-        return torch.cat(
-            (
-                obj_imu,
-                obj_rot_delta,
-                obj_vel,
-                contact_prob,
-                lhand_position,
-                lhand_imu,
-                rhand_position,
-                rhand_imu,
-                lb_prior_feature,
-            ),
-            dim=-1,
-        )
+        parts = [
+            obj_imu,
+            obj_rot_delta,
+            obj_vel,
+            contact_prob,
+            lhand_position,
+            lhand_imu,
+            rhand_position,
+            rhand_imu,
+        ]
+        if forearm_feature is not None:
+            parts.append(forearm_feature)
+        # The l_b quantiles stay the LAST block: the state-free prior heads slice
+        # them off by position (``prediction_input[..., :-LB_QUANTILE_DIM]``).
+        parts.append(lb_prior_feature)
+        return torch.cat(parts, dim=-1)
 
     @staticmethod
     def _pad_or_trim_last_dim(x: torch.Tensor, out_dim: int) -> torch.Tensor:
@@ -684,6 +813,9 @@ class ObjectTransModule(nn.Module):
         lb_prior_feature = (
             lb_prior_quantiles.flatten(1).unsqueeze(1).expand(batch_size, seq_len, self.LB_QUANTILE_DIM)
         )
+        forearm_feature, forearm_init = None, None
+        if self.forearm_obj_rotation_enabled:
+            forearm_feature, forearm_init = self._forearm_object_features(human_imu, obj_rotm)
         prediction_input = self._build_prediction_inputs(
             obj_imu,
             obj_rot_delta,
@@ -694,6 +826,7 @@ class ObjectTransModule(nn.Module):
             rhand_position,
             rhand_imu,
             lb_prior_feature,
+            forearm_feature=forearm_feature,
         )
 
         static_gate = self._compute_static_gate(obj_imu, obj_rotm, pred_hand_contact_prob)
@@ -703,6 +836,13 @@ class ObjectTransModule(nn.Module):
             if not isinstance(root_trans_input, torch.Tensor) or root_trans_input.shape != (batch_size, seq_len, 3):
                 raise ValueError("bigrasp requires root_trans_input with shape [B,T,3]")
             bigrasp = self.bigrasp(hand_positions, root_trans_input.to(hand_positions), human_imu, obj_imu, pred_hand_contact_prob)
+        closure = None
+        if self.bimanual_closure_enabled:
+            if not isinstance(root_trans_input, torch.Tensor) or root_trans_input.shape != (batch_size, seq_len, 3):
+                raise ValueError("bimanual closure requires root_trans_input with shape [B,T,3]")
+            closure = self.bimanual_closure(
+                hand_positions, root_trans_input.to(hand_positions), human_imu, obj_imu, pred_hand_contact_prob, obj_rotm
+            )
 
         l_oe0_init, l_lb0_init, r_oe0_init, r_lb0_init = l_oe0, l_lb0, r_oe0, r_lb0
         state_trust = None
@@ -868,13 +1008,16 @@ class ObjectTransModule(nn.Module):
                     r_lb0_init,
                     contact_init_vec,
                     lb_prior_quantiles.flatten(1),
-                ),
+                )
+                + ((forearm_init,) if forearm_init is not None else ()),
                 dim=-1,
             ),
             "state_trust": state_trust,
+            "forearm_init": forearm_init,
             "grasp": grasp,
             "contact_init": contact_init_vec,
             "bigrasp": bigrasp,
+            "closure": closure,
             "obj_trans_init": obj_trans_init,
             "l_oe0": l_oe0,
             "r_oe0": r_oe0,
@@ -1103,7 +1246,8 @@ class ObjectTransModule(nn.Module):
                 lengths0[:, 1:2],
                 context["contact_init"],
                 context["lb_prior_quantiles"].flatten(1),
-            ),
+            )
+            + ((context["forearm_init"],) if context.get("forearm_init") is not None else ()),
             dim=-1,
         )
 
@@ -1143,11 +1287,21 @@ class ObjectTransModule(nn.Module):
             "prev_obj_trans": obj_trans_init,
             "prev_prev_obj_trans": torch.zeros_like(obj_trans_init),
             "prev_obj_delta": torch.zeros_like(obj_trans_init),
-            "prev_gating_weights": obj_trans_init.new_tensor((0.0, 0.0, 0.0, 1.0)).expand(batch_size, -1).clone(),
+            "prev_gating_weights": self._static_branch_onehot.to(
+                device=obj_trans_init.device, dtype=obj_trans_init.dtype
+            ).expand(batch_size, -1).clone(),
             "prev_obj_rotm": None,
             "lb_prior_quantiles": context["lb_prior_quantiles"],
             "frames_seen": 0,
         }
+        if self.feedback_source == "anchor":
+            anchor_init = obj_trans_init
+            known = context.get("anchor_known")
+            if known is not None:
+                valid0 = known["mask"][:, 0]
+                anchor_init = torch.where(valid0[:, None], known["values"][:, 0], anchor_init)
+            state["prev_anchor_obj_trans"] = anchor_init
+            state["prev_anchor_delta"] = torch.zeros_like(obj_trans_init)
         if self.bigrasp_enabled:
             state["bigrasp_vector"] = torch.zeros_like(obj_trans_init)
             state["bigrasp_active"] = torch.zeros(batch_size, device=obj_trans_init.device, dtype=torch.bool)
@@ -1172,16 +1326,27 @@ class ObjectTransModule(nn.Module):
                 self._object_frame_vector(obj_rotm, state["prev_obj_delta"]),
                 state["prev_gating_weights"],
             )
-        prev_pos = state["prev_obj_trans"]
+        if self.feedback_source == "anchor":
+            prev_pos, prev_delta = state["prev_anchor_obj_trans"], state["prev_anchor_delta"]
+        else:
+            prev_pos, prev_delta = state["prev_obj_trans"], state["prev_obj_delta"]
         return torch.cat(
             (
                 self._object_frame_vector(obj_rotm, prev_pos - lhand_position),
                 self._object_frame_vector(obj_rotm, prev_pos - rhand_position),
-                self._object_frame_vector(obj_rotm, state["prev_obj_delta"]),
+                self._object_frame_vector(obj_rotm, prev_delta),
                 state["prev_gating_weights"],
             ),
             dim=-1,
         )
+
+    def _closure_weights5(self, weights, gate_logits, bimanual_logit):
+        """Five-way fusion; v2 overrides this to retain its fixed four-way prior."""
+        logits5 = torch.cat((gate_logits.to(bimanual_logit.dtype), bimanual_logit.unsqueeze(-1)), dim=-1)
+        return F.softmax(logits5, dim=-1)
+
+    def _closure_uses_effective_candidates(self):
+        return False
 
     def _decode_prediction_output(self, prediction_out, contact_prob=None):
         del contact_prob
@@ -1207,6 +1372,9 @@ class ObjectTransModule(nn.Module):
             step_state["prev_obj_trans"] = context["feedback_prev_obj_trans"][:, time_index]
             step_state["prev_prev_obj_trans"] = context["feedback_prev_prev_obj_trans"][:, time_index]
             step_state["prev_obj_delta"] = context["feedback_prev_obj_delta"][:, time_index]
+            if self.feedback_source == "anchor":
+                step_state["prev_anchor_obj_trans"] = step_state["prev_obj_trans"]
+                step_state["prev_anchor_delta"] = step_state["prev_obj_delta"]
         elif feedback_mode == "perturb":
             injection_mask = context["feedback_injection_mask"][:, time_index]
             if bool(injection_mask.any().item()):
@@ -1304,7 +1472,7 @@ class ObjectTransModule(nn.Module):
         r_pos_fk = rhand_position + r_dir_world * r_len.unsqueeze(-1)
 
         previous_pos = step_state["prev_obj_trans"]
-        imu_integrated_pos = previous_pos + context["obj_vel_input"][:, time_index] / FRAME_RATE
+        imu_integrated_pos = previous_pos + self._imu_branch_displacement(context, time_index)
         static_pos = previous_pos
         bigrasp_output = {}
         if self.bigrasp_enabled:
@@ -1323,7 +1491,9 @@ class ObjectTransModule(nn.Module):
                 context["pred_hand_contact_prob"][:, time_index], active,
             )
             if context.get("static_gate") is not None:
-                static_weights = pair_weights.new_tensor((0.0, 0.0, 0.0, 1.0, 0.0))
+                static_weights = self._static_branch_onehot5.to(
+                    device=pair_weights.device, dtype=pair_weights.dtype
+                )
                 pair_weights = torch.where(context["static_gate"][:, time_index, None], static_weights, pair_weights)
             effective_hands, weights = self.bigrasp.publication_candidates(candidates, pair_weights)
             l_pos_fk, r_pos_fk = effective_hands.unbind(dim=1)
@@ -1343,12 +1513,58 @@ class ObjectTransModule(nn.Module):
                 "bigrasp_quality_logits": quality_logits,
                 "pred_bimanual_obj_trans": pair_pos,
             }
-        fused_model_pos = (
-            weights[:, 0:1] * l_pos_fk
-            + weights[:, 1:2] * r_pos_fk
-            + weights[:, 2:3] * imu_integrated_pos
-            + weights[:, 3:4] * static_pos
-        )
+        closure_output = {}
+        if self.bimanual_closure_enabled:
+            closure_ctx = context["closure"]
+            contact_t = context["pred_hand_contact_prob"][:, time_index]
+            midpoint = closure_ctx["midpoint"][:, time_index]
+            prior_c = closure_ctx["prior_c"][:, time_index]
+            bimanual_pos = closure_ctx["candidate"][:, time_index]
+            consistency = self.bimanual_closure.consistency(
+                obj_rotm, l_pos_fk.detach(), r_pos_fk.detach(), previous_pos.detach(), midpoint, prior_c.detach(), contact_t
+            )
+            bimanual_logit = self.bimanual_closure.logit(
+                rnn_state[0][-1].to(obj_rotm.dtype), closure_ctx["hidden"][:, time_index], consistency, contact_t
+            )
+            weights5 = self._closure_weights5(weights, gate_logits, bimanual_logit)
+            static_gate = context.get("static_gate")
+            if static_gate is not None:
+                static5 = self._static_branch_onehot5.to(
+                    device=weights5.device, dtype=weights5.dtype
+                ).expand_as(weights5)
+                weights5 = torch.where(static_gate[:, time_index].unsqueeze(-1), static5, weights5)
+            fused_model_pos = (
+                weights5[:, 0:1] * l_pos_fk
+                + weights5[:, 1:2] * r_pos_fk
+                + weights5[:, 2:3] * imu_integrated_pos
+                + weights5[:, 3:4] * static_pos
+                + weights5[:, 4:5] * bimanual_pos
+            )
+            # Four-way view (bimanual weight folded into the hand branches) for
+            # feedback, publication and the refine head.
+            weights = self.bimanual_closure.effective_weights(weights5)
+            if self._closure_uses_effective_candidates():
+                # v2's evaluator replays four branches. This exact algebraic
+                # equivalent preserves the pair candidate through refined-hand
+                # publication, and is filtered before the v2 alpha-beta step.
+                l_pos_fk, r_pos_fk = self.bimanual_closure.effective_candidates(
+                    l_pos_fk, r_pos_fk, bimanual_pos, weights5
+                )
+            closure_output = {
+                "pred_bimanual_obj_trans": bimanual_pos,
+                "bimanual_prior_c": prior_c,
+                "bimanual_weight": weights5[:, 4],
+                "gating_weights_5": weights5,
+                "bimanual_logit": bimanual_logit,
+                "bimanual_consistency": consistency,
+            }
+        else:
+            fused_model_pos = (
+                weights[:, 0:1] * l_pos_fk
+                + weights[:, 1:2] * r_pos_fk
+                + weights[:, 2:3] * imu_integrated_pos
+                + weights[:, 3:4] * static_pos
+            )
         if known_mask is None:
             known_mask = torch.zeros(context["batch_size"], device=previous_pos.device, dtype=torch.bool)
         if isinstance(known_obj_trans, torch.Tensor):
@@ -1380,6 +1596,27 @@ class ObjectTransModule(nn.Module):
             "prev_obj_rotm": obj_rotm,
             "frames_seen": frames_seen + 1,
         }
+        anchor_output = {}
+        if self.feedback_source == "anchor":
+            prev_anchor = step_state["prev_anchor_obj_trans"]
+            anchor_weights = self._apply_static_gate(
+                build_contact_fusion_weights(context["pred_hand_contact_prob"][:, time_index]).to(prev_anchor.dtype),
+                context,
+                time_index,
+            )
+            anchor_pos = (
+                anchor_weights[:, 0:1] * l_pos_fk
+                + anchor_weights[:, 1:2] * r_pos_fk
+                + anchor_weights[:, 2:3] * (prev_anchor + self._imu_branch_displacement(context, time_index))
+                + anchor_weights[:, 3:4] * prev_anchor
+            )
+            known_anchor = context.get("anchor_known")
+            if known_anchor is not None:
+                valid = known_anchor["mask"][:, time_index]
+                anchor_pos = torch.where(valid[:, None], known_anchor["values"][:, time_index].to(anchor_pos.dtype), anchor_pos)
+            next_state["prev_anchor_obj_trans"] = anchor_pos
+            next_state["prev_anchor_delta"] = anchor_pos - prev_anchor
+            anchor_output["pred_anchor_obj_trans"] = anchor_pos
         frame_output = {
             "pred_obj_trans": fused_pos,
             # Published window prefixes are authoritative for all derived
@@ -1402,6 +1639,7 @@ class ObjectTransModule(nn.Module):
         }
         if gate_logits is not None:
             frame_output["gate_logits"] = gate_logits
+        frame_output.update(anchor_output)
         if self.bigrasp_enabled:
             next_state["bigrasp_vector"] = vector
             next_state["bigrasp_active"] = active
@@ -1418,6 +1656,8 @@ class ObjectTransModule(nn.Module):
             next_state["grasp_active"] = grasp_active
             next_state["grasp_age"] = grasp_age
             frame_output.update(grasp_output)
+        if self.bimanual_closure_enabled:
+            frame_output.update(closure_output)
         if state_confidence is not None:
             frame_output["state_confidence"] = state_confidence
             frame_output["state_confidence_logit"] = state_confidence_logit
@@ -1427,12 +1667,68 @@ class ObjectTransModule(nn.Module):
             frame_output["ot_state_prev_obj_trans"] = step_state["prev_obj_trans"]
         return frame_output, next_state
 
+    def _fast_known_prefix_supported(self, context, prefix_len):
+        """Branch-specific guard on top of the shared one.
+
+        grasp latent, bigrasp and the state-trust head each keep their own
+        per-frame latent recurrence, which the batched prefix does not
+        reproduce; those configurations keep the sequential scan.
+
+        The bimanual closure needs no guard: its encoder runs over the whole
+        window from inputs alone, and per frame it only shapes that frame's
+        fused position and gate, both of which a teacher-forced frame replaces
+        by the published values before they reach the recurrence.
+        """
+        anchor_ok = True
+        if self.feedback_source == "anchor":
+            known = context.get("anchor_known")
+            anchor_ok = known is not None and bool(known["mask"][:, :prefix_len].all())
+        return (
+            super()._fast_known_prefix_supported(context, prefix_len)
+            and not self.grasp_latent_enabled
+            and not self.bigrasp_enabled
+            and context.get("state_trust") is None
+            and context.get("bigrasp_known") is None
+            and context.get("grasp_known") is None
+            and anchor_ok
+        )
+
+    def _known_prefix_anchor_sequences(self, context, state, prefix_len):
+        """Anchor recurrence carriers of a teacher-forced prefix, as [B,k,3]."""
+        anchor = context["anchor_known"]["values"][:, :prefix_len]
+        prev_anchor = torch.cat((state["prev_anchor_obj_trans"].unsqueeze(1), anchor[:, :-1]), dim=1)
+        prev_delta = torch.cat(
+            (torch.zeros_like(prev_anchor[:, :1]), anchor[:, :-1] - prev_anchor[:, :-1]), dim=1
+        )
+        return anchor, prev_anchor, prev_delta
+
+    def _known_prefix_feedback_input(self, context, prev_pos, prev_delta, prev_weights, prefix_len):
+        if self.feedback_source == "anchor":
+            _, prev_pos, prev_delta = self._known_prefix_anchor_sequences(context, self._prefix_state, prefix_len)
+        return super()._known_prefix_feedback_input(context, prev_pos, prev_delta, prev_weights, prefix_len)
+
+    def _batched_known_prefix(self, context, state, known_pos, known_weights, prefix_len, **kwargs):
+        overrides = dict(kwargs.pop("state_overrides", None) or {})
+        if self.feedback_source == "anchor":
+            anchor, prev_anchor, _ = self._known_prefix_anchor_sequences(context, state, prefix_len)
+            overrides["prev_anchor_obj_trans"] = anchor[:, -1]
+            overrides["prev_anchor_delta"] = anchor[:, -1] - prev_anchor[:, -1]
+        self._prefix_state = state
+        try:
+            return super()._batched_known_prefix(
+                context, state, known_pos, known_weights, prefix_len, state_overrides=overrides, **kwargs
+            )
+        finally:
+            self._prefix_state = None
+
     def _scan_predictor(
         self,
         context,
         known_obj_trans_prefix=None,
         known_obj_trans_prefix_mask=None,
         known_gating_weights_prefix=None,
+        fast_known_prefix: bool = False,
+        scan_end: int = None,
     ):
         state = self._init_scan_state(context)
         use_vectorized_fast_path = (
@@ -1481,8 +1777,19 @@ class ObjectTransModule(nn.Module):
             context["dtype"],
             None,
         )
+        seq_len = int(context["seq_len"])
+        scan_start = 0
+        if fast_known_prefix:
+            scan_start = self._resolve_known_prefix(
+                context, known_mask, known_weights_mask, scan_end
+            )
+            if scan_start:
+                state = self._batched_known_prefix(
+                    context, state, known_pos, known_weights, scan_start
+                )
+        scan_stop = seq_len if scan_end is None else min(int(scan_end), seq_len)
         collected = {}
-        for time_index in range(context["seq_len"]):
+        for time_index in range(scan_start, scan_stop):
             frame_output, state = self._predict_step(
                 context,
                 time_index,
@@ -1494,7 +1801,12 @@ class ObjectTransModule(nn.Module):
             )
             for key, value in frame_output.items():
                 collected.setdefault(key, []).append(value)
-        return {key: torch.stack(values, dim=1) for key, values in collected.items()}, state
+        prediction = {key: torch.stack(values, dim=1) for key, values in collected.items()}
+        if scan_start > 0 or scan_stop < seq_len:
+            prediction = self._restore_window_shape(
+                prediction, context, known_pos, known_weights, scan_start, scan_stop
+            )
+        return prediction, state
 
     @staticmethod
     def _resolve_object_mask(has_object_mask, batch_size, device, dtype):
@@ -1576,6 +1888,7 @@ class ObjectTransModule(nn.Module):
                 "pred_static_obj_trans",
                 "prior_lhand_obj_trans",
                 "prior_rhand_obj_trans",
+                "pred_bimanual_obj_trans",
             ):
                 if key in results:
                     results[key] = results[key] * mask
@@ -1652,8 +1965,17 @@ class ObjectTransModule(nn.Module):
         compute_refine: bool = True,
         feedback_control=None,
         known_segment_state_prefix=None,
+        fast_known_prefix: bool = False,
+        scan_end: int = None,
     ):
-        """Run a causal OT scan from the supplied window initializers."""
+        """Run a causal OT scan from the supplied window initializers.
+
+        ``fast_known_prefix`` lets callers that only publish frames at or after
+        the teacher-forced prefix trade the prefix's per-frame Python scan for a
+        single batched LSTM call; ``scan_end`` stops the scan after the last
+        frame the caller publishes (every branch here is causal).  Both default
+        to the original full sequential scan.
+        """
         context = self._prepare_prediction_context(
             hand_positions,
             pred_hand_contact_prob,
@@ -1680,11 +2002,27 @@ class ObjectTransModule(nn.Module):
             context["bigrasp_known"] = known
         if self.grasp_latent_enabled:
             self._attach_known_grasp_state(context, known_segment_state_prefix, known_obj_trans_prefix_mask)
+        if self.feedback_source == "anchor" and isinstance(known_segment_state_prefix, dict):
+            values, valid = self._prepare_known_sequence(
+                known_segment_state_prefix.get("pred_anchor_obj_trans"), context["batch_size"], context["seq_len"], 3,
+                context["device"], context["dtype"], known_obj_trans_prefix_mask,
+            )
+            context["anchor_known"] = {"values": values, "mask": valid}
+        context["known_segment_state_prefix"] = known_segment_state_prefix
+        context["known_segment_mask"] = known_obj_trans_prefix_mask
+        # Subclasses override _scan_predictor with their own signature, so the
+        # performance hints only travel to scans that declare support for them.
+        scan_hints = (
+            {"fast_known_prefix": fast_known_prefix, "scan_end": scan_end}
+            if getattr(self, "SUPPORTS_FAST_KNOWN_PREFIX", False)
+            else {}
+        )
         prediction, _ = self._scan_predictor(
             context,
             known_obj_trans_prefix=known_obj_trans_prefix,
             known_obj_trans_prefix_mask=known_obj_trans_prefix_mask,
             known_gating_weights_prefix=known_gating_weights_prefix,
+            **scan_hints,
         )
         results = self._build_results(context, prediction, enable_refine=enable_refine and compute_refine)
         return results
@@ -1748,7 +2086,7 @@ class ObjectTransModule(nn.Module):
             else:
                 step_obj_trans_init = obj_trans_init
             segment_kwargs = {}
-            if self.bigrasp_enabled:
+            if getattr(self, "SEGMENT_STATE_OUTPUT_KEYS", ()):
                 segment_kwargs["known_segment_state_prefix"] = {key: prefix_context.get(key) for key in self.SEGMENT_STATE_OUTPUT_KEYS}
             if self.grasp_latent_enabled:
                 segment_kwargs["known_segment_state_prefix"] = {key: prefix_context.get(key) for key in GraspLatent.STATE_KEYS}

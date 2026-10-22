@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import json
 import sys
 import time
@@ -40,6 +41,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import torch
+import yaml
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -63,6 +65,7 @@ from model.rnn.online import (  # noqa: E402
     resolve_online_lookahead,
     resolve_online_window,
 )
+from utils.ot_experiment import resolve_pipeline_files
 from utils.ot_dump_selection import resolve_dump_data_path, select_sequence_paths  # noqa: E402
 from utils.human_pose import select_hand_anchor_positions  # noqa: E402
 from utils.utils import build_model_input_dict, load_config  # noqa: E402
@@ -85,6 +88,7 @@ PRED_KEYS = (
     "root_trans_pred",
     "stage1_root_trans_pred",
     "pred_obj_vel",
+    "pred_anchor_obj_trans",  # anchor-state feedback (object_trans_feedback_source=anchor)
     # v3 extras
     "pred_lhand_obj_vector",
     "pred_rhand_obj_vector",
@@ -106,6 +110,12 @@ PRED_KEYS = (
     "state_trust_gap_age",
     "state_trust_rest_flag",
     "ot_hand_positions",
+    # bimanual closure extras (object_trans_bimanual_closure)
+    "pred_bimanual_obj_trans",
+    "gating_weights_5",
+    "bimanual_weight",
+    "bimanual_prior_c",
+    "bimanual_consistency",
 )
 GT_KEYS = (
     "obj_trans",
@@ -182,21 +192,17 @@ def _record_from(
     return record
 
 
-def _build_config(manifest: Dict[str, Any], variant: str):
-    pipeline = manifest["pipelines"][variant]
-    config = load_config(pipeline["config"])
+def _build_config(manifest: Dict[str, Any], variant: str, ckpt_tag: str = "best"):
+    config_path, resolved_paths, pipeline = resolve_pipeline_files(manifest, variant, ckpt_tag, PROJECT_ROOT)
+    config = load_config(str(config_path))
     config.model_arch = "rnn"
-    config.object_trans_arch = pipeline["object_trans_arch"]
-    config.velocity_contact_arch = pipeline["velocity_contact_arch"]
+    # The BEHAVE full-pipeline manifest records the archs at the top level only.
+    config.object_trans_arch = pipeline.get("object_trans_arch", manifest.get("object_trans_arch", "current"))
+    config.velocity_contact_arch = pipeline.get("velocity_contact_arch", manifest.get("velocity_contact_arch", "v4"))
     config.enable_ot_refine = bool(getattr(config, "enable_ot_refine", False))
     if not hasattr(config, "debug"):
         config.debug = False
-    module_paths = {
-        "human_pose": manifest["reused_checkpoints"]["hp_ckpt"],
-        "velocity_contact": pipeline["joint_vc_ckpt"],
-        "object_trans": pipeline["joint_ot_ckpt"],
-    }
-    return config, module_paths, pipeline
+    return config, {name: str(path) for name, path in resolved_paths.items()}, pipeline
 
 
 def _offline_predict(
@@ -239,6 +245,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--variant", required=True)
+    parser.add_argument("--ckpt_tag", choices=("best", "final"), default="best",
+                        help="which joint checkpoints to dump; BEHAVE long-sequence numbers are reported on final")
     parser.add_argument("--mode", choices=("online", "offline"), default="online")
     parser.add_argument("--out", required=True)
     parser.add_argument("--dataset", default="omomo")
@@ -249,9 +257,28 @@ def main() -> int:
     parser.add_argument("--online_batch_size", type=int, default=32)
     parser.add_argument("--online_window", type=int, default=None)
     parser.add_argument("--online_lookahead", type=int, default=None)
+    parser.add_argument("--online_chunk", type=int, default=1,
+                        help="Target frames per batched HP/VC forward (eval_batch_online uses 16; 1 = legacy).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no_imu_noise", action="store_true", help="Disable the simulated IMU noise used by the ablation eval.")
     parser.add_argument("--limit", type=int, default=None, help="Only dump the first N sequences (smoke test).")
+    parser.add_argument("--human_pose_smoothing_half_width", type=int, default=None,
+                        help="Override the HumanPose output smoothing half-width (frames).")
+    parser.add_argument("--online_obj_vel_init_diff_frames", type=int, default=None,
+                        help="Override the published-trajectory VC velocity initialiser (frames; 0 = VC's own output).")
+    parser.add_argument("--object_trans_nocontact_lock_vertical", action="store_true", default=None,
+                        help="Inference-only: the OT IMU-integration branch keeps the previous height (y).")
+    parser.add_argument("--vc_ckpt", default=None,
+                        help="Override the pipeline's VelocityContact checkpoint (e.g. a standalone VC plugged into this OT).")
+    parser.add_argument("--velocity_contact_arch", default=None, help="Architecture of --vc_ckpt.")
+    parser.add_argument("--set", dest="config_sets", action="append", default=[], metavar="KEY=VALUE",
+                        help="Config override (YAML value), e.g. --set v5_heading_normalize_imu=false.")
+    parser.add_argument("--oracle_vc_contact", choices=("all", "hands", "move"), default=None,
+                        help="Diagnostic: replace these VC contact channels with GT (see eval_batch_online).")
+    parser.add_argument("--oracle_vc_region", choices=("all", "boundary", "interior"), default="all")
+    parser.add_argument("--oracle_vc_boundary_frames", type=int, default=10)
+    parser.add_argument("--oracle_vc_shift", type=int, default=0)
+    parser.add_argument("--oracle_vc_obj_vel", action="store_true")
     args = parser.parse_args()
 
     if args.limit is not None and args.limit <= 0:
@@ -262,7 +289,16 @@ def main() -> int:
         parser.error("--device cuda requested but CUDA is unavailable")
     with open(args.manifest, encoding="utf-8") as manifest_file:
         manifest = json.load(manifest_file)
-    config, module_paths, pipeline = _build_config(manifest, args.variant)
+    config, module_paths, pipeline = _build_config(manifest, args.variant, args.ckpt_tag)
+    if args.vc_ckpt:
+        module_paths["velocity_contact"] = str(args.vc_ckpt)
+    if args.velocity_contact_arch:
+        config.velocity_contact_arch = args.velocity_contact_arch
+    for item in args.config_sets:
+        key, sep, value = item.partition("=")
+        if not sep:
+            parser.error(f"--set expects KEY=VALUE, got {item!r}")
+        setattr(config, key.strip(), yaml.safe_load(value))
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     _set_eval_seed(args.seed)
 
@@ -341,6 +377,24 @@ def main() -> int:
     provenance["available_file_count"] = sum(1 for path in data_path.glob("*.pt") if path.is_file())
     print(f"[Dump] {args.variant}/{args.mode}/{args.split}: {len(dataset)} sequences from {data_path}")
 
+    for key in ("human_pose_smoothing_half_width", "online_obj_vel_init_diff_frames"):
+        if getattr(args, key) is not None:
+            setattr(config, key, int(getattr(args, key)))
+        provenance[key] = int(getattr(config, key, 0) or 0)
+    if args.object_trans_nocontact_lock_vertical:
+        config.object_trans_nocontact_lock_vertical = True
+    provenance["object_trans_nocontact_lock_vertical"] = bool(
+        getattr(config, "object_trans_nocontact_lock_vertical", False)
+    )
+    if args.oracle_vc_contact or args.oracle_vc_obj_vel:
+        config.eval_oracle_vc = {
+            "contact": args.oracle_vc_contact,
+            "region": args.oracle_vc_region,
+            "boundary_frames": args.oracle_vc_boundary_frames,
+            "shift": args.oracle_vc_shift,
+            "obj_vel": bool(args.oracle_vc_obj_vel),
+        }
+    provenance["eval_oracle_vc"] = getattr(config, "eval_oracle_vc", None)
     model = load_model(
         config,
         device,
@@ -378,6 +432,7 @@ def main() -> int:
                 sort_desc=True,
                 eval_imu_noise=False,
                 eval_imu_noise_seed=None,
+                online_chunk=args.online_chunk,
             )
         records = []
         for sample in sample_cache:
@@ -395,9 +450,10 @@ def main() -> int:
         "provenance": provenance,
         "variant": args.variant,
         "mode": args.mode,
-        "object_trans_arch": pipeline["object_trans_arch"],
+        "object_trans_arch": pipeline.get("object_trans_arch", manifest.get("object_trans_arch", "current")),
         "online_window": online_window,
         "online_lookahead": online_lookahead,
+        "online_chunk": args.online_chunk,
         "seed": args.seed,
         "simulate_imu_noise": not args.no_imu_noise,
         "refine_human": refine_human,

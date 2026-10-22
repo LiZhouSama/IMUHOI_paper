@@ -959,6 +959,18 @@ def postprocess_contact_labels(
     return filtered
 
 
+def remove_short_contact_runs(contact_labels, min_frames):
+    """Drop True runs shorter than ``min_frames``; never fills gaps."""
+    min_frames = int(min_frames)
+    if min_frames < 1:
+        raise ValueError("min_frames must be at least 1")
+    cleaned = torch.zeros_like(contact_labels.bool())
+    for is_contact, start, end in _boolean_runs(contact_labels.bool()):
+        if is_contact and end - start + 1 >= min_frames:
+            cleaned[start:end + 1] = True
+    return cleaned
+
+
 def find_unheld_object_displacement_interval(
     obj_trans,
     lhand_contact,
@@ -1030,7 +1042,131 @@ def find_unheld_object_displacement_interval(
     return None
 
 
-CONTACT_POSTPROCESS_VERSION = 1
+# v2: object-movement (obj_move) detection switched from per-frame pose diffs to
+# a jitter-robust criterion (zero-phase low-pass + windowed net displacement).
+# v3: obj_move cleanup no longer fills holes; it only drops raw moving runs
+# shorter than OBJ_MOVE_MIN_RUN_FRAMES.  Hole filling / minimum duration
+# (contact_max_hole_frames / contact_min_duration_frames) apply to hands only.
+CONTACT_POSTPROCESS_VERSION = 3
+
+# Object-movement criterion.  Vision-fitted object poses (e.g. BEHAVE) jitter by
+# ~0.2-1 mm / ~0.3 deg per frame and drift slowly at 2-4 Hz, which the old
+# per-frame thresholds (0.8 mm, |dR|_F 0.005) flagged as motion on ~40% of
+# static frames.  Fitting noise does not accumulate over a window while real
+# motion does, so movement is detected from the net displacement across a short
+# window of the low-passed trajectory.  Only the obj_move decision uses the
+# filtered signal; saved GT poses are untouched.
+OBJ_MOTION_LOWPASS_HZ = 6.0
+OBJ_MOTION_LOWPASS_ORDER = 4
+OBJ_MOTION_HALF_WINDOW_FRAMES = 5
+OBJ_MOTION_TRANS_THRESHOLD_M = 0.01
+OBJ_MOTION_ROT_THRESHOLD_DEG = 3.0
+# The windowed criterion's "static" is strict (net < 1 cm and < 3 deg), so raw
+# static frames are trusted as-is: even gaps of a few frames inside a carry are
+# near-still pauses.  Filling them would let 1-2 frame rotation-jitter spikes act
+# as bridges that merge long static stretches into motion.  Only short isolated
+# moving runs (jitter spikes) are removed.
+OBJ_MOVE_MIN_RUN_FRAMES = 15
+
+
+def _zero_phase_lowpass(values, cutoff_hz, fps, order=OBJ_MOTION_LOWPASS_ORDER):
+    """Zero-phase Butterworth low-pass along axis 0 (numpy, float64)."""
+    from scipy.signal import butter, filtfilt
+
+    values = np.asarray(values, dtype=np.float64)
+    nyquist = 0.5 * float(fps)
+    if cutoff_hz is None or cutoff_hz <= 0 or cutoff_hz >= nyquist or values.shape[0] < 2:
+        return values.copy()
+    b, a = butter(int(order), float(cutoff_hz) / nyquist)
+    padlen = min(values.shape[0] - 1, 3 * max(len(a), len(b)))
+    return filtfilt(b, a, values, axis=0, padlen=padlen)
+
+
+def _lowpass_rotation_matrices(rot, cutoff_hz, fps):
+    """Low-pass a rotation track [T, 3, 3] on sign-continuous quaternions."""
+    quat = SciPyRotation.from_matrix(np.asarray(rot, dtype=np.float64)).as_quat()
+    if quat.shape[0] > 1:
+        step_sign = np.sign(np.sum(quat[1:] * quat[:-1], axis=-1))
+        step_sign[step_sign == 0] = 1.0
+        quat = quat * np.concatenate(([1.0], np.cumprod(step_sign)))[:, None]
+    quat = _zero_phase_lowpass(quat, cutoff_hz, fps)
+    quat = quat / np.linalg.norm(quat, axis=-1, keepdims=True)
+    return SciPyRotation.from_quat(quat).as_matrix()
+
+
+def compute_object_motion_stats(
+    obj_trans,
+    obj_rot,
+    fps=FRAME_RATE,
+    lowpass_hz=OBJ_MOTION_LOWPASS_HZ,
+    half_window_frames=OBJ_MOTION_HALF_WINDOW_FRAMES,
+):
+    """Windowed net object motion used by the obj_move criterion.
+
+    The object pose is low-passed (zero-phase), then for every frame t the net
+    translation (m) and net rotation angle (deg) between frames
+    t - half_window_frames and t + half_window_frames (clamped) are measured.
+
+    Args:
+        obj_trans: [T, 3] object translation (torch or numpy).
+        obj_rot: [T, 3, 3] object rotation matrices (torch or numpy).
+    Returns:
+        (net_trans_m, net_rot_deg): two float64 numpy arrays of shape [T].
+    """
+    trans = (
+        obj_trans.detach().cpu().double().numpy()
+        if isinstance(obj_trans, torch.Tensor)
+        else np.asarray(obj_trans, dtype=np.float64)
+    ).reshape(-1, 3)
+    rot = (
+        obj_rot.detach().cpu().double().numpy()
+        if isinstance(obj_rot, torch.Tensor)
+        else np.asarray(obj_rot, dtype=np.float64)
+    ).reshape(-1, 3, 3)
+    if trans.shape[0] != rot.shape[0]:
+        raise ValueError("obj_trans and obj_rot must have the same length")
+    num_frames = trans.shape[0]
+    if num_frames <= 1:
+        return np.zeros(num_frames), np.zeros(num_frames)
+
+    trans_lp = _zero_phase_lowpass(trans, lowpass_hz, fps)
+    rot_lp = _lowpass_rotation_matrices(rot, lowpass_hz, fps)
+
+    half_window = max(1, int(half_window_frames))
+    frame_index = np.arange(num_frames)
+    start = np.clip(frame_index - half_window, 0, num_frames - 1)
+    end = np.clip(frame_index + half_window, 0, num_frames - 1)
+    net_trans = np.linalg.norm(trans_lp[end] - trans_lp[start], axis=-1)
+    relative_rot = np.einsum("tji,tjk->tik", rot_lp[start], rot_lp[end])
+    net_rot_deg = np.degrees(SciPyRotation.from_matrix(relative_rot).magnitude())
+    return net_trans, net_rot_deg
+
+
+def compute_object_movement_mask(
+    obj_trans,
+    obj_rot,
+    fps=FRAME_RATE,
+    lowpass_hz=OBJ_MOTION_LOWPASS_HZ,
+    half_window_frames=OBJ_MOTION_HALF_WINDOW_FRAMES,
+    trans_threshold_m=OBJ_MOTION_TRANS_THRESHOLD_M,
+    rot_threshold_deg=OBJ_MOTION_ROT_THRESHOLD_DEG,
+):
+    """Per-frame object-movement mask robust to pose-fitting jitter.
+
+    Frame t is moving when the windowed net motion from
+    ``compute_object_motion_stats`` exceeds ``trans_threshold_m`` or
+    ``rot_threshold_deg``.
+
+    Returns:
+        torch.bool tensor [T] on the device of ``obj_trans`` when it is a tensor.
+    """
+    device = obj_trans.device if isinstance(obj_trans, torch.Tensor) else torch.device("cpu")
+    net_trans, net_rot_deg = compute_object_motion_stats(
+        obj_trans, obj_rot, fps=fps, lowpass_hz=lowpass_hz,
+        half_window_frames=half_window_frames,
+    )
+    moving = (net_trans > float(trans_threshold_m)) | (net_rot_deg > float(rot_threshold_deg))
+    return torch.from_numpy(moving).to(device=device, dtype=torch.bool)
 
 
 def postprocess_sequence_contact_labels(
@@ -1062,11 +1198,7 @@ def postprocess_sequence_contact_labels(
         max_hole_frames=max_hole_frames,
         min_contact_frames=min_contact_frames,
     )
-    obj_contact = postprocess_contact_labels(
-        obj_contact_raw,
-        max_hole_frames=max_hole_frames,
-        min_contact_frames=min_contact_frames,
-    )
+    obj_contact = remove_short_contact_runs(obj_contact_raw, OBJ_MOVE_MIN_RUN_FRAMES)
 
     unheld_motion_interval = None
     if skip_object_displacement_without_hand_contact:
@@ -1132,6 +1264,11 @@ def contact_postprocess_metadata(
 ):
     return {
         "contact_postprocess_version": int(CONTACT_POSTPROCESS_VERSION),
+        "obj_motion_lowpass_hz": float(OBJ_MOTION_LOWPASS_HZ),
+        "obj_motion_half_window_frames": int(OBJ_MOTION_HALF_WINDOW_FRAMES),
+        "obj_motion_trans_threshold_m": float(OBJ_MOTION_TRANS_THRESHOLD_M),
+        "obj_motion_rot_threshold_deg": float(OBJ_MOTION_ROT_THRESHOLD_DEG),
+        "obj_move_min_run_frames": int(OBJ_MOVE_MIN_RUN_FRAMES),
         "contact_max_hole_frames": int(max_hole_frames),
         "contact_min_duration_frames": int(min_contact_frames),
         "skip_object_displacement_without_hand_contact": bool(
@@ -1233,12 +1370,12 @@ def write_contact_skip_manifest(
 
 
 def compute_improved_contact_labels(obj_trans, obj_rot, obj_scale, position_global_full_gt_world,
-                                  obj_mesh_dir, obj_name, device, T):
+                                  obj_mesh_dir, obj_name, device, T, obj_movement_mask=None):
     """
     改进的接触标签计算函数
 
     算法流程：
-    1. 物体移动检测：基于IMU两帧的diff > threshold 判断是否有接触
+    1. 物体移动检测：对物体位姿做 6 Hz 零相位低通后，按 ±5 帧窗口净位移/净转角判断是否在动
     2. 距离筛选：使用宽松的距离阈值排除非手部接触
     3. 速度相似度：比较左右手和物体的速度相似度，判断具体是哪只手在交互
 
@@ -1251,6 +1388,9 @@ def compute_improved_contact_labels(obj_trans, obj_rot, obj_scale, position_glob
         object_name: 物体名称
         device: 计算设备
         T: 时间步数
+        obj_movement_mask: 可选 [T] bool，预先在完整序列上计算的物体运动掩码。
+            分块处理的调用方应传入完整序列 compute_object_movement_mask 的切片，
+            避免低通/窗口判据在块边界处失真；为 None 时在当前输入上计算。
 
     返回:
         lhand_contact, rhand_contact, obj_contact: 接触标签 [T]
@@ -1263,17 +1403,18 @@ def compute_improved_contact_labels(obj_trans, obj_rot, obj_scale, position_glob
     if T <= 1 or not obj_mesh_dir:
         return lhand_contact, rhand_contact, obj_contact
 
-    try:
-        # 1. 物体移动检测 - 基于IMU两帧diff
-        trans_change_threshold = 0.0008  # 调整阈值 (0.8mm)
-        rot_change_threshold = 0.005    # 调整旋转阈值
+    # 1. Object-movement detection (low-pass + windowed net displacement).
+    # Kept outside the try block below so that a malformed mask fails loudly
+    # instead of being swallowed into all-zero labels.
+    if obj_movement_mask is None:
+        obj_movement_mask = compute_object_movement_mask(obj_trans, obj_rot)
+    obj_movement_mask = torch.as_tensor(obj_movement_mask).to(device=device, dtype=torch.bool).reshape(-1)
+    if obj_movement_mask.shape[0] != T:
+        raise ValueError(
+            f"obj_movement_mask length {obj_movement_mask.shape[0]} does not match T={T}"
+        )
 
-        obj_movement_mask = torch.zeros(T, dtype=torch.bool, device=device)
-        for t in range(1, T):
-            trans_diff = torch.norm(obj_trans[t] - obj_trans[t-1])
-            rot_diff = torch.norm(obj_rot[t] - obj_rot[t-1])
-            if trans_diff > trans_change_threshold or rot_diff > rot_change_threshold:
-                obj_movement_mask[t] = True
+    try:
 
         # 如果没有检测到物体移动，直接返回
         if not obj_movement_mask.any():
@@ -1473,6 +1614,7 @@ def load_object_geometry(
     obj_geo_root='./datasets/OMOMO/captured_objects',
     device='cpu',
     max_vertices=None,
+    max_faces=None,
 ):
     """加载物体几何体并应用变换，返回变换后的顶点与面片。"""
     if obj_name is None:
@@ -1495,6 +1637,7 @@ def load_object_geometry(
         scale=obj_scale,
         device=device,
         max_vertices=max_vertices,
+        max_faces=max_faces,
     )  # [T, N_v, 3]
     return transformed_verts, obj_mesh_faces
 
@@ -1547,7 +1690,43 @@ def load_object_canonical_points(
         return None
 
 
-def apply_transformation_to_obj_geometry(obj_mesh_path, obj_rot, obj_trans, scale=None, device='cpu', max_vertices=None):
+_DECIMATED_MESH_CACHE = {}
+
+
+def decimate_mesh_arrays(vertices, faces, max_faces, cache_key=None):
+    """Quadric-decimate a display mesh, keeping a watertight face list.
+
+    Visualization does not need the captured resolution: a BEHAVE chair is
+    132857 vertices, and one transformed sequence of it is gigabytes.  Results
+    are cached per (mesh, target) because a viewer reloads the same object for
+    every sequence it shows.
+    """
+    if not max_faces or faces is None or len(faces) == 0 or len(faces) <= int(max_faces):
+        return vertices, faces
+    key = (cache_key, int(max_faces))
+    if cache_key is not None and key in _DECIMATED_MESH_CACHE:
+        return _DECIMATED_MESH_CACHE[key]
+    try:
+        import open3d as o3d
+
+        mesh = o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(np.asarray(vertices, dtype=np.float64)),
+            o3d.utility.Vector3iVector(np.asarray(faces, dtype=np.int32)),
+        )
+        simplified = mesh.simplify_quadric_decimation(int(max_faces))
+        out_vertices = np.asarray(simplified.vertices, dtype=np.float32)
+        out_faces = np.asarray(simplified.triangles, dtype=np.int64)
+    except Exception as exc:
+        print(f"Mesh decimation failed, keeping the original resolution: {exc}")
+        return vertices, faces
+    if out_vertices.shape[0] == 0 or out_faces.shape[0] == 0:
+        return vertices, faces
+    if cache_key is not None:
+        _DECIMATED_MESH_CACHE[key] = (out_vertices, out_faces)
+    return out_vertices, out_faces
+
+
+def apply_transformation_to_obj_geometry(obj_mesh_path, obj_rot, obj_trans, scale=None, device='cpu', max_vertices=None, max_faces=None):
     """
     应用变换到物体顶点 (遵循 hand_foot_dataset.py 的逻辑: Rotate -> Scale -> Translate)
 
@@ -1564,6 +1743,10 @@ def apply_transformation_to_obj_geometry(obj_mesh_path, obj_rot, obj_trans, scal
     """
     try:
         obj_mesh_verts_np, obj_mesh_faces = _load_mesh_arrays(obj_mesh_path) # Nv X 3
+        obj_mesh_verts_np, obj_mesh_faces = decimate_mesh_arrays(
+            obj_mesh_verts_np, obj_mesh_faces, max_faces,
+            cache_key=os.path.abspath(obj_mesh_path),
+        )
         centroid = obj_mesh_verts_np.mean(axis=0)
         obj_mesh_verts_np = obj_mesh_verts_np - centroid  # 适配BEHAVE TODO:不确定对其他数据集是否有效
         if max_vertices is not None and obj_mesh_verts_np.shape[0] > int(max_vertices):
@@ -1837,11 +2020,7 @@ def process_sequence(
             max_hole_frames=contact_max_hole_frames,
             min_contact_frames=contact_min_duration_frames,
         )
-        obj_contact = postprocess_contact_labels(
-            obj_contact_raw,
-            max_hole_frames=contact_max_hole_frames,
-            min_contact_frames=contact_min_duration_frames,
-        )
+        obj_contact = remove_short_contact_runs(obj_contact_raw, OBJ_MOVE_MIN_RUN_FRAMES)
         if resolve_bimanual_contact_conflicts:
             lhand_contact, rhand_contact = resolve_bimanual_contact_labels_sequence(
                 lhand_contact,

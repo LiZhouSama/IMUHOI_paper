@@ -61,6 +61,9 @@ class V3ObjectTransModule(V2ObjectTransModule):
     """v2 fusion + forearm/object geometry + learned soft latch."""
 
     ARCH_VERSION = 3
+    # The whole latch state is published, so a teacher-forced prefix is fully
+    # determined and _scan_predictor can batch it (see known_prefix_scan.py).
+    SUPPORTS_FAST_KNOWN_PREFIX = True
     # Per hand: bone direction (3), bone length (1), latch gate logit (1).
     HAND_OUTPUT_DIM = 5
     # Two hands x 6D for R_obj^T R_forearm.
@@ -346,19 +349,79 @@ class V3ObjectTransModule(V2ObjectTransModule):
         )
         return out
 
+    @staticmethod
+    def _segment_rel_rotm(value):
+        """[.., 12] published 6D latch rotations -> [.., 2, 3, 3]."""
+        lead = tuple(value.shape[:-1])
+        return rotation_6d_to_matrix(value.reshape(-1, 6)).reshape(*lead, 2, 3, 3)
+
+    def _fast_known_prefix_supported(self, context, prefix_len):
+        """v3 additionally needs the published latch over the whole prefix.
+
+        Without it the latch would evolve from the head's own bone proposals,
+        which the batched prefix cannot know in advance.
+        """
+        if not super()._fast_known_prefix_supported(context, prefix_len):
+            return False
+        known_segment = context.get("known_segment_state")
+        if not isinstance(known_segment, dict):
+            return False
+        return bool(known_segment["mask"][:, :prefix_len].all().item())
+
+    def _known_prefix_onset_input(self, context, known_segment, prefix_len):
+        """The swing term of the predictor input over teacher-forced frames.
+
+        Entering frame ``t`` the latch reference is the published rotation of
+        ``t-1``, because ``_apply_known_segment_state`` overwrites it after
+        every prefix step; frame 0 uses the scan's own initializer.
+        """
+        batch_size = context["batch_size"]
+        relative = context["forearm_obj_rotm"][:, :prefix_len]
+        published = self._segment_rel_rotm(
+            known_segment["segment_rel_rot6d"][:, :prefix_len - 1]
+        )
+        reference = torch.cat((context["forearm_obj_rotm"][:, :1], published), dim=1)
+        swing = torch.matmul(relative, reference.transpose(-1, -2))
+        return self.onset_embed(
+            matrix_to_rotation_6d(swing.reshape(-1, 3, 3)).reshape(
+                batch_size, prefix_len, self.REL_ROT_FEATURE_DIM
+            )
+        )
+
+    def _known_prefix_latch_overrides(self, known_segment, prefix_len):
+        """Latch state after the prefix, straight from the published frame."""
+        last = prefix_len - 1
+        return {
+            "bone": torch.stack(
+                (
+                    known_segment["pred_lhand_obj_vector"][:, last],
+                    known_segment["pred_rhand_obj_vector"][:, last],
+                ),
+                dim=1,
+            ),
+            "segment_rel_rotm": self._segment_rel_rotm(
+                known_segment["segment_rel_rot6d"][:, last]
+            ),
+            "hand_contact_active": known_segment["segment_contact_active"][:, last] > 0.5,
+        }
+
     def _scan_predictor(
         self,
         context,
         known_obj_trans_prefix=None,
         known_obj_trans_prefix_mask=None,
         known_gating_weights_prefix=None,
+        fast_known_prefix: bool = False,
+        scan_end: int = None,
     ):
-        """Always scan step by step.
+        """Scan step by step, apart from a teacher-forced prefix.
 
         The base class runs the head over the whole sequence at once whenever
         state feedback is off, which is only sound while the head's input has no
         recurrent dependence.  v3 injects the swing measured against the
-        latched segment reference, so that dependence always exists.
+        latched segment reference, so that dependence always exists; on a
+        teacher-forced prefix, however, the latch is published too, so those
+        frames still collapse into one batched call.
         """
         state = self._init_scan_state(context)
         known_pos, known_mask = self._prepare_known_sequence(
@@ -380,8 +443,30 @@ class V3ObjectTransModule(V2ObjectTransModule):
             None,
         )
         known_segment = self._prepare_known_segment_state(context)
+        context["known_segment_state"] = known_segment
+        seq_len = int(context["seq_len"])
+        scan_start = 0
+        if fast_known_prefix:
+            scan_start = self._resolve_known_prefix(
+                context, known_mask, known_weights_mask, scan_end
+            )
+            if scan_start:
+                state = self._batched_known_prefix(
+                    context,
+                    state,
+                    known_pos,
+                    known_weights,
+                    scan_start,
+                    extra_input=self._known_prefix_onset_input(
+                        context, known_segment, scan_start
+                    ),
+                    state_overrides=self._known_prefix_latch_overrides(
+                        known_segment, scan_start
+                    ),
+                )
+        scan_stop = seq_len if scan_end is None else min(int(scan_end), seq_len)
         collected = {}
-        for time_index in range(context["seq_len"]):
+        for time_index in range(scan_start, scan_stop):
             frame_output, state = self._predict_step(
                 context,
                 time_index,
@@ -395,9 +480,12 @@ class V3ObjectTransModule(V2ObjectTransModule):
                 state = self._apply_known_segment_state(state, known_segment, time_index)
             for key, value in frame_output.items():
                 collected.setdefault(key, []).append(value)
-        return {
-            key: torch.stack(values, dim=1) for key, values in collected.items()
-        }, state
+        prediction = {key: torch.stack(values, dim=1) for key, values in collected.items()}
+        if scan_start > 0 or scan_stop < seq_len:
+            prediction = self._restore_window_shape(
+                prediction, context, known_pos, known_weights, scan_start, scan_stop
+            )
+        return prediction, state
 
     # ------------------------------------------------------------------
     # One frame
@@ -497,9 +585,7 @@ class V3ObjectTransModule(V2ObjectTransModule):
         weights = build_contact_fusion_weights(contact_prob)
         weights = self._apply_static_gate(weights, context, time_index)
         previous_pos = step_state["prev_obj_trans"]
-        imu_integrated_pos = (
-            previous_pos + context["obj_vel_input"][:, time_index] / FRAME_RATE
-        )
+        imu_integrated_pos = previous_pos + self._imu_branch_displacement(context, time_index)
         static_pos = previous_pos
         fused_model_pos = (
             weights[:, 0:1] * l_pos_fk

@@ -1,0 +1,29 @@
+output_root: outputs/experiments/ot_plane_full_20261001
+datasets: [OMOMO, BEHAVE]
+variants: [baseline, plane_predicted, plane_gt]
+seed: 1201
+# Complete fine-tuning of the original OT parameters from matching checkpoint.
+# HP and VC are frozen but are executed on each training batch, without caches.
+epochs: 80
+reference_steps_per_epoch: 32
+minimum_epochs: 40
+patience_epochs: 20
+learning_rate: 0.0001
+milestones: [30, 60]
+gamma: 0.3
+batch_size: 512
+windows_per_sequence: 4
+window_frames: 90
+validation_window_frames: 90
+history_window_frames: 60
+history_probability: 0.5
+plane_weight: 5.0
+object_init_noise_std_m: 0.10
+object_init_noise_probability: 0.5
+num_workers: 0
+minimum_gpu_free_mib: 6500
+maximum_gpu_utilization_to_start: 60
+validation_interval: 1
+
+
+

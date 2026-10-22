@@ -1,0 +1,27 @@
+# Frozen-pipeline, mesh-free bimanual correction student study.
+output_root: outputs/experiments/meshfree_temporal_20261001
+datasets: [OMOMO, BEHAVE]
+variants: [frame_category, temporal_unknown, temporal_category, temporal_mesh_aux]
+seeds: [1001, 1002, 1003]
+epochs: 60
+steps_per_epoch: 32
+# Fixed protocol documented below; the controller reads the schedule above.
+# Subject-object group split; all groups come from original training data.
+validation_fraction: 0.15
+calibration_fraction: 0.15
+hidden_dim: 64
+window_frames: 128
+window_burnin_frames: 24
+batch_size: 48
+max_correction_m: 0.25
+mesh_auxiliary_weight: 0.10
+# Test poses/contacts/meshes do not enter the correction function.
+fit_object_weight: 1.0
+fit_hoi_weight: 0.20
+fit_geometry_aux_weight: 0.05
+fit_uncertainty_weight: 0.002
+calibration_gains: [0.0, 0.1, 0.25, 0.5, 0.75, 1.0]
+calibration_max_hoi_increase_cm: 0.02
+calibration_max_acceleration_ratio: 1.03
+calibration_max_bimanual_p95_increase_cm: 0.2
+

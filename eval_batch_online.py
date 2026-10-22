@@ -39,6 +39,7 @@ from model.rnn.online import (
     slice_time_dict,
 )
 from utils.utils import apply_eval_imu_noise_to_sequence, build_model_input_dict, load_config
+from utils.hoi_metrics import hoi_metric_metadata
 from utils.dataset_config import (
     get_full_sequence_test_path,
     resolve_dataset_path,
@@ -245,6 +246,58 @@ def _pad_sample_to_length(sample: Dict[str, Any], target_len: int) -> Dict[str, 
     return padded
 
 
+def _distance_to_transition(labels: np.ndarray) -> np.ndarray:
+    """Frames from each frame to the nearest label transition (inf if none)."""
+    labels = np.asarray(labels, dtype=bool)
+    boundaries = np.flatnonzero(np.diff(labels.astype(np.int8)) != 0) + 0.5
+    if boundaries.size == 0:
+        return np.full(labels.shape[0], np.inf)
+    frames = np.arange(labels.shape[0], dtype=np.float64)
+    return np.abs(frames[:, None] - boundaries[None, :]).min(axis=1)
+
+
+def _build_vc_oracles(
+    raw_batch: Dict[str, Any],
+    spec: Dict[str, Any],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Dict[str, torch.Tensor]:
+    """Diagnostic GT substitutes for VelocityContact outputs (NaN = keep prediction).
+
+    ``spec``: contact in {None, all, hands, move}; region in {all, boundary,
+    interior} relative to +-boundary_frames around each channel's GT
+    transitions; shift delays the GT labels by that many frames; obj_vel
+    replaces the predicted object velocity with GT.
+    """
+    oracles = {}
+    channels = {"all": (0, 1, 2), "hands": (0, 1), "move": (2,)}.get(spec.get("contact"))
+    if channels:
+        gt = torch.stack(
+            [raw_batch[key].bool() for key in ("lhand_contact", "rhand_contact", "obj_contact")], dim=-1
+        ).cpu().numpy()
+        shift = int(spec.get("shift", 0))
+        if shift > 0:
+            gt = np.concatenate((np.repeat(gt[:, :1], shift, axis=1), gt[:, :-shift]), axis=1)
+        elif shift < 0:
+            gt = np.concatenate((gt[:, -shift:], np.repeat(gt[:, -1:], -shift, axis=1)), axis=1)
+        region = str(spec.get("region", "all"))
+        radius = float(spec.get("boundary_frames", 10))
+        oracle = np.full(gt.shape, np.nan, dtype=np.float32)
+        for row in range(gt.shape[0]):
+            for channel in channels:
+                labels = gt[row, :, channel]
+                if region == "all":
+                    keep = np.ones(labels.shape[0], dtype=bool)
+                else:
+                    near = _distance_to_transition(labels) <= radius
+                    keep = near if region == "boundary" else ~near
+                oracle[row, keep, channel] = labels[keep].astype(np.float32)
+        oracles["oracle_vc_contact"] = torch.from_numpy(oracle).to(device=device, dtype=dtype)
+    if spec.get("obj_vel"):
+        oracles["oracle_vc_obj_vel"] = raw_batch["obj_vel"].to(device=device, dtype=dtype)
+    return oracles
+
+
 def _run_batched_online_group(
     model,
     config,
@@ -257,6 +310,7 @@ def _run_batched_online_group(
     refine_human: bool,
     desc: str,
     feedback_kwargs: Optional[Dict[str, Any]] = None,
+    online_chunk: int = 1,
 ) -> List[Dict[str, Any]]:
     if not samples:
         return []
@@ -293,6 +347,8 @@ def _run_batched_online_group(
                 compute_fk=compute_fk,
                 refine_human=refine_human,
                 desc=f"{desc}.{group_idx}",
+                feedback_kwargs=feedback_kwargs,
+                online_chunk=online_chunk,
             )
             for idx, output in zip(positions, group_outputs):
                 outputs[idx] = output
@@ -306,6 +362,22 @@ def _run_batched_online_group(
         [max_len] * len(padded_samples),
     )
     data_dict = build_model_input_dict(raw_batch, config, device, add_noise=False)
+    oracle_spec = getattr(config, "eval_oracle_vc", None)
+    if oracle_spec:
+        data_dict.update(_build_vc_oracles(raw_batch, oracle_spec, device, data_dict["human_imu"].dtype))
+    init_frame = int(getattr(config, "eval_contact_init_frame", 0) or 0)
+    if init_frame > 0:
+        # The full-sequence splits label hand contact 0 at frame 0 for every
+        # sequence (raw labels too; the segment splits do not), so the frame-0
+        # initial contact state is an artifact; read it from a later frame.
+        data_dict["contact_init"] = torch.stack(
+            [raw_batch[key][:, init_frame].float() for key in ("lhand_contact", "rhand_contact", "obj_contact")],
+            dim=-1,
+        ).to(device=device, dtype=data_dict["contact_init"].dtype)
+    if getattr(config, "eval_vc_contact_init", None) == "gt":
+        data_dict["oracle_vc_contact_init"] = torch.stack(
+            [raw_batch[key].bool() for key in ("lhand_contact", "rhand_contact", "obj_contact")], dim=-1
+        ).to(device=device, dtype=data_dict["human_imu"].dtype)
     max_publish_len = max(max_len - int(online_lookahead), 0)
     frame_progress = tqdm(
         total=max_publish_len,
@@ -328,6 +400,7 @@ def _run_batched_online_group(
             online_window=online_window,
             online_lookahead=online_lookahead,
             online_progress_callback=_update_progress,
+            online_chunk=online_chunk,
             # Diagnostics only: feedback_mode / feedback_perturbation /
             # feedback_injection_frame for the ObjectTrans state loop.
             **(feedback_kwargs or {}),
@@ -364,6 +437,7 @@ def _batched_online_predict_dataset(
     eval_imu_noise: bool,
     eval_imu_noise_seed: Optional[int],
     feedback_kwargs: Optional[Dict[str, Any]] = None,
+    online_chunk: int = 1,
 ) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
     order = list(range(len(dataset)))
     order.sort(key=lambda idx: int(dataset.sequence_info[idx]["seq_len"]), reverse=sort_desc)
@@ -414,6 +488,7 @@ def _batched_online_predict_dataset(
             refine_human=refine_human,
             desc=f"OnlineFrames {offset // online_batch_size + 1}",
             feedback_kwargs=feedback_kwargs,
+            online_chunk=online_chunk,
         )
         for key, output in zip(keys, outputs):
             pred_cache[key] = output
@@ -483,10 +558,20 @@ def _make_parser() -> argparse.ArgumentParser:
         help="Base online window; defaults to test.window from the config.",
     )
     parser.add_argument(
+        "--online_chunk",
+        "--online-chunk",
+        type=int,
+        default=16,
+        help=(
+            "Target frames whose HumanPose/VelocityContact windows run as one batch "
+            "(1 = one window per frame; capped at online_window - 1)"
+        ),
+    )
+    parser.add_argument(
         "--online_lookahead",
         "--online-lookahead",
         type=int,
-        default=None,
+        default=10,
         help="Future frames appended after the legacy online update frame (strict tail).",
     )
     parser.add_argument("--sort_asc", action="store_true", help="Sort sequence lengths ascending instead of descending.")
@@ -528,6 +613,63 @@ def _make_parser() -> argparse.ArgumentParser:
         choices=("none", "fused"),
         default=None,
         help="Override OT feedback mode for a shared-head checkpoint.",
+    )
+    parser.add_argument(
+        "--human_pose_smoothing_half_width",
+        type=int,
+        default=None,
+        help="Override the HumanPose output smoothing half-width in frames (0 disables; must be <= the online lookahead).",
+    )
+    parser.add_argument(
+        "--online_obj_vel_init_diff_frames",
+        type=int,
+        default=None,
+        help="Initialise the VC object velocity from the published object trajectory differenced over N frames (0 = VC's own output).",
+    )
+    parser.add_argument(
+        "--object_trans_nocontact_lock_vertical",
+        action="store_true",
+        default=None,
+        help="Inference-only: the OT IMU-integration branch (object moving without hand contact) keeps the previous height (y).",
+    )
+    parser.add_argument(
+        "--contact_init_frame",
+        type=int,
+        default=0,
+        help="Frame whose GT contact labels form the initial contact state (0 = protocol default). "
+        "The full-sequence splits carry a frame-0 hand-contact label artifact (always 0).",
+    )
+    parser.add_argument(
+        "--eval_vc_contact_init",
+        choices=("gt", "neutral", "zero"),
+        default=None,
+        help="Diagnostic: VelocityContact's per-window contact initializer (online), instead of the "
+        "published contact at the window start.",
+    )
+    parser.add_argument(
+        "--oracle_vc_contact",
+        choices=("all", "hands", "move"),
+        default=None,
+        help="Diagnostic: replace these VC contact channels with GT labels inside the online loop.",
+    )
+    parser.add_argument(
+        "--oracle_vc_region",
+        choices=("all", "boundary", "interior"),
+        default="all",
+        help="Diagnostic: apply the contact oracle only within (boundary) or beyond (interior) "
+        "--oracle_vc_boundary_frames of each GT transition.",
+    )
+    parser.add_argument("--oracle_vc_boundary_frames", type=int, default=10)
+    parser.add_argument(
+        "--oracle_vc_shift",
+        type=int,
+        default=0,
+        help="Diagnostic: delay the oracle GT contact labels by this many frames (negative = earlier).",
+    )
+    parser.add_argument(
+        "--oracle_vc_obj_vel",
+        action="store_true",
+        help="Diagnostic: replace the VC object velocity with GT inside the online loop.",
     )
     parser.add_argument("--hand_contact_threshold", type=float, default=None)
     parser.add_argument("--object_contact_threshold", type=float, default=None)
@@ -617,6 +759,9 @@ def main() -> int:
     all_sequence_records = {}
     model_body_models = {}
     resolved_ot_state_feedback = None
+    resolved_hp_smoothing = 0
+    resolved_obj_vel_diff = 0
+    resolved_vertical_lock = False
     resolved_ot_arch = None
     for dataset_name, dataset_cfg in dataset_runs:
         print(f"\n=== Batch-online evaluating dataset: {dataset_name} ===")
@@ -645,6 +790,30 @@ def main() -> int:
             else bool(getattr(config, "enable_ot_refine", False))
         )
         config.enable_ot_refine = ot_refine
+        if args.human_pose_smoothing_half_width is not None:
+            config.human_pose_smoothing_half_width = int(args.human_pose_smoothing_half_width)
+        if args.online_obj_vel_init_diff_frames is not None:
+            config.online_obj_vel_init_diff_frames = int(args.online_obj_vel_init_diff_frames)
+        if args.object_trans_nocontact_lock_vertical:
+            config.object_trans_nocontact_lock_vertical = True
+        if args.contact_init_frame:
+            config.eval_contact_init_frame = int(args.contact_init_frame)
+            print(f"Initial contact state read from frame {args.contact_init_frame}")
+        if args.eval_vc_contact_init:
+            config.eval_vc_contact_init = args.eval_vc_contact_init
+            print(f"DIAGNOSTIC VC window contact_init: {args.eval_vc_contact_init}")
+        if args.oracle_vc_contact or args.oracle_vc_obj_vel:
+            config.eval_oracle_vc = {
+                "contact": args.oracle_vc_contact,
+                "region": args.oracle_vc_region,
+                "boundary_frames": args.oracle_vc_boundary_frames,
+                "shift": args.oracle_vc_shift,
+                "obj_vel": bool(args.oracle_vc_obj_vel),
+            }
+            print(f"DIAGNOSTIC VC oracle: {config.eval_oracle_vc}")
+        resolved_hp_smoothing = int(getattr(config, "human_pose_smoothing_half_width", 0) or 0)
+        resolved_obj_vel_diff = int(getattr(config, "online_obj_vel_init_diff_frames", 0) or 0)
+        resolved_vertical_lock = bool(getattr(config, "object_trans_nocontact_lock_vertical", False))
         if args.num_workers is not None:
             config.num_workers = args.num_workers
         if not hasattr(config, "debug"):
@@ -744,10 +913,17 @@ def main() -> int:
 
         online_window = resolve_online_window(config, args.online_window)
         online_lookahead = resolve_online_lookahead(config, args.online_lookahead)
+        online_chunk = int(
+            args.online_chunk
+            if args.online_chunk is not None
+            else getattr(config, "online_chunk", 1)
+        )
+        config.online_chunk = online_chunk
         compute_fk = bool(args.compare_3 and run_object_branch)
         print(f"Dataset size: {len(test_dataset)}")
         print(f"Online window: {online_window}")
         print(f"Online lookahead: {online_lookahead} (strict tail)")
+        print(f"Online chunk: {online_chunk} window(s) per batched HP/VC forward")
         print(
             "OT predictor feedback: "
             f"{'fused' if bool(getattr(config, 'object_trans_state_feedback', False)) else 'none'}"
@@ -771,6 +947,7 @@ def main() -> int:
                 sort_desc=not args.sort_asc,
                 eval_imu_noise=bool(args.eval_imu_noise),
                 eval_imu_noise_seed=args.eval_imu_noise_seed,
+                online_chunk=online_chunk,
             )
 
         metric_model = IMUHOIModelCached(model, pred_cache, device).eval()
@@ -855,13 +1032,21 @@ def main() -> int:
         )
         payload = {
             "config": args.config,
+            **hoi_metric_metadata(config),
             "inference_mode": "batch_online",
             "online_window": output_online_window,
             "resolved_online_window": output_online_window,
             "online_lookahead": output_online_lookahead,
             "resolved_online_lookahead": output_online_lookahead,
             "online_batch_size": args.online_batch_size,
+            "online_chunk": int(args.online_chunk) if args.online_chunk is not None else 1,
             "object_trans_state_feedback": resolved_ot_state_feedback,
+            "human_pose_smoothing_half_width": resolved_hp_smoothing,
+            "online_obj_vel_init_diff_frames": resolved_obj_vel_diff,
+            "object_trans_nocontact_lock_vertical": resolved_vertical_lock,
+            "eval_oracle_vc": getattr(config, "eval_oracle_vc", None),
+            "eval_vc_contact_init": getattr(config, "eval_vc_contact_init", None),
+            "contact_init_frame": int(getattr(config, "eval_contact_init_frame", 0) or 0),
             "object_trans_arch": resolved_ot_arch or _normalize_object_trans_arch(
                 getattr(load_config(args.config), "object_trans_arch", "current")
             ),
@@ -908,6 +1093,7 @@ def main() -> int:
                 "velocity_contact_arch": args.velocity_contact_arch,
                 "object_trans_arch": resolved_ot_arch,
                 "object_trans_state_feedback": resolved_ot_state_feedback,
+                "object_trans_nocontact_lock_vertical": resolved_vertical_lock,
                 "human_pose_checkpoint": args.hp_ckpt,
                 "velocity_contact_checkpoint": args.vc_ckpt,
                 "object_trans_checkpoint": args.ot_ckpt,

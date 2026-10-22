@@ -74,6 +74,9 @@ hidden_dim_multiplier: 1
 # --velocity_contact_arch v4 to reproduce those rows.
 # See docs/cano_ot_v3_vs_current_and_mesh_20260908.md.
 object_trans_arch: "current"  # current | v2 | v3 | legacy | legacy_mesh | mergeHeads_obs | imuhoi*
+# v2 only; alpha=1 and beta=0 reproduce unfiltered historical evaluations.
+v2_fk_filter_alpha: 0.35
+v2_fk_filter_beta: 0.05
 object_trans_hidden_dim: 192
 object_trans_num_layers: 2
 object_trans_dropout: 0.2
@@ -90,7 +93,7 @@ object_trans_v3_contact_on_threshold: 0.15
 object_trans_v3_contact_off_threshold: 0.075
 object_trans_v3_online_carry_segment_state: true
 # Object-static hard gate shared by every ObjectTrans arch (none | imu | pmove | both)
-object_trans_static_gate: none
+object_trans_static_gate: imu
 object_trans_static_gate_pmove_threshold: 0.5
 object_trans_static_gate_imu_window: 5
 object_trans_static_gate_imu_angle_deg: 0.6
@@ -406,6 +409,12 @@ loss_weights:
 # 覆盖上面 loss_weights 的同名项，其它架构完全不受影响。没有块的架构（v2/v3/
 # legacy/...）沿用上面的共享权重，行为与本节新增前逐位一致。
 object_trans_arch_loss_weights:
+  v2:
+    # Temporal bone-loss trial retired; retain the original bone-length losses.
+    lhand_bone_cons: 0.0
+    rhand_bone_cons: 0.0
+    lhand_bone_acc_smooth: 0.0
+    rhand_bone_acc_smooth: 0.0
   # "cur_hoi": 正式指标是"融合输出相对 OT 消费的手"在 GT 接触帧上的相对向量，
   # 直接监督它（hoi_fused）并把绝对位置项降权，学习门控会把接触帧的 FK 权重
   # 从 0.88 降到 0.75，融合输出转而贴合真值相对向量：HOI 9.86 -> 9.44、
@@ -425,6 +434,19 @@ train:
 test:
   window: 60
   online_lookahead: 10
+
+# ============ Unified online protocol (2026-10-02, every dataset) ============
+# VelocityContact's object-velocity window initializer = backward difference of
+# the published object trajectory over this many frames (0 = VC's own previous
+# output, which random-walks on long sequences).  HumanPose outputs used
+# downstream (VC/OT training and online inference) get a centred Savitzky-Golay
+# filter; HP training itself stays unsmoothed (train/rnn/train_human_pose.py).
+# These used to be BEHAVE-only overrides; configs that omit them still fall back
+# to 0 / 0, so pass them explicitly when re-evaluating older runs.
+# See docs/vc_v5_oracles_and_coupling_20260930.md §9-10.
+online_obj_vel_init_diff_frames: 3
+human_pose_smoothing_half_width: 7
+human_pose_smoothing_polyorder: 2
 
 # ============ 预训练模块路径（可选）============
 # 注意：boundary_bidirectional=false 与 OT arch v6 之后，旧 VC/OT checkpoint

@@ -33,6 +33,7 @@ try:
         build_unheld_object_motion_skip_record,
         contact_postprocess_metadata,
         compute_improved_contact_labels,
+        compute_object_movement_mask,
         compute_foot_contact_labels,
         load_canonical_points_from_mesh_path,
         precompute_sequence_features,
@@ -45,6 +46,7 @@ except ModuleNotFoundError:
         build_unheld_object_motion_skip_record,
         contact_postprocess_metadata,
         compute_improved_contact_labels,
+        compute_object_movement_mask,
         compute_foot_contact_labels,
         load_canonical_points_from_mesh_path,
         precompute_sequence_features,
@@ -125,6 +127,47 @@ def _moving_avg_timewise(x, k=3):
         if orig_dtype in (torch.float16, torch.float32, torch.float64, torch.bfloat16):
             out = out.to(dtype=orig_dtype)
         return out
+
+
+def _moving_avg_axis_angle_timewise(aa, k=3):
+    """Temporal moving average of axis-angle rotations, performed on quaternions.
+
+    Averaging axis-angle components directly is invalid near |theta| = pi, where
+    the representation wraps (theta -> 2*pi - theta with a flipped axis) and a
+    component-wise mean yields an unrelated rotation.  Here each rotation track is
+    converted to quaternions, made sign-continuous over time, averaged, and
+    re-normalised.
+
+    aa: numpy array [T, 3*J] or [T, J, 3] (J independent rotation tracks).
+    """
+    aa = np.asarray(aa)
+    orig_shape = aa.shape
+    orig_dtype = aa.dtype if np.issubdtype(aa.dtype, np.floating) else np.float32
+    T = orig_shape[0]
+    if k <= 1 or T <= 2:
+        return aa.astype(orig_dtype, copy=True)
+    if orig_shape[-1] != 3 and (aa.ndim != 2 or orig_shape[1] % 3 != 0):
+        raise ValueError(f"expected axis-angle data with trailing groups of 3, got {orig_shape}")
+
+    rotvec = aa.reshape(T, -1, 3).astype(np.float64)
+    num_tracks = rotvec.shape[1]
+    quat = R.from_rotvec(rotvec.reshape(-1, 3)).as_quat().reshape(T, num_tracks, 4)
+
+    # Sign continuity: flip q_t whenever it lies in the opposite hemisphere of q_{t-1}.
+    # Flipping q_{t-1} also flips dot(q_t, q_{t-1}), so the cumulative product of the
+    # raw per-step signs gives the consistent sign for every frame.
+    step_sign = np.sign(np.sum(quat[1:] * quat[:-1], axis=-1))
+    step_sign[step_sign == 0] = 1.0
+    cum_sign = np.concatenate(
+        (np.ones((1, num_tracks)), np.cumprod(step_sign, axis=0)), axis=0
+    )
+    quat = quat * cum_sign[..., None]
+
+    quat = _moving_avg_timewise(quat, k=k)
+    quat = quat / np.linalg.norm(quat, axis=-1, keepdims=True)
+    out = R.from_quat(quat.reshape(-1, 4)).as_rotvec().reshape(orig_shape)
+    return out.astype(orig_dtype)
+
 
 # ROT_Z90 = np.array([[1.0, 0.0, 0.0],
 #                     [0.0, 1.0, 0.0],
@@ -549,9 +592,15 @@ def process_imhd_sequence(
     
     # 在降采样前对位置、旋转和姿态数据进行平滑（k=3）
     # 平滑关键的连续数据以减少噪声
-    for key in ["smplTrans", "smplPose", "objectTrans", "objectRot"]:
+    # Translations are averaged directly; axis-angle rotations must be averaged on
+    # quaternions (see _moving_avg_axis_angle_timewise), otherwise frames near
+    # |theta| = pi turn into ~120 deg single-frame jumps.
+    for key in ["smplTrans", "objectTrans"]:
         if key in data_np:
             data_np[key] = _moving_avg_timewise(data_np[key], k=3)
+    for key in ["smplPose", "objectRot"]:
+        if key in data_np:
+            data_np[key] = _moving_avg_axis_angle_timewise(data_np[key], k=3)
     # if obj_imu_real is not None:
     #     obj_imu_real["ori"] = _moving_avg_timewise(obj_imu_real["ori"], k=3)
     #     obj_imu_real["acc"] = _moving_avg_timewise(obj_imu_real["acc"], k=3)
@@ -669,6 +718,11 @@ def process_imhd_sequence(
     obj_rot_chunks: List[torch.Tensor] = []
     obj_scale_chunks: List[torch.Tensor] = []
 
+    # obj_move is decided on the full sequence (low-pass + window) and sliced per chunk.
+    obj_movement_mask_full = compute_object_movement_mask(
+        object_trans[:T], R.from_rotvec(object_angles[:T]).as_matrix()
+    )
+
     with torch.no_grad():
         for start, end in iter_slices(T, DEFAULT_CHUNK_LEN):
             smpl_input = build_smpl_input(
@@ -703,6 +757,7 @@ def process_imhd_sequence(
                 mesh_basename,
                 device,
                 end - start,
+                obj_movement_mask=obj_movement_mask_full[start:end],
             )
 
             lfoot_chunks.append(lfoot_c.cpu())

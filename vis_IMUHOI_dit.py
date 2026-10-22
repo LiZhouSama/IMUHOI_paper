@@ -53,16 +53,8 @@ R_yup = torch.tensor([[1.0, 0.0, 0.0],
                       [0.0, 1.0, 0.0],
                       [0.0, 0.0, 1.0]], dtype=torch.float32)
 
-OBJ_TRAJ_RADIUS = 0.006
 HAND_TRAJ_RADIUS = 0.004
 HAND_DASH_STRIDE = 2
-
-OBJ_TRAJ_COLORS = {
-    "gt": (0.1, 0.8, 0.3, 1),
-    "pred": (0.9, 0.2, 0.2, 1),
-    "pred_imu": (0.2, 0.2, 0.9, 1),
-    "fk": (1.0, 1.0, 0.0, 1),
-}
 
 HAND_TRAJ_COLORS = {
     "gt_l_contact": (1.0, 0.0, 0.0, 1),
@@ -316,7 +308,7 @@ def _global_to_local_rotmat(global_rotmats, parents):
 
 def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root, 
                          show_objects=True, vis_gt_only=False, show_foot_contact=False, 
-                         show_obj_traj=False, show_hand_traj=False, use_fk=False, compare_3=False, 
+                         show_hand_traj=False, use_fk=False, compare_3=False, 
                          pred_offset_np=None, no_trans=False, overlay_frames=None):
     """Visualize one batch sequence."""
     try:
@@ -459,7 +451,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                 if human_trans_source not in {"pred", "gt"}:
                     human_trans_source = "pred"
                 want_object_predictions = bool(
-                    has_object_bool and (show_objects or show_obj_traj or compare_3 or use_fk)
+                    has_object_bool and (show_objects or compare_3 or use_fk)
                 )
                 compute_fk_flag = bool((use_fk or compare_3) and want_object_predictions)
 
@@ -815,28 +807,6 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                 )
                 viewer.scene.add(fk_mesh)
 
-        if show_obj_traj:
-            if gt_obj_trans_seq is not None:
-                _add_line_node_if_nonempty(
-                    viewer, gt_obj_trans_seq, device, f"GT-{obj_name}-ObjTraj",
-                    OBJ_TRAJ_COLORS["gt"], OBJ_TRAJ_RADIUS, "line_strip"
-                )
-            if not vis_gt_only and pred_obj_trans_seq is not None:
-                _add_line_node_if_nonempty(
-                    viewer, pred_obj_trans_seq + pred_offset, device, f"Pred-{obj_name}-ObjTraj",
-                    OBJ_TRAJ_COLORS["pred"], OBJ_TRAJ_RADIUS, "line_strip"
-                )
-            if not vis_gt_only and compare_3 and pred_obj_trans_imu_seq is not None:
-                _add_line_node_if_nonempty(
-                    viewer, pred_obj_trans_imu_seq + pred_offset, device, f"Pred-IMU-{obj_name}-ObjTraj",
-                    OBJ_TRAJ_COLORS["pred_imu"], OBJ_TRAJ_RADIUS, "line_strip"
-                )
-            if not vis_gt_only and compare_3 and pred_obj_trans_fk_seq is not None:
-                _add_line_node_if_nonempty(
-                    viewer, pred_obj_trans_fk_seq + pred_offset, device, f"FK-{obj_name}-ObjTraj",
-                    OBJ_TRAJ_COLORS["fk"], OBJ_TRAJ_RADIUS, "line_strip"
-                )
-
         if show_hand_traj:
             lhand_idx, rhand_idx = 20, 21
 
@@ -909,7 +879,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
 class InteractiveViewer(Viewer):
     def __init__(self, data_list, model, smpl_model, config, device, obj_geo_root, 
                  show_objects=True, vis_gt_only=False, show_foot_contact=False,
-                 show_obj_traj=False, show_hand_traj=False, use_fk=False, compare_3=False, 
+                 show_hand_traj=False, use_fk=False, compare_3=False, 
                  pred_offset=None, no_trans=False, overlay_frames=None, interaction_human_source="pred",
                  human_trans_source="pred", **kwargs):
         super().__init__(**kwargs)
@@ -921,7 +891,6 @@ class InteractiveViewer(Viewer):
         self.device = device
         self.show_objects = show_objects
         self.vis_gt_only = vis_gt_only
-        self.show_obj_traj = show_obj_traj
         self.show_hand_traj = show_hand_traj
         self.show_foot_contact = show_foot_contact
         self.obj_geo_root = obj_geo_root
@@ -965,7 +934,7 @@ class InteractiveViewer(Viewer):
                 visualize_batch_data(
                     self, batch, self.model, self.smpl_model, self.device,
                     self.obj_geo_root, self.show_objects, self.vis_gt_only,
-                    self.show_foot_contact, self.show_obj_traj, self.show_hand_traj,
+                    self.show_foot_contact, self.show_hand_traj,
                     self.use_fk, self.compare_3, self.pred_offset, self.no_trans, self.overlay_frames,
                 )
                 title_base = f"Sequence: {seq_file_name}" if seq_file_name else f"Sequence Index: {self.current_index}/{len(self.data_list)-1}"
@@ -1014,7 +983,6 @@ def main():
     parser.add_argument('--no_objects', action='store_true', help='Disable object mesh rendering')
     parser.add_argument('--vis_gt_only', action='store_true', help='Render GT only')
     parser.add_argument('--show_foot_contact', action='store_true', help='Show foot contact')
-    parser.add_argument('--show_obj_traj', action='store_true', help='Show object trajectory')
     parser.add_argument('--show_hand_traj', action='store_true', help='Show hand contact trajectory')
     parser.add_argument('--use_fk', action='store_true', help='Enable FK branch')
     parser.add_argument('--compare_3', action='store_true', help='Compare three object branches')
@@ -1223,7 +1191,6 @@ def main():
         show_objects=(not args.no_objects),
         vis_gt_only=args.vis_gt_only,
         show_foot_contact=args.show_foot_contact,
-        show_obj_traj=args.show_obj_traj,
         show_hand_traj=args.show_hand_traj,
         use_fk=args.use_fk,
         compare_3=args.compare_3,

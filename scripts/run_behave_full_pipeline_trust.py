@@ -47,9 +47,9 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SAGE_PYTHON = Path("/home/l/anaconda3/envs/SAGE/bin/python")
 DEFAULT_CFG = PROJECT_ROOT / "configs/IMUHOI_train_rnn.yaml"
-DATASET = "behave"
+DATASET = "behave"                   # overridden by --dataset
 REFERENCE_DATASET = "omomo"          # the dataset the config's schedule was tuned on
-VC_ARCH = "v4"
+VC_ARCH = "v4"                       # overridden by --vc_arch
 
 # Variant recipes: identical to the OMOMO state-trust comparison so the two
 # experiments can be read side by side.
@@ -82,6 +82,90 @@ VARIANTS = {
             "object_trans_init_noise_std": 0.20,
             "object_trans_init_noise_prob": 0.5,
         },
+    },
+    "cur_hoi_eag_modes": {
+        "label": "cur_hoi_eag + contact modes (per-hand rigidity scaling the increment, supervised by GT bone speed)",
+        "overrides": {
+            "loss_weights": {**HOI_ALIGNED, "prior_hoi_l": 5.0, "prior_hoi_r": 5.0, "grasp_mode": 1.0},
+            "object_trans_grasp_latent": True,
+            "object_trans_grasp_modes": True,
+        },
+    },
+    "cur_hoi_p800_histmix": {
+        "label": "cur_hoi_p800 + mixed-regime rollout-aligned training (hist prob 0.5 from reference epoch 20, schedule-scaled)",
+        # Epoch-like variant overrides are written in reference-dataset epochs and
+        # scaled in variant() (VARIANT_SCALED_SCALARS), like the shared schedule.
+        "overrides": {"loss_weights": dict(HOI_ALIGNED), "train_data_window": 90, "ot_history_training_window": 60,
+                      "ot_history_training_prob": 0.5, "ot_history_training_start_epoch": 20},
+    },
+    # Forearm-vs-object rotation as a predictor input (no architecture change):
+    # B = R_obj^T R_forearm drives the in-segment bone change and was not derivable
+    # from the old inputs (root-relative forearm orientation, no root orientation).
+    # EgoIMU-style baseline: the IMUHOI VC (independent of HumanPose) + the
+    # four-head IMUHOI ObjectTrans.  Its joint phase fine-tunes HumanPose and
+    # freezes VC (train_object_trans.py::_joint_trainable_modules), the OT human
+    # refine is off, and the losses come from `imuhoi_loss_weights`.  Run it with
+    # --vc_arch imuhoi in its own experiment root.
+    "vc_imuhoi_ot_4heads": {
+        "label": "EgoIMU baseline: VC-IMUHOI + ObjectTrans IMUHOI_4heads (joint phase fine-tunes HP, VC frozen)",
+        "ot_arch": "imuhoi_4heads",
+        "overrides": {},
+    },
+    # The original three-branch IMUHOI ObjectTrans of the conference paper
+    # (left FK, right FK, IMU integration; no static hold), same recipe as above.
+    "vc_imuhoi_ot_3branch": {
+        "label": "IMUHOI paper baseline: VC-IMUHOI + three-branch ObjectTrans IMUHOI (joint phase fine-tunes HP, VC frozen)",
+        "ot_arch": "imuhoi",
+        "overrides": {},
+    },
+    # Feedback-free predictor: the published object is no longer fed back into
+    # the shared LSTM each frame (the IMUHOI bone heads have no such loop).  The
+    # IMU/static candidates still integrate from the previous published position.
+    "cur_hoi_nofb": {
+        "label": "cur_hoi_p800 with object_trans_state_feedback off (feedback-free predictor)",
+        "overrides": {"loss_weights": dict(HOI_ALIGNED), "object_trans_state_feedback": False},
+    },
+    # Fixed contact-driven fusion instead of the learned gate: ObjectTrans v2 is the
+    # current pipeline (state feedback included) with weights
+    # [p_L, p_R, p_move * P(no hand | move), 1 - p_move] from VelocityContact.
+    "v2_fixed_fusion": {
+        "label": "ObjectTrans v2: current predictor + fixed VC-driven fusion weights (no learned gate)",
+        "ot_arch": "v2",
+        "overrides": {},
+    },
+    "v2_armrot_biclose": {
+        "label": "v2 fixed VC fusion + forearm/object rotation + explicit bimanual closure candidate",
+        "ot_arch": "v2",
+        "overrides": {
+            "loss_weights": {"bimanual_hoi": 5.0, "bimanual_prior": 1.0},
+            "object_trans_forearm_obj_rotation": True,
+            "object_trans_bimanual_closure": True,
+        },
+    },
+    # Plan A (2026-09-22): the state feedback reads an anchor recursion fused with
+    # the fixed v2 contact weights (sits on the FK candidates during contact, no
+    # IMU-integration drift); the published output keeps the learned gate.
+    "cur_hoi_anchorfb": {
+        "label": "cur_hoi_p800 + anchor-state feedback (object_trans_feedback_source=anchor)",
+        "overrides": {"loss_weights": dict(HOI_ALIGNED), "object_trans_feedback_source": "anchor"},
+    },
+    "cur_hoi_anchorfb_bonecons": {
+        "label": "anchorfb + bone-vector delta consistency loss (GT-delta-matched, contact frames)",
+        "overrides": {"loss_weights": {**HOI_ALIGNED, "lhand_bone_cons": 1.0, "rhand_bone_cons": 1.0},
+                      "object_trans_feedback_source": "anchor"},
+    },
+    "cur_hoi_armrot": {
+        "label": "cur_hoi_p800 + forearm-vs-object rotation input (B, its per-frame delta, and B(0)^T B(t))",
+        "overrides": {"loss_weights": dict(HOI_ALIGNED), "object_trans_forearm_obj_rotation": True},
+    },
+    "cur_hoi_biclose_armrot": {
+        "label": "biclose + forearm-vs-object rotation input",
+        "overrides": {"loss_weights": {**HOI_ALIGNED, "bimanual_hoi": 5.0, "bimanual_prior": 1.0},
+                      "object_trans_bimanual_closure": True, "object_trans_forearm_obj_rotation": True},
+    },
+    "cur_hoi_biclose": {
+        "label": "cur_hoi + explicit bimanual closure (state-free hand-pair-frame candidate, closure-aware 5-way gate)",
+        "overrides": {"loss_weights": {**HOI_ALIGNED, "bimanual_hoi": 5.0, "bimanual_prior": 1.0}, "object_trans_bimanual_closure": True},
     },
     "cur_hoi_trust_perturb": {
         "label": "state trust + init corruption + rest-phase state perturbation (0.20 m)",
@@ -148,7 +232,11 @@ SCALED_SCALARS = (
     "joint_train_eval_interval",
     "vc_velocity_stage_epochs",
     "vc_joint_stage_epochs",
+    "ot_history_training_start_epoch",
 )
+# Epoch-like keys that may appear in a variant's overrides (applied after
+# scale_schedule, so variant() scales them itself).
+VARIANT_SCALED_SCALARS = ("ot_history_training_start_epoch",)
 SCALED_LISTS = (
     "milestones",
     "joint_train_milestones",
@@ -283,15 +371,23 @@ def find_object_trans_stage(root: Path, suffix: str) -> Optional[Path]:
     return None
 
 
-def find_joint_checkpoints(root: Path, suffix: str):
+def find_joint_checkpoints(root: Path, suffix: str) -> Optional[Path]:
+    """Stage dir of a FINISHED joint run, else None.
+
+    The joint phase is finished only when the trainer wrote its final
+    ObjectTrans checkpoint; best_* alone exist from the first joint evaluation
+    on, and treating those as "done" evaluated half-trained joint runs after an
+    interruption (2026-09-19 WSL restart).  Which of VC / HP is also written
+    depends on the arch (current: VC fine-tuned, HP frozen; imuhoi: the other
+    way round), so only ObjectTrans is required here.
+    """
     if not root.is_dir():
         return None
     for path in sorted(root.iterdir(), reverse=True):
         if not (path.is_dir() and path.name.endswith(suffix)):
             continue
-        vc, ot = path / "best_velocity_contact.pt", path / "best_object_trans.pt"
-        if vc.is_file() and ot.is_file():
-            return path, vc, ot
+        if (path / "best_object_trans.pt").is_file() and (path / "final_object_trans.pt").is_file():
+            return path
     return None
 
 
@@ -310,6 +406,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run_tag", default=datetime.now().strftime("%Y%m%d"))
     parser.add_argument("--variants", nargs="+", default=list(VARIANTS))
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--noise_profile", choices=("current", "egoimu_gaussian"), default="current",
+                        help="egoimu_gaussian: train/validation feature Gaussian std 0.1; clean independent eval.")
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--eval_batch_size", type=int, default=48)
@@ -328,15 +426,41 @@ def parse_args() -> argparse.Namespace:
              "whenever two trainings share the GPU; each retry resumes from last.pt, so a "
              "fault costs at most the current epoch.",
     )
+    parser.add_argument("--check_gpu_before_stage", action="store_true",
+                        help="Print all GPU memory levels before each training/evaluation subprocess.")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--skip_hp", type=Path, default=None, help="reuse an existing HumanPose checkpoint")
     parser.add_argument("--skip_vc", type=Path, default=None, help="reuse an existing VelocityContact checkpoint")
+    parser.add_argument("--set", dest="shared_overrides", action="append", default=[], metavar="KEY=VALUE",
+                        help="Root-level config override applied to every stage of this experiment root "
+                             "(YAML value), e.g. --set human_pose_smoothing_half_width=4")
+    parser.add_argument("--vc_arch", default=VC_ARCH,
+                        help="VelocityContact architecture for this run (v4, imuhoi, ...); it is trained from scratch, "
+                             "so a different arch needs its own experiment root")
+    parser.add_argument("--dataset", default="behave",
+                        help="training/evaluation dataset key under config.datasets (behave, omomo, ...); the schedule "
+                             "is scaled against REFERENCE_DATASET (scale 1 for omomo)")
     return parser.parse_args()
 
 
+def configure_noise_profile(cfg: dict, profile: str, seed: int) -> tuple[list[str], list[str]]:
+    """Resolve training and independent-eval noise without changing default runs."""
+    if profile == "current":
+        return ["--simulate_imu_noise"], ["--simulate_imu_noise", "--simulate_imu_noise_seed", str(seed)]
+    if profile != "egoimu_gaussian":
+        raise ValueError(f"Unknown noise profile: {profile}")
+    cfg.update({"simulate_imu_noise": False, "validation_add_imu_noise": True,
+                "imu_acc_noise_std": 0.1, "imu_rot_noise_std": 0.1,
+                "obj_imu_acc_noise_std": 0.1, "obj_imu_rot_noise_std": 0.1})
+    return ["--no_simulate_imu_noise"], []
+
+
 def main() -> int:
+    global DATASET, VC_ARCH
     args = parse_args()
+    DATASET = str(args.dataset).strip().lower()
+    VC_ARCH = str(args.vc_arch).strip().lower()
     unknown = [name for name in args.variants if name not in VARIANTS]
     if unknown:
         raise ValueError(f"Unknown variants {unknown}; choose from {list(VARIANTS)}")
@@ -364,6 +488,14 @@ def main() -> int:
         # affects the host->device copy speed.
         "dataloader_pin_memory": False,
     })
+    shared_overrides = {}
+    for item in args.shared_overrides:
+        key, sep, value = item.partition("=")
+        if not sep or not key.strip():
+            raise ValueError(f"--set expects KEY=VALUE, got {item!r}")
+        shared_overrides[key.strip()] = yaml.safe_load(value)
+    shared_cfg.update(shared_overrides)
+    training_noise_args, evaluation_noise_args = configure_noise_profile(shared_cfg, args.noise_profile, args.seed)
 
     # Early stopping, placed past the first lr decay (and, for the staged VC
     # trainer, past the last stage transition).
@@ -432,11 +564,13 @@ def main() -> int:
         else {
             "status": "running", "started_at": now(), "source_config": str(cfg_path), "dataset": DATASET,
             "seed": args.seed, "velocity_contact_arch": VC_ARCH, "schedule": schedule,
+            "shared_overrides": shared_overrides,
             "variants": {name: VARIANTS[name] for name in args.variants},
             "gpu": args.gpu, "max_parallel": args.max_parallel, "stages": {}, "pipelines": {},
         }
     )
     manifest["schedule"] = schedule
+    manifest["noise_profile"] = args.noise_profile
     write_json(manifest_path, manifest)
 
     root_log = root / "orchestrator.log"
@@ -462,8 +596,12 @@ def main() -> int:
             write_json(manifest_path, manifest)
 
     def run_stage(command, log_path: Path) -> None:
+        if args.check_gpu_before_stage:
+            subprocess.run(["nvidia-smi", "--query-gpu=index,memory.total,memory.used,memory.free,utilization.gpu",
+                            "--format=csv,noheader"], check=True)
         log("RUN " + " ".join(str(part) for part in command))
-        with log_path.open("w", encoding="utf-8") as output:
+        # Append: a retried stage must not overwrite the traceback of the failed attempt.
+        with log_path.open("a", encoding="utf-8") as output:
             result = subprocess.run([str(part) for part in command], cwd=PROJECT_ROOT, env=env,
                                     stdout=output, stderr=subprocess.STDOUT)
         log(f"END rc={result.returncode} log={log_path}")
@@ -477,14 +615,14 @@ def main() -> int:
     else:
         hp_root = root / "hp"
         hp_root.mkdir(parents=True, exist_ok=True)
-        hp_suffix = f"behave_hp_{args.run_tag}"
+        hp_suffix = f"{DATASET}_hp_{args.run_tag}"
         update("stages", "human_pose", status="running", started_at=now())
         stage = find_completed_stage(hp_root, "human_pose", hp_suffix)
         if stage is None:
             command = [SAGE_PYTHON, PROJECT_ROOT / "train/rnn/train_human_pose.py", "--cfg", hp_cfg_path,
                        "--save_dir", hp_root, "--run_suffix", hp_suffix, "--seed", args.seed,
                        "--train_datasets", DATASET, "--num_workers", args.num_workers,
-                       "--simulate_imu_noise", "--epochs", hp_cfg["epochs"]]
+                       *training_noise_args, "--epochs", hp_cfg["epochs"]]
             interrupted = find_interrupted_stage(hp_root, "human_pose", hp_suffix)
             if interrupted is not None:
                 command += ["--resume_dir", interrupted]
@@ -500,16 +638,16 @@ def main() -> int:
         vc_ckpt = args.skip_vc.resolve()
         update("stages", "velocity_contact", status="reused", checkpoint=str(vc_ckpt))
     else:
-        vc_root = root / "vc_v4"
+        vc_root = root / f"vc_{VC_ARCH}"  # keeps two archs apart inside one root (legacy roots used "vc_v4")
         vc_root.mkdir(parents=True, exist_ok=True)
-        vc_suffix = f"behave_vc_{VC_ARCH}_{args.run_tag}"
+        vc_suffix = f"{DATASET}_vc_{VC_ARCH}_{args.run_tag}"
         update("stages", "velocity_contact", status="running", started_at=now())
         stage = find_completed_stage(vc_root, "velocity_contact", vc_suffix)
         if stage is None:
             command = [SAGE_PYTHON, PROJECT_ROOT / "train/rnn/train_velocity_contact.py", "--cfg", vc_cfg_path,
                        "--save_dir", vc_root, "--run_suffix", vc_suffix, "--seed", args.seed,
                        "--train_datasets", DATASET, "--num_workers", args.num_workers,
-                       "--simulate_imu_noise", "--epochs", vc_cfg["epochs"],
+                       *training_noise_args, "--epochs", vc_cfg["epochs"],
                        "--velocity_contact_arch", VC_ARCH, "--hp_ckpt", hp_ckpt]
             interrupted = find_interrupted_stage(vc_root, "velocity_contact", vc_suffix)
             if interrupted is not None:
@@ -518,19 +656,22 @@ def main() -> int:
             stage = find_completed_stage(vc_root, "velocity_contact", vc_suffix)
         if stage is None:
             raise FileNotFoundError("BEHAVE VelocityContact training produced no completed stage")
-        vc_ckpt = stage / "best.pt"
+        # best.pt is written on the first test-loss improvement; fall back to the
+        # final checkpoint so an arch without a test-selectable best still works.
+        vc_ckpt = stage / "best.pt" if (stage / "best.pt").is_file() else stage / "final.pt"
         update("stages", "velocity_contact", status="complete", checkpoint=str(vc_ckpt), save_dir=str(stage), finished_at=now())
 
     commit(reused_checkpoints={"hp_ckpt": str(hp_ckpt), "vc_ckpt": str(vc_ckpt)})
 
     # ---- stage 3: one ObjectTrans + joint run per variant, then full-sequence eval ----
-    def evaluate(tag: str, cfg_file: Path, vc_path: Path, ot_path: Path, out_json: Path, log_path: Path) -> None:
+    def evaluate(tag: str, cfg_file: Path, hp_path: Path, vc_path: Path, ot_path: Path, ot_arch: str,
+                 out_json: Path, log_path: Path) -> None:
         if out_json.is_file():
             return
         run_stage([SAGE_PYTHON, PROJECT_ROOT / "eval_batch_online.py", "--config", cfg_file,
-                   "--dataset", DATASET, "--hp_ckpt", hp_ckpt, "--vc_ckpt", vc_path, "--ot_ckpt", ot_path,
-                   "--velocity_contact_arch", VC_ARCH, "--object_trans_arch", "current",
-                   "--simulate_imu_noise", "--simulate_imu_noise_seed", args.seed, "--seed", args.seed,
+                   "--dataset", DATASET, "--hp_ckpt", hp_path, "--vc_ckpt", vc_path, "--ot_ckpt", ot_path,
+                   "--velocity_contact_arch", VC_ARCH, "--object_trans_arch", ot_arch,
+                   *evaluation_noise_args, "--seed", args.seed,
                    "--num_workers", args.num_workers, "--online_batch_size", args.eval_batch_size,
                    "--output_json", out_json], log_path)
 
@@ -538,10 +679,14 @@ def main() -> int:
         spec = VARIANTS[name]
         pipeline_root = root / name
         pipeline_root.mkdir(parents=True, exist_ok=True)
-        suffix = f"behave_ot_{name}_{args.run_tag}"
-        config = deep_update(copy.deepcopy(shared_cfg), {"save_dir": str(pipeline_root), "object_trans_arch": "current"})
+        suffix = f"{DATASET}_ot_{name}_{args.run_tag}"
+        ot_arch = str(spec.get("ot_arch", "current"))
+        config = deep_update(copy.deepcopy(shared_cfg), {"save_dir": str(pipeline_root), "object_trans_arch": ot_arch})
         config.update(ot_common)
         config = deep_update(config, spec["overrides"])
+        for key in VARIANT_SCALED_SCALARS:
+            if isinstance(spec["overrides"].get(key), (int, float)):
+                config[key] = max(0, int(round(float(spec["overrides"][key]) * scale)))
         variant_cfg = pipeline_root / "config.yaml"
         write_yaml(variant_cfg, config)
         update("pipelines", name, variant=name, label=spec["label"], overrides=spec["overrides"],
@@ -555,9 +700,9 @@ def main() -> int:
                     raise RuntimeError(f"{name}: ObjectTrans stage failed {attempt - 1} times")
                 command = [SAGE_PYTHON, PROJECT_ROOT / "train/rnn/train_object_trans.py", "--cfg", variant_cfg,
                            "--save_dir", pipeline_root, "--run_suffix", suffix, "--seed", args.seed,
-                           "--train_datasets", DATASET, "--num_workers", args.num_workers, "--simulate_imu_noise",
+                           "--train_datasets", DATASET, "--num_workers", args.num_workers, *training_noise_args,
                            "--epochs", config["epochs"], "--joint_train", "--velocity_contact_arch", VC_ARCH,
-                           "--object_trans_arch", "current", "--hp_ckpt", hp_ckpt, "--vc_ckpt", vc_ckpt]
+                           "--object_trans_arch", ot_arch, "--hp_ckpt", hp_ckpt, "--vc_ckpt", vc_ckpt]
                 stage = find_object_trans_stage(pipeline_root, suffix)
                 if stage is not None:
                     command += ["--resume_dir", stage]
@@ -580,17 +725,27 @@ def main() -> int:
                     if attempt >= max(1, int(args.max_attempts)):
                         raise
                 joint = find_joint_checkpoints(pipeline_root, suffix)
-            stage_dir, joint_vc, joint_ot = joint
-            update("pipelines", name, phase="eval", stage_dir=str(stage_dir),
-                   joint_vc_ckpt=str(joint_vc), joint_ot_ckpt=str(joint_ot))
+            stage_dir = joint
+            # Whichever of VC / HP the joint phase fine-tuned is taken from the
+            # stage dir; the other one stays the stage-2 / reused checkpoint.
+            def ckpt_set(tag: str):
+                pick = lambda name_, fallback: (stage_dir / name_) if (stage_dir / name_).is_file() else fallback  # noqa: E731
+                return (pick(f"{tag}_human_pose.pt", hp_ckpt), pick(f"{tag}_velocity_contact.pt", vc_ckpt),
+                        stage_dir / f"{tag}_object_trans.pt")
+            best_hp, best_vc, best_ot = ckpt_set("best")
+            update("pipelines", name, phase="eval", stage_dir=str(stage_dir), object_trans_arch=ot_arch,
+                   velocity_contact_arch=VC_ARCH, joint_hp_ckpt=str(best_hp), joint_vc_ckpt=str(best_vc),
+                   joint_ot_ckpt=str(best_ot))
             # Long-horizon metrics move with the checkpoint (the segment-window
             # score is a noisy proxy), so report both best and final.
-            best_json = pipeline_root / "eval_behave_best.json"
-            evaluate(name, variant_cfg, joint_vc, joint_ot, best_json, pipeline_root / "eval_behave_best.log")
-            final_json = pipeline_root / "eval_behave_final.json"
-            final_vc, final_ot = stage_dir / "final_velocity_contact.pt", stage_dir / "final_object_trans.pt"
-            if final_vc.is_file() and final_ot.is_file():
-                evaluate(name, variant_cfg, final_vc, final_ot, final_json, pipeline_root / "eval_behave_final.log")
+            best_json = pipeline_root / f"eval_{DATASET}_best.json"
+            evaluate(name, variant_cfg, best_hp, best_vc, best_ot, ot_arch, best_json,
+                     pipeline_root / f"eval_{DATASET}_best.log")
+            final_json = pipeline_root / f"eval_{DATASET}_final.json"
+            final_hp, final_vc, final_ot = ckpt_set("final")
+            if final_ot.is_file():
+                evaluate(name, variant_cfg, final_hp, final_vc, final_ot, ot_arch, final_json,
+                         pipeline_root / f"eval_{DATASET}_final.log")
             update("pipelines", name, status="complete", phase="complete", finished_at=now(),
                    metrics_best=read_metrics(best_json),
                    metrics_final=read_metrics(final_json) if final_json.is_file() else None)

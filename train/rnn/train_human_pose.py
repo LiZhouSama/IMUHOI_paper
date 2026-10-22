@@ -87,6 +87,12 @@ def main():
         cfg.train_data_window = int(cfg.train.window) + cfg.target_lookahead
         cfg.test_data_window = int(cfg.test.window) + cfg.target_lookahead
     
+    # Output smoothing is a downstream post-process (VC/OT training and online
+    # inference); every validated HP checkpoint was trained on raw outputs.
+    if int(getattr(cfg, 'human_pose_smoothing_half_width', 0) or 0) > 0:
+        print(f"HP training ignores human_pose_smoothing_half_width={cfg.human_pose_smoothing_half_width}")
+        cfg.human_pose_smoothing_half_width = 0
+
     setup_seed(cfg.seed)
     cfg = setup_device(cfg)
     save_dir = create_save_dir(cfg, 'human_pose')

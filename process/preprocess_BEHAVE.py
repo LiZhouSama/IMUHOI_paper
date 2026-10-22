@@ -30,6 +30,7 @@ try:
         contact_postprocess_metadata,
         precompute_sequence_features,
         compute_improved_contact_labels,
+        compute_object_movement_mask,
         compute_foot_contact_labels,
         load_canonical_points_from_mesh_path,
         postprocess_sequence_contact_labels,
@@ -42,6 +43,7 @@ except ModuleNotFoundError:
         contact_postprocess_metadata,
         precompute_sequence_features,
         compute_improved_contact_labels,
+        compute_object_movement_mask,
         compute_foot_contact_labels,
         load_canonical_points_from_mesh_path,
         postprocess_sequence_contact_labels,
@@ -327,6 +329,11 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
     obj_rot_all      : List[torch.Tensor] = []
     obj_scale_all    : List[torch.Tensor] = []
 
+    # obj_move is decided on the full sequence (low-pass + window) and sliced per chunk.
+    obj_movement_mask_full = compute_object_movement_mask(
+        object_trans_norm, R.from_rotvec(object_angles).as_matrix()
+    )
+
     with torch.no_grad():
         for s, e in iter_slices(T, DEFAULT_CHUNK_LEN):
             # 切块取数据
@@ -364,7 +371,8 @@ def process_behave_sequence(seq_dir: str, bm_loader: BodyModelLoader, objects_ro
             lfoot_c, rfoot_c = compute_foot_contact_labels(pos_dev)
             lhand_c, rhand_c, obj_c = compute_improved_contact_labels(
                 obj_trans_t, obj_rot_t, obj_scale_t,
-                pos_dev, mesh_dir, object_name, device, e - s
+                pos_dev, mesh_dir, object_name, device, e - s,
+                obj_movement_mask=obj_movement_mask_full[s:e],
             )
 
             lfoot_list.append(lfoot_c.cpu()); rfoot_list.append(rfoot_c.cpu())

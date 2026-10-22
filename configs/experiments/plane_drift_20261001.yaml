@@ -1,0 +1,20 @@
+# Full sequence epochs; each fit frame is visited once per epoch.
+output_root: outputs/experiments/plane_drift_20261001
+source_root: outputs/experiments/meshfree_temporal_20261001
+datasets: [OMOMO, BEHAVE]
+variants: [vector_state, plane_state, plane_predicted_band, plane_gt_band]
+seeds: [1101, 1102]
+epochs: 40
+min_epochs: 20
+patience_epochs: 10
+batch_sequences: 32
+chunk_frames: 256
+hidden_dim: 64
+memory_frames: 90
+ridge: 0.5
+learning_rate: 0.001
+plane_loss_weight: 0.5
+calibration_gains: [0.0, 0.1, 0.25, 0.5, 0.75, 1.0]
+calibration_max_hoi_increase_cm: 0.05
+calibration_max_acceleration_ratio: 1.05
+calibration_max_p95_increase_cm: 0.3

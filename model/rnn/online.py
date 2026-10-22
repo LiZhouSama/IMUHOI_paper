@@ -385,30 +385,65 @@ def _history_tensor(output: InferenceOutput, key: str, index: int = -1) -> Optio
     return None
 
 
+def _published_object_velocity(
+    history: InferenceOutput, index: int, frames: int, fps: float
+) -> Optional[torch.Tensor]:
+    """Backward difference of the published object position ending at ``index``."""
+    trans = history.get("pred_obj_trans")
+    if not isinstance(trans, torch.Tensor) or trans.dim() != 3:
+        return None
+    length = trans.shape[1]
+    end = index if index >= 0 else length + index
+    span = min(int(frames), end)
+    if end >= length or span <= 0:
+        return None
+    return ((trans[:, end] - trans[:, end - span]) * (fps / span)).detach()
+
+
 def update_data_inits_from_history(
     data: Dict[str, Any],
     history: InferenceOutput,
     index: int = -1,
     contact_index: Optional[int] = None,
     trans_index: Optional[int] = None,
+    obj_vel_diff_frames: int = 0,
+    fps: float = 30.0,
+    hp_init_smoothing=None,
 ) -> Dict[str, Any]:
     """Refresh init tensors from known predictions.
 
     ``index`` keeps predecessor-frame semantics for recurrent initializers.
     ``contact_index`` and ``trans_index`` can independently select the first
     frame of the current window, because those values represent frame-0 state.
+
+    ``obj_vel_diff_frames`` > 0 initialises the object velocity from the
+    PUBLISHED object trajectory (backward difference over that many frames)
+    instead of VelocityContact's own previous output.  The velocity RNN
+    integrates the object IMU from its initialiser, so feeding it its own
+    output makes the velocity error a random walk over the sequence; the
+    published object is anchored by the FK/static branches, which turns that
+    loop into a leaky integrator.
     """
     if not history:
         return data
 
     updated = dict(data)
 
+    # ``hp_init_smoothing(history_tensor, index, is_rotation)`` de-noises the
+    # recurrent HumanPose initialisers from the already published frames around
+    # ``index``.  Every published frame comes from its own window pass, whose
+    # offset is inherited from its initialiser; white noise in the initialiser
+    # chain therefore survives in the published pose forever.
     value = _history_tensor(history, "v_pred", index)
     if value is not None:
+        if callable(hp_init_smoothing):
+            value = hp_init_smoothing(history["v_pred"], index, False)
         updated["v_init"] = value.reshape(value.shape[0], -1, 3)
 
     value = _history_tensor(history, "p_pred", index)
     if value is not None:
+        if callable(hp_init_smoothing):
+            value = hp_init_smoothing(history["p_pred"], index, True)
         updated["p_init"] = value.reshape(value.shape[0], -1, 6)
 
     resolved_trans_index = index if trans_index is None else trans_index
@@ -427,6 +462,12 @@ def update_data_inits_from_history(
     value = _history_tensor(history, "pred_obj_vel", index)
     if value is not None:
         updated["obj_vel_init"] = value
+    if int(obj_vel_diff_frames) > 0:
+        diff_velocity = _published_object_velocity(history, index, int(obj_vel_diff_frames), float(fps))
+        if diff_velocity is not None:
+            if value is not None:
+                diff_velocity = diff_velocity.to(dtype=value.dtype)
+            updated["obj_vel_init"] = diff_velocity
 
     resolved_contact_index = index if contact_index is None else contact_index
     for contact_key in ("pred_hand_contact_prob_frame", "pred_hand_contact_prob"):

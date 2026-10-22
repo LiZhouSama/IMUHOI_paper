@@ -19,6 +19,7 @@ from .velocity_contact_legacy import LegacyVelocityContactModule
 from .velocity_contact_v2 import V2VelocityContactModule
 from .velocity_contact_v3 import V3VelocityContactModule
 from .velocity_contact_v4 import V4VelocityContactModule
+from .velocity_contact_v5 import V5VelocityContactModule
 from .human_pose import HumanPoseModule
 from .object_trans import ObjectTransModule
 from .object_trans_v2 import V2ObjectTransModule
@@ -61,6 +62,7 @@ __all__ = [
     'V2VelocityContactModule',
     'V3VelocityContactModule',
     'V4VelocityContactModule',
+    'V5VelocityContactModule',
     'VELOCITY_CONTACT_ARCH_CHOICES',
     'build_velocity_contact_module',
     'normalize_velocity_contact_arch',

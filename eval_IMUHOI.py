@@ -59,7 +59,7 @@ from utils.human_pose import (
     build_smpl24_joint_positions,
     select_hand_anchor_positions,
 )
-from utils.hoi_metrics import compute_hoi_error_at_gt_contact
+from utils.hoi_metrics import compute_hoi_error_at_gt_contact, compute_hoi_error_egoimu, hoi_metric_metadata
 from configs import (
     FRAME_RATE,
     _IGNORED_INDICES,
@@ -436,6 +436,7 @@ def evaluate_model(
     sequence_records: Optional[list] = None,
 ):
     """评估模型"""
+    hoi_protocol = hoi_metric_metadata(config)["hoi_metric_protocol"]
     residual_predictor = None
     residual_checkpoint = getattr(config, "hoi_contact_residual_checkpoint", None)
     if residual_checkpoint and evaluate_objects:
@@ -893,6 +894,12 @@ def evaluate_model(
                 def compute_hoi_error(pred_obj_trans_seq_, pred_hand_pos):
                     if not (evaluate_objects and has_object_sample):
                         return float("nan")
+                    if hoi_protocol == "egoimu":
+                        return compute_hoi_error_egoimu(
+                            pred_obj_trans_seq_, gt_obj_trans_seq,
+                            pred_joints_all, gt_joints_all,
+                            gt_lhand_contact_seq, gt_rhand_contact_seq,
+                        )
                     return compute_hoi_error_at_gt_contact(
                         pred_obj_trans_seq_,
                         gt_obj_trans_seq,
@@ -906,6 +913,15 @@ def evaluate_model(
                     pred_obj_trans_fusion_refine, pred_hand_pos_refined
                 )
                 metrics["hoi_err_fusion"].append(hoi_err_fusion)
+                if hoi_protocol == "egoimu":
+                    metrics.setdefault("hoi_err_fusion_egoimu", []).append(hoi_err_fusion)
+                    metrics.setdefault("hoi_err_fusion_contact_palm", []).append(
+                        compute_hoi_error_at_gt_contact(
+                            pred_obj_trans_fusion_refine, gt_obj_trans_seq,
+                            pred_hand_pos_refined, gt_hand_pos,
+                            gt_lhand_contact_seq, gt_rhand_contact_seq,
+                        )
+                    )
                 metrics["hoi_err_fk"].append(
                     compute_hoi_error(pred_obj_trans_fk, pred_hand_pos_refined)
                 )
@@ -1676,6 +1692,7 @@ def main():
         output_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "config": args.config,
+            **hoi_metric_metadata(config),
             "inference_mode": args.inference_mode,
             "online_window": args.online_window,
             "online_lookahead": args.online_lookahead,

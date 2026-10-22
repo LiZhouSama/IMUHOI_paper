@@ -6,10 +6,13 @@ from pathlib import Path
 import torch
 
 from process.preprocess import (
+    CONTACT_POSTPROCESS_VERSION,
     contact_postprocess_metadata,
     find_unheld_object_displacement_interval,
     postprocess_contact_labels,
     postprocess_sequence_contact_labels,
+    remove_short_contact_runs,
+    OBJ_MOVE_MIN_RUN_FRAMES,
     saved_contact_postprocess_matches,
     split_unified_by_json,
     write_contact_skip_manifest,
@@ -146,10 +149,33 @@ class ContactPostprocessTests(unittest.TestCase):
 
         self.assertFalse(bool(lhand.any()))
         self.assertFalse(bool(rhand.any()))
-        self.assertTrue(bool(obj.all()))
+        # obj_move is never hole-filled; runs >= OBJ_MOVE_MIN_RUN_FRAMES are kept as-is.
+        self.assertTrue(torch.equal(obj, obj_raw))
         self.assertIsNotNone(interval)
         self.assertEqual(interval["interval_start_frame"], 0)
         self.assertEqual(interval["interval_end_frame"], 39)
+
+    def test_obj_move_drops_short_runs_without_filling_gaps(self):
+        short = OBJ_MOVE_MIN_RUN_FRAMES - 1
+        raw = _mask(
+            (True, 40), (False, 20), (True, 2), (False, 28),   # spike inside a static stretch
+            (True, OBJ_MOVE_MIN_RUN_FRAMES), (False, 3), (True, short), (False, 10),
+        )
+        cleaned = remove_short_contact_runs(raw, OBJ_MOVE_MIN_RUN_FRAMES)
+        expected = _mask(
+            (True, 40), (False, 50),
+            (True, OBJ_MOVE_MIN_RUN_FRAMES), (False, 3 + short + 10),
+        )
+        self.assertTrue(torch.equal(cleaned, expected))
+
+        lhand, rhand, obj, _ = postprocess_sequence_contact_labels(
+            raw, torch.zeros_like(raw), raw, torch.zeros(raw.numel(), 3),
+            max_hole_frames=30, min_contact_frames=30,
+            skip_object_displacement_without_hand_contact=False,
+        )
+        self.assertTrue(torch.equal(obj, expected))
+        # Hands keep the fill-then-min-duration cleanup (the 2-frame spike bridges).
+        self.assertTrue(bool(lhand[:90].all()))
 
     def test_unheld_displacement_is_exact_across_distance_blocks(self):
         frame_count = 2050
@@ -203,7 +229,9 @@ class ContactPostprocessTests(unittest.TestCase):
             )
             self.assertEqual(manifest["saved_sequences"], 1)
             self.assertEqual(manifest["skipped_sequences_count"], 1)
-            self.assertEqual(manifest["contact_postprocess_version"], 1)
+            self.assertEqual(
+                manifest["contact_postprocess_version"], CONTACT_POSTPROCESS_VERSION
+            )
 
     def test_split_preserves_numeric_hole_and_writes_filtered_json(self):
         with tempfile.TemporaryDirectory() as temp_dir:

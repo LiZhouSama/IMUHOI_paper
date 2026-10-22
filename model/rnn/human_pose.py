@@ -63,6 +63,16 @@ class HumanPoseModule(nn.Module):
         num_layer = getattr(cfg, "human_pose_layers", 2)
         dropout = getattr(cfg, "human_pose_dropout", 0.2)
         self.fps = float(getattr(cfg, "frame_rate", FRAME_RATE))
+        # Output smoothing (no retraining).  The hand jitter has two white-noise
+        # sources: the posers' per-frame regression noise and -- larger -- the
+        # orientation noise of the root/forearm sensors, which enters FK directly.
+        # A centred Savitzky-Golay filter (half-width in frames, local polynomial
+        # order) is applied to the predicted pose, to the sensor orientations used
+        # for FK (the network inputs stay raw) and to the root velocity.  Online,
+        # the published frame sits `online_lookahead` frames before the window end,
+        # so any half-width <= lookahead is a zero-lag filter there.
+        self.smoothing_half_width = max(0, int(getattr(cfg, "human_pose_smoothing_half_width", 0) or 0))
+        self.smoothing_polyorder = max(0, int(getattr(cfg, "human_pose_smoothing_polyorder", 2)))
         self.sensor_names = list(_SENSOR_NAMES)
         self.v_names = list(_SENSOR_VEL_NAMES)
         self.p_names = list(_REDUCED_POSE_NAMES)
@@ -306,8 +316,11 @@ class HumanPoseModule(nn.Module):
         rest = rest.unsqueeze(1).expand(batch_size, seq_len, 24, 3).reshape(
             batch_size * seq_len, 24, 3
         )
+        # Host-side parents: batch_rigid_transform indexes its Python transform
+        # chain with parents[i], which costs one GPU sync per joint when the
+        # tensor lives on the device.
         joints, _ = batch_rigid_transform(
-            rot_mats, rest, self.smpl_parents.to(device), dtype=dtype
+            rot_mats, rest, self.smpl_parents, dtype=dtype
         )
         return joints.reshape(batch_size, seq_len, 24, 3)
 
@@ -454,6 +467,79 @@ class HumanPoseModule(nn.Module):
             ) * self.fps
         return velocity
 
+    @staticmethod
+    def _savgol_center_kernel(half_width: int, polyorder: int) -> torch.Tensor:
+        """Savitzky-Golay smoothing weights for the centre sample of a 2h+1 window."""
+        offsets = torch.arange(-half_width, half_width + 1, dtype=torch.float64)
+        order = min(int(polyorder), 2 * half_width)
+        design = torch.stack([offsets ** power for power in range(order + 1)], dim=-1)
+        return torch.linalg.pinv(design)[0].to(torch.float32)
+
+    def _smoothing_matrix(self, seq_len: int, device) -> torch.Tensor:
+        """``[T, T]`` filter: row t holds the centre-sample kernel of the widest symmetric support at t."""
+        cache = self.__dict__.setdefault("_smoothing_matrix_cache", {})
+        key = (int(seq_len), str(device), self.smoothing_half_width, self.smoothing_polyorder)
+        matrix = cache.get(key)
+        if matrix is None:
+            matrix = torch.zeros(seq_len, seq_len, dtype=torch.float32)
+            kernels = {}
+            for frame in range(seq_len):
+                half = min(self.smoothing_half_width, frame, seq_len - 1 - frame)
+                if half not in kernels:
+                    kernels[half] = self._savgol_center_kernel(half, self.smoothing_polyorder)
+                matrix[frame, frame - half:frame + half + 1] = kernels[half]
+            matrix = matrix.to(device)
+            if len(cache) > 16:
+                cache.clear()
+            cache[key] = matrix
+        return matrix
+
+    def _temporal_smooth(self, x: torch.Tensor) -> torch.Tensor:
+        """Centred Savitzky-Golay smoothing over time of ``[B, T, ...]``.
+
+        The support stays symmetric and shrinks towards the window edges, so the
+        filter never lags; polynomial motion up to the configured order is
+        reproduced exactly (order 0 is a plain moving average).  Runs in fp32
+        outside autocast: half precision would put its own noise on the result.
+        """
+        seq_len = x.shape[1]
+        if self.smoothing_half_width <= 0 or seq_len < 3:
+            return x
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            value = x.float().reshape(x.shape[0], seq_len, -1)
+            out = torch.matmul(self._smoothing_matrix(seq_len, x.device), value)
+        return out.reshape(x.shape).to(x.dtype)
+
+    def fk_orientation_6d(self, human_imu: torch.Tensor) -> torch.Tensor:
+        """Sensor orientations ``[B, T, S, 6]`` as used for FK (smoothed when enabled)."""
+        orientation_6d = human_imu[..., -6:]
+        if self.smoothing_half_width > 0:
+            orientation_6d = self._smooth_rotation_6d(orientation_6d)
+        return orientation_6d
+
+    def smooth_history_init(self, history_value: torch.Tensor, index: int, is_rotation: bool) -> torch.Tensor:
+        """Published ``[B, T, D]`` value at ``index``, smoothed over the published frames around it."""
+        length = history_value.shape[1]
+        center = index if index >= 0 else length + index
+        if self.smoothing_half_width <= 0:
+            return history_value[:, center].detach()
+        lo = max(0, center - self.smoothing_half_width)
+        hi = min(length, center + self.smoothing_half_width + 1)
+        window = history_value[:, lo:hi].detach()
+        if is_rotation:
+            window = window.reshape(window.shape[0], window.shape[1], -1, 6)
+            smoothed = self._smooth_rotation_6d(window)
+        else:
+            smoothed = self._temporal_smooth(window)
+        return smoothed[:, center - lo].reshape(history_value.shape[0], -1)
+
+    def _smooth_rotation_6d(self, rot6d: torch.Tensor) -> torch.Tensor:
+        """Smooth 6D rotations over time and project back onto valid rotations."""
+        with torch.autocast(device_type=rot6d.device.type, enabled=False):
+            smoothed = self._temporal_smooth(rot6d.float())
+            projected = matrix_to_rotation_6d(rotation_6d_to_matrix(smoothed.reshape(-1, 6)))
+        return projected.reshape(rot6d.shape).to(rot6d.dtype)
+
     def _fuse_velocities_batched(
         self,
         root_vel_local: torch.Tensor,
@@ -546,8 +632,13 @@ class HumanPoseModule(nn.Module):
 
         v_pred = torch.cat(v_components, dim=-1)
         p_pred = torch.cat(p_components, dim=-1)
-
-        orientation_6d = human_imu[..., -6:]
+        if self.smoothing_half_width > 0:
+            p_pred = self._smooth_rotation_6d(
+                p_pred.reshape(batch_size, seq_len, -1, 6)
+            ).reshape(p_pred.shape)
+        # Only the orientations that drive FK and the root frame are smoothed;
+        # the posers above already consumed the raw readings.
+        orientation_6d = self.fk_orientation_6d(human_imu)
         orientation_mat = rotation_6d_to_matrix(orientation_6d.reshape(-1, 6)).reshape(
             batch_size, seq_len, self.num_human_imus, 3, 3
         )
@@ -643,6 +734,7 @@ class HumanPoseModule(nn.Module):
                 root_vel_unadjusted_pred = (
                     torch.matmul(root_R, root_vel_local_pred.unsqueeze(-1)).squeeze(-1)
                 )
+            root_vel_unadjusted_pred = self._temporal_smooth(root_vel_unadjusted_pred)
 
             if trans_init is None:
                 trans_init = torch.zeros(batch_size, 3, device=device, dtype=human_imu.dtype)

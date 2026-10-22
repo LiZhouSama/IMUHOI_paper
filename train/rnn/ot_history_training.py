@@ -15,6 +15,14 @@ def forward_with_ot_history(module, hands, contact, obj_init, window, **kwargs):
 
     with torch.no_grad():
         warmup = module(hands[:, :window], contact[:, :window], obj_init, **sliced(0, window))
+    # Autocast caches the low-precision copies of fp32 weights for the duration
+    # of the enclosing autocast context.  Copies created inside the no_grad
+    # warm-up carry no autograd edge to the parameters, so the training window
+    # below would reuse them and every Linear/LayerNorm weight of the module
+    # would silently receive no gradient (only the LSTM cores, which run in fp32
+    # outside autocast, kept training).  Drop the cache so the training pass
+    # re-casts the weights with grad tracking.  No-op when autocast is off.
+    torch.clear_autocast_cache()
     start = seq_len - window
     history_end = window - start
     known_position = warmup['pred_obj_trans'][:, start:window].detach()

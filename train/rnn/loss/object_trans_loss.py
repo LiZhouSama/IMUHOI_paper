@@ -3,7 +3,7 @@ ObjectTransModule的损失函数
 """
 import torch
 import torch.nn.functional as F
-from utils.rotation_conversions import matrix_to_rotation_6d
+from utils.rotation_conversions import matrix_to_rotation_6d, rotation_6d_to_matrix
 from utils.human_pose import select_hand_anchor_positions
 from utils.object_fusion import build_contact_fusion_weights
 from configs import FRAME_RATE, _REDUCED_POSE_NAMES
@@ -75,12 +75,17 @@ class ObjectTransLoss:
         'prior_hoi_r',
         'state_conf',
         'grasp_mode',
+        'bimanual_hoi',
+        'bimanual_prior',
         'lhand_obj_direction',
         'rhand_obj_direction',
         'lhand_lb',
         'rhand_lb',
         'lhand_lb_cons',
         'rhand_lb_cons',
+        'lhand_bone_cons',
+        'rhand_bone_cons',
+        'lhand_bone_acc_smooth', 'rhand_bone_acc_smooth',
         'hoi_error_l',
         'hoi_error_r',
         'hoi_fused_l',
@@ -102,12 +107,17 @@ class ObjectTransLoss:
         'prior_hoi_r',
         'state_conf',
         'grasp_mode',
+        'bimanual_hoi',
+        'bimanual_prior',
         'lhand_obj_direction',
         'rhand_obj_direction',
         'lhand_lb',
         'rhand_lb',
         'lhand_lb_cons',
         'rhand_lb_cons',
+        'lhand_bone_cons',
+        'rhand_bone_cons',
+        'lhand_bone_acc_smooth', 'rhand_bone_acc_smooth',
         'hoi_error_l',
         'hoi_error_r',
         'hoi_fused_l',
@@ -127,6 +137,8 @@ class ObjectTransLoss:
         'rhand_lb',
         'lhand_lb_cons',
         'rhand_lb_cons',
+        'lhand_bone_cons',
+        'rhand_bone_cons',
         'hoi_error_l',
         'hoi_error_r',
         'hoi_fused_l',
@@ -146,6 +158,12 @@ class ObjectTransLoss:
         # grasp-latent contact modes (object_trans_grasp_modes): BCE of the
         # per-hand rigidity against "GT bone speed below grasp_mode_speed_threshold".
         'grasp_mode',
+        'bimanual_hoi',
+        'bimanual_prior',
+        # bone-vector temporal consistency (object-frame direction x length):
+        # the vector generalisation of lhand_lb_cons, off unless configured.
+        'lhand_bone_cons', 'rhand_bone_cons',
+        'lhand_bone_acc_smooth', 'rhand_bone_acc_smooth',
     )
     
     def __init__(self, weights=None):
@@ -157,6 +175,29 @@ class ObjectTransLoss:
         self.state_conf_threshold = float((weights or {}).get('state_conf_threshold', 0.10))
         self.grasp_mode_speed_threshold = float((weights or {}).get('grasp_mode_speed_threshold', 0.05))
         self.bigrasp_quality_temperature = max(float(self.weights.get('bigrasp_quality_temperature', 0.05)), 1e-6)
+
+    @staticmethod
+    def _bone_consistency_terms(pred_dir, pred_lb, dir_gt, lb_gt, mask):
+        """MSE between predicted and GT frame-to-frame deltas of the object-frame bone vector (m/s)."""
+        vec_pred = pred_dir * pred_lb.unsqueeze(-1)
+        vec_gt = dir_gt * lb_gt.unsqueeze(-1)
+        zero = vec_pred.new_zeros(())
+        return _masked_mse(
+            (vec_pred[:, 1:] - vec_pred[:, :-1]) * FRAME_RATE,
+            (vec_gt[:, 1:] - vec_gt[:, :-1]) * FRAME_RATE,
+            mask[:, 1:] & mask[:, :-1], zero,
+        )
+
+    @staticmethod
+    def _bone_acc_smooth(pred_dir, pred_lb, mask):
+        """Zero-target acceleration regularizer, on three consecutive contact frames."""
+        with torch.autocast(device_type=pred_dir.device.type, enabled=False):
+            vector = pred_dir.float() * pred_lb.float().unsqueeze(-1)
+            if vector.shape[1] < 3:
+                return vector.sum() * 0.
+            acceleration = (vector[:, 2:] - 2 * vector[:, 1:-1] + vector[:, :-2]) * FRAME_RATE ** 2
+            valid = mask[:, 2:] & mask[:, 1:-1] & mask[:, :-2]
+            return _masked_mse(acceleration, torch.zeros_like(acceleration), valid, vector.sum() * 0.)
 
     @staticmethod
     def _build_gate_weak_target(contact_prob, eps=1e-6):
@@ -382,6 +423,22 @@ class ObjectTransLoss:
                     cons_mask_r = mask_r[:, 1:] & mask_r[:, :-1]
                     losses['rhand_lb_cons'] = _masked_mse(pred_delta_r, gt_delta_r, cons_mask_r, zero)
             
+            # 骨向量（物体系方向 x 长度）的帧间差分一致性：与 lb_cons 同样对齐 GT
+            # 的差分而不是直接压 |Δbone|，刚性抓握时 GT 差分≈0，滑动时跟随 GT。
+            if seq > 1 and lhand_dir_gt is not None and rhand_dir_gt is not None:
+                for side, dir_gt, lb_gt, mask in (('l', lhand_dir_gt, lb_l_gt, mask_l), ('r', rhand_dir_gt, lb_r_gt, mask_r)):
+                    if f'pred_{side}hand_obj_direction' not in pred_dict or f'pred_{side}hand_lb' not in pred_dict:
+                        continue
+                    losses[f'{side}hand_bone_cons'] = self._bone_consistency_terms(
+                        pred_dict[f'pred_{side}hand_obj_direction'], pred_dict[f'pred_{side}hand_lb'], dir_gt, lb_gt, mask,
+                    )
+
+            for side, mask in (('l', mask_l), ('r', mask_r)):
+                key = f'{side}hand_bone_acc_smooth'
+                if self.weights.get(key, 0.) > 0 and f'pred_{side}hand_obj_direction' in pred_dict and f'pred_{side}hand_lb' in pred_dict:
+                    losses[key] = self._bone_acc_smooth(
+                        pred_dict[f'pred_{side}hand_obj_direction'], pred_dict[f'pred_{side}hand_lb'], mask)
+
             if 'pred_lhand_obj_direction' in pred_dict and lhand_dir_gt is not None:
                 losses['lhand_obj_direction'] = _masked_mse(pred_dict['pred_lhand_obj_direction'], lhand_dir_gt, mask_l, zero)
             
@@ -429,6 +486,30 @@ class ObjectTransLoss:
                 if isinstance(prior_r, torch.Tensor) and prior_r.shape == (bs, seq, 3):
                     diff_prior_r = torch.norm((prior_r - hands_in[:, :, 1]) - rel_gt_r, dim=-1)
                     losses['prior_hoi_r'] = _masked_mean(diff_prior_r, mask_r, zero)
+                # Bimanual closure (object_trans_bimanual_closure): the
+                # hand-pair-frame candidate scored with the metric-aligned HOI on
+                # GT bimanual frames, and its common-mode prior against
+                # R_gt^T (p_gt - midpoint of the GT palms).
+                bimanual = pred_dict.get('pred_bimanual_obj_trans')
+                both_mask = mask_l & mask_r
+                if isinstance(bimanual, torch.Tensor) and bimanual.shape == (bs, seq, 3):
+                    diff_bi = 0.5 * (
+                        torch.norm((bimanual - hands_in[:, :, 0]) - rel_gt_l, dim=-1)
+                        + torch.norm((bimanual - hands_in[:, :, 1]) - rel_gt_r, dim=-1)
+                    )
+                    losses['bimanual_hoi'] = _masked_mean(diff_bi, both_mask, zero)
+                prior_c = pred_dict.get('bimanual_prior_c')
+                obj_rot_gt = batch.get('obj_rot')
+                if (
+                    isinstance(prior_c, torch.Tensor) and prior_c.shape == (bs, seq, 3)
+                    and isinstance(obj_rot_gt, torch.Tensor)
+                ):
+                    obj_rot_gt = obj_rot_gt.to(device=device, dtype=prior_c.dtype)
+                    if obj_rot_gt.shape == (bs, seq, 6):
+                        rot_gt = rotation_6d_to_matrix(obj_rot_gt.reshape(-1, 6)).reshape(bs, seq, 3, 3)
+                        midpoint_gt = 0.5 * (lhand_pos_gt + rhand_pos_gt)
+                        c_gt = torch.einsum('btji,btj->bti', rot_gt, obj_trans_gt.to(prior_c.dtype) - midpoint_gt.to(prior_c.dtype))
+                        losses['bimanual_prior'] = _masked_mean(torch.norm(prior_c - c_gt, dim=-1), both_mask, zero)
 
             common_vector = pred_dict.get('bigrasp_vector_world')
             if isinstance(common_vector, torch.Tensor):

@@ -1,0 +1,25 @@
+# Experiment protocol; the launcher freezes a complete training config in outputs.
+base_config: configs/IMUHOI_train_rnn.yaml
+seed: 42
+noise_profile: egoimu_gaussian
+dataset: omomo
+paper_table: 2
+paper_targets_cm:
+  obj_trans_err_fusion_refine: 11.31
+  hoi_err_fusion: 17.44
+  mpjpe: 2.35
+  root_trans_err: 11.07
+# A scheduling criterion only, never a claim of exact paper reproduction.
+numerical_gate_relative_tolerance: 0.10
+gate_checkpoint: final
+gate_inference_mode: offline
+evaluation_modes: [offline, online]
+num_workers: 0
+eval_batch_size: 24
+minimum_free_gpu_mib: 8000
+v5ar:
+  v5_heading_normalize_imu: false
+  v5_init_noise_prob: 0.5
+  v5_obj_vel_init_noise_std: 0.2
+  v5_hand_vel_init_noise_std: 0.2
+  v5_contact_init_flip_prob: 0.0

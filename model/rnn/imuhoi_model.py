@@ -40,6 +40,7 @@ from .online import (
     TimeDictAccumulator,
     update_data_inits_from_history,
 )
+from configs import FRAME_RATE
 from utils.human_pose import select_hand_anchor_positions, select_wrist_positions
 
 
@@ -290,6 +291,60 @@ class IMUHOIModel(nn.Module):
             return vc_out
         return apply_segment_contact(vc_out, contact_init=contact_init)
 
+    # Diagnostic oracles (eval_batch_online --oracle_vc_*): temporal [B, T, 3]
+    # inputs whose finite entries replace the VelocityContact output before
+    # anything downstream reads it; NaN entries keep the prediction.
+    VC_ORACLE_KEYS = (
+        ("oracle_vc_contact", "pred_hand_contact_prob"),
+        ("oracle_vc_obj_vel", "pred_obj_vel"),
+    )
+
+    @classmethod
+    def _apply_vc_oracle(
+        cls,
+        vc_out: Dict[str, torch.Tensor],
+        data: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        if not any(isinstance(data.get(key), torch.Tensor) for key, _ in cls.VC_ORACLE_KEYS):
+            return vc_out
+        vc_out = dict(vc_out)
+        for oracle_key, output_key in cls.VC_ORACLE_KEYS:
+            oracle = data.get(oracle_key)
+            pred = vc_out.get(output_key)
+            if not isinstance(oracle, torch.Tensor) or not isinstance(pred, torch.Tensor):
+                continue
+            oracle = oracle[:, : pred.shape[1]].to(device=pred.device, dtype=pred.dtype)
+            head = pred[..., : oracle.shape[-1]]
+            head = torch.where(torch.isfinite(oracle), oracle, head)
+            vc_out[output_key] = torch.cat((head, pred[..., oracle.shape[-1]:]), dim=-1)
+        contact = vc_out.get("pred_hand_contact_prob")
+        if isinstance(data.get("oracle_vc_contact"), torch.Tensor) and isinstance(contact, torch.Tensor):
+            if isinstance(vc_out.get("pred_obj_move_prob"), torch.Tensor):
+                vc_out["pred_obj_move_prob"] = contact[..., 2:3]
+            if isinstance(vc_out.get("pred_hand_contact_prob_marginal"), torch.Tensor):
+                vc_out["pred_hand_contact_prob_marginal"] = contact[..., :2]
+            vc_out.pop("pred_hand_contact_prob_frame", None)
+        return vc_out
+
+    def _vc_window_contact_init(self, window_data: Dict[str, torch.Tensor]):
+        """VelocityContact's window initializer; diagnostic overrides only.
+
+        ``eval_vc_contact_init``: gt (GT contact at the window start, from
+        ``oracle_vc_contact_init``), neutral (0.5) or zero.  ObjectTrans keeps
+        the published initializer either way.
+        """
+        init = window_data.get("contact_init")
+        mode = getattr(self.cfg, "eval_vc_contact_init", None)
+        if not mode or not isinstance(init, torch.Tensor):
+            return init
+        if mode == "gt":
+            return window_data["oracle_vc_contact_init"][:, 0].to(init)
+        if mode == "neutral":
+            return torch.full_like(init, 0.5)
+        if mode == "zero":
+            return torch.zeros_like(init)
+        raise ValueError(f"unknown eval_vc_contact_init {mode!r}")
+
     @staticmethod
     def _resolve_hoi_hand_positions(hp_out: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Return the palm anchor positions used by VC/OT geometry."""
@@ -355,7 +410,15 @@ class IMUHOIModel(nn.Module):
         results: Dict[str, torch.Tensor],
         ot_out: Dict[str, torch.Tensor],
         data_dict: Dict[str, torch.Tensor],
+        derive: bool = True,
     ) -> None:
+        """Publish the OT-refined pose and root, keeping Stage-1 under ``stage1_*``.
+
+        ``derive=False`` skips the quantities computed from them (root
+        velocity, FK joints, full-pose rotations); the online loop does those
+        once for the whole published sequence in
+        ``_derive_refined_human_outputs`` because no later window reads them.
+        """
         refined_pose = ot_out.get("refined_pose")
         refined_root = ot_out.get("refined_root_trans")
         if not isinstance(refined_pose, torch.Tensor) or not isinstance(refined_root, torch.Tensor):
@@ -378,10 +441,32 @@ class IMUHOIModel(nn.Module):
 
         results["p_pred"] = refined_pose
         results["root_trans_pred"] = refined_root
+        if derive:
+            self._derive_refined_human_outputs(results, data_dict)
 
+    # Frame rows per FK call when the whole published sequence is derived at
+    # once (batch x time); bounds the transient memory of the batched FK.
+    DERIVE_CHUNK_ROWS = 16384
+
+    def _derive_refined_human_outputs(
+        self,
+        results: Dict[str, torch.Tensor],
+        data_dict: Dict[str, torch.Tensor],
+        chunk_rows: Optional[int] = None,
+    ) -> None:
+        """Root velocity, FK joints and full-pose rotations of the published pose.
+
+        Everything here is per frame apart from the root velocity (a backward
+        difference of ``root_trans_pred``) and the sensor-orientation smoothing,
+        which runs over all of ``data_dict["human_imu"]``: that input may extend
+        past the published frames, as the lookahead does, so every frame sees
+        the same neighbours it saw inside its own window.
+        """
+        refined_pose = results["p_pred"]
+        refined_root = results["root_trans_pred"]
         hp_module = self.human_pose_module
         human_imu = data_dict["human_imu"]
-        batch_size, seq_len = human_imu.shape[:2]
+        batch_size, seq_len = refined_pose.shape[:2]
         device = refined_pose.device
         dtype = refined_pose.dtype
 
@@ -392,7 +477,13 @@ class IMUHOIModel(nn.Module):
                 results["root_vel_pred"] = root_vel
 
         try:
-            orientation_6d = human_imu[..., -6:].to(device=device, dtype=dtype)
+            # Same (optionally smoothed) sensor orientations as the HumanPose FK, so
+            # the refined skeleton does not re-import the raw orientation noise.
+            if hasattr(hp_module, "fk_orientation_6d"):
+                orientation_6d = hp_module.fk_orientation_6d(human_imu)
+            else:
+                orientation_6d = human_imu[..., -6:]
+            orientation_6d = orientation_6d[:, :seq_len].to(device=device, dtype=dtype)
             orientation_mat = rotation_6d_to_matrix(orientation_6d.reshape(-1, 6)).reshape(
                 batch_size, seq_len, human_imu.shape[2], 3, 3
             )
@@ -407,14 +498,29 @@ class IMUHOIModel(nn.Module):
                 hp_module.body_model = hp_module.body_model.to(device)
                 hp_module.body_model_device = device
 
-            joints_local = None
-            if hasattr(hp_module, "_compute_fk_joints_batched"):
-                joints_local = hp_module._compute_fk_joints_batched(
-                    refined_pose,
-                    orientation_mat.clone(),
-                    data_dict.get("body_model_type"),
-                )
-            if isinstance(joints_local, torch.Tensor):
+            step = seq_len
+            if chunk_rows:
+                step = max(1, int(chunk_rows) // max(batch_size, 1))
+            joints_parts, full_parts = [], []
+            for start in range(0, seq_len, step):
+                pose_part = refined_pose[:, start:start + step]
+                orient_part = orientation_mat[:, start:start + step]
+                part_len = int(pose_part.shape[1])
+                if hasattr(hp_module, "_compute_fk_joints_batched"):
+                    joints_parts.append(hp_module._compute_fk_joints_batched(
+                        pose_part,
+                        orient_part.clone(),
+                        data_dict.get("body_model_type"),
+                    ))
+                if hasattr(hp_module, "_reduced_glb_6d_to_full_glb_mat"):
+                    bt = batch_size * part_len
+                    full_parts.append(hp_module._reduced_glb_6d_to_full_glb_mat(
+                        pose_part.reshape(bt, -1, 6),
+                        orient_part[:, :, :6].reshape(bt, 6, 3, 3),
+                    ).reshape(batch_size, part_len, 24, 3, 3))
+
+            if joints_parts and all(isinstance(part, torch.Tensor) for part in joints_parts):
+                joints_local = torch.cat(joints_parts, dim=1)
                 results["pred_joints_local"] = joints_local
                 joints_global = joints_local + refined_root.unsqueeze(2)
                 results["pred_joints_global"] = joints_global
@@ -422,14 +528,10 @@ class IMUHOIModel(nn.Module):
                     results["pred_hand_glb_pos"] = select_wrist_positions(joints_global)
                     results["pred_palm_glb_pos"] = select_hand_anchor_positions(joints_global)
 
-            if hasattr(hp_module, "_reduced_glb_6d_to_full_glb_mat"):
-                bt = batch_size * seq_len
-                reduced = refined_pose.reshape(bt, -1, 6)
-                orientation_flat = orientation_mat[:, :, :6].reshape(bt, 6, 3, 3)
-                full_flat = hp_module._reduced_glb_6d_to_full_glb_mat(reduced, orientation_flat)
-                full_rotmats = full_flat.reshape(batch_size, seq_len, 24, 3, 3)
+            if full_parts:
+                full_rotmats = torch.cat(full_parts, dim=1)
                 results["pred_full_pose_rotmat"] = full_rotmats
-                results["pred_full_pose_6d"] = matrix_to_rotation_6d(full_flat.reshape(-1, 3, 3)).reshape(
+                results["pred_full_pose_6d"] = matrix_to_rotation_6d(full_rotmats.reshape(-1, 3, 3)).reshape(
                     batch_size, seq_len, 24, 6
                 )
         except Exception as exc:
@@ -510,6 +612,7 @@ class IMUHOIModel(nn.Module):
             vc_out,
             data_dict.get("contact_init"),
         )
+        vc_out = self._apply_vc_oracle(vc_out, data_dict)
         results.update(vc_out)
         hoi_hand_positions = self._resolve_ot_hand_positions(hp_out)
         
@@ -739,6 +842,177 @@ class IMUHOIModel(nn.Module):
             "injection_mask": injection_mask,
         }
 
+    @staticmethod
+    def _stack_chunk_inputs(dicts):
+        """Stack per-window input dicts along the batch dimension."""
+        if len(dicts) == 1:
+            return dicts[0]
+        stacked = {}
+        for key in dicts[0]:
+            values = [item.get(key) for item in dicts]
+            if all(isinstance(value, torch.Tensor) for value in values):
+                stacked[key] = torch.cat(values, dim=0)
+            elif all(isinstance(value, (list, tuple)) for value in values):
+                stacked[key] = [entry for value in values for entry in value]
+            elif all(isinstance(value, dict) for value in values):
+                stacked[key] = IMUHOIModel._stack_chunk_inputs(values)
+            else:
+                stacked[key] = values[0]
+        return stacked
+
+    @staticmethod
+    def _split_chunk_output(output, count, batch_size):
+        """Split a chunk-batched module output back into per-window dicts."""
+        if count == 1:
+            return [output]
+        rows = []
+        for index in range(count):
+            row = {}
+            for key, value in output.items():
+                if isinstance(value, torch.Tensor) and int(value.shape[0]) == count * batch_size:
+                    row[key] = value[index * batch_size:(index + 1) * batch_size]
+                elif isinstance(value, dict):
+                    row[key] = IMUHOIModel._split_chunk_output(value, count, batch_size)[index]
+                else:
+                    row[key] = value
+            rows.append(row)
+        return rows
+
+    def _published_hp_prefix(self, published_raw, staged_stack, start, chunk_start, index, latest):
+        """Raw stage-1 HP history over ``[start, target)`` for one chunk window.
+
+        Frames before the chunk come from the accumulated history, where the
+        stage-1 aliases hold the values HP itself published; frames inside the
+        chunk come from the frames this chunk has already finalized.
+        """
+        parts = []
+        if start < chunk_start:
+            history_slice = select_time_context(published_raw, start, chunk_start)
+            parts.append({key: history_slice[key] for key in latest if key in history_slice})
+        if index > 0:
+            parts.append(
+                {key: value[:, :index] for key, value in staged_stack.items() if key in latest}
+            )
+        if not parts:
+            return {}
+        return concat_time_dicts(parts)
+
+    def _prepare_online_chunk(
+        self,
+        data_dict,
+        history,
+        targets,
+        window,
+        lookahead,
+        batch_size,
+        seq_len,
+        feedback_mode,
+        feedback_perturbation,
+        feedback_injection_frame,
+    ):
+        """Run HumanPose and VelocityContact once for a whole chunk of targets.
+
+        Every window in the chunk reads its initializers from frames at or
+        before ``targets[0] - 1``, so all of them are known before the chunk
+        starts and the two window forwards can run as one batch.  Only the
+        published-frame finalization and the ObjectTrans scan stay sequential,
+        because they consume the frame published just before them.
+        """
+        chunk_start = int(targets[0])
+        plans = []
+        for target in targets:
+            start = target - window + 1
+            end = target + lookahead + 1
+            window_data = slice_time_dict(data_dict, start, end, batch_size, seq_len)
+            window_data = update_data_inits_from_history(
+                window_data,
+                self._stage1_history_for_inits(history),
+                index=start - 1,
+                contact_index=start,
+                trans_index=start,
+                obj_vel_diff_frames=int(getattr(self.cfg, "online_obj_vel_init_diff_frames", 0) or 0),
+                hp_init_smoothing=getattr(self.human_pose_module, "smooth_history_init", None),
+                fps=float(getattr(self.cfg, "frame_rate", FRAME_RATE)),
+            )
+            plans.append(
+                {
+                    "target": target,
+                    "start": start,
+                    "window_data": window_data,
+                    "window_len": end - start,
+                    "target_local": target - start,
+                    "feedback_control": self._build_feedback_control(
+                        data_dict,
+                        start,
+                        end,
+                        mode=feedback_mode,
+                        perturbation=feedback_perturbation,
+                        injection_frame=feedback_injection_frame,
+                        target_frame=target,
+                    ),
+                }
+            )
+
+        count = len(plans)
+        hp_inputs = [self._build_hp_input_dict(plan["window_data"]) for plan in plans]
+        hp_out = self.human_pose_module.forward(self._stack_chunk_inputs(hp_inputs))
+        for plan, row in zip(plans, self._split_chunk_output(hp_out, count, batch_size)):
+            plan["hp_raw"] = row
+
+        # The published frame integrates the root from the frame before it, so
+        # this chain cannot be batched; it is one ground correction per frame.
+        finalize_history = history
+        staged = []
+        for plan in plans:
+            frame = slice_time_dict(
+                plan["hp_raw"],
+                plan["target_local"],
+                plan["target_local"] + 1,
+                batch_size,
+                plan["window_len"],
+            )
+            frame = self._finalize_hp_online_frame(frame, finalize_history)
+            plan["hp_frame"] = frame
+            staged.append(frame)
+            finalize_history = frame
+
+        published_raw = self._stage1_history_for_inits(history)
+        staged_stack = concat_time_dicts(staged)
+        vc_inputs = []
+        for index, plan in enumerate(plans):
+            hp_future = slice_time_dict(
+                plan["hp_raw"],
+                plan["target_local"] + 1,
+                plan["window_len"],
+                batch_size,
+                plan["window_len"],
+            )
+            latest = concat_time_dicts([plan["hp_frame"], hp_future])
+            prefix = self._published_hp_prefix(
+                published_raw, staged_stack, plan["start"], chunk_start, index, latest
+            )
+            hp_context = merge_latest_context(prefix, latest)
+            plan["hp_context"] = hp_context
+            window_data = plan["window_data"]
+            vc_inputs.append(
+                {
+                    "human_imu": window_data["human_imu"],
+                    "obj_imu": window_data["obj_imu"],
+                    "hand_vel_glb_init": window_data["hand_vel_glb_init"],
+                    "obj_vel_init": window_data["obj_vel_init"],
+                    "obj_trans_init": window_data["obj_trans_init"],
+                    "contact_init": self._vc_window_contact_init(window_data),
+                    "hp_out": hp_context,
+                }
+            )
+        stacked_vc_input = self._stack_chunk_inputs(vc_inputs)
+        vc_out = self.velocity_contact_module.forward(
+            stacked_vc_input, hp_out=stacked_vc_input["hp_out"]
+        )
+        for plan, row in zip(plans, self._split_chunk_output(vc_out, count, batch_size)):
+            plan["vc_out_raw"] = row
+        return plans
+
     def _inference_online_sequence(
         self,
         data_dict: Dict[str, torch.Tensor],
@@ -751,6 +1025,7 @@ class IMUHOIModel(nn.Module):
         feedback_mode: str = "normal",
         feedback_perturbation=None,
         feedback_injection_frame: Optional[int] = None,
+        online_chunk: int = 1,
     ) -> Dict[str, torch.Tensor]:
         refine_human = self._resolve_refine_human(refine_human)
         batch_size, seq_len = infer_batch_seq(data_dict)
@@ -810,123 +1085,128 @@ class IMUHOIModel(nn.Module):
         if callable(progress_callback):
             progress_callback(warmup_publish_len, publish_len)
 
-        for target in range(warmup_publish_len, publish_len):
-            start = target - window + 1
-            end = target + lookahead + 1
-            window_data = slice_time_dict(data_dict, start, end, batch_size, seq_len)
-            window_data = update_data_inits_from_history(
-                window_data,
-                self._stage1_history_for_inits(history),
-                index=start - 1,
-                contact_index=start,
-                trans_index=start,
-            )
-            window_len = end - start
-            target_local = target - start
-            prefix = select_time_context(history, start, target)
-            feedback_control = self._build_feedback_control(
+        # Windows whose initializers all predate the chunk can run their
+        # HumanPose and VelocityContact forwards as one batch; the sequential
+        # part is then the published-frame finalization plus ObjectTrans.
+        chunk = max(1, min(int(online_chunk), max(1, window - 1)))
+        deferred_refine = False
+        for chunk_start in range(warmup_publish_len, publish_len, chunk):
+            plans = self._prepare_online_chunk(
                 data_dict,
-                start,
-                end,
-                mode=feedback_mode,
-                perturbation=feedback_perturbation,
-                injection_frame=feedback_injection_frame,
-                target_frame=target,
+                history,
+                list(range(chunk_start, min(chunk_start + chunk, publish_len))),
+                window,
+                lookahead,
+                batch_size,
+                seq_len,
+                feedback_mode,
+                feedback_perturbation,
+                feedback_injection_frame,
             )
-
-            hp_out_raw = self.human_pose_module.forward(self._build_hp_input_dict(window_data))
-            hp_frame = slice_time_dict(
-                hp_out_raw, target_local, target_local + 1, batch_size, window_len
-            )
-            hp_frame = self._finalize_hp_online_frame(hp_frame, history)
-            hp_future = slice_time_dict(
-                hp_out_raw, target_local + 1, window_len, batch_size, window_len
-            )
-            hp_current_future = concat_time_dicts([hp_frame, hp_future])
-            hp_context = self._merge_raw_human_pose_context(prefix, hp_current_future)
-
-            vc_input_dict = {
-                "human_imu": window_data["human_imu"],
-                "obj_imu": window_data["obj_imu"],
-                "hand_vel_glb_init": window_data["hand_vel_glb_init"],
-                "obj_vel_init": window_data["obj_vel_init"],
-                "obj_trans_init": window_data["obj_trans_init"],
-                "contact_init": window_data.get("contact_init"),
-                "hp_out": hp_context,
-            }
-            vc_out_raw = self.velocity_contact_module.forward(vc_input_dict, hp_out=hp_context)
-            vc_out_raw = self._apply_vc_segment_contact_if_enabled(
-                vc_out_raw,
-                window_data.get("contact_init"),
-            )
-            vc_current_future = slice_time_dict(
-                vc_out_raw, target_local, window_len, batch_size, window_len
-            )
-            vc_context = self._merge_stage_context(prefix, vc_current_future)
-
-            results = {}
-            results.update(hp_context)
-            results.update(vc_context)
-
-            has_object = window_data.get("has_object")
-            if use_object_data and (has_object is None or has_object.any()):
-                lb_prior_quantiles = self._predict_lb_prior(
-                    hp_context, vc_context, window_data["obj_imu"]
+            for plan in plans:
+                target = plan["target"]
+                start = plan["start"]
+                window_data = plan["window_data"]
+                window_len = plan["window_len"]
+                target_local = plan["target_local"]
+                prefix = select_time_context(history, start, target)
+                feedback_control = plan["feedback_control"]
+                hp_context = plan["hp_context"]
+                vc_out_raw = self._apply_vc_segment_contact_if_enabled(
+                    plan["vc_out_raw"],
+                    window_data.get("contact_init"),
                 )
-                if lb_prior_quantiles is None and self._online_lb_stats_enabled():
-                    # Cross-segment statistics use the full accumulated
-                    # history, not just the current window prefix.
-                    lb_prior_quantiles = self._compute_online_lb_stats(history)
-                obj_prefix = prefix.get("pred_obj_trans")
-                gate_prefix = prefix.get("gating_weights")
-                if isinstance(obj_prefix, torch.Tensor) and obj_prefix.shape[1] > 0:
-                    ot_obj_trans_init = obj_prefix[:, 0]
-                else:
-                    ot_obj_trans_init = window_data["obj_trans_init"]
-                ot_extra_kwargs = {}
-                segment_state_keys = getattr(
-                    self.object_trans_module, "SEGMENT_STATE_OUTPUT_KEYS", None
+                vc_out_raw = self._apply_vc_oracle(vc_out_raw, window_data)
+                vc_current_future = slice_time_dict(
+                    vc_out_raw, target_local, window_len, batch_size, window_len
                 )
-                if segment_state_keys and isinstance(prefix, dict):
-                    # Segment-latching OTs publish their latch state; hand it
-                    # back so the window continues the segment instead of
-                    # re-deriving it from the published trajectory.
-                    ot_extra_kwargs["known_segment_state_prefix"] = {
-                        key: prefix.get(key) for key in segment_state_keys
-                    }
-                ot_out = self.object_trans_module.forward(
-                    self._resolve_ot_hand_positions(hp_context),
-                    vc_context["pred_hand_contact_prob"],
-                    ot_obj_trans_init,
-                    obj_imu=window_data["obj_imu"],
-                    human_imu=window_data["human_imu"],
-                    obj_vel_input=vc_context["pred_obj_vel"],
-                    contact_init=window_data.get("contact_init"),
-                    has_object_mask=has_object,
-                    human_pose_input=hp_context.get("p_pred"),
-                    root_trans_input=hp_context.get("root_trans_pred"),
-                    lb_prior_quantiles=lb_prior_quantiles,
-                    enable_refine=refine_human,
-                    known_obj_trans_prefix=obj_prefix,
-                    known_gating_weights_prefix=gate_prefix,
-                    feedback_control=feedback_control,
-                    **ot_extra_kwargs,
-                )
-                results.update(ot_out)
-                if refine_human:
-                    self._promote_refined_human_outputs(results, ot_out, window_data)
-                if compute_fk:
-                    self._compute_fk_output(results, vc_context, window_data, ot_obj_trans_init)
+                vc_context = self._merge_stage_context(prefix, vc_current_future)
 
-            results["has_object"] = has_object
-            frame = slice_time_dict(
-                results, target_local, target_local + 1, batch_size, window_len
+                results = {}
+                results.update(hp_context)
+                results.update(vc_context)
+
+                has_object = window_data.get("has_object")
+                if use_object_data and (has_object is None or has_object.any()):
+                    lb_prior_quantiles = self._predict_lb_prior(
+                        hp_context, vc_context, window_data["obj_imu"]
+                    )
+                    if lb_prior_quantiles is None and self._online_lb_stats_enabled():
+                        # Cross-segment statistics use the full accumulated
+                        # history, not just the current window prefix.
+                        lb_prior_quantiles = self._compute_online_lb_stats(history)
+                    obj_prefix = prefix.get("pred_obj_trans")
+                    gate_prefix = prefix.get("gating_weights")
+                    if isinstance(obj_prefix, torch.Tensor) and obj_prefix.shape[1] > 0:
+                        ot_obj_trans_init = obj_prefix[:, 0]
+                    else:
+                        ot_obj_trans_init = window_data["obj_trans_init"]
+                    ot_extra_kwargs = {}
+                    if getattr(self.object_trans_module, "SUPPORTS_FAST_KNOWN_PREFIX", False):
+                        # Only frame ``target_local`` is published from this window
+                        # and every OT branch is causal, so the teacher-forced
+                        # prefix can run as one batched LSTM call and the lookahead
+                        # tail does not need to be scanned at all.
+                        ot_extra_kwargs["fast_known_prefix"] = True
+                        ot_extra_kwargs["scan_end"] = target_local + 1
+                    segment_state_keys = getattr(
+                        self.object_trans_module, "SEGMENT_STATE_OUTPUT_KEYS", None
+                    )
+                    if segment_state_keys and isinstance(prefix, dict):
+                        # Segment-latching OTs publish their latch state; hand it
+                        # back so the window continues the segment instead of
+                        # re-deriving it from the published trajectory.
+                        ot_extra_kwargs["known_segment_state_prefix"] = {
+                            key: prefix.get(key) for key in segment_state_keys
+                        }
+                    ot_out = self.object_trans_module.forward(
+                        self._resolve_ot_hand_positions(hp_context),
+                        vc_context["pred_hand_contact_prob"],
+                        ot_obj_trans_init,
+                        obj_imu=window_data["obj_imu"],
+                        human_imu=window_data["human_imu"],
+                        obj_vel_input=vc_context["pred_obj_vel"],
+                        contact_init=window_data.get("contact_init"),
+                        has_object_mask=has_object,
+                        human_pose_input=hp_context.get("p_pred"),
+                        root_trans_input=hp_context.get("root_trans_pred"),
+                        lb_prior_quantiles=lb_prior_quantiles,
+                        enable_refine=refine_human,
+                        known_obj_trans_prefix=obj_prefix,
+                        known_gating_weights_prefix=gate_prefix,
+                        feedback_control=feedback_control,
+                        **ot_extra_kwargs,
+                    )
+                    results.update(ot_out)
+                    if refine_human:
+                        # Later windows read only the stage1_* values, so the
+                        # refined skeleton is output-only: one FK call per
+                        # published frame (host/sync bound, whatever its
+                        # length) becomes one call after the loop.  The FK
+                        # object baseline still needs refined palms per window.
+                        self._promote_refined_human_outputs(
+                            results, ot_out, window_data, derive=compute_fk
+                        )
+                        deferred_refine = deferred_refine or not compute_fk
+                    if compute_fk:
+                        self._compute_fk_output(results, vc_context, window_data, ot_obj_trans_init)
+
+                results["has_object"] = has_object
+                frame = slice_time_dict(
+                    results, target_local, target_local + 1, batch_size, window_len
+                )
+                history = history_acc.append(frame)
+                if callable(progress_callback):
+                    progress_callback(target + 1, publish_len)
+
+        output = history_acc.current()
+        if deferred_refine:
+            # The warmup block was derived inside its own forward; redoing it
+            # here is per frame and gives the same values.
+            self._derive_refined_human_outputs(
+                output, data_dict, chunk_rows=self.DERIVE_CHUNK_ROWS
             )
-            history = history_acc.append(frame)
-            if callable(progress_callback):
-                progress_callback(target + 1, publish_len)
-
-        return history_acc.current()
+        return output
 
     def inference(
         self,
@@ -940,6 +1220,7 @@ class IMUHOIModel(nn.Module):
         online_window: Optional[int] = None,
         online_lookahead: Optional[int] = None,
         online_progress_callback=None,
+        online_chunk: Optional[int] = None,
         online_state: Optional[dict] = None,
         return_online_state: bool = False,
         feedback_mode: str = "normal",
@@ -979,6 +1260,9 @@ class IMUHOIModel(nn.Module):
 
         window = resolve_online_window(self.cfg, online_window)
         lookahead = resolve_online_lookahead(self.cfg, online_lookahead)
+        # Windows whose initializers predate the chunk share one HP/VC forward.
+        # 1 keeps the original one-window-per-frame schedule.
+        chunk = online_chunk if online_chunk is not None else getattr(self.cfg, "online_chunk", 1)
         previous_output_len = 0
         if isinstance(online_state, dict):
             previous_output_len = int(online_state.get("emitted_len", 0))
@@ -997,6 +1281,7 @@ class IMUHOIModel(nn.Module):
             feedback_mode=feedback_mode,
             feedback_perturbation=feedback_perturbation,
             feedback_injection_frame=feedback_injection_frame,
+            online_chunk=int(chunk or 1),
         )
         _, output_len = infer_batch_seq(output, key="p_pred")
         state = {"data_dict": run_data, "outputs": output, "emitted_len": output_len}

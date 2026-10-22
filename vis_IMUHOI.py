@@ -1,9 +1,12 @@
 import torch
 import os
 import sys
+import threading
+import time as _walltime
 import numpy as np
 import random
 import argparse
+from dataclasses import dataclass
 import yaml
 import re
 import types
@@ -47,8 +50,10 @@ from utils.dataset_config import (
     get_full_sequence_test_path,
     resolve_dataset_path,
 )
+from utils.vis_model_spec import resolve_vis_models
 from utils.utils import (
     apply_eval_imu_noise_to_sequence,
+    load_checkpoint,
     load_config,
     load_smpl_model,
     build_model_input_dict,
@@ -80,15 +85,11 @@ R_yup = torch.tensor([[1.0, 0.0, 0.0],
                       [0.0, 1.0, 0.0],
                       [0.0, 0.0, 1.0]], dtype=torch.float32)
 
-OBJ_TRAJ_RADIUS = 0.006
 HAND_TRAJ_RADIUS = 0.004
-
-OBJ_TRAJ_COLORS = {
-    "gt": (0.1, 0.8, 0.3, 1),
-    "pred": (0.9, 0.2, 0.2, 1),
-    "pred_imu": (0.2, 0.2, 0.9, 1),
-    "fk": (1.0, 1.0, 0.0, 1),
-}
+# Probability -> opacity mapping shared by --show_hand_traj and the predicted
+# object under --show_obj_move: alpha = MIN + (MAX - MIN) * prob.
+PROB_MIN_ALPHA = 0.08
+PROB_MAX_ALPHA = 0.95
 
 HAND_TRAJ_COLORS = {
     "gt_l": (1.0, 0.0, 0.0, 1),
@@ -99,9 +100,44 @@ HAND_TRAJ_COLORS = {
 
 GT_HUMAN_COLOR = (118/255, 147/255, 248/255, 0.9)
 GT_OBJECT_COLOR = (186/255, 161/255, 246/255, 0.9)
+# --show_obj_move: GT and predicted objects are coloured per frame from obj_move
+# (GT: obj_contact label; prediction: pred_obj_move_prob > 0.5).
+OBJ_MOVE_MOVING_COLOR = (0.95, 0.40, 0.15, 0.9)
+OBJ_MOVE_STATIC_COLOR = GT_OBJECT_COLOR
 
 PRED_HUMAN_COLOR = (246 / 255, 153 / 255, 19 / 255, 153/255)
 PRED_OBJECT_COLOR = (255 / 255, 82 / 255, 0 / 255, 153/255)
+
+# One colour set per prediction lane (repeated --model); lane 1 is also the
+# single-model set.  GT owns blue/lavender, so no lane uses them.  Under
+# --show_obj_move the object keeps the shared moving/static colours instead.
+PRED_LANE_COLORS = (
+    {"name": "orange", "human": PRED_HUMAN_COLOR, "object": PRED_OBJECT_COLOR,
+     "lhand": HAND_TRAJ_COLORS["pred_l"], "rhand": HAND_TRAJ_COLORS["pred_r"]},
+    {"name": "green", "human": (70 / 255, 185 / 255, 90 / 255, 153 / 255),
+     "object": (0 / 255, 125 / 255, 55 / 255, 153 / 255),
+     "lhand": (0.45, 0.85, 0.2, 1), "rhand": (0.0, 0.6, 0.45, 1)},
+    {"name": "magenta", "human": (220 / 255, 90 / 255, 200 / 255, 153 / 255),
+     "object": (150 / 255, 30 / 255, 135 / 255, 153 / 255),
+     "lhand": (1.0, 0.35, 0.7, 1), "rhand": (0.65, 0.3, 1.0, 1)},
+    {"name": "yellow", "human": (230 / 255, 205 / 255, 50 / 255, 153 / 255),
+     "object": (170 / 255, 135 / 255, 0 / 255, 153 / 255),
+     "lhand": (1.0, 0.9, 0.0, 1), "rhand": (0.8, 0.5, 0.0, 1)},
+    {"name": "teal", "human": (40 / 255, 190 / 255, 190 / 255, 153 / 255),
+     "object": (0 / 255, 120 / 255, 120 / 255, 153 / 255),
+     "lhand": (0.2, 0.9, 0.9, 1), "rhand": (0.0, 0.55, 0.6, 1)},
+)
+
+
+def _lane_colors(lane):
+    """Colour set of 1-based prediction lane ``lane`` (cycles past the palette)."""
+    return PRED_LANE_COLORS[(int(lane) - 1) % len(PRED_LANE_COLORS)]
+
+
+def _lane_offset(pred_offset, lane):
+    """Lane ``lane`` sits ``lane`` steps of --pred_offset from GT."""
+    step = np.asarray((1.0, 0.0, 0.0) if pred_offset is None else pred_offset, dtype=np.float32)
+    return (int(lane) * step).astype(np.float32)
 
 
 def _unwrap_model(model):
@@ -137,6 +173,75 @@ def _infer_model_kind(model):
     return "unknown"
 
 
+@dataclass
+class ComparisonModel:
+    label: str
+    config: object
+    model: object
+    ot_refine: bool
+
+
+def _load_comparison_models(specs, dataset, no_trans=False):
+    """Strictly load each manifest variant, parked on CPU between predictions."""
+    cpu = torch.device("cpu")
+    bundles = []
+    for spec in specs:
+        config = load_config(str(spec.config_path))
+        if str(getattr(config, "model_arch", "rnn")).lower() != "rnn":
+            raise ValueError(f"{spec.label}: --model variant directories currently require an RNN pipeline")
+        ot_arch = _normalize_object_trans_arch(getattr(config, "object_trans_arch", spec.object_trans_arch))
+        vc_arch = normalize_velocity_contact_arch(getattr(config, "velocity_contact_arch", spec.velocity_contact_arch))
+        if ot_arch.lower() != spec.object_trans_arch.lower() or vc_arch != normalize_velocity_contact_arch(spec.velocity_contact_arch):
+            raise ValueError(f"{spec.label}: config OT/VC architectures do not match its experiment manifest")
+        if dataset not in get_dataset_configs(config):
+            raise ValueError(f"{spec.label}: dataset {dataset!r} is absent from its config")
+        config.device = str(cpu)
+        config.object_trans_arch = ot_arch
+        config.velocity_contact_arch = vc_arch
+        model = load_model(config, cpu, no_trans=no_trans)
+        for module_name, path in spec.checkpoints.items():
+            module = getattr(_unwrap_model(model), f"{module_name}_module", None)
+            if module is None:
+                raise ValueError(f"{spec.label}: missing {module_name} module for checkpoint {path}")
+            # Modular RNN default loading is non-strict for VC/OT and can leave
+            # randomly initialized layers in a mismatched architecture. A
+            # comparison must fail instead of displaying that partial model.
+            load_checkpoint(module, str(path), cpu, strict=True)
+        model.eval()
+        print(f"[Vis] {spec.label}: OT={ot_arch}, VC={vc_arch}, config={spec.config_path}")
+        for module_name, path in spec.checkpoints.items():
+            print(f"[Vis]   {module_name}: {path}")
+        bundles.append(ComparisonModel(
+            spec.label, config, model,
+            False if is_imuhoi_object_trans_arch(ot_arch) else bool(getattr(config, "enable_ot_refine", False)),
+        ))
+    return bundles
+
+
+def _comparison_prediction_length(prediction, batch_length):
+    """Shared display length across the full GT sequence and every prediction."""
+    source = prediction.get("p_pred")
+    if not isinstance(source, torch.Tensor):
+        source = prediction.get("root_trans_pred")
+    if not isinstance(source, torch.Tensor) or source.ndim < 2:
+        raise ValueError("Pipeline prediction is missing a time-indexed human pose/root")
+    length = min(int(batch_length), int(source.shape[1]))
+    if length < 1:
+        raise ValueError("Online inference produced no publishable frames")
+    return length
+
+
+def _move_comparison_model(bundle, device):
+    bundle.model.to(device)
+    core = _unwrap_model(bundle.model)
+    core.device = device
+    human = _get_human_pose_module(bundle.model)
+    if human is not None:
+        human.device = device
+        if getattr(human, "body_model", None) is not None:
+            human.body_model_device = device
+
+
 def _global_to_local_rotmat(global_rotmats, parents):
     if global_rotmats.dim() != 4 or global_rotmats.shape[-2:] != (3, 3):
         raise ValueError(f"Expected [T, J, 3, 3], got {tuple(global_rotmats.shape)}")
@@ -154,6 +259,247 @@ def _global_to_local_rotmat(global_rotmats, parents):
     return local_rotmats
 
 
+class SequenceCancelled(BaseException):
+    """Raised inside a sequence job once the user has asked for another one.
+
+    It derives from BaseException on purpose: the visualization pipeline wraps
+    every stage in ``except Exception`` so that one failing branch still shows
+    the rest, and a cancellation must pass straight through those handlers.
+    """
+
+
+_JOB_CONTEXT = threading.local()
+
+
+def _raise_if_cancelled():
+    """Cancellation checkpoint; a no-op outside a background sequence job."""
+    job = getattr(_JOB_CONTEXT, "job", None)
+    if job is not None and job.cancel.is_set():
+        raise SequenceCancelled()
+
+
+def _cancel_check_callback(_completed=None, _total=None):
+    """Online-inference progress hook: checked once per published frame."""
+    _raise_if_cancelled()
+
+
+def _format_seconds(seconds):
+    seconds = max(0.0, float(seconds))
+    if seconds < 60.0:
+        return f"{seconds:.0f}s"
+    minutes, rest = divmod(int(round(seconds)), 60)
+    return f"{minutes}m{rest:02d}s"
+
+
+class _ProgressLine:
+    """A single terminal line that long inference passes keep overwriting.
+
+    Worker and GL thread both print, so writes go through one lock, and any
+    other message first calls ``break_line`` so it does not land on the end of
+    a half-drawn progress line.  When stdout is not a terminal, ``\\r`` would
+    only produce one enormous line, so updates become ordinary lines at a
+    slower rate instead.
+    """
+
+    TTY_INTERVAL = 0.25
+    PLAIN_INTERVAL = 10.0
+
+    def __init__(self, stream=None):
+        self._stream = stream
+        self._lock = threading.Lock()
+        self._open = False
+
+    @property
+    def stream(self):
+        return self._stream if self._stream is not None else sys.stdout
+
+    def is_tty(self):
+        try:
+            return bool(self.stream.isatty())
+        except Exception:
+            return False
+
+    def interval(self):
+        return self.TTY_INTERVAL if self.is_tty() else self.PLAIN_INTERVAL
+
+    @staticmethod
+    def _fit(label, body, width):
+        """``[label] body`` within ``width``, shortening the label first."""
+        text = f"[{label}] {body}"
+        if len(text) <= width:
+            return text
+        room = width - len(body) - 3
+        if room >= 8:
+            return f"[{label[:room - 3]}...] {body}"
+        return body[:width]
+
+    def update(self, label, body, final=False):
+        with self._lock:
+            stream = self.stream
+            if self.is_tty():
+                import shutil
+
+                # A wrapped line cannot be overwritten with \r, so clip it,
+                # keeping the numbers.  A pty with no size set reports 0
+                # columns: treat that as unknown.
+                columns = shutil.get_terminal_size((120, 20)).columns
+                width = (columns if columns > 0 else 120) - 1
+                text = self._fit(label, body, width)
+                stream.write("\r" + text + "\x1b[K" + ("\n" if final else ""))
+                self._open = not final
+            else:
+                stream.write(f"[{label}] {body}\n")
+                self._open = False
+            stream.flush()
+
+    def break_line(self):
+        with self._lock:
+            if self._open:
+                self.stream.write("\n")
+                self.stream.flush()
+                self._open = False
+
+
+_PROGRESS_LINE = _ProgressLine()
+
+
+class _InferenceProgress:
+    """Online progress callback: cancellation checkpoint plus a live ETA line.
+
+    The pipeline reports the warmup block in one call and then every published
+    frame, so the rate is measured from the first report: the warmup is a
+    single batched forward and would make the ETA far too optimistic.
+    """
+
+    def __init__(self, label, line=None, clock=None):
+        self.label = label
+        self.line = line if line is not None else _PROGRESS_LINE
+        self.clock = clock if clock is not None else _walltime.perf_counter
+        self.started = self.clock()
+        self._first = None
+        self._last_draw = None
+        self._finished = False
+
+    def __call__(self, completed=None, total=None):
+        _raise_if_cancelled()
+        if completed is None or not total or self._finished:
+            return
+        now = self.clock()
+        completed, total = int(completed), int(total)
+        if self._first is None:
+            self._first = (completed, now)
+        final = completed >= total
+        if not final and self._last_draw is not None and now - self._last_draw < self.line.interval():
+            return
+        self._last_draw = now
+        elapsed = now - self.started
+        first_done, first_at = self._first
+        if final:
+            self._finished = True
+            fps = completed / elapsed if elapsed > 0 else 0.0
+            body = f"{completed}/{total} frames in {_format_seconds(elapsed)} ({fps:.1f} fps)"
+        else:
+            span = now - first_at
+            rate = (completed - first_done) / span if span > 0 else 0.0
+            eta = _format_seconds((total - completed) / rate) if rate > 0 else "--"
+            body = (f"{completed}/{total} frames {100.0 * completed / total:5.1f}% | "
+                    f"{rate:.1f} fps | elapsed {_format_seconds(elapsed)} | ETA {eta}")
+        self.line.update(self.label, body, final=final)
+
+    def close(self):
+        """End a line that an interruption or an error left half drawn."""
+        self.line.break_line()
+
+
+def _progress_label(model_label=None):
+    job = getattr(_JOB_CONTEXT, "job", None)
+    parts = [part for part in (getattr(job, "label", None), model_label) if part]
+    return " | ".join(parts) or "inference"
+
+
+class _RecordingScene:
+    """Scene stand-in for a worker thread: reads pass through, edits are queued.
+
+    aitviewer nodes may only be added, removed and released on the GL thread,
+    so a background job records its scene edits and the render loop applies
+    them in one go once the job has finished.
+    """
+
+    def __init__(self, scene, ops):
+        self._scene = scene
+        self._ops = ops
+
+    def add(self, *nodes, **kwargs):
+        self._ops.append(("add", nodes, kwargs))
+
+    def remove(self, *nodes):
+        self._ops.append(("remove", nodes, {}))
+
+    def collect_nodes(self, *args, **kwargs):
+        return list(self._scene.collect_nodes(*args, **kwargs))
+
+    def __getattr__(self, name):
+        return getattr(self._scene, name)
+
+
+class _WorkerViewerProxy:
+    """The viewer as a background job sees it: a recording scene, shared state."""
+
+    def __init__(self, viewer, ops):
+        object.__setattr__(self, "_viewer", viewer)
+        object.__setattr__(self, "scene", _RecordingScene(viewer.scene, ops))
+
+    def __getattr__(self, name):
+        return getattr(self._viewer, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._viewer, name, value)
+
+
+class _LaneScene:
+    """Name every prediction node after its model, without touching GT nodes."""
+
+    def __init__(self, scene, label):
+        self._scene = scene
+        self._label = label
+
+    def add(self, *nodes, **kwargs):
+        for node in nodes:
+            if getattr(node, "name", None) and not node.name.startswith("GT-"):
+                node.name = f"Pred-{self._label}::{node.name}"
+        self._scene.add(*nodes, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._scene, name)
+
+
+class _LaneViewer:
+    def __init__(self, viewer, label, config):
+        object.__setattr__(self, "_viewer", viewer)
+        object.__setattr__(self, "scene", _LaneScene(viewer.scene, label))
+        object.__setattr__(self, "config", config)
+
+    def __getattr__(self, name):
+        return getattr(self._viewer, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._viewer, name, value)
+
+
+class _SequenceJob:
+    def __init__(self, index, generation):
+        self.index = index
+        self.generation = generation
+        self.label = None            # sequence name, prefixes the progress line
+        self.cancel = threading.Event()
+        self.ops = []
+        self.status = "running"      # running | done | cancelled | failed
+        self.title = None
+        self.started_at = _walltime.perf_counter()
+        self.finished_at = None
+        self.cancel_requested_at = None
+
+
 def _run_model_prediction(
     model,
     model_input,
@@ -164,6 +510,8 @@ def _run_model_prediction(
     inference_mode="online",
     online_window=None,
     online_lookahead=5,
+    online_chunk=1,
+    progress_label=None,
 ):
     model_kind = _infer_model_kind(model)
 
@@ -171,13 +519,29 @@ def _run_model_prediction(
         kwargs.setdefault("inference_mode", inference_mode)
         kwargs.setdefault("online_window", online_window)
         kwargs.setdefault("online_lookahead", online_lookahead)
+        kwargs.setdefault("online_chunk", online_chunk)
+        # Called once per published frame, which is what lets a key press
+        # interrupt a long online pass instead of waiting for it; it also
+        # redraws the progress/ETA line.
+        progress = _InferenceProgress(_progress_label(progress_label))
+        kwargs.setdefault("online_progress_callback", progress)
         try:
             return model.inference(*args, **kwargs)
-        except TypeError:
+        except TypeError as exc:
+            progress.close()
+            print(f"[vis] model.inference rejected the online arguments ({exc!r}); "
+                  "retrying without them", flush=True)
+            import traceback
+            traceback.print_exc()
             kwargs.pop("inference_mode", None)
             kwargs.pop("online_window", None)
             kwargs.pop("online_lookahead", None)
+            kwargs.pop("online_chunk", None)
+            kwargs.pop("online_progress_callback", None)
             return model.inference(*args, **kwargs)
+        finally:
+            # A cancellation or an error leaves the line half drawn.
+            progress.close()
 
     if model_kind == "human_pose":
         if hasattr(model, "inference"):
@@ -214,40 +578,11 @@ def compute_virtual_bone_info(wrist_pos, obj_trans, obj_rot_mat):
     return bone_length, obj_direction
 
 
-def _to_np_yup(points_torch, device):
+def _to_np_yup(points_torch, device=None):
     if points_torch is None or points_torch.dim() != 2 or points_torch.shape[0] < 2:
         return None
-    points_yup = torch.matmul(points_torch, R_yup.T.to(device))
+    points_yup = torch.matmul(points_torch, R_yup.T.to(points_torch.device))
     return points_yup.detach().cpu().numpy()
-
-
-def _add_line_node_if_nonempty(viewer, points_torch, device, name, color, r_base, mode):
-    if points_torch is None:
-        return
-    if points_torch.dim() != 2 or points_torch.shape[0] < 2:
-        return
-
-    draw_points = points_torch
-    if mode == "lines" and draw_points.shape[0] % 2 != 0:
-        draw_points = draw_points[:-1]
-    if draw_points.shape[0] < 2:
-        return
-
-    points_np = _to_np_yup(draw_points, device)
-    if points_np is None:
-        return
-
-    line_node = Lines(
-        lines=points_np,
-        mode=mode,
-        r_base=r_base,
-        color=color,
-        cast_shadow=False,
-        name=name,
-        gui_affine=False,
-        is_selectable=False,
-    )
-    viewer.scene.add(line_node)
 
 
 def _add_prob_traj_nodes(
@@ -258,8 +593,8 @@ def _add_prob_traj_nodes(
     name_prefix,
     base_color,
     r_base,
-    min_alpha=0.08,
-    max_alpha=0.95,
+    min_alpha=PROB_MIN_ALPHA,
+    max_alpha=PROB_MAX_ALPHA,
 ):
     if points_torch is None or prob_torch is None:
         return
@@ -358,7 +693,7 @@ def _add_overlay_meshes(viewer, verts_seq, faces_np, frame_ids, base_name, base_
         if frame_id < 0 or frame_id >= max_frames:
             continue
         frame_verts = verts_seq[frame_id:frame_id + 1]
-        frame_verts_yup = torch.matmul(frame_verts, R_yup.T.to(device))
+        frame_verts_yup = torch.matmul(frame_verts, R_yup.T.to(frame_verts.device))
         alpha = float(alpha_values[idx]) if idx < len(alpha_values) else 0.95
         mesh = Meshes(
             frame_verts_yup.detach().cpu().numpy(), faces_np,
@@ -371,12 +706,184 @@ def _add_overlay_meshes(viewer, verts_seq, faces_np, frame_ids, base_name, base_
         viewer.scene.add(mesh)
 
 
+class StableMeshes(Meshes):
+    """Meshes that re-upload only what actually changed.
+
+    aitviewer rewrites positions, vertex normals *and* vertex colors on every
+    buffer upload.  Here the colors are one uniform value for the whole
+    sequence, so that write is pure traffic, and under WSL's D3D12 OpenGL
+    translation every write costs driver memory that is reclaimed lazily.  On a
+    6890-vertex body the colors are 110 KB of the 276 KB written per frame.
+    """
+
+    def _upload_buffers(self):
+        if not self.is_renderable or not self._need_upload:
+            return
+        if (
+            self.face_colors is not None
+            or self.has_texture
+            or self.instance_transforms is not None
+        ):
+            super()._upload_buffers()
+            return
+
+        frame_id = self.current_frame_id if self.vertices.shape[0] > 1 else 0
+        color_key = tuple(np.asarray(self.material.color).reshape(-1).tolist())
+        per_vertex_colors = not self._use_uniform_color
+
+        if frame_id != getattr(self, "_uploaded_frame_id", None):
+            self.vbo_vertices.write(self.current_vertices.astype("f4").tobytes())
+            if not self.flat_shading:
+                self.vbo_normals.write(
+                    self.vertex_normals_at(frame_id).astype("f4").tobytes()
+                )
+        if per_vertex_colors or color_key != getattr(self, "_uploaded_color_key", None):
+            self.vbo_colors.write(self.current_vertex_colors.astype("f4").tobytes())
+            self._uploaded_color_key = color_key
+
+        self._uploaded_frame_id = frame_id
+        self._need_upload = False
+
+    def release_normals_cache(self):
+        """Drop the per-frame normal cache, which is 250 KB per cached frame."""
+        self.compute_vertex_and_face_normals.cache_clear()
+
+
+class FrameColoredMeshes(StableMeshes):
+    """Uniform-colour mesh whose colour follows a per-frame label.
+
+    Only ``material.color`` is swapped on frame change (the shader reads it as a
+    uniform), so a per-frame label costs no per-vertex colour buffer.
+    """
+
+    def __init__(self, vertices, faces, frame_colors, **kwargs):
+        frame_colors = np.asarray(frame_colors, dtype=np.float32).reshape(-1, 4)
+        if frame_colors.shape[0] == 0:
+            raise ValueError("frame_colors must not be empty")
+        self._frame_colors = frame_colors
+        super().__init__(vertices, faces, color=tuple(frame_colors[0].tolist()), **kwargs)
+
+    def on_frame_update(self):
+        index = min(int(self.current_frame_id), self._frame_colors.shape[0] - 1)
+        self.material.color = tuple(self._frame_colors[index].tolist())
+        super().on_frame_update()
+
+
+def _obj_move_frame_colors(obj_move_seq, num_frames):
+    """[num_frames, 4] colours from a bool obj_move sequence (padded with the last label)."""
+    labels = obj_move_seq.detach().cpu().bool().numpy().reshape(-1)[:num_frames]
+    if labels.shape[0] < num_frames:
+        pad_value = labels[-1] if labels.shape[0] else False
+        labels = np.concatenate((labels, np.full(num_frames - labels.shape[0], pad_value)))
+    return np.where(
+        labels[:, None],
+        np.asarray(OBJ_MOVE_MOVING_COLOR, dtype=np.float32),
+        np.asarray(OBJ_MOVE_STATIC_COLOR, dtype=np.float32),
+    )
+
+
+def _format_obj_move_segments(obj_move_seq):
+    """Summarise obj_move as '[start-end]' runs of moving frames (inclusive, 0-based)."""
+    labels = obj_move_seq.detach().cpu().bool().numpy().reshape(-1)
+    runs, start = [], None
+    for index, value in enumerate(labels):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            runs.append(f"{start}-{index - 1}")
+            start = None
+    if start is not None:
+        runs.append(f"{start}-{labels.shape[0] - 1}")
+    return runs
+
+
+def _smpl_forward_chunked(smpl_model, pose_body, root_orient, trans, chunk=256):
+    """SMPL over a long sequence in slices.
+
+    The body model's skinning intermediates scale with frames x vertices, so a
+    whole sequence in one call peaks at gigabytes (3.5 GiB at 3920 frames) and
+    the caching allocator then keeps that pool for the rest of the session.
+    Slicing keeps the peak flat without changing the result.
+    """
+    lengths = {int(pose_body.shape[0]), int(root_orient.shape[0])}
+    if trans is not None:
+        lengths.add(int(trans.shape[0]))
+    if len(lengths) != 1:
+        raise ValueError(
+            f"SMPL inputs must share their frame count, got {sorted(lengths)}"
+        )
+    total = int(pose_body.shape[0])
+    step = max(1, int(chunk))
+    if total <= step:
+        out = smpl_model(pose_body=pose_body, root_orient=root_orient, trans=trans)
+        return out.v, out.Jtr
+    verts = joints = None
+    for start in range(0, total, step):
+        _raise_if_cancelled()
+        stop = min(start + step, total)
+        out = smpl_model(
+            pose_body=pose_body[start:stop],
+            root_orient=root_orient[start:stop],
+            trans=trans[start:stop] if trans is not None else None,
+        )
+        if verts is None:
+            # Write into one preallocated buffer: torch.cat would hold the
+            # slices and the result at the same time.
+            verts = out.v.new_empty((total,) + tuple(out.v.shape[1:]))
+            joints = out.Jtr.new_empty((total,) + tuple(out.Jtr.shape[1:]))
+        verts[start:stop] = out.v
+        joints[start:stop] = out.Jtr
+        del out
+    return verts, joints
+
+
 def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root, 
                          show_objects=True, vis_gt_only=False, show_foot_contact=False, 
-                         show_obj_traj=False, show_hand_traj=False, use_fk=False, compare_3=False, 
+                         show_hand_traj=False, use_fk=False, compare_3=False,
                          pred_offset_np=None, no_trans=False, overlay_frames=None, ot_refine=False,
-                         inference_mode="online", online_window=None, online_lookahead=5):
-    """Visualize one batch sequence."""
+                         inference_mode="online", online_window=None, online_lookahead=5,
+                         online_chunk=1, obj_max_faces=0, show_obj_move=False,
+                         prediction_override=None, display_length=None, render_gt=True, clear_scene=True,
+                         lane_colors=None):
+    """Visualize one batch sequence or one lane of a prepared comparison."""
+    if clear_scene:
+        _clear_visual_nodes(viewer)
+    with torch.no_grad():
+        return _render_batch_sequence(
+            viewer, batch, model, smpl_model, device, obj_geo_root,
+            show_objects=show_objects, vis_gt_only=vis_gt_only,
+            show_foot_contact=show_foot_contact, show_hand_traj=show_hand_traj,
+            use_fk=use_fk, compare_3=compare_3, pred_offset_np=pred_offset_np,
+            no_trans=no_trans, overlay_frames=overlay_frames, ot_refine=ot_refine,
+            inference_mode=inference_mode, online_window=online_window,
+            online_lookahead=online_lookahead, online_chunk=online_chunk,
+            obj_max_faces=obj_max_faces, show_obj_move=show_obj_move,
+            prediction_override=prediction_override, display_length=display_length,
+            render_gt=render_gt, lane_colors=lane_colors,
+        )
+
+
+def _clear_removed_node_selection(scene, nodes):
+    """Detach selection references before a removed subtree releases its GL buffers."""
+    removed_ids = set()
+    pending = list(nodes)
+    while pending:
+        node = pending.pop()
+        if id(node) in removed_ids:
+            continue
+        removed_ids.add(id(node))
+        pending.extend(getattr(node, "nodes", ()))
+    if id(getattr(scene, "selected_object", None)) in removed_ids:
+        select = getattr(scene, "select", None)
+        if callable(select):
+            select(None)
+        else:
+            scene.selected_object = None
+    # Scene.select(None) intentionally keeps the property-panel selection.
+    if id(getattr(scene, "gui_selected_object", None)) in removed_ids:
+        scene.gui_selected_object = None
+
+def _clear_visual_nodes(viewer):
     try:
         nodes_to_remove = [
             node for node in viewer.scene.collect_nodes()
@@ -389,9 +896,31 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                 viewer.scene.remove(node)
             except Exception:
                 pass
+        # aitviewer caches per-frame normals with @lru_cache on a *method*, so
+        # `self` sits in the cache key and every mesh that ever rendered stays
+        # reachable, pinning its whole vertex array.  Clearing the class-level
+        # cache when a sequence goes away is what actually frees it.
+        try:
+            Meshes.compute_vertex_and_face_normals.cache_clear()
+        except Exception:
+            pass
     except Exception:
         pass
 
+    # The previous sequence's tensors are gone with its scene nodes; give the
+    # allocator's pool back so switching sequences does not pin the card.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+def _render_batch_sequence(viewer, batch, model, smpl_model, device, obj_geo_root,
+                           show_objects=True, vis_gt_only=False, show_foot_contact=False,
+                           show_hand_traj=False, use_fk=False, compare_3=False,
+                           pred_offset_np=None, no_trans=False, overlay_frames=None,
+                           ot_refine=False, inference_mode="online", online_window=None,
+                           online_lookahead=5, online_chunk=1, obj_max_faces=0,
+                           show_obj_move=False, prediction_override=None,
+                           display_length=None, render_gt=True, lane_colors=None):
+    colors = lane_colors or PRED_LANE_COLORS[0]
     with torch.no_grad():
         config = getattr(viewer, "config", edict({}))
         
@@ -409,6 +938,8 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
         if human_imu_batch.dim() == 3:
             human_imu_batch = human_imu_batch.unsqueeze(0)
         batch_size, T = human_imu_batch.shape[:2]
+        if display_length is not None:
+            T = min(T, int(display_length))
         bs = 0
         human_imu_seq = human_imu_batch[bs]
         overlay_frame_ids = _normalize_overlay_frames(overlay_frames, T)
@@ -470,10 +1001,10 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
 
         verts_gt_seq = None
         Jtr_gt_seq = None
-        if pose_batch is not None and trans_batch is not None:
+        if render_gt and pose_batch is not None and trans_batch is not None:
             try:
-                gt_pose_seq = pose_batch[bs]
-                gt_trans_seq = trans_batch[bs]
+                gt_pose_seq = pose_batch[bs, :T]
+                gt_trans_seq = trans_batch[bs, :T]
                 if gt_pose_seq.dim() == 2 and gt_trans_seq.dim() == 2:
                     root_orient = gt_pose_seq[:, :3]
                     pose_body = gt_pose_seq[:, 3:]
@@ -483,26 +1014,23 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                         pose_body = pose_body_padded
                     elif pose_body.shape[1] > 63:
                         pose_body = pose_body[:, :63]
-                    body_pose_gt = smpl_model(
-                        pose_body=pose_body,
-                        root_orient=root_orient,
-                        trans=gt_trans_seq
+                    verts_gt_seq, Jtr_gt_seq = _smpl_forward_chunked(
+                        smpl_model, pose_body, root_orient, gt_trans_seq
                     )
-                    verts_gt_seq = body_pose_gt.v
-                    Jtr_gt_seq = body_pose_gt.Jtr
             except Exception as exc:
                 print(f"Failed to build GT SMPL mesh: {exc}")
 
-        pred_dict = None
+        pred_dict = prediction_override
         verts_pred_seq = None
         Jtr_pred_seq = None
         pred_obj_trans_seq = None
         pred_obj_trans_fk_seq = None
         pred_obj_trans_imu_seq = None
         pred_hand_contact_prob_seq = None
+        pred_obj_move_prob_seq = None
         model_input = None
 
-        if not vis_gt_only:
+        if not vis_gt_only and pred_dict is None:
             try:
                 model_input = build_model_input_dict(batch_device, config, device, add_noise=False)
                 compute_fk_flag = bool(use_fk or compare_3)
@@ -517,10 +1045,12 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                     inference_mode=inference_mode,
                     online_window=online_window,
                     online_lookahead=online_lookahead,
+                    online_chunk=online_chunk,
                 )
             except Exception as exc:
                 print(f"Model inference failed: {exc}")
                 pred_dict = None
+        _raise_if_cancelled()
 
         if pred_dict is not None:
             pred_length_source = pred_dict.get("p_pred")
@@ -560,6 +1090,18 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
             pred_hand_contact_prob_all = pred_dict.get("pred_hand_contact_prob")
             if pred_hand_contact_prob_all is not None:
                 pred_hand_contact_prob_seq = pred_hand_contact_prob_all[bs].to(device)
+            pred_obj_move_prob_all = pred_dict.get("pred_obj_move_prob")
+            if (
+                not isinstance(pred_obj_move_prob_all, torch.Tensor)
+                and isinstance(pred_hand_contact_prob_all, torch.Tensor)
+                and pred_hand_contact_prob_all.shape[-1] >= 3
+            ):
+                # VCs without a separate obj_move head (the IMUHOI baseline)
+                # predict the same obj_contact label as contact channel 2;
+                # v4's pred_obj_move_prob is that channel too.
+                pred_obj_move_prob_all = pred_hand_contact_prob_all[..., 2]
+            if isinstance(pred_obj_move_prob_all, torch.Tensor):
+                pred_obj_move_prob_seq = pred_obj_move_prob_all[bs].reshape(-1)[:T].to(device)
 
             if compare_3 and "pred_obj_vel" in pred_dict and model_input is not None:
                 try:
@@ -600,13 +1142,9 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                     ).reshape(T, full_glb.shape[1], 3)
                     root_axis = pose_axis[:, 0, :]
                     pose_body_axis = pose_axis[:, 1:22, :].reshape(T, -1)
-                    smpl_pred = smpl_model(
-                        pose_body=pose_body_axis,
-                        root_orient=root_axis,
-                        trans=pred_root_trans_seq,
+                    verts_pred_seq, Jtr_pred_seq = _smpl_forward_chunked(
+                        smpl_model, pose_body_axis, root_axis, pred_root_trans_seq
                     )
-                    verts_pred_seq = smpl_pred.v
-                    Jtr_pred_seq = smpl_pred.Jtr
                 except Exception as exc:
                     print(f"Predicted SMPL reconstruction from pred_full_pose_rotmat failed: {exc}")
 
@@ -636,13 +1174,9 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                     ).reshape(T, full_glb.shape[1], 3)
                     root_axis = pose_axis[:, 0, :]
                     pose_body_axis = pose_axis[:, 1:22, :].reshape(T, -1)
-                    smpl_pred = smpl_model(
-                        pose_body=pose_body_axis,
-                        root_orient=root_axis,
-                        trans=pred_root_trans_seq
+                    verts_pred_seq, Jtr_pred_seq = _smpl_forward_chunked(
+                        smpl_model, pose_body_axis, root_axis, pred_root_trans_seq
                     )
-                    verts_pred_seq = smpl_pred.v
-                    Jtr_pred_seq = smpl_pred.Jtr
                 except Exception as exc:
                     print(f"Predicted SMPL reconstruction failed: {exc}")
 
@@ -651,6 +1185,10 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
         else:
             pred_offset = torch.tensor([0.0, 0.0, 0.0], device=device, dtype=torch.float32)
 
+        # BEHAVE object meshes are large (chairwood has 132857 vertices), so a
+        # transformed sequence is gigabytes.  The renderer only ever sees the
+        # numpy copy, so keep the whole object-vertex pipeline off the GPU.
+        obj_verts_device = torch.device("cpu")
         gt_obj_verts_seq = None
         pred_obj_verts_seq_mesh = None
         pred_obj_verts_seq_fk = None
@@ -662,6 +1200,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
         if has_object_bool and obj_trans_batch is not None:
             gt_obj_trans_seq = obj_trans_batch[bs, :T]
 
+        _raise_if_cancelled()
         if show_objects and has_object_bool and obj_trans_batch is not None and obj_rot_batch is not None:
             gt_obj_rot_6d_seq = obj_rot_batch[bs, :T]
             gt_obj_rot_mat_seq = transforms.rotation_6d_to_matrix(gt_obj_rot_6d_seq)
@@ -675,7 +1214,8 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
             try:
                 gt_obj_verts_seq, obj_faces_np = load_object_geometry(
                     obj_name, gt_obj_rot_mat_seq, gt_obj_trans_seq, gt_obj_scale_seq,
-                    device=device, obj_geo_root=obj_geo_root
+                    device=obj_verts_device, obj_geo_root=obj_geo_root,
+                    max_faces=obj_max_faces or None
                 )
             except Exception as exc:
                 print(f"Failed to load GT object geometry: {exc}")
@@ -684,7 +1224,8 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                 try:
                     pred_obj_verts_seq_mesh, _ = load_object_geometry(
                         obj_name, gt_obj_rot_mat_seq, pred_obj_trans_seq, gt_obj_scale_seq,
-                        device=device, obj_geo_root=obj_geo_root
+                        device=obj_verts_device, obj_geo_root=obj_geo_root,
+                    max_faces=obj_max_faces or None
                     )
                 except Exception:
                     pass
@@ -693,7 +1234,8 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                 try:
                     pred_obj_verts_seq_fk, _ = load_object_geometry(
                         obj_name, gt_obj_rot_mat_seq, pred_obj_trans_fk_seq, gt_obj_scale_seq,
-                        device=device, obj_geo_root=obj_geo_root
+                        device=obj_verts_device, obj_geo_root=obj_geo_root,
+                    max_faces=obj_max_faces or None
                     )
                 except Exception:
                     pass
@@ -702,7 +1244,8 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                 try:
                     pred_obj_verts_seq_imu, _ = load_object_geometry(
                         obj_name, gt_obj_rot_mat_seq, pred_obj_trans_imu_seq, gt_obj_scale_seq,
-                        device=device, obj_geo_root=obj_geo_root
+                        device=obj_verts_device, obj_geo_root=obj_geo_root,
+                    max_faces=obj_max_faces or None
                     )
                 except Exception:
                     pass
@@ -715,7 +1258,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                 )
             else:
                 verts_gt_yup = torch.matmul(verts_gt_seq, R_yup.T.to(device))
-                gt_human_mesh = Meshes(
+                gt_human_mesh = StableMeshes(
                     verts_gt_yup.detach().cpu().numpy(), faces_gt_np,
                     name="GT-Human", color=GT_HUMAN_COLOR,
                     gui_affine=False, is_selectable=False
@@ -729,59 +1272,104 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
             if overlay_mode:
                 _add_overlay_meshes(
                     viewer, verts_pred_shifted, faces_gt_np, overlay_frame_ids,
-                    "Pred-Human", PRED_HUMAN_COLOR, overlay_alpha_values, device
+                    "Pred-Human", colors["human"], overlay_alpha_values, device
                 )
             else:
                 verts_pred_yup = torch.matmul(verts_pred_shifted, R_yup.T.to(device))
-                pred_human_mesh = Meshes(
+                pred_human_mesh = StableMeshes(
                     verts_pred_yup.detach().cpu().numpy(), faces_gt_np,
-                    name="Pred-Human", color=PRED_HUMAN_COLOR,
+                    name="Pred-Human", color=colors["human"],
                     gui_affine=False, is_selectable=False
                 )
                 viewer.scene.add(pred_human_mesh)
 
-        if gt_obj_verts_seq is not None and obj_faces_np is not None:
+        if show_obj_move:
+            if obj_contact_seq is None:
+                print("[obj_move] this sequence has no obj_contact label")
+            else:
+                runs = _format_obj_move_segments(obj_contact_seq)
+                print(
+                    f"[obj_move] moving {int(obj_contact_seq.sum())}/{int(obj_contact_seq.numel())} frames; "
+                    f"moving runs: {', '.join(runs) if runs else 'none'}"
+                    + (" (overlay mode: mesh colouring disabled)" if overlay_mode else ""),
+                    flush=True,
+                )
+            if not vis_gt_only:
+                if pred_obj_move_prob_seq is None:
+                    print("[obj_move] prediction has no pred_obj_move_prob", flush=True)
+                else:
+                    pred_move = pred_obj_move_prob_seq > 0.5
+                    pred_runs = _format_obj_move_segments(pred_move)
+                    agreement = ""
+                    if obj_contact_seq is not None:
+                        count = min(int(pred_move.numel()), int(obj_contact_seq.numel()))
+                        match = (pred_move[:count].cpu() == obj_contact_seq[:count].cpu()).float().mean()
+                        agreement = f"; frame agreement with GT {float(match):.1%}"
+                    print(
+                        f"[obj_move] pred (prob>0.5) moving {int(pred_move.sum())}/{int(pred_move.numel())} frames; "
+                        f"moving runs: {', '.join(pred_runs) if pred_runs else 'none'}{agreement}",
+                        flush=True,
+                    )
+
+        if render_gt and gt_obj_verts_seq is not None and obj_faces_np is not None:
             if overlay_mode:
                 _add_overlay_meshes(
                     viewer, gt_obj_verts_seq, obj_faces_np, overlay_frame_ids,
                     f"GT-{obj_name}", GT_OBJECT_COLOR, overlay_alpha_values, device
                 )
             else:
-                gt_obj_verts_yup = torch.matmul(gt_obj_verts_seq, R_yup.T.to(device))
-                gt_obj_mesh = Meshes(
-                    gt_obj_verts_yup.detach().cpu().numpy(), obj_faces_np,
-                    name=f"GT-{obj_name}", color=GT_OBJECT_COLOR,
-                    gui_affine=False, is_selectable=False
-                )
+                gt_obj_verts_yup = torch.matmul(gt_obj_verts_seq, R_yup.T.to(gt_obj_verts_seq.device))
+                if show_obj_move and obj_contact_seq is not None:
+                    gt_obj_mesh = FrameColoredMeshes(
+                        gt_obj_verts_yup.detach().cpu().numpy(), obj_faces_np,
+                        _obj_move_frame_colors(obj_contact_seq, gt_obj_verts_yup.shape[0]),
+                        name=f"GT-{obj_name}-ObjMove", gui_affine=False, is_selectable=False
+                    )
+                else:
+                    gt_obj_mesh = StableMeshes(
+                        gt_obj_verts_yup.detach().cpu().numpy(), obj_faces_np,
+                        name=f"GT-{obj_name}", color=GT_OBJECT_COLOR,
+                        gui_affine=False, is_selectable=False
+                    )
                 gt_obj_mesh.material.ambient = 0.24
                 viewer.scene.add(gt_obj_mesh)
 
         if pred_obj_verts_seq_mesh is not None and obj_faces_np is not None and not vis_gt_only:
-            pred_obj_verts_shifted = pred_obj_verts_seq_mesh + pred_offset
+            pred_obj_verts_shifted = pred_obj_verts_seq_mesh + pred_offset.to(pred_obj_verts_seq_mesh.device)
             if overlay_mode:
                 _add_overlay_meshes(
                     viewer, pred_obj_verts_shifted, obj_faces_np, overlay_frame_ids,
-                    f"Pred-{obj_name}", PRED_OBJECT_COLOR, overlay_alpha_values, device
+                    f"Pred-{obj_name}", colors["object"], overlay_alpha_values, device
                 )
             else:
-                pred_obj_verts_yup = torch.matmul(pred_obj_verts_shifted, R_yup.T.to(device))
-                pred_obj_mesh = Meshes(
-                    pred_obj_verts_yup.detach().cpu().numpy(), obj_faces_np,
-                    name=f"Pred-{obj_name}", color=PRED_OBJECT_COLOR,
-                    gui_affine=False, is_selectable=False
-                )
+                pred_obj_verts_yup = torch.matmul(pred_obj_verts_shifted, R_yup.T.to(pred_obj_verts_shifted.device))
+                if show_obj_move and pred_obj_move_prob_seq is not None:
+                    # Same palette as the GT object: orange = moving (prob > 0.5), purple = static.
+                    pred_obj_mesh = FrameColoredMeshes(
+                        pred_obj_verts_yup.detach().cpu().numpy(), obj_faces_np,
+                        _obj_move_frame_colors(
+                            pred_obj_move_prob_seq > 0.5, pred_obj_verts_yup.shape[0]
+                        ),
+                        name=f"Pred-{obj_name}-ObjMove", gui_affine=False, is_selectable=False
+                    )
+                else:
+                    pred_obj_mesh = StableMeshes(
+                        pred_obj_verts_yup.detach().cpu().numpy(), obj_faces_np,
+                        name=f"Pred-{obj_name}", color=colors["object"],
+                        gui_affine=False, is_selectable=False
+                    )
                 viewer.scene.add(pred_obj_mesh)
 
         if compare_3 and pred_obj_verts_seq_imu is not None and obj_faces_np is not None and not vis_gt_only:
-            obj_verts_imu_shifted = pred_obj_verts_seq_imu + pred_offset
+            obj_verts_imu_shifted = pred_obj_verts_seq_imu + pred_offset.to(pred_obj_verts_seq_imu.device)
             if overlay_mode:
                 _add_overlay_meshes(
                     viewer, obj_verts_imu_shifted, obj_faces_np, overlay_frame_ids,
                     f"Pred-IMU-{obj_name}", (0.2, 0.2, 0.9), overlay_alpha_values, device
                 )
             else:
-                obj_verts_imu_yup = torch.matmul(obj_verts_imu_shifted, R_yup.T.to(device))
-                imu_mesh = Meshes(
+                obj_verts_imu_yup = torch.matmul(obj_verts_imu_shifted, R_yup.T.to(obj_verts_imu_shifted.device))
+                imu_mesh = StableMeshes(
                     obj_verts_imu_yup.detach().cpu().numpy(), obj_faces_np,
                     name=f"Pred-IMU-{obj_name}", color=(0.2, 0.2, 0.9, 0.8),
                     gui_affine=False, is_selectable=False
@@ -789,47 +1377,25 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                 viewer.scene.add(imu_mesh)
 
         if compare_3 and pred_obj_verts_seq_fk is not None and obj_faces_np is not None and not vis_gt_only:
-            obj_verts_fk_shifted = pred_obj_verts_seq_fk + pred_offset
+            obj_verts_fk_shifted = pred_obj_verts_seq_fk + pred_offset.to(pred_obj_verts_seq_fk.device)
             if overlay_mode:
                 _add_overlay_meshes(
                     viewer, obj_verts_fk_shifted, obj_faces_np, overlay_frame_ids,
                     f"FK-{obj_name}", (1.0, 1.0, 0.0), overlay_alpha_values, device
                 )
             else:
-                obj_verts_fk_yup = torch.matmul(obj_verts_fk_shifted, R_yup.T.to(device))
-                fk_mesh = Meshes(
+                obj_verts_fk_yup = torch.matmul(obj_verts_fk_shifted, R_yup.T.to(obj_verts_fk_shifted.device))
+                fk_mesh = StableMeshes(
                     obj_verts_fk_yup.detach().cpu().numpy(), obj_faces_np,
                     name=f"FK-{obj_name}", color=(1.0, 1.0, 0.0, 0.8),
                     gui_affine=False, is_selectable=False
                 )
                 viewer.scene.add(fk_mesh)
 
-        if show_obj_traj:
-            if gt_obj_trans_seq is not None:
-                _add_line_node_if_nonempty(
-                    viewer, gt_obj_trans_seq, device, f"GT-{obj_name}-ObjTraj",
-                    OBJ_TRAJ_COLORS["gt"], OBJ_TRAJ_RADIUS, "line_strip"
-                )
-            if not vis_gt_only and pred_obj_trans_seq is not None:
-                _add_line_node_if_nonempty(
-                    viewer, pred_obj_trans_seq + pred_offset, device, f"Pred-{obj_name}-ObjTraj",
-                    OBJ_TRAJ_COLORS["pred"], OBJ_TRAJ_RADIUS, "line_strip"
-                )
-            if not vis_gt_only and compare_3 and pred_obj_trans_imu_seq is not None:
-                _add_line_node_if_nonempty(
-                    viewer, pred_obj_trans_imu_seq + pred_offset, device, f"Pred-IMU-{obj_name}-ObjTraj",
-                    OBJ_TRAJ_COLORS["pred_imu"], OBJ_TRAJ_RADIUS, "line_strip"
-                )
-            if not vis_gt_only and compare_3 and pred_obj_trans_fk_seq is not None:
-                _add_line_node_if_nonempty(
-                    viewer, pred_obj_trans_fk_seq + pred_offset, device, f"FK-{obj_name}-ObjTraj",
-                    OBJ_TRAJ_COLORS["fk"], OBJ_TRAJ_RADIUS, "line_strip"
-                )
-
         if show_hand_traj:
             lhand_idx, rhand_idx = 20, 21
 
-            if Jtr_gt_seq is not None:
+            if render_gt and Jtr_gt_seq is not None:
                 if lhand_contact_seq is not None:
                     _add_prob_traj_nodes(
                         viewer,
@@ -860,7 +1426,7 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                         pred_hand_contact_prob_seq[:, 0],
                         device,
                         "Pred-LHandTraj",
-                        HAND_TRAJ_COLORS["pred_l"],
+                        colors["lhand"],
                         HAND_TRAJ_RADIUS,
                     )
                     _add_prob_traj_nodes(
@@ -869,29 +1435,110 @@ def visualize_batch_data(viewer, batch, model, smpl_model, device, obj_geo_root,
                         pred_hand_contact_prob_seq[:, 1],
                         device,
                         "Pred-RHandTraj",
-                        HAND_TRAJ_COLORS["pred_r"],
+                        colors["rhand"],
                         HAND_TRAJ_RADIUS,
                     )
 
         viewer.virtual_bone_info = {'has_data': False}
 
 
+def visualize_comparison_data(viewer, batch, bundles, smpl_model, device, obj_geo_root):
+    """Infer N model lanes sequentially, then draw one GT and synchronized predictions."""
+    from model.rnn.online import resolve_online_lookahead, resolve_online_window
+
+    batch_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+    human_imu = batch_device.get("human_imu")
+    if not isinstance(human_imu, torch.Tensor):
+        raise ValueError("Comparison batch has no human_imu")
+    total_frames = int(human_imu.shape[1])
+    predictions = []
+    for lane, bundle in enumerate(bundles, 1):
+        _raise_if_cancelled()
+        _move_comparison_model(bundle, device)
+        try:
+            config = bundle.config
+            model_input = build_model_input_dict(batch_device, config, device, add_noise=False)
+            window = resolve_online_window(config, viewer.online_window)
+            lookahead = resolve_online_lookahead(config, viewer.online_lookahead)
+            chunk = viewer.online_chunk if viewer.online_chunk is not None else min(59, window - 1)
+            with torch.inference_mode():
+                pred = _run_model_prediction(
+                    bundle.model, model_input, batch_device, bool(viewer.use_fk),
+                    "rnn", ot_refine=bundle.ot_refine, inference_mode=viewer.inference_mode,
+                    online_window=window, online_lookahead=lookahead, online_chunk=chunk,
+                    progress_label=f"{lane}/{len(bundles)} {bundle.label}",
+                )
+            _raise_if_cancelled()
+            length = _comparison_prediction_length(pred, total_frames)
+            for key in ("pred_obj_trans", "root_trans_pred"):
+                value = pred.get(key)
+                if not isinstance(value, torch.Tensor) or value.shape[1] < length:
+                    raise ValueError(f"{bundle.label}: missing/short {key} prediction")
+            predictions.append((bundle, {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
+                                         for k, v in pred.items()}, length))
+        finally:
+            _move_comparison_model(bundle, torch.device("cpu"))
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+    common_length = min(length for _, _, length in predictions)
+    _normalize_overlay_frames(viewer.overlay_frames, common_length)
+    from model.rnn.online import slice_time_dict
+    predictions = [
+        (bundle, slice_time_dict(pred, 0, common_length, int(human_imu.shape[0]), length), length)
+        for bundle, pred, length in predictions
+    ]
+    # Object vertex arrays remain resident for every visible lane. Divide the
+    # default face budget among lanes rather than multiplying its VRAM cost.
+    face_budget = viewer.obj_max_faces
+    if face_budget:
+        face_budget = min(face_budget, max(2000, 20000 // len(bundles)))
+    for index, (bundle, pred, _) in enumerate(predictions, 1):
+        _raise_if_cancelled()
+        # The worker only records scene changes; the GL thread commits all lanes
+        # together after every model has succeeded. A cancelled job commits none.
+        _move_comparison_model(bundle, device)
+        try:
+            lane = _LaneViewer(viewer, bundle.label, bundle.config)
+            visualize_batch_data(
+                lane, batch, bundle.model, smpl_model, device, obj_geo_root,
+                show_objects=viewer.show_objects, show_foot_contact=viewer.show_foot_contact,
+                show_hand_traj=viewer.show_hand_traj, show_obj_move=viewer.show_obj_move,
+                pred_offset_np=_lane_offset(getattr(viewer, "pred_offset", None), index),
+                no_trans=viewer.no_trans, overlay_frames=viewer.overlay_frames,
+                ot_refine=bundle.ot_refine, obj_max_faces=face_budget,
+                prediction_override=pred, display_length=common_length,
+                render_gt=(index == 1), clear_scene=False, lane_colors=_lane_colors(index),
+            )
+        finally:
+            _move_comparison_model(bundle, torch.device("cpu"))
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+
 class InteractiveViewer(Viewer):
     def __init__(self, data_list, model, smpl_model, config, device, obj_geo_root, 
                  show_objects=True, vis_gt_only=False, show_foot_contact=False,
-                 show_obj_traj=False, show_hand_traj=False, use_fk=False, compare_3=False, 
+                 show_hand_traj=False, use_fk=False, compare_3=False,
                  pred_offset=None, no_trans=False, overlay_frames=None, ot_refine=False,
-                 inference_mode="online", online_window=None, online_lookahead=5, **kwargs):
+                 inference_mode="online", online_window=None, online_lookahead=5,
+                 online_chunk=1, auto_advance=0.0, obj_max_faces=0, show_obj_move=False,
+                 comparison_models=None, **kwargs):
         super().__init__(**kwargs)
+        # Debug/instrumentation: step through sequences on a timer, which is how
+        # sequence-switch memory behaviour gets measured without a keyboard.
+        self.auto_advance = float(auto_advance or 0.0)
+        self._last_advance_at = None
         self.data_list = data_list
         self.current_index = 0
         self.model = model
+        self.comparison_models = comparison_models or []
+        self._comparison_nodes = []
         self.smpl_model = smpl_model
         self.config = config
         self.device = device
         self.show_objects = show_objects
         self.vis_gt_only = vis_gt_only
-        self.show_obj_traj = show_obj_traj
+        self.show_obj_move = show_obj_move
         self.show_hand_traj = show_hand_traj
         self.show_foot_contact = show_foot_contact
         self.obj_geo_root = obj_geo_root
@@ -904,9 +1551,18 @@ class InteractiveViewer(Viewer):
         self.inference_mode = inference_mode
         self.online_window = online_window
         self.online_lookahead = online_lookahead
+        self.online_chunk = online_chunk
+        self.obj_max_faces = int(obj_max_faces or 0)
         self.virtual_bone_info = {'has_data': False}
-        
-        self.visualize_current_sequence()
+
+        # Sequences are computed on a background thread so that a key press can
+        # interrupt one that is still running; the render loop schedules jobs
+        # and applies a finished job's scene edits on the GL thread.
+        self._job = None
+        self._worker = None
+        self._pending_index = None
+        self._generation = 0
+        self.request_sequence(self.current_index)
 
         light_front = self.scene.lights[1]
         light_front.strength = 1.32 
@@ -919,34 +1575,215 @@ class InteractiveViewer(Viewer):
         self.scene.background_color = (0.5, 0.5, 0.5, 1.0)
 
     def visualize_current_sequence(self):
+        """Kept for callers of the old API: schedules the current sequence."""
+        self.request_sequence(self.current_index)
+
+    # ------------------------------------------------------------------
+    # Background sequence jobs
+    # ------------------------------------------------------------------
+    def _sequence_label(self, index):
+        entry = self.data_list[index]
+        name = ""
+        if isinstance(entry, dict):
+            name = entry.get("seq_file_name") or os.path.basename(entry.get("seq_file_path", ""))
+        return name or f"index {index}"
+
+    def _target_index(self):
+        """Where the next q/e press steps from: the newest request, not the screen."""
+        if self._pending_index is not None:
+            return self._pending_index
+        if self._job is not None and self._job.status == "running":
+            return self._job.index
+        return self.current_index
+
+    def request_sequence(self, index):
+        """Ask for a sequence; interrupts the one being computed, if any."""
         if not self.data_list:
             print("Error: Data list is empty.")
             return
-        if 0 <= self.current_index < len(self.data_list):
-            entry = self.data_list[self.current_index]
+        index = max(0, min(len(self.data_list) - 1, int(index)))
+        job = self._job
+        if job is not None and job.status == "running":
+            if job.index == index and not job.cancel.is_set():
+                return
+            if not job.cancel.is_set():
+                _PROGRESS_LINE.break_line()
+                print(
+                    f"Interrupted sequence {self._sequence_label(job.index)} "
+                    f"after {_walltime.perf_counter() - job.started_at:.1f}s; "
+                    f"switching to {self._sequence_label(index)}",
+                    flush=True,
+                )
+                job.cancel_requested_at = _walltime.perf_counter()
+                job.cancel.set()
+            else:
+                _PROGRESS_LINE.break_line()
+                print(f"Switching to {self._sequence_label(index)} instead", flush=True)
+        self._pending_index = index
+
+    def _start_job(self, index):
+        self._generation += 1
+        job = _SequenceJob(index, self._generation)
+        self._job = job
+        self._worker = threading.Thread(
+            target=self._run_sequence_job, args=(job,), name=f"vis-seq-{index}", daemon=True
+        )
+        self._worker.start()
+
+    def _run_sequence_job(self, job):
+        _JOB_CONTEXT.job = job
+        try:
+            entry = self.data_list[job.index]
             batch = entry["batch"] if isinstance(entry, dict) and "batch" in entry else entry
             mode_str = " (GT only)" if self.vis_gt_only else " (GT+Pred)"
-            seq_file_name = ""
-            if isinstance(entry, dict):
-                seq_file_name = entry.get("seq_file_name") or os.path.basename(entry.get("seq_file_path", ""))
-            if seq_file_name:
-                print(f"Visualizing sequence: {seq_file_name}{mode_str}")
+            label = self._sequence_label(job.index)
+            job.label = os.path.splitext(label)[0]
+            print(f"Visualizing sequence: {label}{mode_str}", flush=True)
+            proxy = _WorkerViewerProxy(self, job.ops)
+            if self.comparison_models:
+                for node in self._comparison_nodes:
+                    proxy.scene.remove(node)
+                visualize_comparison_data(
+                    proxy, batch, self.comparison_models, self.smpl_model,
+                    self.device, self.obj_geo_root,
+                )
             else:
-                print(f"Visualizing sequence index: {self.current_index}{mode_str}")
-            try:
                 visualize_batch_data(
-                    self, batch, self.model, self.smpl_model, self.device,
+                    proxy, batch, self.model, self.smpl_model, self.device,
                     self.obj_geo_root, self.show_objects, self.vis_gt_only,
-                    self.show_foot_contact, self.show_obj_traj, self.show_hand_traj,
+                    self.show_foot_contact, self.show_hand_traj,
                     self.use_fk, self.compare_3, self.pred_offset, self.no_trans, self.overlay_frames,
                     self.ot_refine, self.inference_mode, self.online_window, self.online_lookahead,
+                    self.online_chunk, self.obj_max_faces, self.show_obj_move,
                 )
-                title_base = f"Sequence: {seq_file_name}" if seq_file_name else f"Sequence Index: {self.current_index}/{len(self.data_list)-1}"
-                self.title = f"{title_base}{mode_str} (q/e:闁?, Ctrl+q/e:闁?0, Alt+q/e:闁?0)"
-            except Exception as e:
-                print(f"Error visualizing sequence {self.current_index}: {e}")
-                import traceback
-                traceback.print_exc()
+            _raise_if_cancelled()
+            job.title = f"Sequence: {label}{mode_str} (q/e: +-1, Ctrl+q/e: +-10, Alt+q/e: +-50)"
+            job.status = "done"
+        except SequenceCancelled:
+            job.status = "cancelled"
+            job.ops.clear()
+            if job.cancel_requested_at is not None:
+                print(
+                    f"Stopped {self._sequence_label(job.index)} "
+                    f"{(_walltime.perf_counter() - job.cancel_requested_at) * 1000:.0f} ms after the request",
+                    flush=True,
+                )
+        except Exception as exc:
+            job.status = "failed"
+            job.ops.clear()
+            print(f"Error visualizing sequence {job.index}: {exc}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            job.finished_at = _walltime.perf_counter()
+            _JOB_CONTEXT.job = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def _apply_finished_job(self, job):
+        """Swap the new sequence in; runs on the GL thread."""
+        _clear_removed_node_selection(
+            self.scene,
+            [node for op, nodes, _ in job.ops if op == "remove" for node in nodes],
+        )
+        for op, nodes, kwargs in job.ops:
+            if op == "remove":
+                for node in nodes:
+                    try:
+                        self.scene.remove(node)
+                    except Exception:
+                        pass
+            else:
+                self.scene.add(*nodes, **kwargs)
+        # The previous sequence's meshes are gone now; drop the normal cache
+        # that would otherwise keep them (and their vertex arrays) alive.
+        try:
+            Meshes.compute_vertex_and_face_normals.cache_clear()
+        except Exception:
+            pass
+        if self.comparison_models:
+            self._comparison_nodes = [node for op, nodes, _ in job.ops if op == "add" for node in nodes]
+        job.ops.clear()
+        self.current_index = job.index
+        self.scene.current_frame_id = 0
+        if self.comparison_models:
+            self._frame_comparison_camera()
+        if job.title:
+            self.title = job.title
+        print(
+            f"Ready: {self._sequence_label(job.index)} "
+            f"({job.finished_at - job.started_at:.1f}s)",
+            flush=True,
+        )
+
+    def _frame_comparison_camera(self):
+        """Show the GT and every prediction lane when a sequence first opens."""
+        bounds = []
+        for node in self._comparison_nodes:
+            if getattr(node, "name", "").startswith(("GT-", "Pred-")) and hasattr(node, "current_bounds"):
+                bound = np.asarray(node.current_bounds, dtype=np.float64)
+                if bound.shape == (3, 2) and np.isfinite(bound).all():
+                    bounds.append(bound)
+        if not bounds:
+            return
+        lower = np.min([b[:, 0] for b in bounds], axis=0)
+        upper = np.max([b[:, 1] for b in bounds], axis=0)
+        center = (lower + upper) * 0.5
+        # Keep the leftmost GT lane clear of aitviewer's scene-tree sidebar.
+        center[0] -= 0.10 * float(upper[0] - lower[0])
+        diagonal = float(np.linalg.norm(upper - lower))
+        camera = self.scene.camera
+        forward = np.asarray(camera.forward, dtype=np.float64)
+        camera.target = center
+        camera.position = center - forward * max(5.0, diagonal * 1.4)
+
+    def _pump_sequence_jobs(self):
+        job = self._job
+        if job is not None and job.status != "running" and not (
+            self._worker is not None and self._worker.is_alive()
+        ):
+            self._job = None
+            self._worker = None
+            superseded = self._pending_index is not None and self._pending_index != job.index
+            if job.status == "done" and not superseded:
+                self._apply_finished_job(job)
+        if self._job is None and self._pending_index is not None:
+            index = self._pending_index
+            self._pending_index = None
+            self._start_job(index)
+
+    def render(self, time, frame_time, **kwargs):
+        if self.auto_advance > 0.0:
+            if self._last_advance_at is None:
+                self._last_advance_at = time
+            elif time - self._last_advance_at >= self.auto_advance:
+                self._last_advance_at = time
+                new_index = min(len(self.data_list) - 1, self._target_index() + 1)
+                if new_index != self._target_index():
+                    print(f"[auto_advance] requesting sequence index {new_index}", flush=True)
+                    self.request_sequence(new_index)
+        self._pump_sequence_jobs()
+        self._yield_to_running_job()
+        return super().render(time, frame_time, **kwargs)
+
+    # The render loop and a background job share the GIL.  Left alone the loop
+    # spins far faster than the screen needs and starves the job: in testing the
+    # job ran over 30x slower and noticed a cancellation 40 s late.  While a job
+    # is running, pace the loop so most of each frame is spent off the GIL; at
+    # 15 fps the job runs as fast as it does without a window at all.
+    BUSY_FRAME_PERIOD = 1.0 / 15.0
+
+    def _yield_to_running_job(self):
+        job = self._job
+        now = _walltime.perf_counter()
+        last = getattr(self, "_last_render_wall", None)
+        self._last_render_wall = now
+        if job is None or job.status != "running" or last is None:
+            return
+        remaining = self.BUSY_FRAME_PERIOD - (now - last)
+        if remaining > 0:
+            _walltime.sleep(remaining)
+            self._last_render_wall = _walltime.perf_counter()
 
     def key_event(self, key, action, modifiers):
         super().key_event(key, action, modifiers)
@@ -961,20 +1798,16 @@ class InteractiveViewer(Viewer):
             ctrl_pressed = modifiers.ctrl
             alt_pressed = modifiers.alt
             
-            if key == self.wnd.keys.Q:
+            if key in (self.wnd.keys.Q, self.wnd.keys.E):
                 step = 50 if alt_pressed else (10 if ctrl_pressed else 1)
-                new_index = max(0, self.current_index - step)
-                if new_index != self.current_index:
-                    self.current_index = new_index
-                    self.visualize_current_sequence()
-                    self.scene.current_frame_id = 0
-            elif key == self.wnd.keys.E:
-                step = 50 if alt_pressed else (10 if ctrl_pressed else 1)
-                new_index = min(len(self.data_list) - 1, self.current_index + step)
-                if new_index != self.current_index:
-                    self.current_index = new_index
-                    self.visualize_current_sequence()
-                    self.scene.current_frame_id = 0
+                if key == self.wnd.keys.Q:
+                    step = -step
+                # Step from the newest request, so repeated presses while a
+                # sequence is still computing keep moving instead of piling up.
+                base = self._target_index()
+                new_index = max(0, min(len(self.data_list) - 1, base + step))
+                if new_index != base:
+                    self.request_sequence(new_index)
 
 
 OBJECT_TRANS_ARCH_CHOICES = (
@@ -998,6 +1831,8 @@ def _normalize_object_trans_arch(value: str) -> str:
 
 def _make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Interactive IMUHOI Visualization Tool')
+    parser.add_argument('--model', action='append', metavar='VARIANT_DIR',
+                        help='Repeat for each model lane; resolve config and final HP/VC/OT checkpoints from its experiment manifest')
     parser.add_argument('--config', type=str, default='configs/IMUHOI_train_rnn.yaml', help='Path to config file')
     parser.add_argument('--model_arch', type=str, choices=['rnn', 'dit', 'mamba'], default=None, help='Override model architecture in config')
     parser.add_argument('--hp_ckpt', type=str, default=None, help='Override HumanPose checkpoint')
@@ -1044,21 +1879,44 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument('--no_objects', action='store_true', help='Disable object mesh rendering')
     parser.add_argument('--vis_gt_only', action='store_true', help='Render GT only')
     parser.add_argument('--show_foot_contact', action='store_true', help='Show foot contact')
-    parser.add_argument('--show_obj_traj', action='store_true', help='Show object trajectory')
+    parser.add_argument(
+        '--show_obj_move', action='store_true',
+        help=(
+            'Colour the GT object by its obj_move label and the predicted object by '
+            'pred_obj_move_prob > 0.5 (orange = moving, purple = static); also prints moving runs.'
+        ),
+    )
     parser.add_argument('--show_hand_traj', action='store_true', help='Show hand contact trajectory')
     parser.add_argument('--use_fk', action='store_true', help='Enable FK branch')
     parser.add_argument('--compare_3', action='store_true', help='Compare three object branches')
     parser.add_argument('--limit_sequences', type=int, default=500, help='Limit number of loaded sequences')
-    parser.add_argument('--pred_offset', type=float, nargs=3, default=[1.0, 0.0, 0.0], help='Prediction translation offset')
+    parser.add_argument('--pred_offset', type=float, nargs=3, default=[1.0, 0.0, 0.0],
+                        help='Prediction translation offset; with repeated --model, lane i is drawn '
+                             'at i * offset, so neighbouring lanes (GT first) are one offset apart')
     parser.add_argument('--overlay_frames', type=int, nargs='+', default=None, help='Overlay selected 0-based frames in one scene')
     parser.add_argument('--no_trans', action='store_true', help='Enable noTrans mode')
+    parser.add_argument('--obj_max_faces', '--obj-max-faces', type=int, default=20000,
+                        help='Decimate object meshes to at most N faces for display; 0 keeps the '
+                             'captured resolution. BEHAVE chairwood is 226563 faces and a 1000-frame '
+                             'sequence of it costs 10.8 GB of RAM at full resolution against 1.3 GB '
+                             'at 20000 faces, with 0.84 mm mean surface error')
+    parser.add_argument('--auto_advance', '--auto-advance', type=float, default=0.0,
+                        help='Debug: step to the next sequence every N seconds (0 = off)')
+    parser.add_argument('--no_shadows', '--no-shadows', action='store_true',
+                        help='Disable the scene lights shadow maps; each is an 8192x8192 '
+                             'depth texture worth about 257 MiB of GPU memory')
     parser.add_argument('--inference_mode', '--inference-mode', choices=['online', 'offline'], default='online', help='RNN inference mode')
-    parser.add_argument('--online_window', '--online-window', type=int, default=60, help='RNN online sliding window size')
+    parser.add_argument('--online_window', '--online-window', type=int, default=None, help='RNN online sliding window size')
+    parser.add_argument(
+        '--online_chunk', '--online-chunk', type=int, default=None,
+        help='Target frames whose HumanPose/VelocityContact windows run as one batch '
+             '(1 = one window per frame; capped at online_window - 1)',
+    )
     parser.add_argument(
         '--online_lookahead',
         '--online-lookahead',
         type=int,
-        default=5,
+        default=10,
         help='Future frames appended after the legacy RNN online update frame (strict tail)',
     )
     noise_group = parser.add_mutually_exclusive_group()
@@ -1107,6 +1965,14 @@ def _make_parser() -> argparse.ArgumentParser:
 
 def main():
     args = _make_parser().parse_args()
+    comparison_specs = resolve_vis_models(args.model, PROJECT_ROOT) if args.model else []
+    if comparison_specs and (
+        args.config != 'configs/IMUHOI_train_rnn.yaml'
+        or args.hp_ckpt or args.vc_ckpt or args.ot_ckpt or args.interaction_ckpt
+        or args.model_arch or args.object_trans_arch or args.velocity_contact_arch
+        or args.ot_refine is not None or args.compare_3 or args.vis_gt_only
+    ):
+        raise SystemExit('[Vis] --model cannot be combined with --config, single-model checkpoint/architecture/refine overrides, --compare_3 or --vis_gt_only')
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -1127,8 +1993,8 @@ def main():
         + " (sequence-level)"
     )
 
-    print(f"Loading config from: {args.config}")
-    config = load_config(args.config)
+    print(f"Loading config from: {comparison_specs[0].config_path if comparison_specs else args.config}")
+    config = load_config(str(comparison_specs[0].config_path) if comparison_specs else args.config)
     try:
         # ``--data_dir`` is an explicit input override.  It intentionally does
         # not require a valid dataset key, so a standalone PT can be visualized
@@ -1228,9 +2094,27 @@ def main():
     smpl_model_path = config.get('body_model_path', 'datasets/smpl_models/smplh/neutral/model.npz')
     smpl_model = load_smpl_model(smpl_model_path, device)
 
-    model = load_model(config, device, no_trans=args.no_trans, module_paths=module_paths)
-    if _infer_model_kind(model) == "human_pose" and not args.no_objects:
+    comparison_models = _load_comparison_models(comparison_specs, args.dataset, args.no_trans) if comparison_specs else []
+    for lane, bundle in enumerate(comparison_models, 1):
+        offset = ", ".join(f"{value:g}" for value in _lane_offset(args.pred_offset, lane))
+        print(f"[Vis] lane {lane}: {bundle.label} -> {_lane_colors(lane)['name']}, offset ({offset})")
+    model = comparison_models[0].model if comparison_models else load_model(
+        config, device, no_trans=args.no_trans, module_paths=module_paths
+    )
+    if not comparison_models and _infer_model_kind(model) == "human_pose" and not args.no_objects:
         print("[Vis] 当前加载的是 human-only 模型；如需渲染预测物体，请提供 pretrained_modules.interaction 或 --interaction_ckpt。")
+
+    if comparison_models:
+        for bundle in comparison_models[1:]:
+            other = get_dataset_configs(bundle.config)[args.dataset]
+            other_path = resolve_dataset_path(get_full_sequence_test_path(other), PROJECT_ROOT)
+            if args.data_dir is None and Path(other_path).resolve() != Path(test_data_input).resolve():
+                raise ValueError(f"{bundle.label}: test split {other_path} differs from shared data {test_data_input}")
+            for key in ("body_model_type", "num_human_imus", "imu_dim"):
+                first = dataset_config.get(key) if key == "body_model_type" else getattr(config, key, None)
+                second = other.get(key) if key == "body_model_type" else getattr(bundle.config, key, None)
+                if first != second:
+                    raise ValueError(f"{bundle.label}: incompatible shared data convention {key}: {second} != {first}")
 
     if not test_data_input or not os.path.exists(test_data_input):
         print(f"Error: Dataset test path not found: {test_data_input}")
@@ -1351,7 +2235,7 @@ def main():
         show_objects=(not args.no_objects),
         vis_gt_only=args.vis_gt_only,
         show_foot_contact=args.show_foot_contact,
-        show_obj_traj=args.show_obj_traj,
+        show_obj_move=args.show_obj_move,
         show_hand_traj=args.show_hand_traj,
         use_fk=args.use_fk,
         compare_3=args.compare_3,
@@ -1360,11 +2244,21 @@ def main():
         overlay_frames=args.overlay_frames,
         ot_refine=ot_refine,
         inference_mode=args.inference_mode,
-        online_window=args.online_window,
-        online_lookahead=args.online_lookahead,
+        online_window=args.online_window if comparison_models else (args.online_window or 60),
+        online_lookahead=args.online_lookahead if comparison_models else (10 if args.online_lookahead is None else args.online_lookahead),
+        online_chunk=args.online_chunk if comparison_models else (args.online_chunk or 59),
+        comparison_models=comparison_models,
+        auto_advance=args.auto_advance,
+        obj_max_faces=args.obj_max_faces,
         window_size=(1920, 1080)
     )
-    
+
+    if args.no_shadows:
+        for light in getattr(viewer_instance.scene, "lights", []):
+            light.shadow_enabled = False
+        print(f"Shadow maps disabled for {len(viewer_instance.scene.lights)} light(s) "
+              "(about 257 MiB of GPU memory each)")
+
     print("Viewer Initialized. Controls:")
     print("  q/e: Previous/Next 1 sequence")
     print("  Ctrl+q/e: Previous/Next 10 sequences")
@@ -1374,4 +2268,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

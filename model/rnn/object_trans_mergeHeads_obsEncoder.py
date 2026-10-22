@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_axis_angle
 
 from .base import RNN, RNNWithInit
+from .known_prefix_scan import KnownPrefixScan
 from .online import (
     append_stream_data,
     infer_batch_seq,
@@ -81,12 +82,16 @@ class _ObsEncoder(nn.Module):
         return code
 
 
-class ObjectTransModule(nn.Module):
+class ObjectTransModule(KnownPrefixScan, nn.Module):
     """
     物体位置预测模块
     基于手部位置、接触概率和物体IMU预测物体位置
     """
     ARCH_VERSION = 5
+    # The observation encoder runs once per window and the only per-frame
+    # recurrence is the state feedback, so a teacher-forced prefix collapses
+    # into one batched call (see known_prefix_scan.py).
+    SUPPORTS_FAST_KNOWN_PREFIX = True
     INTERACTION_CODE_DIM = 32
     PREDICTOR_HIDDEN_DIM = 320
     _LEGACY_HEAD_PREFIXES = (
@@ -171,6 +176,11 @@ class ObjectTransModule(nn.Module):
         )
         self.n_prediction_input = n_prediction_input
         self.feedback_feature_dim = 13
+        # Rebuilding this from a Python tuple costs a host-to-device copy on
+        # every call; keep it as a buffer instead.
+        self.register_buffer(
+            "_static_branch_onehot", torch.tensor((0.0, 0.0, 0.0, 1.0)), persistent=False
+        )
         feedback_hidden_dim = int(getattr(cfg, "object_trans_feedback_hidden_dim", 64))
         self.feedback_embed = nn.Sequential(
             nn.LayerNorm(self.feedback_feature_dim),
@@ -693,7 +703,9 @@ class ObjectTransModule(nn.Module):
             "prev_obj_trans": obj_trans_init,
             "prev_prev_obj_trans": torch.zeros_like(obj_trans_init),
             "prev_obj_delta": torch.zeros_like(obj_trans_init),
-            "prev_gating_weights": obj_trans_init.new_tensor((0.0, 0.0, 0.0, 1.0)).expand(batch_size, -1).clone(),
+            "prev_gating_weights": self._static_branch_onehot.to(
+                device=obj_trans_init.device, dtype=obj_trans_init.dtype
+            ).expand(batch_size, -1).clone(),
             "prev_obj_rotm": None,
             "obs_encoder_state": context["obs_encoder_state"],
             "frames_seen": 0,
@@ -819,6 +831,8 @@ class ObjectTransModule(nn.Module):
         known_obj_trans_prefix=None,
         known_obj_trans_prefix_mask=None,
         known_gating_weights_prefix=None,
+        fast_known_prefix: bool = False,
+        scan_end: int = None,
     ):
         state = self._init_scan_state(context)
         use_vectorized_fast_path = (
@@ -867,8 +881,19 @@ class ObjectTransModule(nn.Module):
             context["dtype"],
             None,
         )
+        seq_len = int(context["seq_len"])
+        scan_start = 0
+        if fast_known_prefix:
+            scan_start = self._resolve_known_prefix(
+                context, known_mask, known_weights_mask, scan_end
+            )
+            if scan_start:
+                state = self._batched_known_prefix(
+                    context, state, known_pos, known_weights, scan_start
+                )
+        scan_stop = seq_len if scan_end is None else min(int(scan_end), seq_len)
         collected = {}
-        for time_index in range(context["seq_len"]):
+        for time_index in range(scan_start, scan_stop):
             frame_output, state = self._predict_step(
                 context,
                 time_index,
@@ -881,7 +906,12 @@ class ObjectTransModule(nn.Module):
             for key, value in frame_output.items():
                 collected.setdefault(key, []).append(value)
         state["obs_encoder_state"] = context["obs_encoder_state"]
-        return {key: torch.stack(values, dim=1) for key, values in collected.items()}, state
+        prediction = {key: torch.stack(values, dim=1) for key, values in collected.items()}
+        if scan_start > 0 or scan_stop < seq_len:
+            prediction = self._restore_window_shape(
+                prediction, context, known_pos, known_weights, scan_start, scan_stop
+            )
+        return prediction, state
 
     @staticmethod
     def _resolve_object_mask(has_object_mask, batch_size, device, dtype):
@@ -1002,6 +1032,8 @@ class ObjectTransModule(nn.Module):
         known_obj_trans_prefix_mask: torch.Tensor = None,
         known_gating_weights_prefix: torch.Tensor = None,
         compute_refine: bool = True,
+        fast_known_prefix: bool = False,
+        scan_end: int = None,
         **_,
     ):
         """Run a causal OT scan from the supplied window initializers."""
@@ -1022,6 +1054,8 @@ class ObjectTransModule(nn.Module):
             known_obj_trans_prefix=known_obj_trans_prefix,
             known_obj_trans_prefix_mask=known_obj_trans_prefix_mask,
             known_gating_weights_prefix=known_gating_weights_prefix,
+            fast_known_prefix=fast_known_prefix,
+            scan_end=scan_end,
         )
         results = self._build_results(context, prediction, enable_refine=enable_refine and compute_refine)
         return results

@@ -1,0 +1,9 @@
+# Exact saved EgoIMU split, current preprocessing tensors, historical train seed.
+previous_recipe: outputs/IMUHOI++/paper_noise_omomo_20261016/recipe.yaml
+previous_protocol: configs/experiments/omomo_paper_noise_20261016.yaml
+egoimu_training_config: ../EgoIMU/outputs/IMUHOI/omomo/training_config.yaml
+egoimu_split: ../EgoIMU/process/processed_split_data_OMOMO/split_info.json
+current_unified: process/IMUHOI++cano/processed_split_data_OMOMO_full/unified
+seed: 10
+split_seed: 42
+eval_hoi_protocol: egoimu

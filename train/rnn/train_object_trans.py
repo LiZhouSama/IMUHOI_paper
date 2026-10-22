@@ -83,6 +83,7 @@ from train.rnn.train_utils import (
 )
 from torch.nn.utils import clip_grad_norm_
 from train.rnn.ot_history_training import forward_with_ot_history
+from train.rnn.train_utils import resumed_last_improvement_epoch as _resumed_last_improvement_epoch
 try:
     from torch.utils.tensorboard.writer import SummaryWriter
 except Exception:
@@ -807,6 +808,17 @@ class Stage3JointTrainer:
             ot_kwargs['feedback_control'] = feedback_control
         history_window = int(getattr(self.cfg, 'ot_history_training_window', 0)) if training else 0
         if history_window:
+            # Regime mixing: the history path never supervises the cold-start
+            # window (GT init, no published prefix) that the online protocol
+            # also runs, and its LSTM init network gets ~no gradient there.
+            # Use it only on a fraction of the batches (ot_history_training_prob)
+            # and only after ot_history_training_start_epoch, so the ordinary
+            # GT-init regime keeps training alongside the own-rollout regime.
+            history_prob = float(getattr(self.cfg, 'ot_history_training_prob', 1.0))
+            history_start = int(getattr(self.cfg, 'ot_history_training_start_epoch', 0))
+            if int(epoch) < history_start or torch.rand(()).item() >= history_prob:
+                history_window = 0
+        if history_window:
             ot_out = forward_with_ot_history(self.ot_model, hand_positions, contact_prob, obj_trans_init, history_window, **ot_kwargs)
         else:
             ot_out = call_model_inference(
@@ -953,7 +965,10 @@ class Stage3JointTrainer:
             test_iter = tqdm(self.test_loader, desc=f'Test {epoch}', leave=False)
 
             for batch in test_iter:
-                data_dict = build_model_input_dict(batch, self.cfg, self.device, add_noise=False)
+                data_dict = build_model_input_dict(
+                    batch, self.cfg, self.device,
+                    add_noise=bool(getattr(self.cfg, "validation_add_imu_noise", False)),
+                )
                 with autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
                     results, vc_out, hp_out, ot_out = self.forward_all(
                         data_dict, batch=batch, epoch=epoch, training=False
@@ -1040,7 +1055,9 @@ class Stage3JointTrainer:
         eval_interval = max(1, int(getattr(self.cfg, "eval_interval", 10) or 10))
         patience_epochs = int(getattr(self.cfg, "early_stopping_patience_epochs", 0) or 0)
         min_epochs = int(getattr(self.cfg, "early_stopping_min_epochs", 0) or 0)
-        last_improvement_epoch = self.start_epoch
+        last_improvement_epoch = _resumed_last_improvement_epoch(
+            self.cfg.save_dir, self.start_epoch, "best_joint.pt" if self.joint_train else "best.pt"
+        )
         stopped_early_at = None
         for epoch in range(self.start_epoch, max_epoch):
             train_loss, train_components = self.train_epoch(epoch)

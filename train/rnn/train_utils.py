@@ -616,6 +616,26 @@ def resolve_resume_checkpoint(resume_dir):
     raise FileNotFoundError(f"resume_dir contains no last.pt, final.pt, or best.pt: {resume_dir}")
 
 
+def resumed_last_improvement_epoch(save_dir, start_epoch, best_name="best.pt"):
+    """Epoch of the best checkpoint already in ``save_dir`` when resuming.
+
+    Without it every resume restarted the early-stopping window at the resume
+    epoch, so a run interrupted after its best epoch trained on long past its
+    patience.  Falls back to ``start_epoch`` (the old behaviour) when there is no
+    readable best checkpoint.
+    """
+    if not start_epoch:
+        return start_epoch
+    path = os.path.join(str(save_dir), best_name)
+    try:
+        epoch = torch.load(path, map_location="cpu").get("epoch")
+    except Exception:  # noqa: BLE001 - missing/corrupt file: keep the old behaviour
+        return start_epoch
+    if isinstance(epoch, (int, float)) and 0 <= int(epoch) < start_epoch:
+        return int(epoch)
+    return start_epoch
+
+
 def should_stop_early(epoch, last_improvement_epoch, patience_epochs, min_epochs, has_test_loader=True):
     """Early-stopping rule shared by every RNN training stage.
 
@@ -835,7 +855,10 @@ class BaseTrainer:
             test_iter = tqdm(self.test_loader, desc=f'Test {epoch}', leave=False)
             
             for batch in test_iter:
-                data_dict = build_model_input_dict(batch, self.cfg, self.device, add_noise=False)
+                data_dict = build_model_input_dict(
+                    batch, self.cfg, self.device,
+                    add_noise=bool(getattr(self.cfg, "validation_add_imu_noise", False)),
+                )
                 with autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
                     pred_dict = self.model_forward(data_dict, batch=batch)
 
@@ -869,7 +892,7 @@ class BaseTrainer:
         
         patience_epochs = int(getattr(self.cfg, "early_stopping_patience_epochs", 0) or 0)
         min_epochs = int(getattr(self.cfg, "early_stopping_min_epochs", 0) or 0)
-        last_improvement_epoch = self.start_epoch
+        last_improvement_epoch = resumed_last_improvement_epoch(self.cfg.save_dir, self.start_epoch)
         stopped_early_at = None
         for epoch in range(self.start_epoch, max_epoch):
             train_loss, train_components = self.train_epoch(epoch)
