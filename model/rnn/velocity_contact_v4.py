@@ -103,6 +103,9 @@ class V4VelocityContactModule(IMUHOIConditionalVelocityContactModule):
 
     ARCH_VERSION = 42
     requires_hp = True
+    # Velocity-then-joint staged training applies even to a v5 ablation whose
+    # endpoint head was removed together with the pose prior.
+    SUPPORTS_STAGED_TRAINING = True
     # v4's endpoint head reads boundary features only, so an endpoint-only
     # fine-tune stage would train 6 output channels on a frozen encoder and
     # give the pose prior — the whole point of the head — nothing.  Staged
@@ -212,6 +215,21 @@ class V4VelocityContactModule(IMUHOIConditionalVelocityContactModule):
             "left_leg": [1, 4, 7, 10],
             "right_leg": [2, 5, 8, 11],
         }
+        # Module ablation: whole body groups left out of the pose prior.
+        dropped = list(getattr(cfg, "vc_ablation_drop_body_groups", None) or ())
+        unknown = sorted(set(dropped) - set(self.body_group_indices))
+        if unknown:
+            raise ValueError(
+                f"vc_ablation_drop_body_groups names unknown groups {unknown}; "
+                f"choose from {sorted(self.body_group_indices)}"
+            )
+        if len(set(dropped)) >= len(self.body_group_indices):
+            raise ValueError(
+                "vc_ablation_drop_body_groups cannot drop every body group; "
+                "use vc_ablation_no_pose_prior instead."
+            )
+        for name in set(dropped):
+            del self.body_group_indices[name]
         group_hidden = int(
             getattr(cfg, "boundary_group_hidden", max(hidden_dim // 2, 32))
         )

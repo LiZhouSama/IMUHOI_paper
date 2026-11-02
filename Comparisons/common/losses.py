@@ -88,6 +88,133 @@ class DIPLoss(torch.nn.Module):
         }
 
 
+class DIPPaperLoss(torch.nn.Module):
+    """DIP objective: Gaussian NLL of the z-scored SMPL targets plus the
+    auxiliary NLL reconstruction of the z-scored input accelerations
+    (tf_models.IMUWrapper ``use_acc_loss``); the object terms belong to the
+    separate object branch."""
+
+    def __init__(self, obj_weight: float = 1.0):
+        super().__init__()
+        self.obj_weight = float(obj_weight)
+
+    def forward(self, output: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        pose = gaussian_nll(output["pose_mu_n"], output["pose_sigma_n"], output["pose_target_n"])
+        acc = gaussian_nll(output["acc_mu_n"], output["acc_sigma_n"], output["acc_target_n"])
+        obj_velocity = object_motion_loss(
+            output["obj_trans"], batch["obj_vel_target"], batch["has_object"]
+        )
+        obj_position = object_motion_loss(
+            output["obj_position_relative"], batch["obj_trans_target"], batch["has_object"]
+        )
+        total = pose + acc + self.obj_weight * (obj_velocity + obj_position)
+        return {
+            "loss": total,
+            "pose_nll": pose.detach(),
+            "acc_nll": acc.detach(),
+            "pose_mse_n": F.mse_loss(output["pose_mu_n"], output["pose_target_n"]).detach(),
+            "obj_velocity": obj_velocity.detach(),
+            "obj_position": obj_position.detach(),
+        }
+
+
+class GlobalPosePaperLoss(torch.nn.Module):
+    """GlobalPose Sec. 4.1: L2 on every estimate, BCE on stationary
+    probabilities, and an L2 loss on joint positions obtained by forward
+    kinematics of the RA pose output."""
+
+    def __init__(self, obj_weight: float = 1.0, fk_weight: float = 1.0):
+        super().__init__()
+        self.obj_weight = float(obj_weight)
+        self.fk_weight = float(fk_weight)
+
+    def forward(self, output: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        from Comparisons.common.paper_protocol import globalpose_fk_positions
+
+        pred = output["human"]
+        target = batch["target"]
+        terms = {
+            "pl_position": F.mse_loss(pred[..., :15], target[..., :15]),
+            "pl_gravity": F.mse_loss(pred[..., 15:18], target[..., 15:18]),
+            "ik_position": F.mse_loss(pred[..., 18:87], target[..., 18:87]),
+            "ik_gravity": F.mse_loss(pred[..., 87:90], target[..., 87:90]),
+            "ik_rotation": F.mse_loss(pred[..., 90:180], target[..., 90:180]),
+            "vr_velocity": F.mse_loss(pred[..., 180:184], target[..., 180:184]),
+            "vr_stationary": F.binary_cross_entropy_with_logits(
+                pred[..., 184:189], target[..., 184:189]
+            ),
+        }
+        terms["ik_fk_position"] = F.mse_loss(
+            globalpose_fk_positions(pred[..., 90:180], batch["bone_offsets"]),
+            target[..., 18:87],
+        )
+        terms["obj_velocity"] = object_motion_loss(
+            output["obj_trans"], batch["obj_vel_target"], batch["has_object"]
+        )
+        total = (
+            sum(value for key, value in terms.items() if key not in ("ik_fk_position", "obj_velocity"))
+            + self.fk_weight * terms["ik_fk_position"]
+            + self.obj_weight * terms["obj_velocity"]
+        )
+        return {"loss": total, **{key: value.detach() for key, value in terms.items()}}
+
+
+def transpose_accumulated_velocity_loss(
+    pred: torch.Tensor, target: torch.Tensor, scales: tuple[int, ...] = (1, 3, 9, 27)
+) -> torch.Tensor:
+    """TransPose Eq. 7-8: sum over n of squared n-frame velocity-error sums.
+
+    Averaged over windows and batch so the scale does not depend on the
+    training window length.
+    """
+    batch_size, seq_len, channels = pred.shape
+    error = pred - target
+    total = pred.sum() * 0.0
+    for scale in scales:
+        blocks = seq_len // scale
+        if blocks == 0:
+            continue
+        summed = error[:, : blocks * scale].reshape(batch_size, blocks, scale, channels).sum(dim=2)
+        total = total + summed.square().sum(dim=-1).mean()
+    return total
+
+
+class TransPosePaperLoss(torch.nn.Module):
+    """Per-network TransPose objectives (Eq. 1-3, 5, 7); the networks are
+    trained on noisy ground-truth upstream inputs and share no parameters, so
+    the sum equals training them separately."""
+
+    def __init__(self, obj_weight: float = 1.0):
+        super().__init__()
+        self.obj_weight = float(obj_weight)
+
+    def forward(self, output: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        terms = {
+            "leaf": F.mse_loss(output["leaf_pos"], batch["leaf_target"]),
+            "full": F.mse_loss(output["full_pos"], batch["full_target"]),
+            "pose": F.mse_loss(output["pose"], batch["pose_target"]),
+            "contact": F.binary_cross_entropy_with_logits(
+                output["contact_logits"], batch["contact_target"]
+            ),
+            "root_velocity": transpose_accumulated_velocity_loss(
+                output["root_vel"], batch["root_vel_target"]
+            ),
+        }
+        obj_velocity = object_motion_loss(
+            output["obj_trans"], batch["obj_vel_target"], batch["has_object"]
+        )
+        obj_position = object_motion_loss(
+            output["obj_position_relative"], batch["obj_trans_target"], batch["has_object"]
+        )
+        total = sum(terms.values()) + self.obj_weight * (obj_velocity + obj_position)
+        return {
+            "loss": total,
+            **{key: value.detach() for key, value in terms.items()},
+            "obj_velocity": obj_velocity.detach(),
+            "obj_position": obj_position.detach(),
+        }
+
+
 def tip_pose_root_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """TIP's pose/root velocity loss split."""
     pose_loss = ((pred[..., :108] - target[..., :108]) ** 2).mean() * 100.0

@@ -8,7 +8,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
+import os
 import sys
+from collections import deque
+from concurrent.futures import Future, ProcessPoolExecutor
 from pathlib import Path
 
 import torch
@@ -22,20 +26,36 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from Comparisons.common.adapters import tensor_to_device
-from Comparisons.common.inference import infer_comparison
+from Comparisons.common.geometry import local_pose_axis_angle_to_rotmat
+from Comparisons.common.inference import (
+    apply_globalpose_physics,
+    globalpose_physics_inputs,
+    infer_comparison,
+    use_ground_truth_root_translation,
+)
 from Comparisons.common.metrics import (
     METRIC_UNITS,
     MetricAccumulator,
     add_compatibility_aliases,
     comparison_metric_stats,
+    per_joint_rotation_errors,
 )
-from Comparisons.dip18 import DIP18HOIModel, DIP18ReferenceHOIModel
+from Comparisons.dip18 import DIP18HOIModel, DIP18PaperModel, DIP18ReferenceHOIModel
 from Comparisons.globalpose import GlobalPoseHOIModel
+from Comparisons.globalpose.physics import (
+    GlobalPosePhysics,
+    armature_from_body_model,
+    run_globalpose_physics,
+)
 from Comparisons.tip import TIPHOIModel, TIPReferenceHOIModel
 from Comparisons.transpose import TransPoseHOIModel
 from Comparisons.common.dataset import IMUDataset
+from Comparisons.common.paper_protocol import TIP_GROUND_SBP_HEIGHTS
 from utils.human_pose import load_body_model
-from utils.dataset_config import get_full_sequence_test_path
+from utils.dataset_config import (
+    get_full_sequence_test_path,
+    resolve_evaluation_body_model_path,
+)
 from utils.utils import setup_seed
 
 
@@ -81,6 +101,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tip_window", type=int, default=40)
     parser.add_argument(
+        "--tip_ground_height",
+        type=float,
+        default=None,
+        help="TIP flat-ground foot-SBP height (m); default per dataset (TIP_GROUND_SBP_HEIGHTS)",
+    )
+    parser.add_argument(
         "--tip_variant",
         "--tip-variant",
         choices=("legacy", "official"),
@@ -116,9 +142,36 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no_globalpose_physics",
+        action="store_true",
+        help=(
+            "Report the protocol-v3 GlobalPose network output without the "
+            "released per-frame physics optimizer (applied by default)."
+        ),
+    )
+    parser.add_argument(
+        "--physics_workers",
+        type=int,
+        default=12,
+        help="CPU processes running the GlobalPose physics optimizer (0: inline)",
+    )
+    parser.add_argument(
+        "--per_joint_rot_error",
+        action="store_true",
+        help="Also report per-joint rotation errors for local joints 1..21 (per_joint_rot).",
+    )
+    parser.add_argument(
+        "--gt_root_trans",
+        action="store_true",
+        help=(
+            "Oracle: evaluate with the ground-truth root translation (for methods "
+            "without a translation estimator, e.g. DIP); root orientation stays measured."
+        ),
+    )
+    parser.add_argument(
         "--protocol_version",
         type=int,
-        choices=(1, 2),
+        choices=(1, 2, 3),
         default=None,
         help="Override checkpoint protocol: 1=legacy, 2=corrected",
     )
@@ -246,6 +299,19 @@ def _build_model(
             object_with_init=globalpose_object_with_init,
             human_condition_on_object=human_condition_on_object,
         )
+    raise ValueError(method)
+
+
+def _build_paper_model(method: str, model_kwargs: dict) -> torch.nn.Module:
+    """Rebuild a protocol-v3 (paper-faithful) model from checkpoint kwargs."""
+    if method == "dip18":
+        return DIP18PaperModel(**model_kwargs)
+    if method == "tip":
+        return TIPHOIModel(**model_kwargs)
+    if method == "transpose":
+        return TransPoseHOIModel(**model_kwargs)
+    if method == "globalpose":
+        return GlobalPoseHOIModel(**model_kwargs)
     raise ValueError(method)
 
 
@@ -588,6 +654,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("TransPose past/future frame counts must be non-negative")
     if args.transpose_window_batch_size <= 0:
         raise ValueError("--transpose_window_batch_size must be positive")
+    if args.physics_workers < 0:
+        raise ValueError("--physics_workers must be non-negative")
     if args.eval_imu_noise:
         raise ValueError(
             "Comparisons.eval_comparison supports --simulate-imu-noise; "
@@ -617,8 +685,12 @@ def _serialize_predictions(
         "root_trans": prediction["root_trans"][0].detach().cpu(),
         "joints": prediction["joints"][0].detach().cpu(),
         "target_joints": prediction["target_joints"][0].detach().cpu(),
+        "target_local_rot": local_pose_axis_angle_to_rotmat(
+            batch["pose"], num_joints=24
+        )[0].detach().cpu(),
         "target_root_trans": batch["trans"][0].detach().cpu(),
         "obj_trans": prediction["obj_trans"][0].detach().cpu(),
+        "target_obj_trans": batch["obj_trans"][0].detach().cpu(),
         "has_object": bool(batch["has_object"][0]),
     }
     safe_name = name.replace("/", "_").replace("\\", "_")
@@ -675,7 +747,10 @@ def main() -> None:
         else "legacy"
     )
     globalpose_obj_imu_dim = 9 if globalpose_variant == "official" else 12
-    if args.method == "transpose" and transpose_variant == "official":
+    paper = protocol_version >= 3
+    if paper:
+        object_output_mode = "velocity"
+    if args.method == "transpose" and transpose_variant == "official" and not paper:
         # RefCodes/TransPose's object branch is trained on world velocity,
         # while the raw checkpoint has no metadata describing this contract.
         object_output_mode = "velocity"
@@ -688,7 +763,9 @@ def main() -> None:
             raise ValueError(
                 f"Checkpoint method is {checkpoint_method!r}, not {args.method!r}"
             )
-    model = _build_model(
+    model = _build_paper_model(
+        args.method, dict(checkpoint.get("model_kwargs") or {})
+    ).to(device) if paper else _build_model(
         args.method,
         n_sbps=n_sbps,
         tip_n_heads=tip_n_heads,
@@ -704,9 +781,14 @@ def main() -> None:
         globalpose_obj_imu_dim=globalpose_obj_imu_dim,
     ).to(device)
     checkpoint_state = _checkpoint_state(checkpoint)
-    if args.method == "transpose" and transpose_variant == "official":
+    if paper:
+        model.load_state_dict(checkpoint_state, strict=True)
+        object_parameters_initialized = True
+    elif args.method == "transpose" and transpose_variant == "official":
         checkpoint_state = _map_transpose_reference_state(checkpoint_state)
-    if args.method == "globalpose":
+    if paper:
+        pass
+    elif args.method == "globalpose":
         checkpoint_state = _map_globalpose_reference_state(checkpoint_state)
         # Public GlobalPose weights contain only the 68 human tensors.  The
         # object extension has no released checkpoint; allow exactly those
@@ -731,12 +813,20 @@ def main() -> None:
         object_parameters_initialized = bool(
             set(key for key in checkpoint_state if key.startswith("obj_head."))
         )
-    else:
+    elif not paper:
         model.load_state_dict(checkpoint_state, strict=True)
         object_parameters_initialized = True
     model.eval()
 
-    body_model_path = args.body_model_path or getattr(cfg, "body_model_path", None)
+    if args.dataset and args.dataset in cfg.datasets:
+        # Same rule as eval_IMUHOI.py: the dataset's declared family (SMPL-H
+        # for BEHAVE/IMHD/HODome) selects the evaluation skeleton.
+        body_model_path, body_model_type, body_model_source = resolve_evaluation_body_model_path(
+            cfg, cfg.datasets[args.dataset], explicit_path=args.body_model_path
+        )
+    else:
+        body_model_path = args.body_model_path or getattr(cfg, "body_model_path", None)
+        body_model_type, body_model_source = None, "cli" if args.body_model_path else "config"
     if not body_model_path:
         raise ValueError("body_model_path is missing from arguments and config")
     body_model_path = Path(body_model_path)
@@ -755,6 +845,9 @@ def main() -> None:
         data_dir=data_dirs,
         sequence_paths=sequence_paths,
         full_sequence=True,
+        # Protocol v3 evaluates every method on the main pipeline's stream.
+        imu_source="stored" if paper else "synthesize",
+        lean=paper,
         window_size=1,
         random_window=False,
         debug=False,
@@ -765,14 +858,16 @@ def main() -> None:
         obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
         body_model_path=(
             str(body_model_path)
-            if args.method == "globalpose" and globalpose_variant == "official"
+            if args.method == "globalpose" and globalpose_variant == "official" and not paper
             else None
         ),
         resolve_bimanual_contact_conflicts=bool(
             getattr(cfg, "resolve_bimanual_contact_conflicts", False)
         ),
         imu_protocol=(
-            "dip18_reference"
+            "imuhoi"
+            if paper
+            else "dip18_reference"
             if args.method == "dip18" and dip_variant == "official"
             else "tip_reference"
             if args.method == "tip" and tip_variant == "official"
@@ -793,7 +888,11 @@ def main() -> None:
         pin_memory=device.type == "cuda",
     )
 
-    protocol_name = "corrected_v2" if protocol_version >= 2 else "legacy_v1"
+    protocol_name = (
+        "paper_v3" if protocol_version >= 3
+        else "corrected_v2" if protocol_version >= 2
+        else "legacy_v1"
+    )
     print(
         f"method={args.method} checkpoint={checkpoint_path} protocol={protocol_name} "
         f"object_output={object_output_mode} sequences={len(dataset)} device={device}"
@@ -813,11 +912,35 @@ def main() -> None:
             "warning: checkpoint has no corrected protocol metadata; using legacy "
             "input/object semantics for compatibility"
         )
-    if args.method == "globalpose":
-        print(
-            "note: GlobalPose evaluation uses neural VR/stationary fusion; the "
-            "Windows-only physics optimizer is not applied"
+    tip_ground_height = None
+    if args.method == "tip" and protocol_version >= 3:
+        tip_ground_height = (
+            args.tip_ground_height
+            if args.tip_ground_height is not None
+            else TIP_GROUND_SBP_HEIGHTS.get(args.dataset, TIP_GROUND_SBP_HEIGHTS["omomo"])
         )
+        print(f"TIP flat ground at foot-SBP height {tip_ground_height:.4f} m")
+    use_physics = (
+        args.method == "globalpose" and protocol_version >= 3 and not args.no_globalpose_physics
+    )
+    armature = None
+    physics_pool = None
+    if use_physics:
+        armature = armature_from_body_model(body_model, device=device)
+        print(
+            "note: GlobalPose runs the released per-frame physics optimizer "
+            f"(armature mass {armature.mass.sum():.1f} kg, "
+            f"workers={args.physics_workers})"
+        )
+        if args.physics_workers > 0:
+            # One BLAS thread per worker; spawned workers read this at import.
+            for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+                os.environ[name] = "1"
+            physics_pool = ProcessPoolExecutor(
+                args.physics_workers, mp_context=multiprocessing.get_context("spawn")
+            )
+    elif args.method == "globalpose":
+        print("note: GlobalPose evaluation reports the network output without physics")
 
     aggregate = MetricAccumulator()
     per_sequence = []
@@ -825,6 +948,37 @@ def main() -> None:
     initialization_modes = set()
     object_velocity_frames = set()
     prediction_dir = Path(args.save_predictions) if args.save_predictions else None
+
+    def finish(raw_batch, batch, prediction, physics_job) -> None:
+        if physics_job is not None:
+            refined = physics_job.result() if isinstance(physics_job, Future) else physics_job
+            apply_globalpose_physics(prediction, *refined, armature, body_model)
+        if args.gt_root_trans:
+            use_ground_truth_root_translation(prediction, batch, body_model)
+        stats = comparison_metric_stats(prediction, batch, per_joint=args.per_joint_rot_error)
+        sequence_raw_metrics = stats.means()
+        aggregate.add_sequence_means(stats)
+        sequence_metrics = add_compatibility_aliases(sequence_raw_metrics)
+        per_sequence.append(
+            {
+                "seq_name": _sequence_name(raw_batch),
+                "num_frames": int(batch["human_imu"].shape[1]),
+                "has_object": bool(batch["has_object"][0]),
+                "metrics": sequence_metrics,
+            }
+        )
+        translation_modes.add(str(prediction["translation_mode"]))
+        initialization_modes.add(str(prediction["initialization_mode"]))
+        object_velocity_frames.add(str(prediction["object_velocity_frame"]))
+        if prediction_dir is not None:
+            _serialize_predictions(
+                prediction_dir, raw_batch, prediction, args.method
+            )
+
+    # Sequences wait here until their physics job is done; finishing in
+    # loader order keeps per_sequence deterministic.
+    pending = deque()
+    max_pending = 4 * max(args.physics_workers, 1)
     with torch.inference_mode():
         for raw_batch in tqdm(loader, desc=f"eval {args.method}"):
             batch = tensor_to_device(raw_batch, device)
@@ -849,31 +1003,32 @@ def main() -> None:
                 transpose_variant=transpose_variant,
                 globalpose_obj_imu_dim=globalpose_obj_imu_dim,
                 globalpose_init_mode=args.globalpose_init_mode,
+                tip_ground_height=tip_ground_height,
             )
             prediction["object_metrics_available"] = bool(
                 object_parameters_initialized
                 if args.method == "globalpose"
                 else True
             )
-            stats = comparison_metric_stats(prediction, batch)
-            sequence_raw_metrics = stats.means()
-            aggregate.add_sequence_means(stats)
-            sequence_metrics = add_compatibility_aliases(sequence_raw_metrics)
-            per_sequence.append(
-                {
-                    "seq_name": _sequence_name(raw_batch),
-                    "num_frames": int(batch["human_imu"].shape[1]),
-                    "has_object": bool(batch["has_object"][0]),
-                    "metrics": sequence_metrics,
-                }
-            )
-            translation_modes.add(str(prediction["translation_mode"]))
-            initialization_modes.add(str(prediction["initialization_mode"]))
-            object_velocity_frames.add(str(prediction["object_velocity_frame"]))
-            if prediction_dir is not None:
-                _serialize_predictions(
-                    prediction_dir, raw_batch, prediction, args.method
+            physics_job = None
+            if use_physics:
+                inputs = globalpose_physics_inputs(prediction, batch, armature, args.fps)
+                physics_job = (
+                    physics_pool.submit(run_globalpose_physics, **inputs)
+                    if physics_pool is not None
+                    else run_globalpose_physics(**inputs)
                 )
+            pending.append((raw_batch, batch, prediction, physics_job))
+            while pending and (
+                len(pending) > max_pending
+                or not isinstance(pending[0][3], Future)
+                or pending[0][3].done()
+            ):
+                finish(*pending.popleft())
+        while pending:
+            finish(*pending.popleft())
+    if physics_pool is not None:
+        physics_pool.shutdown()
 
     metrics = add_compatibility_aliases(aggregate.means())
     print("\nComparison evaluation")
@@ -885,6 +1040,7 @@ def main() -> None:
         "root_trans_err_cm",
         "obj_err_cm",
         "hoi_err_cm",
+        "hoi_err_egoimu_cm",
         "obj_trans_jitter_mm_frame2",
     ]
     for name in display_order:
@@ -900,8 +1056,19 @@ def main() -> None:
         "method": args.method,
         "dataset": args.dataset,
         "split": args.split,
+        "body_model": {
+            "path": str(body_model_path),
+            "type": body_model_type,
+            "source": body_model_source,
+        },
         "checkpoint": str(checkpoint_path.resolve()),
         "checkpoint_epoch": checkpoint.get("epoch") if isinstance(checkpoint, dict) else None,
+        "checkpoint_policy": (
+            checkpoint.get("checkpoint_policy") if isinstance(checkpoint, dict) else None
+        ),
+        "checkpoint_network_selection": (
+            checkpoint.get("network_selection") if isinstance(checkpoint, dict) else None
+        ),
         "protocol": protocol_name,
         "protocol_version": protocol_version,
         "object_output_mode": object_output_mode,
@@ -927,6 +1094,7 @@ def main() -> None:
         ),
         "object_velocity_frame": sorted(object_velocity_frames),
         "tip_n_heads": tip_n_heads if args.method == "tip" else None,
+        "tip_ground_height": tip_ground_height,
         "tip_object_state_feedback": (
             model.object_state_feedback if args.method == "tip" else None
         ),
@@ -946,8 +1114,20 @@ def main() -> None:
             else {"history": "recurrent_state"}
         ),
         "translation_mode": sorted(translation_modes),
+        "root_translation_oracle": bool(args.gt_root_trans),
         "initialization_mode": sorted(initialization_modes),
-        "globalpose_physics_applied": False if args.method == "globalpose" else None,
+        "globalpose_physics_applied": use_physics if args.method == "globalpose" else None,
+        "globalpose_physics": (
+            {
+                "step_s": GlobalPosePhysics.dt,
+                "steps_per_frame": round(1.0 / (args.fps * GlobalPosePhysics.dt)),
+                "armature": "eval body model, articulate voxel inertia",
+                "armature_mass_kg": float(armature.mass.sum()),
+                "floor": "lowest contact joint of the first frame",
+            }
+            if use_physics
+            else None
+        ),
         "globalpose_object_head_causal": (
             not model.object_bidirectional if args.method == "globalpose" else None
         ),
@@ -970,6 +1150,11 @@ def main() -> None:
         "aggregation": "macro_mean_over_sequences",
         "metrics": metrics,
         "metric_units": METRIC_UNITS,
+        **(
+            {"per_joint_rot": per_joint_rotation_errors(aggregate.means())}
+            if args.per_joint_rot_error
+            else {}
+        ),
         "metric_counts": {
             name: aggregate.counts.get(name, 0) for name in METRIC_UNITS
         },

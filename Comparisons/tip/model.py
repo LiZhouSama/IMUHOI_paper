@@ -29,6 +29,7 @@ class TIPHOIModel(nn.Module):
         past_state_dropout: float = 0.8,
         with_rnn: bool = True,
         object_state_feedback: bool = True,
+        past_dropout_always_on: bool = False,
     ):
         super().__init__()
         self.input_size_imu = input_size_imu
@@ -39,6 +40,11 @@ class TIPHOIModel(nn.Module):
         self.with_rnn = with_rnn
         self.n_heads = n_heads
         self.object_state_feedback = bool(object_state_feedback)
+        # The released TIP builds ``nn.Dropout`` inside ``forward`` and never
+        # calls ``model.eval()`` at test time, so the 0.8 history dropout is
+        # active during inference too (simple_transformer_with_state.py:76,
+        # offline_testing_simple.py:87-98).  The paper variant keeps that.
+        self.past_dropout_always_on = bool(past_dropout_always_on)
         self.in_dropout = nn.Dropout(in_dropout)
         self.past_dropout = nn.Dropout(past_state_dropout)
         history_dim = self.human_state_dim + (
@@ -127,9 +133,13 @@ class TIPHOIModel(nn.Module):
             history = torch.cat(
                 [state, prev_obj_velocity.nan_to_num(0.0)], dim=-1
             )
-        x = torch.cat(
-            [self.in_dropout(imu), obj_imu, self.past_dropout(history)], dim=-1
-        )
+        if self.past_dropout_always_on:
+            history = nn.functional.dropout(
+                history, p=self.past_dropout.p, training=True
+            )
+        else:
+            history = self.past_dropout(history)
+        x = torch.cat([self.in_dropout(imu), obj_imu, history], dim=-1)
         x = self.in_linear(x)
         x = self._official_head_shuffle(x)
         x = self.tf_encode(x, mask=self._causal_mask(x.shape[1], x.device))
@@ -150,11 +160,15 @@ class TIPHOIModel(nn.Module):
         initial_state: torch.Tensor | None = None,
         emit_initial_state: bool = False,
         smooth_output: bool = True,
+        measured_root_2axis: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Run TIP causally using only the initial and previously predicted states.
 
         With ``emit_initial_state=True``, frame 0 is the supplied initial state and
         IMU/state at frame ``t`` predicts frame ``t + 1``, matching TIP training.
+        ``measured_root_2axis`` [B,T,6] replaces the fed-back root rotation with
+        the root sensor reading, as the released real-time runner does
+        (real_time_runner_minimal.py: "provided by IMU directly").
         """
         if window_size <= 0:
             raise ValueError("window_size must be positive")
@@ -229,6 +243,8 @@ class TIPHOIModel(nn.Module):
             feedback_index = frame if emit_initial_state else frame + 1
             if feedback_index < seq_len:
                 previous[:, feedback_index] = self._state_for_feedback(state)
+                if measured_root_2axis is not None:
+                    previous[:, feedback_index, :6] = measured_root_2axis[:, feedback_index]
                 previous_object[:, feedback_index] = obj_trans.detach()
 
         return {

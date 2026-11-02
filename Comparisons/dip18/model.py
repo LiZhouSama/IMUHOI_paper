@@ -45,6 +45,164 @@ class DIPBiRNNHead(nn.Module):
         return self.output(y)
 
 
+class DIP18PaperModel(nn.Module):
+    """DIP BiRNN as configured by the released best model (paper version).
+
+    Reference: Huang et al., SIGGRAPH Asia 2018, and
+    ``dip18/train_and_eval`` (model ``birnn-fc1_512-lstm2_512-idrop2-relu-
+    norm_ori_acc_smpl-auxloss_acc``).  The five non-root sensors are
+    normalized to the root sensor and fed as ``[ori 45, acc 15]``; inputs and
+    SMPL targets are z-scored with training-set statistics.  The network is
+    input dropout 0.2 -> Dense 512 ReLU -> 2-layer BiLSTM 512 -> Dense 256
+    ReLU, followed by Gaussian heads (softplus sigma) for the 15 local joint
+    rotation matrices and, as auxiliary task, for the input accelerations.
+    The root rotation comes from the root sensor at decode time.
+
+    The object branch is a project extension with its own parameters, so its
+    loss cannot change the human pose network.
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 60,
+        pose_dim: int = 135,
+        acc_dim: int = 15,
+        obj_imu_dim: int = 12,
+        input_dropout: float = 0.2,
+        fps: float = 30.0,
+    ):
+        super().__init__()
+        self.dip_variant = "paper"
+        self.input_dim = int(input_dim)
+        self.pose_dim = int(pose_dim)
+        self.acc_dim = int(acc_dim)
+        self.obj_imu_dim = int(obj_imu_dim)
+        self.fps = float(fps)
+        self.input_dropout = nn.Dropout(float(input_dropout))
+        self.input_layer = nn.Sequential(nn.Linear(self.input_dim, 512), nn.ReLU())
+        self.rnn = nn.LSTM(512, 512, 2, batch_first=True, bidirectional=True)
+        self.output_hidden = nn.Sequential(nn.Linear(1024, 256), nn.ReLU())
+        self.pose_mu = nn.Linear(256, self.pose_dim)
+        self.pose_sigma = nn.Linear(256, self.pose_dim)
+        self.acc_mu = nn.Linear(256, self.acc_dim)
+        self.acc_sigma = nn.Linear(256, self.acc_dim)
+        self.obj_head = DIPBiRNNHead(
+            input_dim=self.input_dim + self.obj_imu_dim,
+            output_dim=3,
+        )
+        # z-score statistics; ``set_normalization`` fills them before training.
+        self.register_buffer("input_mean", torch.zeros(self.input_dim))
+        self.register_buffer("input_std", torch.ones(self.input_dim))
+        self.register_buffer("pose_mean", torch.zeros(self.pose_dim))
+        self.register_buffer("pose_std", torch.ones(self.pose_dim))
+        self.register_buffer("obj_mean", torch.zeros(self.obj_imu_dim))
+        self.register_buffer("obj_std", torch.ones(self.obj_imu_dim))
+
+    @torch.no_grad()
+    def set_normalization(self, stats: dict[str, torch.Tensor]) -> None:
+        for name in ("input", "pose", "obj"):
+            getattr(self, f"{name}_mean").copy_(stats[f"{name}_mean"])
+            getattr(self, f"{name}_std").copy_(stats[f"{name}_std"])
+
+    def normalize_pose(self, pose: torch.Tensor) -> torch.Tensor:
+        return (pose - self.pose_mean) / self.pose_std
+
+    def forward(self, imu: torch.Tensor, obj_imu: torch.Tensor) -> dict[str, torch.Tensor]:
+        x = (imu - self.input_mean) / self.input_std
+        hidden = self.input_layer(self.input_dropout(x))
+        hidden, _ = self.rnn(hidden)
+        hidden = self.output_hidden(hidden)
+        pose_mu_n = self.pose_mu(hidden)
+        obj_x = (obj_imu - self.obj_mean) / self.obj_std
+        obj_trans = self.obj_head(torch.cat([x, obj_x], dim=-1))
+        obj_position_relative = torch.zeros_like(obj_trans)
+        if obj_trans.shape[1] > 1:
+            obj_position_relative[:, 1:] = torch.cumsum(
+                obj_trans[:, 1:] / self.fps, dim=1
+            )
+        return {
+            "pose_mu_n": pose_mu_n,
+            "pose_sigma_n": F.softplus(self.pose_sigma(hidden)).clamp_min(1e-6),
+            "acc_mu_n": self.acc_mu(hidden),
+            "acc_sigma_n": F.softplus(self.acc_sigma(hidden)).clamp_min(1e-6),
+            # The auxiliary target is the normalized (pre-dropout) input acc.
+            "acc_target_n": x[..., self.input_dim - self.acc_dim :],
+            "pose_mu": pose_mu_n * self.pose_std + self.pose_mean,
+            "obj_trans": obj_trans,
+            "obj_position_relative": obj_position_relative,
+            "dip_paper": True,
+        }
+
+    @torch.no_grad()
+    def reconstruct_chunks(
+        self,
+        imu: torch.Tensor,
+        obj_imu: torch.Tensor,
+        past_frames: int = 20,
+        future_frames: int = 5,
+        window_batch_size: int = 128,
+    ) -> dict[str, torch.Tensor]:
+        """DIP's online protocol: each frame sees ``past`` + ``future`` frames."""
+        return _reconstruct_windows(
+            self, imu, obj_imu, self.pose_dim, "pose_mu",
+            past_frames, future_frames, window_batch_size,
+        )
+
+
+def _reconstruct_windows(
+    model: nn.Module,
+    imu: torch.Tensor,
+    obj_imu: torch.Tensor,
+    pose_dim: int,
+    pose_key: str,
+    past_frames: int,
+    future_frames: int,
+    window_batch_size: int,
+) -> dict[str, torch.Tensor]:
+    """Evaluate a bidirectional model on per-frame sliding windows."""
+    if past_frames < 0 or future_frames < 0:
+        raise ValueError("past_frames and future_frames must be non-negative")
+    if window_batch_size <= 0:
+        raise ValueError("window_batch_size must be positive")
+    batch_size, seq_len = imu.shape[:2]
+    if seq_len <= 0:
+        raise ValueError("DIP inference requires at least one frame")
+    pose_all = imu.new_empty(batch_size, seq_len, pose_dim)
+    obj_all = imu.new_empty(batch_size, seq_len, 3)
+    groups: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
+    for frame in range(seq_len):
+        start = max(0, frame - past_frames)
+        end = min(seq_len, frame + future_frames + 1)
+        groups[(end - start, frame - start)].append((frame, start))
+    frames_per_batch = max(1, window_batch_size // batch_size)
+    for (window_len, center), entries in groups.items():
+        for offset in range(0, len(entries), frames_per_batch):
+            chunk = entries[offset : offset + frames_per_batch]
+            human_windows = torch.stack(
+                [imu[:, start : start + window_len] for _, start in chunk], dim=1
+            )
+            object_windows = torch.stack(
+                [obj_imu[:, start : start + window_len] for _, start in chunk], dim=1
+            )
+            num_windows = human_windows.shape[1]
+            output = model.forward(
+                human_windows.reshape(batch_size * num_windows, window_len, -1),
+                object_windows.reshape(batch_size * num_windows, window_len, -1),
+            )
+            frame_index = torch.as_tensor(
+                [frame for frame, _ in chunk], device=imu.device, dtype=torch.long
+            )
+            pose_all.index_copy_(
+                1, frame_index,
+                output[pose_key][:, center].reshape(batch_size, num_windows, -1),
+            )
+            obj_all.index_copy_(
+                1, frame_index,
+                output["obj_trans"][:, center].reshape(batch_size, num_windows, -1),
+            )
+    return {"pose_mu": pose_all, "obj_trans": obj_all}
+
+
 class DIPReferenceRNN(nn.Module):
     """The RNN block used by the public OMOMO DIP adaptation.
 

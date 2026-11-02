@@ -18,17 +18,22 @@ class BatchRNN(nn.Module):
         bidirectional: bool = True,
         dropout: float = 0.2,
         input_linear: bool = True,
+        lstm_dropout: float | None = None,
     ):
         super().__init__()
         rnn_input = n_hidden if input_linear else n_input
         self.linear1 = nn.Linear(n_input, n_hidden) if input_linear else nn.Identity()
+        # ``lstm_dropout=None`` keeps the historical inter-layer dropout; the
+        # released TransPose RNN uses input dropout only (net.py: nn.LSTM
+        # without a dropout argument).
+        inter_layer = dropout if lstm_dropout is None else float(lstm_dropout)
         self.rnn = nn.LSTM(
             rnn_input,
             n_hidden,
             n_layers,
             batch_first=True,
             bidirectional=bidirectional,
-            dropout=dropout if n_layers > 1 else 0.0,
+            dropout=inter_layer if n_layers > 1 else 0.0,
         )
         self.linear2 = nn.Linear(n_hidden * (2 if bidirectional else 1), n_output)
         self.dropout = nn.Dropout(dropout)

@@ -9,7 +9,12 @@ import numpy as np
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 import random # Import random for shuffling sequence info in debug mode
-from utils.rotation_conversions import matrix_to_axis_angle, matrix_to_rotation_6d, rotation_6d_to_matrix
+from utils.rotation_conversions import (
+    axis_angle_to_matrix,
+    matrix_to_axis_angle,
+    matrix_to_rotation_6d,
+    rotation_6d_to_matrix,
+)
 
 from configs import (
     FRAME_RATE, _SENSOR_POS_INDICES, _SENSOR_ROT_INDICES, _VEL_SELECTION_INDICES,
@@ -419,6 +424,76 @@ def _build_tip_reference_features(
 
 # --- 结束 IMU 计算函数 ---
 
+
+def _sequence_local_pose_axis_angle(seq_data) -> Optional[torch.Tensor]:
+    """Return the full-sequence local pose as [T, J, 3] axis-angle.
+
+    The canonical corpus stores ``pose`` (SMPL-24 axis-angle); older corpora
+    stored ``rotation_local_full_gt_list`` (row-based 6D).  Both describe the
+    same local rotations, so either layout yields identical targets.
+    """
+    pose = seq_data.get("pose")
+    if pose is not None:
+        pose = torch.as_tensor(pose).float()
+        return pose.reshape(pose.shape[0], -1, 3)
+    rotation_6d = seq_data.get("rotation_local_full_gt_list")
+    if rotation_6d is None:
+        return None
+    rotation_6d = torch.as_tensor(rotation_6d).float()
+    return matrix_to_axis_angle(
+        rotation_6d_to_matrix(rotation_6d.reshape(rotation_6d.shape[0], -1, 6))
+    )
+
+
+def _axis_angle_to_rotation_6d(pose_axis_angle: torch.Tensor) -> torch.Tensor:
+    """[T, J, 3] axis-angle -> [T, J, 6] row-based 6D (PyTorch3D convention)."""
+    return matrix_to_rotation_6d(axis_angle_to_matrix(pose_axis_angle))
+
+
+def _load_tip_sbp(file_path, cache_root, seq_len: int) -> Optional[torch.Tensor]:
+    """Full-sequence TIP SBP labels from the sidecar cache, or None."""
+    from Comparisons.tip.sbp_cache import TIP_SBP_VERSION, cache_path_for_source
+
+    cache_file = cache_path_for_source(file_path, cache_root)
+    if not cache_file.exists():
+        return None
+    cached = torch.load(cache_file, map_location="cpu", weights_only=False)
+    if not isinstance(cached, dict) or cached.get("version") != TIP_SBP_VERSION:
+        return None
+    sbp = cached["tip_sbp"].float()
+    return sbp if int(sbp.shape[0]) == int(seq_len) else None
+
+
+def apply_main_sequence_noise(seq_data, file_path, base_seed, noise_cfg) -> bool:
+    """Noise the stored full-sequence IMU exactly like ``dataset_IMUHOI``.
+
+    Mirrors ``dataset.dataset_IMUHOI.IMUDataset._apply_sequence_noise``: one
+    Noitom-style realization per sequence, seeded by the base seed plus a hash
+    of the real path, with generator offsets 0 (human) and 1 (object).  The
+    comparison baselines therefore see bit-identical noisy IMU to the main
+    pipeline.
+    """
+    seed = _stable_sequence_seed(base_seed, os.path.realpath(os.path.abspath(file_path)))
+    applied = False
+    for offset, key in enumerate(("human_imu", "obj_imu")):
+        imu = seq_data.get(key)
+        if imu is None:
+            continue
+        imu = torch.as_tensor(imu).float()
+        if key == "obj_imu" and imu.dim() == 3 and imu.shape[1] == 1:
+            imu = imu.squeeze(1)
+        if imu.shape[-1] != 9:
+            raise ValueError(f"{key} must have final dimension 9, got {tuple(imu.shape)}")
+        generator_seed = None if seed is None else (int(seed) + offset) % (2 ** 63 - 1)
+        generator = _make_noise_generator(generator_seed, imu.device)
+        noisy_acc, noisy_rot, _ = apply_imu_noise(
+            imu[..., :3], imu[..., 3:9], FRAME_RATE, noise_cfg, generator=generator
+        )
+        seq_data[key] = torch.cat((noisy_acc, noisy_rot), dim=-1).float()
+        applied = True
+    seq_data["sequence_noise_applied"] = applied
+    return applied
+
 def find_contact_segments(contact_mask):
     """找到连续的接触段"""
     segments = []
@@ -617,6 +692,24 @@ def compute_obj_direction_supervision(position_global, obj_trans, obj_rot,
 
     return result
 
+
+def _compact_tensors(seq_data):
+    """Copy tensors that are views of a larger saved storage.
+
+    Segment files were written from slices of whole sequences, and torch.save
+    keeps the full parent storage (BEHAVE: ~5x the segment), which multiplied
+    the preload memory of every training process.
+    """
+    if not isinstance(seq_data, dict):
+        return seq_data
+    for key, value in seq_data.items():
+        if (
+            isinstance(value, torch.Tensor)
+            and value.storage().nbytes() > value.numel() * value.element_size()
+        ):
+            seq_data[key] = value.clone()
+    return seq_data
+
 class IMUDataset(Dataset):
     def __init__(
         self,
@@ -635,6 +728,10 @@ class IMUDataset(Dataset):
         imu_protocol="imuhoi",
         body_model_path=None,
         globalpose_mesh_model_path=None,
+        imu_source="synthesize",
+        windows_per_sequence=1,
+        tip_sbp_cache_root=None,
+        lean=False,
     ):
         """
         IMU数据集 - 每个epoch为每个序列随机采样一个窗口
@@ -673,6 +770,25 @@ class IMUDataset(Dataset):
         self.globalpose_mesh_model_path = globalpose_mesh_model_path
         self._globalpose_mesh_models = {}
         self._globalpose_sensor_cache = {}
+        # "stored": use the corpus' own human_imu/obj_imu (the stream the main
+        # pipeline consumes), noised once per sequence at preload when a seed
+        # is given.  "synthesize": rebuild a method-specific stream per sample.
+        self.imu_source = str(imu_source).lower()
+        if self.imu_source not in {"stored", "synthesize"}:
+            raise ValueError(f"imu_source must be 'stored' or 'synthesize', got {imu_source!r}")
+        if self.imu_source == "stored" and self.imu_protocol != "imuhoi":
+            raise ValueError("imu_source='stored' only supports imu_protocol='imuhoi'")
+        self.windows_per_sequence = int(windows_per_sequence)
+        if self.windows_per_sequence < 1:
+            raise ValueError("windows_per_sequence must be >= 1")
+        # TIP SBP labels are read once per sequence at preload; looking them
+        # up per sample costs several slow filesystem calls on WSL drives.
+        self.tip_sbp_cache_root = tip_sbp_cache_root
+        # ``lean`` skips the VC/OT supervision labels (contact endpoints,
+        # hand-object directions/lengths, sensor velocities) that the
+        # comparison baselines never read; their keys are filled with zeros.
+        self.lean = bool(lean)
+        self._real_paths = {}
         if self.imu_protocol not in {
             "imuhoi", "dip18_reference", "tip_reference", "transpose_reference",
             "globalpose_reference",
@@ -838,7 +954,7 @@ class IMUDataset(Dataset):
         for file_path in tqdm(self.sequence_files, desc="预加载和收集信息"):
             try:
                 # 加载序列数据
-                seq_data = torch.load(file_path)
+                seq_data = _compact_tensors(torch.load(file_path))
                 seq_name = os.path.basename(file_path).replace(".pt", "")
 
                 # 判定是否有物体：显式 has_object 优先，其次根据 obj_trans 是否存在
@@ -848,11 +964,15 @@ class IMUDataset(Dataset):
                 has_object_flag = bool(has_object_flag)
 
                 # 检查基本数据是否存在
-                if seq_data is None or "rotation_local_full_gt_list" not in seq_data or seq_data["rotation_local_full_gt_list"] is None:
-                    print(f"警告：跳过文件 {file_path}，缺少必要的 'rotation_local_full_gt_list' 数据。")
+                motion = None
+                if seq_data is not None:
+                    motion = seq_data.get("pose")
+                    if motion is None:
+                        motion = seq_data.get("rotation_local_full_gt_list")
+                if motion is None:
+                    print(f"警告：跳过文件 {file_path}，缺少 'pose' 或 'rotation_local_full_gt_list' 数据。")
                     continue
 
-                motion = seq_data["rotation_local_full_gt_list"]
                 seq_len = motion.shape[0]
 
                 # 检查序列长度是否足够
@@ -894,6 +1014,27 @@ class IMUDataset(Dataset):
                 if seq_data.get("obj_imu_real") is not None:
                     self.has_obj_real_imu = True
 
+                if self.tip_sbp_cache_root:
+                    seq_data["tip_sbp"] = _load_tip_sbp(file_path, self.tip_sbp_cache_root, seq_len)
+
+                if self.imu_source == "stored":
+                    if seq_data.get("human_imu") is None:
+                        raise KeyError(f"{file_path} has no stored human_imu")
+                    if (
+                        self.simulate_imu_noise
+                        and self.simulate_imu_noise_seed is not None
+                        and seq_data.get("human_imu_real") is None
+                    ):
+                        seq_noise_cfg_raw = seq_data.get("imu_noise_params", None)
+                        apply_main_sequence_noise(
+                            seq_data,
+                            file_path,
+                            self.simulate_imu_noise_seed,
+                            merge_noise_cfg(seq_noise_cfg_raw)
+                            if seq_noise_cfg_raw is not None
+                            else self.imu_noise_cfg,
+                        )
+
                 # 存储预加载的数据 (使用 file_path 作为 key)
                 self.loaded_data[file_path] = seq_data
 
@@ -906,6 +1047,10 @@ class IMUDataset(Dataset):
                 })
 
             except Exception as e:
+                if self.lean:
+                    # Protocol v3: a silently skipped file would change the
+                    # training/test set (e.g. ENOMEM under concurrent loads).
+                    raise RuntimeError(f"Failed to load {file_path}") from e
                 print(f"处理文件 {file_path} 时出错: {e}")
                 import traceback
                 traceback.print_exc() # 打印更详细的错误追踪
@@ -932,10 +1077,11 @@ class IMUDataset(Dataset):
             pass
 
     def __len__(self):
-        # 返回独立序列的数量
-        return len(self.sequence_info)
+        # 返回独立序列的数量（每序列可重复采样多个随机窗口）
+        return len(self.sequence_info) * self.windows_per_sequence
 
     def __getitem__(self, idx):
+        idx = int(idx) % max(len(self.sequence_info), 1)
         # 1. 获取序列信息
         try:
             seq_info = self.sequence_info[idx]
@@ -982,11 +1128,10 @@ class IMUDataset(Dataset):
             # 获取实际的序列长度（考虑full_sequence模式）
             actual_seq_len = end_idx - start_idx
 
-            pose = matrix_to_axis_angle(rotation_6d_to_matrix(
-                seq_data["rotation_local_full_gt_list"].reshape(seq_len, -1, 6)[start_idx:end_idx])).reshape(actual_seq_len, -1) # [seq, 66]
-            local_rotation_6d = seq_data["rotation_local_full_gt_list"].reshape(
-                seq_len, -1, 6
-            )[start_idx:end_idx].float()
+            pose_axis_angle_sequence = _sequence_local_pose_axis_angle(seq_data)
+            pose_axis_angle = pose_axis_angle_sequence[start_idx:end_idx]
+            pose = pose_axis_angle.reshape(actual_seq_len, -1)  # [seq, J*3]
+            local_rotation_6d = _axis_angle_to_rotation_6d(pose_axis_angle).float()
             raw_position_global = seq_data["position_global_full_gt_world"]
             raw_rotation_global = seq_data["rotation_global"]
             if not isinstance(raw_position_global, torch.Tensor):
@@ -999,11 +1144,17 @@ class IMUDataset(Dataset):
             if not isinstance(trans_sequence, torch.Tensor):
                 trans_sequence = torch.as_tensor(trans_sequence)
             trans_sequence = trans_sequence.float()
-            globalpose_mesh_targets = self._globalpose_mesh_targets(
-                file_path,
-                seq_data,
-                seq_data["rotation_local_full_gt_list"].float(),
-                trans_sequence,
+            globalpose_mesh_targets = (
+                self._globalpose_mesh_targets(
+                    file_path,
+                    seq_data,
+                    _axis_angle_to_rotation_6d(pose_axis_angle_sequence).reshape(
+                        seq_len, -1
+                    ),
+                    trans_sequence,
+                )
+                if self.imu_protocol == "globalpose_reference"
+                else None
             )
             globalpose_sensor_positions_sequence = (
                 globalpose_mesh_targets["sensor_positions"]
@@ -1048,10 +1199,12 @@ class IMUDataset(Dataset):
             seq_noise_cfg_raw = seq_data.get("imu_noise_params", None)
             seq_noise_cfg = merge_noise_cfg(seq_noise_cfg_raw) if seq_noise_cfg_raw is not None else self.imu_noise_cfg
             imu_noise_applied = False
-            noise_seed = _stable_sequence_seed(
-                self.simulate_imu_noise_seed,
-                os.path.realpath(os.path.abspath(file_path)),
-            )
+            real_path = self._real_paths.get(file_path)
+            if real_path is None:
+                # realpath walks every path component (slow on WSL drives).
+                real_path = os.path.realpath(os.path.abspath(file_path))
+                self._real_paths[file_path] = real_path
+            noise_seed = _stable_sequence_seed(self.simulate_imu_noise_seed, real_path)
             noise_generator = _make_noise_generator(noise_seed, device)
 
             # The released TIP loader normalizes against frame zero of the
@@ -1103,6 +1256,22 @@ class IMUDataset(Dataset):
             if human_imu_real is not None:
                 human_imu = human_imu_real
                 imu_noise_applied = True
+            elif self.imu_source == "stored":
+                human_imu = torch.as_tensor(seq_data["human_imu"])[start_idx:end_idx].to(
+                    device=device, dtype=dtype
+                )
+                imu_noise_applied = bool(seq_data.get("sequence_noise_applied", False))
+                if self.simulate_imu_noise and self.simulate_imu_noise_seed is None:
+                    # No fixed realization requested: draw fresh noise per sample.
+                    human_acc, human_rot6d, _ = apply_imu_noise(
+                        human_imu[:, :, :3],
+                        human_imu[:, :, 3:],
+                        FRAME_RATE,
+                        seq_noise_cfg,
+                        generator=None,
+                    )
+                    human_imu = torch.cat((human_acc, human_rot6d), dim=-1)
+                    imu_noise_applied = True
             elif tip_reference is not None:
                 human_full, _, tip_root_vel_full, tip_obj_vel_full, tip_root_rot0, tip_root_pos0 = tip_reference
                 if self.simulate_imu_noise:
@@ -1177,10 +1346,14 @@ class IMUDataset(Dataset):
                     )
                     human_imu = torch.cat((human_acc, human_rot6d), dim=-1)
                     imu_noise_applied = True
-            joint_vel_root = _compute_joint_velocity_root(rotation_global_full, position_global_full, FRAME_RATE)
             root_vel = _central_diff(position_global_full[:, 0, :], 1.0 / FRAME_RATE)
-            sensor_vel_root = joint_vel_root[:, _VEL_SELECTION_INDEX_LIST, :] # [seq, 6, 3]
-            sensor_vel_glb = _central_diff(position_global_full[:, _SENSOR_POS_INDICES, :], 1.0 / FRAME_RATE)
+            if self.lean:
+                sensor_vel_root = position_global_full.new_zeros(actual_seq_len, len(_VEL_SELECTION_INDEX_LIST), 3)
+                sensor_vel_glb = position_global_full.new_zeros(actual_seq_len, len(_SENSOR_POS_INDICES), 3)
+            else:
+                joint_vel_root = _compute_joint_velocity_root(rotation_global_full, position_global_full, FRAME_RATE)
+                sensor_vel_root = joint_vel_root[:, _VEL_SELECTION_INDEX_LIST, :] # [seq, 6, 3]
+                sensor_vel_glb = _central_diff(position_global_full[:, _SENSOR_POS_INDICES, :], 1.0 / FRAME_RATE)
 
             # --- 物体数据准备 ---
             # 优先使用显式标记，其次根据obj字段推断
@@ -1214,6 +1387,16 @@ class IMUDataset(Dataset):
                     if obj_imu.dim() == 3 and obj_imu.shape[1] == 1:
                         obj_imu = obj_imu.squeeze(1)
                     imu_noise_applied = True
+                elif self.imu_source == "stored":
+                    obj_imu = torch.as_tensor(seq_data["obj_imu"])
+                    if obj_imu.dim() == 3 and obj_imu.shape[1] == 1:
+                        obj_imu = obj_imu.squeeze(1)
+                    obj_imu = obj_imu[start_idx:end_idx].to(device=device, dtype=dtype)
+                    if self.simulate_imu_noise and self.simulate_imu_noise_seed is None:
+                        obj_acc, obj_rot6d, _ = apply_imu_noise(
+                            obj_imu[:, :3], obj_imu[:, 3:], FRAME_RATE, seq_noise_cfg, generator=None
+                        )
+                        obj_imu = torch.cat((obj_acc, obj_rot6d), dim=-1)
                 elif tip_reference is not None:
                     _, object_full, _, _, _, _ = tip_reference
                     if self.simulate_imu_noise:
@@ -1313,7 +1496,7 @@ class IMUDataset(Dataset):
             lhand_lb = torch.zeros(actual_seq_len, device=device, dtype=dtype)
             rhand_lb = torch.zeros(actual_seq_len, device=device, dtype=dtype)
 
-            if has_object:
+            if has_object and not self.lean:
                 try:
                     virtual_joint_data = compute_obj_direction_supervision(
                         position_global_full, obj_trans, obj_rot_6d,
@@ -1361,16 +1544,20 @@ class IMUDataset(Dataset):
                 prev_contact = (False, False, False)
                 next_contact = (False, False, False)
 
-            contact_endpoint, contact_endpoint_gauss = build_contact_endpoint_labels(
-                lhand_contact_window,
-                rhand_contact_window,
-                obj_contact_window,
-                prev_contact=prev_contact,
-                next_contact=next_contact,
-                sigma=2.0,
-                device=device,
-                dtype=dtype,
-            )
+            if self.lean:
+                contact_endpoint = torch.zeros(actual_seq_len, 6, device=device, dtype=dtype)
+                contact_endpoint_gauss = torch.zeros_like(contact_endpoint)
+            else:
+                contact_endpoint, contact_endpoint_gauss = build_contact_endpoint_labels(
+                    lhand_contact_window,
+                    rhand_contact_window,
+                    obj_contact_window,
+                    prev_contact=prev_contact,
+                    next_contact=next_contact,
+                    sigma=2.0,
+                    device=device,
+                    dtype=dtype,
+                )
             start_label = contact_endpoint[:, 4]
             end_label = contact_endpoint[:, 5]
             start_gauss = contact_endpoint_gauss[:, 4]
@@ -1442,6 +1629,13 @@ class IMUDataset(Dataset):
                 "pose": pose.float(),
                 "rotation_local_6d": local_rotation_6d.float(),
             }
+            if self.tip_sbp_cache_root:
+                sbp_sequence = seq_data.get("tip_sbp")
+                result["tip_sbp"] = (
+                    sbp_sequence[start_idx:end_idx].to(device=device, dtype=dtype)
+                    if sbp_sequence is not None
+                    else torch.full((actual_seq_len, 20), float("nan"), device=device, dtype=dtype)
+                )
             if globalpose_sensor_positions_sequence is not None:
                 result["globalpose_sensor_positions"] = (
                     globalpose_sensor_positions_sequence[start_idx:end_idx]

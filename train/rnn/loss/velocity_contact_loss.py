@@ -46,6 +46,7 @@ class VelocityContactLoss:
         'obj_move',
         'hand_contact_cond',
         'hand_contact_marginal',
+        'hand_contact_direct',
         'contact_endpoint',
         'contact_endpoint_order',
         'endpoint_contact_consistency',
@@ -57,6 +58,7 @@ class VelocityContactLoss:
         'obj_move',
         'hand_contact_cond',
         'hand_contact_marginal',
+        'hand_contact_direct',
         'contact_endpoint',
         'endpoint_contact_consistency',
     }
@@ -68,6 +70,9 @@ class VelocityContactLoss:
                 - hand_contact_cond: conditional hand-contact BCE
                 - hand_contact_marginal: proper BCE on the downstream-consumed
                   P(object move) * P(hand contact | object move)
+                - hand_contact_direct: BCE on every frame for a hand head that
+                  estimates P(hand contact) directly (VC v5 direct-contact
+                  ablation, IMU-HOI form)
                 - contact_endpoint: endpoint heatmap focal loss
                 - endpoint_contact_consistency: dense endpoint/contact agreement
                 - contact_anticipation: focal loss on "a contact transition
@@ -265,10 +270,28 @@ class VelocityContactLoss:
                     contact_valid_mask.unsqueeze(-1)
                 ].mean()
 
+        # Direct (unfactorized) hand contact, as in IMU-HOI: BCE on every frame.
+        # Its logits also fill pred_hand_contact_logits, so the conditional
+        # fallback below must not read them as conditional logits.
+        direct_logits = pred_dict.get('pred_hand_contact_logits_direct')
+        if isinstance(direct_logits, torch.Tensor):
+            hand_contact_gt_2 = torch.stack(
+                [lhand_contact_gt.float(), rhand_contact_gt.float()], dim=-1
+            )
+            direct_element = F.binary_cross_entropy_with_logits(
+                direct_logits, hand_contact_gt_2, reduction='none'
+            )
+            if contact_valid_mask is None:
+                losses['hand_contact_direct'] = direct_element.mean()
+            elif contact_valid_mask.any():
+                losses['hand_contact_direct'] = direct_element[
+                    contact_valid_mask.unsqueeze(-1).expand_as(direct_element)
+                ].mean()
+
         # conditional hand contact (only when object moving)
         hand_contact_prob = pred_dict.get('pred_hand_contact_prob_cond')
         hand_logits_cond = pred_dict.get('pred_hand_contact_logits_cond')
-        if hand_logits_cond is None:
+        if hand_logits_cond is None and direct_logits is None:
             if contact_logits is not None and contact_logits.shape[-1] >= 2:
                 hand_logits_cond = contact_logits[..., :2]
         if hand_contact_prob is None:

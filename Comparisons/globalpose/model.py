@@ -17,9 +17,8 @@ class GlobalPoseHOIModel(nn.Module):
 
     The original paper's per-frame physics optimizer is not a learnable module.
     This class preserves the PL -> IK1 -> IK2 -> VR prediction chain and exposes
-    the predicted VR/contact outputs used by the physics stage.  Physics-based
-    online refinement can be added around these outputs without changing the
-    training contract.
+    the predicted VR/contact outputs used by the physics stage, which runs at
+    evaluation time (``physics.py``) without changing the training contract.
     """
 
     def __init__(
@@ -116,12 +115,18 @@ class GlobalPoseHOIModel(nn.Module):
         column_r6d: bool = True,
         pl_init: torch.Tensor | None = None,
         vr_init: torch.Tensor | None = None,
+        teacher: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Forward on already-adapted GlobalPose inputs.
 
         Args:
             x: [B, T, 84] GlobalPose PL-stage input.
             obj_imu: [B, T, ``obj_imu_dim``] object IMU extension.
+            teacher: optional ground-truth cascade inputs (``g_r``, ``p_rb``,
+                ``p_rj``, ``rrj``).  GlobalPose first trains every network
+                independently "with their respective inputs and outputs"
+                (Sec. 4.1); feeding ground truth to each downstream network
+                reproduces that stage while sharing one forward pass.
         """
         object_input = torch.cat([x, obj_imu], dim=-1)
         model_input = object_input if self.human_condition_on_object else x
@@ -132,6 +137,9 @@ class GlobalPoseHOIModel(nn.Module):
         p_rb = pl[:, :, :15]
         g_r1 = self._normalize(pl[:, :, 15:18])
         cascade_g_r1 = g_r1.detach() if apply_gravity_correction else g_r1
+        if teacher is not None:
+            p_rb = teacher["p_rb"]
+            cascade_g_r1 = self._normalize(teacher["g_r"])
         if apply_gravity_correction:
             r_rb = from_to_rotation_matrix(g_r0, cascade_g_r1).unsqueeze(2).matmul(r_rb)
 
@@ -143,6 +151,9 @@ class GlobalPoseHOIModel(nn.Module):
         p_rj = ik1[:, :, :69]
         g_r2 = self._normalize(ik1[:, :, 69:72])
         cascade_g_r2 = g_r2.detach() if apply_gravity_correction else g_r2
+        if teacher is not None:
+            p_rj = teacher["p_rj"]
+            cascade_g_r2 = cascade_g_r1
         if apply_gravity_correction:
             r_rb = from_to_rotation_matrix(cascade_g_r1, cascade_g_r2).unsqueeze(2).matmul(r_rb)
 
@@ -156,9 +167,9 @@ class GlobalPoseHOIModel(nn.Module):
         )
         rrj_6d, _ = self.iknet2(ik2_in)
         decoder = r6d_columns_to_rotation_matrix if column_r6d else rotation_6d_to_matrix
-        rrj_mat = decoder(rrj_6d.reshape(-1, 6)).reshape(
-            x.shape[0], x.shape[1], 15 * 9
-        )
+        rrj_mat = decoder(
+            (teacher["rrj"] if teacher is not None else rrj_6d).reshape(-1, 6)
+        ).reshape(x.shape[0], x.shape[1], 15 * 9)
 
         root_correction = from_to_rotation_matrix(cascade_g_r2, g_r0)
         aw_rb = x[:, :, :36]

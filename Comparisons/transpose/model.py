@@ -26,6 +26,7 @@ class TransPoseHOIModel(nn.Module):
         human_condition_on_object: bool = False,
         fps: float = 30.0,
         transpose_reference: bool = False,
+        lstm_dropout: float | None = None,
     ):
         super().__init__()
         object_input_dim = human_imu_dim + obj_imu_dim
@@ -38,45 +39,25 @@ class TransPoseHOIModel(nn.Module):
         self.fps = float(fps)
         self.velocity_scale = 3.0
         self.transpose_reference = bool(transpose_reference)
+        rnn_kwargs = {"n_layers": 2, "dropout": dropout, "lstm_dropout": lstm_dropout}
         self.pose_s1 = BatchRNN(
-            human_model_input_dim,
-            self.n_leaf * 3,
-            256,
-            n_layers=2,
-            bidirectional=True,
-            dropout=dropout,
+            human_model_input_dim, self.n_leaf * 3, 256, bidirectional=True, **rnn_kwargs
         )
         self.pose_s2 = BatchRNN(
-            self.n_leaf * 3 + human_model_input_dim,
-            self.n_full * 3,
-            64,
-            n_layers=2,
-            bidirectional=True,
-            dropout=dropout,
+            self.n_leaf * 3 + human_model_input_dim, self.n_full * 3, 64,
+            bidirectional=True, **rnn_kwargs,
         )
         self.pose_s3 = BatchRNN(
-            self.n_full * 3 + human_model_input_dim,
-            self.n_reduced * 6,
-            128,
-            n_layers=2,
-            bidirectional=True,
-            dropout=dropout,
+            self.n_full * 3 + human_model_input_dim, self.n_reduced * 6, 128,
+            bidirectional=True, **rnn_kwargs,
         )
         self.tran_b1 = BatchRNN(
-            self.n_leaf * 3 + human_model_input_dim,
-            2,
-            64,
-            n_layers=2,
-            bidirectional=True,
-            dropout=dropout,
+            self.n_leaf * 3 + human_model_input_dim, 2, 64,
+            bidirectional=True, **rnn_kwargs,
         )
         self.tran_b2 = BatchRNN(
-            self.n_full * 3 + human_model_input_dim,
-            3,
-            256,
-            n_layers=2,
-            bidirectional=False,
-            dropout=dropout,
+            self.n_full * 3 + human_model_input_dim, 3, 256,
+            bidirectional=False, **rnn_kwargs,
         )
         self.obj_head = BatchRNN(
             self.n_full * 3 + object_input_dim
@@ -96,14 +77,27 @@ class TransPoseHOIModel(nn.Module):
             position[:, 1:] = torch.cumsum(displacement[:, 1:], dim=1)
         return position
 
-    def forward(self, imu: torch.Tensor, obj_imu: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        imu: torch.Tensor,
+        obj_imu: torch.Tensor,
+        teacher: dict[str, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """``teacher`` holds noisy ground-truth ``leaf``/``full`` positions.
+
+        TransPose trains every network separately on ground-truth upstream
+        positions with Gaussian noise (Sec. 4.2); feeding them here makes the
+        joint forward equivalent, since the networks share no parameters.
+        """
         object_input = torch.cat([imu, obj_imu], dim=-1)
         human_input = object_input if self.human_condition_on_object else imu
         leaf, _ = self.pose_s1(human_input)
-        full, _ = self.pose_s2(torch.cat([leaf, human_input], dim=-1))
-        pose, _ = self.pose_s3(torch.cat([full, human_input], dim=-1))
-        contact_logits, _ = self.tran_b1(torch.cat([leaf, human_input], dim=-1))
-        root_vel, _ = self.tran_b2(torch.cat([full, human_input], dim=-1))
+        leaf_in = teacher["leaf"] if teacher is not None else leaf
+        full, _ = self.pose_s2(torch.cat([leaf_in, human_input], dim=-1))
+        full_in = teacher["full"] if teacher is not None else full
+        pose, _ = self.pose_s3(torch.cat([full_in, human_input], dim=-1))
+        contact_logits, _ = self.tran_b1(torch.cat([leaf_in, human_input], dim=-1))
+        root_vel, _ = self.tran_b2(torch.cat([full_in, human_input], dim=-1))
         obj_features = (
             torch.cat([full, object_input], dim=-1)
             if self.object_condition_on_full

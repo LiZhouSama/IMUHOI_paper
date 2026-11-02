@@ -22,7 +22,7 @@ from Comparisons.common.geometry import (
 )
 from utils.human_pose import (
     SMPL_PARENTS,
-    append_virtual_palm_joints,
+    build_smpl24_joint_positions,
     forward_body_model_joints,
 )
 from utils.rotation_conversions import matrix_to_axis_angle, rotation_6d_to_matrix
@@ -94,13 +94,10 @@ def _root_orientation(batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         # place the decoded local pose back in the world frame.
         _, orientation = sixd_imu_to_acc_rotmat(batch["human_imu"])
         return orientation[:, :, 5]
-    if (
-        protocol == "tip_reference"
-        or (
-            torch.is_tensor(batch.get("tip_root_rot0"))
-            and batch["tip_root_rot0"].ndim >= 3
-        )
-    ):
+    # The dataset emits ``tip_root_rot0`` for every protocol, so only the
+    # protocol name may select the TIP decoding (otherwise DIP/TransPose
+    # batches would be decoded as TIP columns, ~150 deg off).
+    if protocol == "tip_reference":
         # Official TIP stores root orientation as a 3x2 matrix in the
         # sequence's initial-root frame.  Compose it with the saved world
         # orientation of frame zero before decoding the comparison output.
@@ -212,12 +209,23 @@ def body_joints_from_local_pose(
     body_model,
     chunk_size: int = 4096,
 ) -> torch.Tensor:
-    """Run body-model FK and append the two IMUHOI virtual palm joints."""
+    """Run body-model FK and return body-22 plus the native palm joints.
+
+    Joints 22/23 are the body model's own palm joints (SMPL-X/SMPL-H middle1),
+    the same anchors stored in the processed corpus and used by
+    ``eval_IMUHOI.py``, so HOI errors are comparable with the main pipeline.
+    """
     if body_model is None:
         raise ValueError("body_model is required for comparison evaluation")
     batch_size, seq_len = local_pose.shape[:2]
     pose22 = local_pose[:, :, :22].reshape(-1, 22, 3, 3)
-    pose_axis = matrix_to_axis_angle(pose22.reshape(-1, 3, 3)).reshape(-1, 22, 3)
+    # float32 matrix->axis-angle loses ~0.5 deg near pi (32% of OMOMO root
+    # frames exceed pi), which shifts every joint; convert in float64.
+    pose_axis = (
+        matrix_to_axis_angle(pose22.reshape(-1, 3, 3).double())
+        .to(pose22.dtype)
+        .reshape(-1, 22, 3)
+    )
     trans = root_trans.reshape(-1, 3)
     chunks = []
     for start in range(0, pose_axis.shape[0], chunk_size):
@@ -228,9 +236,8 @@ def body_joints_from_local_pose(
             pose_body=pose_axis[start:end, 1:22].reshape(end - start, 63),
             trans=trans[start:end],
         )
-        chunks.append(joints[:, :22])
-    joints22 = torch.cat(chunks, dim=0).reshape(batch_size, seq_len, 22, 3)
-    return append_virtual_palm_joints(joints22, num_joints=24)
+        chunks.append(build_smpl24_joint_positions(joints))
+    return torch.cat(chunks, dim=0).reshape(batch_size, seq_len, 24, 3)
 
 
 def _integrate_velocity(
@@ -331,13 +338,19 @@ def _transpose_translation(
     return root
 
 
-def _globalpose_translation(
+def _globalpose_fused_velocity(
     output: Dict[str, torch.Tensor],
     local_pose: torch.Tensor,
     batch: Dict[str, torch.Tensor],
     body_model,
     fps: float,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """VR root velocity fused with the stationary contact joints.
+
+    Returns the fused world velocity [B, T, 3] (frame 0 unused) and the contact
+    joints (pelvis, feet, palms) relative to the root joint [B, T, 5, 3], the
+    inputs of the released per-frame physics optimizer.
+    """
     vr = output["vr"]
     root_rot = local_pose[:, :, 0]
     velocity_world = torch.einsum("bti,btji->btj", vr[:, :, 1:4], root_rot)
@@ -349,18 +362,23 @@ def _globalpose_translation(
     contact_joints = joints[:, :, [0, 10, 11, 22, 23]]
     stationary_weight = (vr[:, :, 4:9].sigmoid() * 5.0 - 3.0).clamp(0.0, 1.0)
 
-    root = batch["trans"][:, :1].expand(-1, vr.shape[1], -1).clone()
-    for frame in range(1, vr.shape[1]):
-        correction = (
-            contact_joints[:, frame - 1] - contact_joints[:, frame]
-        ) * float(fps)
-        weights = stationary_weight[:, frame]
-        fused_velocity = (
-            (weights.unsqueeze(-1) * correction).sum(dim=1)
-            + velocity_world[:, frame]
-        ) / (1.0 + weights.sum(dim=1, keepdim=True))
-        root[:, frame] = root[:, frame - 1] + fused_velocity / float(fps)
-    return root
+    correction = torch.zeros_like(contact_joints)
+    correction[:, 1:] = (contact_joints[:, :-1] - contact_joints[:, 1:]) * float(fps)
+    fused_velocity = (
+        (stationary_weight.unsqueeze(-1) * correction).sum(dim=2) + velocity_world
+    ) / (1.0 + stationary_weight.sum(dim=2, keepdim=True))
+    return fused_velocity, contact_joints
+
+
+def _globalpose_translation(
+    output: Dict[str, torch.Tensor],
+    local_pose: torch.Tensor,
+    batch: Dict[str, torch.Tensor],
+    body_model,
+    fps: float,
+) -> torch.Tensor:
+    fused_velocity, _ = _globalpose_fused_velocity(output, local_pose, batch, body_model, fps)
+    return _integrate_velocity(fused_velocity, batch["trans"][:, 0], fps)
 
 
 def _decode_root_translation(
@@ -420,6 +438,97 @@ def _decode_root_translation(
     raise ValueError(method)
 
 
+def _infer_paper(
+    method: str,
+    model: torch.nn.Module,
+    batch: Dict[str, torch.Tensor],
+    body_model,
+    *,
+    fps: float,
+    dip_past_frames: int,
+    dip_future_frames: int,
+    dip_window_batch_size: int,
+    tip_window: int,
+    transpose_past_frames: int,
+    transpose_future_frames: int,
+    transpose_window_batch_size: int,
+    tip_ground_height: float | None = None,
+) -> tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, str, str, str]:
+    """Online inference of the paper-faithful (protocol v3) baselines.
+
+    Returns raw outputs, local pose, root translation, world object velocity
+    and the translation/initialization/object-frame descriptions.
+    """
+    from Comparisons.common.paper_protocol import (
+        adapt_batch_paper,
+        common_stream,
+        decode_tip_pose,
+        tip_sbp_translation,
+    )
+
+    adapted = adapt_batch_paper(batch, method, fps=fps, training=False, windowed=False)
+    measured_root = common_stream(batch)["root"]
+    if method == "dip18":
+        output = model.reconstruct_chunks(
+            adapted["imu"], adapted["obj_imu"],
+            past_frames=dip_past_frames, future_frames=dip_future_frames,
+            window_batch_size=dip_window_batch_size,
+        )
+        pose = output["pose_mu"]
+        local = _identity_pose(pose)
+        local[:, :, DIP_REDUCED_15] = project_to_rotation_matrix(
+            pose.reshape(*pose.shape[:2], 15, 3, 3)
+        )
+        local[:, :, 0] = measured_root
+        root_trans = batch["trans"][:, :1].expand(-1, local.shape[1], -1).clone()
+        return (output, local, root_trans, output["obj_trans"],
+                "fixed_initial", "not_applicable", "world")
+    if method == "tip":
+        output = model.infer_autoregressive(
+            adapted["imu"], adapted["obj_imu"], window_size=tip_window,
+            initial_state=adapted["initial_state"], emit_initial_state=True,
+            measured_root_2axis=adapted["measured_root_2axis"],
+        )
+        state = output["state"]
+        local = decode_tip_pose(state, measured_root)
+        joints_zero = body_joints_from_local_pose(local, torch.zeros_like(batch["trans"]), body_model)
+        root_trans = tip_sbp_translation(
+            local, state[:, :, 108:111], state[:, :, 111:131],
+            batch["trans"][:, 0], joints_zero, fps,
+            **({} if tip_ground_height is None else {"ground_height": tip_ground_height}),
+        )
+        return (output, local, root_trans, output["obj_trans"],
+                "root_velocity_with_foot_sbp_correction",
+                "ground_truth_first_frame_pose", "world")
+    if method == "transpose":
+        output = model.reconstruct_chunks(
+            adapted["imu"], adapted["obj_imu"],
+            past_frames=transpose_past_frames, future_frames=transpose_future_frames,
+            window_batch_size=transpose_window_batch_size,
+        )
+        local = _decode_local_pose("transpose", output, batch, 2, transpose_variant="legacy")
+        root_trans = _transpose_translation(output, local, batch, body_model, fps, 2, "legacy")
+        return (output, local, root_trans, output["obj_trans"],
+                "b1_b2_contact_fusion", "not_applicable", "world")
+    if method == "globalpose":
+        output = model(
+            adapted["x"], adapted["obj_imu"], apply_gravity_correction=True,
+            column_r6d=True, pl_init=adapted["pl_init"], vr_init=adapted["vr_init"],
+        )
+        local = _decode_local_pose("globalpose", output, batch, 2)
+        fused_velocity, contact_joints = _globalpose_fused_velocity(
+            output, local, batch, body_model, fps
+        )
+        root_trans = _integrate_velocity(fused_velocity, batch["trans"][:, 0], fps)
+        output["fused_root_velocity"] = fused_velocity
+        output["contact_joints"] = contact_joints
+        velocity = torch.einsum("bti,btji->btj", output["obj_trans"], local[:, :, 0])
+        return (output, local, root_trans, velocity,
+                "vr_stationary_fusion_no_physics",
+                "official_first_frame_pose_zero_vr", "current_root")
+    raise ValueError(f"Unknown comparison method: {method}")
+
+
 def infer_comparison(
     method: str,
     model: torch.nn.Module,
@@ -442,9 +551,48 @@ def infer_comparison(
     transpose_variant: str = "legacy",
     globalpose_obj_imu_dim: int | None = None,
     globalpose_init_mode: str = "reference",
+    tip_ground_height: float | None = None,
 ) -> Dict[str, torch.Tensor | str | bool]:
     """Run one complete sequence and decode method-specific predictions."""
     method = method.lower()
+    if protocol_version >= 3:
+        (
+            output, local_pose, root_trans, object_velocity_world,
+            translation_mode, initialization_mode, object_velocity_frame,
+        ) = _infer_paper(
+            method, model, batch, body_model, fps=fps,
+            dip_past_frames=dip_past_frames, dip_future_frames=dip_future_frames,
+            dip_window_batch_size=dip_window_batch_size, tip_window=tip_window,
+            transpose_past_frames=transpose_past_frames,
+            transpose_future_frames=transpose_future_frames,
+            transpose_window_batch_size=transpose_window_batch_size,
+            tip_ground_height=tip_ground_height,
+        )
+        result = {
+            "local_rot": local_pose,
+            "global_rot": local_to_global_rotmats(local_pose),
+            "root_trans": root_trans,
+            "joints": body_joints_from_local_pose(local_pose, root_trans, body_model),
+            "target_joints": body_joints_from_local_pose(
+                local_pose_axis_angle_to_rotmat(batch["pose"], num_joints=24),
+                batch["trans"], body_model,
+            ),
+            "obj_trans": _integrate_velocity(
+                object_velocity_world, batch["obj_trans"][:, 0], fps
+            ),
+            "obj_trans_raw": output["obj_trans"],
+            "object_metrics_available": True,
+            "object_velocity_frame": object_velocity_frame,
+            "translation_mode": translation_mode,
+            "initialization_mode": initialization_mode,
+        }
+        if "contact_logits" in output:
+            result["contact_prob"] = output["contact_logits"].sigmoid()
+        if method == "globalpose":
+            result["stationary_prob"] = output["vr"][:, :, 4:9].sigmoid()
+            result["fused_root_velocity"] = output["fused_root_velocity"]
+            result["contact_joints_rel"] = output["contact_joints"]
+        return result
     adapted = adapt_batch(
         batch,
         method=method,
@@ -607,3 +755,61 @@ def infer_comparison(
     if method == "globalpose":
         result["stationary_prob"] = output["vr"][:, :, 4:9].sigmoid()
     return result
+
+
+def globalpose_physics_inputs(
+    prediction: Dict[str, torch.Tensor],
+    batch: Dict[str, torch.Tensor],
+    armature,
+    fps: float,
+) -> dict:
+    """Keyword arguments of ``run_globalpose_physics`` for a one-sequence batch."""
+    if prediction["local_rot"].shape[0] != 1 or prediction["local_rot"].shape[2] != 24:
+        raise ValueError("physics refinement takes one sequence of 24-joint poses")
+
+    def first(value: torch.Tensor):
+        return value[0].detach().double().cpu().numpy()
+
+    return {
+        "armature": armature,
+        "pose": first(prediction["local_rot"]),
+        "velocity": first(prediction["fused_root_velocity"]),
+        "stationary_prob": first(prediction["stationary_prob"]),
+        "cjoint": first(prediction["contact_joints_rel"]),
+        # The optimizer state holds the root joint; trans is the body-model offset.
+        "root": first(batch["trans"][:, 0]) + armature.root_offset,
+        "fps": float(fps),
+    }
+
+
+def apply_globalpose_physics(
+    prediction: Dict[str, torch.Tensor],
+    refined_pose,
+    refined_root,
+    armature,
+    body_model,
+) -> None:
+    """Replace the network pose and translation with the physics-refined ones."""
+    reference = prediction["root_trans"]
+    local = torch.as_tensor(refined_pose, dtype=reference.dtype, device=reference.device)[None]
+    root_trans = torch.as_tensor(
+        refined_root - armature.root_offset, dtype=reference.dtype, device=reference.device
+    )[None]
+    prediction["local_rot"] = local
+    prediction["global_rot"] = local_to_global_rotmats(local)
+    prediction["root_trans"] = root_trans
+    prediction["joints"] = body_joints_from_local_pose(local, root_trans, body_model)
+    prediction["translation_mode"] = "physics_optimizer"
+
+
+def use_ground_truth_root_translation(
+    prediction: Dict[str, torch.Tensor],
+    batch: Dict[str, torch.Tensor],
+    body_model,
+) -> None:
+    """Oracle: replace the predicted root translation with the ground truth."""
+    prediction["root_trans"] = batch["trans"].to(prediction["root_trans"].dtype).clone()
+    prediction["joints"] = body_joints_from_local_pose(
+        prediction["local_rot"], prediction["root_trans"], body_model
+    )
+    prediction["translation_mode"] = "ground_truth_oracle"

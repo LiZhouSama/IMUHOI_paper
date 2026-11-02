@@ -213,3 +213,153 @@ def test_init_perturbation_is_training_only_and_hits_a_window_subset():
     # the same windows get their hand init and contact init corrupted
     assert torch.equal(touched, h.abs().sum(-1) > 0)
     assert torch.equal(touched, c.sum(-1) == 3)
+
+
+def _loss_batch(data, obj_moving=None):
+    batch_size, seq_len = data["human_imu"].shape[:2]
+    torch.manual_seed(1)
+    return {
+        "human_imu": data["human_imu"],
+        "obj_vel": torch.randn(batch_size, seq_len, 3),
+        "sensor_vel_glb": torch.randn(batch_size, seq_len, 6, 3),
+        "lhand_contact": torch.rand(batch_size, seq_len) > 0.5,
+        "rhand_contact": torch.rand(batch_size, seq_len) > 0.5,
+        "obj_contact": torch.rand(batch_size, seq_len) > 0.3 if obj_moving is None else obj_moving,
+        "contact_endpoint_gauss": torch.rand(batch_size, seq_len, 6),
+        "contact_endpoint": (torch.rand(batch_size, seq_len, 6) > 0.9).float(),
+    }
+
+
+def test_no_pose_prior_ablation_reads_no_hp_output():
+    full = build_velocity_contact_module(_cfg())
+    model = build_velocity_contact_module(_cfg(vc_ablation_no_pose_prior=True)).train()
+    assert not model.requires_hp
+    for name in ("group_encoders", "boundary_rnn", "contact_endpoint_head", "contact_anticipation_head"):
+        assert not hasattr(model, name)
+    # IMU evidence only: base 36 + IMU-only coupling (2 hands x 3 + 2 object + 1 bimanual) x 4.
+    assert model.hand_contact_net.linear1.in_features == 36 + 9 * 4
+    assert model.obj_move_net.linear1.in_features == 27 + 2 * 4
+    assert full.hand_contact_net.linear1.in_features == 36 + 8 + 12 + 12 * 4
+    data, _ = _model_inputs()
+    out = model(data, hp_out=None)
+    assert out["pred_hand_contact_prob"].shape == (2, 12, 3)
+    assert "pred_contact_endpoint_logits" not in out and "pred_contact_anticipation_logits" not in out
+    total, losses, _ = VelocityContactLoss(anticipation_horizon=4)(out, _loss_batch(data), torch.device("cpu"))
+    assert losses["hand_contact_cond"] > 0 and losses["contact_endpoint"] == 0
+    total.backward()
+    assert model.hand_contact_net.linear1.weight.grad is not None
+
+
+def test_no_pose_prior_coupling_keeps_the_imu_signals():
+    full = build_velocity_contact_module(_cfg()).eval()
+    ablated = build_velocity_contact_module(_cfg(vc_ablation_no_pose_prior=True)).eval()
+    human, obj, palms = _world_inputs()
+    object_a, hand_a = full._coupling_features(human, obj, palms)
+    object_b, hand_b = ablated._coupling_features(human, obj, None)
+    assert torch.equal(object_a, object_b)
+    # Per scale block the full model has 12 signals; the palm ones are block offsets 8-10.
+    keep = [block * 12 + k for block in range(4) for k in range(12) if k not in (8, 9, 10)]
+    assert torch.equal(hand_a[..., keep], hand_b)
+
+
+def test_direct_contact_ablation_skips_the_factorization():
+    model = build_velocity_contact_module(_cfg(vc_ablation_direct_contact=True)).train()
+    full = build_velocity_contact_module(_cfg())
+    assert {k: v.shape for k, v in model.state_dict().items() if k != "_v5_ablation_code"} == {
+        k: v.shape for k, v in full.state_dict().items()
+    }
+    data, hp_out = _model_inputs()
+    out = model(data, hp_out=hp_out)
+    assert "pred_hand_contact_prob_cond" not in out and "pred_hand_contact_prob_marginal" not in out
+    assert torch.allclose(out["pred_hand_contact_prob"][..., :2], torch.sigmoid(out["pred_hand_contact_logits_direct"]))
+    # Supervised on every frame, including those where the object rests.
+    batch = _loss_batch(data, obj_moving=torch.zeros(2, 12, dtype=torch.bool))
+    total, losses, _ = VelocityContactLoss(anticipation_horizon=4)(out, batch, torch.device("cpu"))
+    assert losses["hand_contact_direct"] > 0
+    assert losses["hand_contact_cond"] == 0 and losses["hand_contact_marginal"] == 0
+    total.backward()
+    assert model.hand_contact_net.linear1.weight.grad.abs().sum() > 0
+    # The factorized model never produces the direct term.
+    _, full_losses, _ = VelocityContactLoss(anticipation_horizon=4)(full(data, hp_out=hp_out), batch, torch.device("cpu"))
+    assert full_losses["hand_contact_direct"] == 0
+
+
+def test_drop_body_groups_ablation_shrinks_the_prior():
+    model = build_velocity_contact_module(_cfg(vc_ablation_drop_body_groups=["left_leg", "right_leg"]))
+    assert sorted(model.group_encoders) == ["left_arm", "right_arm", "torso"]
+    assert model.dropped_body_groups == ("left_leg", "right_leg")
+    assert model.boundary_rnn.input_size == 3 * 8
+    data, hp_out = _model_inputs()
+    assert model(data, hp_out=hp_out)["pred_hand_contact_prob"].shape == (2, 12, 3)
+    with pytest.raises(ValueError):
+        build_velocity_contact_module(_cfg(vc_ablation_drop_body_groups=["tail"]))
+    with pytest.raises(ValueError):
+        build_velocity_contact_module(
+            _cfg(vc_ablation_no_pose_prior=True, vc_ablation_drop_body_groups=["torso"])
+        )
+
+
+def test_ablation_checkpoint_guard():
+    configs = {
+        "full": _cfg(),
+        "no_prior": _cfg(vc_ablation_no_pose_prior=True),
+        "direct": _cfg(vc_ablation_direct_contact=True),
+        "no_legs": _cfg(vc_ablation_drop_body_groups=["left_leg", "right_leg"]),
+        "no_torso": _cfg(vc_ablation_drop_body_groups=["torso"]),
+    }
+    models = {name: build_velocity_contact_module(cfg) for name, cfg in configs.items()}
+    assert "_v5_ablation_code" not in models["full"].state_dict()
+    for name, model in models.items():
+        model.validate_checkpoint_state_dict(model.state_dict())
+        for other, source in models.items():
+            if other != name:
+                with pytest.raises(ValueError):
+                    model.validate_checkpoint_state_dict(source.state_dict())
+
+
+def test_no_pose_prior_ablation_keeps_staged_training():
+    from train.rnn.train_velocity_contact import _vc_staged_training
+
+    cfg = _cfg(vc_ablation_no_pose_prior=True, vc_staged_training=True)
+    assert _vc_staged_training(build_velocity_contact_module(cfg), cfg)
+
+
+def _bundle_cfg(**overrides):
+    return _cfg(vc_ablation_no_pose_prior=True, vc_ablation_no_coupling=True, vc_ablation_causal_obj_move=True,
+                **overrides)
+
+
+def test_hp_prior_bundle_ablation_leaves_imuhoi_evidence_and_the_factorization():
+    model = build_velocity_contact_module(_bundle_cfg()).train()
+    assert model.ablation_code == 1 | (1 << 7) | (1 << 8)
+    assert not model.requires_hp and not model.obj_move_net.rnn.bidirectional
+    # IMU-HOI's 36-D contact evidence for the hand head, hand + object IMUs for the motion head.
+    assert model.hand_contact_net.linear1.in_features == 36
+    assert model.obj_move_net.linear1.in_features == 27
+    data, _ = _model_inputs()
+    out = model(data, hp_out=None)
+    assert torch.allclose(
+        out["pred_hand_contact_prob"][..., :2], out["pred_obj_move_prob"] * out["pred_hand_contact_prob_cond"]
+    )
+    total, losses, _ = VelocityContactLoss(anticipation_horizon=4)(out, _loss_batch(data), torch.device("cpu"))
+    assert losses["hand_contact_cond"] > 0 and losses["hand_contact_marginal"] > 0
+    total.backward()
+
+
+def test_causal_object_head_does_not_read_the_future():
+    model = build_velocity_contact_module(_bundle_cfg()).eval()
+    data, _ = _model_inputs()
+    future = {k: v.clone() for k, v in data.items()}
+    future["obj_imu"][:, 8:] += 5.0
+    with torch.no_grad():
+        a, b = model(data)["pred_obj_move_prob"], model(future)["pred_obj_move_prob"]
+    assert torch.allclose(a[:, :8], b[:, :8]) and not torch.allclose(a[:, 8:], b[:, 8:])
+
+
+def test_bundle_checkpoint_guard():
+    bundle = build_velocity_contact_module(_bundle_cfg())
+    prior_only = build_velocity_contact_module(_cfg(vc_ablation_no_pose_prior=True))
+    bundle.validate_checkpoint_state_dict(bundle.state_dict())
+    for source, target in ((bundle, prior_only), (prior_only, bundle)):
+        with pytest.raises(ValueError):
+            target.validate_checkpoint_state_dict(source.state_dict())

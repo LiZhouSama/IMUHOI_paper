@@ -60,8 +60,14 @@ def _second_difference_norm(x: torch.Tensor) -> torch.Tensor:
 def comparison_metric_stats(
     prediction: Dict[str, torch.Tensor | str | bool],
     batch: Dict[str, torch.Tensor],
+    per_joint: bool = False,
 ) -> MetricAccumulator:
-    """Compute per-element metric statistics for complete sequences."""
+    """Compute per-element metric statistics for complete sequences.
+
+    ``per_joint`` adds ``per_joint/<metric>/<joint>`` rotation errors for local
+    joints 1..21 (dropped from the stable metric schema, see
+    ``per_joint_rotation_errors``).
+    """
     stats = MetricAccumulator()
     pred_local = prediction["local_rot"]
     pred_joints = prediction["joints"]
@@ -86,16 +92,22 @@ def comparison_metric_stats(
     )
     stats.add("human_geodesic_err_deg", geodesic)
 
-    pred_body_axis = matrix_to_axis_angle(
-        pred_local[:, :, 1:num_joints].reshape(-1, 3, 3)
-    ).reshape(*pred_local.shape[:2], num_joints - 1, 3)
+    # float64: the float32 conversion is inaccurate for rotations near pi.
+    pred_body_axis = (
+        matrix_to_axis_angle(pred_local[:, :, 1:num_joints].reshape(-1, 3, 3).double())
+        .to(pred_local.dtype)
+        .reshape(*pred_local.shape[:2], num_joints - 1, 3)
+    )
     gt_body_axis = batch["pose"].reshape(*batch["pose"].shape[:2], -1, 3)[
         :, :, 1:num_joints
     ]
-    stats.add(
-        "human_ang_err_deg",
-        (pred_body_axis - gt_body_axis).abs() * (180.0 / math.pi),
-    )
+    axis_error = (pred_body_axis - gt_body_axis).abs() * (180.0 / math.pi)
+    stats.add("human_ang_err_deg", axis_error)
+    if per_joint:
+        axis_error = axis_error.mean(dim=-1)
+        for joint in range(1, num_joints):
+            stats.add(f"per_joint/human_ang_err_deg/{joint}", axis_error[:, :, joint - 1])
+            stats.add(f"per_joint/human_geodesic_err_deg/{joint}", geodesic[:, :, joint - 1])
 
     pred_eval = pred_joints[:, :, :num_joints]
     gt_eval = gt_joints[:, :, :num_joints]
@@ -156,39 +168,45 @@ def comparison_metric_stats(
             continue
         left_mask = left_contact[index].bool()
         right_mask = right_contact[index].bool()
+        # Main-pipeline protocol (eval_IMUHOI.py "contact_palm"): palm-relative
+        # object error on GT hand-contact frames only, one observation per
+        # contacting hand.  Sequences without hand contact contribute nothing.
         hoi_errors = []
-        if left_mask.any():
-            pred_relative_obj = pred_obj[index] - pred_hands[index, :, 0]
-            gt_relative_obj = gt_obj - gt_hands[index, :, 0]
-            hoi_errors.append(
-                torch.linalg.norm(
-                    pred_relative_obj[left_mask] - gt_relative_obj[left_mask], dim=-1
+        for hand, mask in enumerate((left_mask, right_mask)):
+            if mask.any():
+                pred_relative_obj = pred_obj[index] - pred_hands[index, :, hand]
+                gt_relative_obj = gt_obj - gt_hands[index, :, hand]
+                hoi_errors.append(
+                    torch.linalg.norm(
+                        pred_relative_obj[mask] - gt_relative_obj[mask], dim=-1
+                    )
+                    * 100.0
                 )
-                * 100.0
-            )
-        if right_mask.any():
-            pred_relative_obj = pred_obj[index] - pred_hands[index, :, 1]
-            gt_relative_obj = gt_obj - gt_hands[index, :, 1]
-            hoi_errors.append(
-                torch.linalg.norm(
-                    pred_relative_obj[right_mask] - gt_relative_obj[right_mask], dim=-1
-                )
-                * 100.0
-            )
-        non_contact = ~left_mask & ~right_mask
-        if non_contact.any():
-            pred_relative_obj = pred_obj[index] - pred_joints[index, :, 0]
-            gt_relative_obj = gt_obj - gt_joints[index, :, 0]
-            hoi_errors.append(
-                torch.linalg.norm(
-                    pred_relative_obj[non_contact] - gt_relative_obj[non_contact],
-                    dim=-1,
-                )
-                * 100.0
-            )
         if hoi_errors:
             stats.add("hoi_err_cm", torch.cat(hoi_errors))
+        # EgoIMU protocol (utils/hoi_metrics.compute_hoi_error_egoimu): wrists
+        # 20/21 on contact frames and the root otherwise; reported alongside.
+        anchors = [20, 21, 0]
+        anchor_error = pred_joints[index][:, anchors] - gt_joints[index][:, anchors]
+        object_error = pred_obj[index] - gt_obj
+        observations = torch.linalg.norm(
+            object_error[:, None] - anchor_error, dim=-1
+        ) * 100.0
+        egoimu_mask = torch.stack(
+            (left_mask, right_mask, ~(left_mask | right_mask)), dim=-1
+        )
+        stats.add("hoi_err_egoimu_cm", observations[egoimu_mask])
     return stats
+
+
+def per_joint_rotation_errors(metrics: Dict[str, float]) -> Dict[str, list]:
+    """Collect ``per_joint/<metric>/<joint>`` means into joint-ordered lists."""
+    out: Dict[str, Dict[int, float]] = {}
+    for name, value in metrics.items():
+        if name.startswith("per_joint/"):
+            _, metric, joint = name.split("/")
+            out.setdefault(metric, {})[int(joint)] = value
+    return {metric: [values[j] for j in sorted(values)] for metric, values in out.items()}
 
 
 def add_compatibility_aliases(
@@ -223,5 +241,6 @@ METRIC_UNITS = {
     "root_trans_err_cm": "cm",
     "obj_err_cm": "cm",
     "hoi_err_cm": "cm",
+    "hoi_err_egoimu_cm": "cm",
     "obj_trans_jitter_mm_frame2": "mm/frame^2",
 }

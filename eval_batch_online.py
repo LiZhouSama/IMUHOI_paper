@@ -675,6 +675,11 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--object_contact_threshold", type=float, default=None)
     parser.add_argument("--output_json", type=str, default=None)
     parser.add_argument(
+        "--per_joint_rot_error",
+        action="store_true",
+        help="Also report per-joint rotation errors (axis-difference f32/f64 and geodesic) in the results.",
+    )
+    parser.add_argument(
         "--sequence_records_json",
         "--sequence-records-json",
         type=str,
@@ -978,6 +983,7 @@ def main() -> int:
             online_window=online_window,
             online_lookahead=online_lookahead,
             sequence_records=sequence_records,
+            per_joint_rot_error=args.per_joint_rot_error,
         )
         eval_duration = time.time() - eval_start
         all_results[dataset_name] = results
@@ -1059,6 +1065,7 @@ def main() -> int:
             "eval_imu_noise": bool(args.eval_imu_noise),
             "eval_imu_noise_seed": args.eval_imu_noise_seed if args.eval_imu_noise else None,
             "joint_metric_source": "pred_joints_global_vs_canonical_position_global",
+            "mpjre_axis_angle_conversion": "canonical_float64",
             "model_body_models": model_body_models,
             "results": all_results,
         }
@@ -1099,6 +1106,7 @@ def main() -> int:
                 "object_trans_checkpoint": args.ot_ckpt,
                 "sequence_paths": args.sequence_path,
                 "joint_metric_source": "pred_joints_global_vs_canonical_position_global",
+            "mpjre_axis_angle_conversion": "canonical_float64",
                 "model_body_models": model_body_models,
             },
             "aggregate_results": all_results,

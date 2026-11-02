@@ -227,14 +227,13 @@ def _as_list(value) -> list:
 
 
 def _lookup_cache_file(source_path, seq_file: str | None, cache_root: str | os.PathLike) -> Path | None:
+    # Only the exact path mapping is trusted: corpora reuse file names such as
+    # ``0.pt``, so a name-based search could attach another sequence's labels.
+    del seq_file
     if source_path:
         path = cache_path_for_source(str(source_path), cache_root)
         if path.exists():
             return path
-    if seq_file:
-        matches = list(Path(cache_root).rglob(seq_file))
-        if len(matches) == 1:
-            return matches[0]
     return None
 
 

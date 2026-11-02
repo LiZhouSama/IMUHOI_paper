@@ -406,6 +406,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run_tag", default=datetime.now().strftime("%Y%m%d"))
     parser.add_argument("--variants", nargs="+", default=list(VARIANTS))
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--eval_seed", type=int, default=None,
+                        help="Evaluation seed and IMU-noise realization (default: --seed). Keep 42 for training-seed "
+                             "repeats so every repeat is scored on the same noisy test stream.")
     parser.add_argument("--noise_profile", choices=("current", "egoimu_gaussian"), default="current",
                         help="egoimu_gaussian: train/validation feature Gaussian std 0.1; clean independent eval.")
     parser.add_argument("--gpu", type=int, default=0)
@@ -495,7 +498,8 @@ def main() -> int:
             raise ValueError(f"--set expects KEY=VALUE, got {item!r}")
         shared_overrides[key.strip()] = yaml.safe_load(value)
     shared_cfg.update(shared_overrides)
-    training_noise_args, evaluation_noise_args = configure_noise_profile(shared_cfg, args.noise_profile, args.seed)
+    training_noise_args, evaluation_noise_args = configure_noise_profile(
+        shared_cfg, args.noise_profile, args.seed if args.eval_seed is None else args.eval_seed)
 
     # Early stopping, placed past the first lr decay (and, for the staged VC
     # trainer, past the last stage transition).
@@ -671,9 +675,9 @@ def main() -> int:
         run_stage([SAGE_PYTHON, PROJECT_ROOT / "eval_batch_online.py", "--config", cfg_file,
                    "--dataset", DATASET, "--hp_ckpt", hp_path, "--vc_ckpt", vc_path, "--ot_ckpt", ot_path,
                    "--velocity_contact_arch", VC_ARCH, "--object_trans_arch", ot_arch,
-                   *evaluation_noise_args, "--seed", args.seed,
+                   *evaluation_noise_args, "--seed", args.seed if args.eval_seed is None else args.eval_seed,
                    "--num_workers", args.num_workers, "--online_batch_size", args.eval_batch_size,
-                   "--output_json", out_json], log_path)
+                   "--per_joint_rot_error", "--output_json", out_json], log_path)
 
     def variant(name: str) -> bool:
         spec = VARIANTS[name]

@@ -86,6 +86,18 @@ def _vc_parameter_group(name):
     return "contact"
 
 
+def _vc_staged_training(target, cfg):
+    """Whether the velocity-then-contact curriculum applies to this VC.
+
+    Endpoint-era VCs use it; so does a v5 ablation whose endpoint head was
+    removed together with the pose prior, so that only the module differs.
+    """
+    return bool(getattr(cfg, "vc_staged_training", False)) and (
+        hasattr(target, "contact_endpoint_head")
+        or bool(getattr(target, "SUPPORTS_STAGED_TRAINING", False))
+    )
+
+
 def _vc_endpoint_finetune_stage(target):
     """Whether this architecture wants a final endpoint-only fine-tune stage.
 
@@ -168,10 +180,7 @@ def _staged_lr_lambda(group_name, cfg, endpoint_stage=True):
 def build_velocity_contact_optimizer_and_scheduler(model, cfg):
     """Use one optimizer/checkpoint with task-specific VC learning-rate decay."""
     target = model.module if isinstance(model, torch.nn.DataParallel) else model
-    staged_training = (
-        bool(getattr(cfg, "vc_staged_training", False))
-        and hasattr(target, "contact_endpoint_head")
-    )
+    staged_training = _vc_staged_training(target, cfg)
     if not staged_training and not bool(getattr(cfg, "vc_grouped_lr", False)):
         return build_optimizer_and_scheduler(model, cfg)
 
@@ -304,6 +313,7 @@ class VelocityContactTrainer(BaseTrainer):
             "obj_move",
             "hand_contact_cond",
             "hand_contact_marginal",
+            "hand_contact_direct",
             "contact_endpoint",
             "contact_endpoint_order",
             "endpoint_contact_consistency",
@@ -357,10 +367,7 @@ class VelocityContactTrainer(BaseTrainer):
 
     def __init__(self, cfg, model, loss_fn, train_loader, test_loader=None, hp_model=None):
         target = model.module if isinstance(model, torch.nn.DataParallel) else model
-        self.staged_training = (
-            bool(getattr(cfg, "vc_staged_training", False))
-            and hasattr(target, "contact_endpoint_head")
-        )
+        self.staged_training = _vc_staged_training(target, cfg)
         self.endpoint_finetune_stage = _vc_endpoint_finetune_stage(target)
         super().__init__(cfg, model, loss_fn, train_loader, test_loader)
         self.hp_model = hp_model

@@ -33,11 +33,13 @@ except Exception:
     t3d.rotation_6d_to_matrix = _rot.rotation_6d_to_matrix
     t3d.matrix_to_rotation_6d = _rot.matrix_to_rotation_6d
     t3d.matrix_to_axis_angle = _rot.matrix_to_axis_angle
+    t3d.axis_angle_to_matrix = _rot.axis_angle_to_matrix
     pytorch3d_mod.transforms = t3d
     sys.modules["pytorch3d"] = pytorch3d_mod
     sys.modules["pytorch3d.transforms"] = t3d
 
 from dataset.dataset_IMUHOI import IMUDataset
+from utils.rotation_conversions import matrix_to_axis_angle as canonical_matrix_to_axis_angle
 from model import IMUHOIModel, load_model
 from model.rnn.velocity_contact import (
     VELOCITY_CONTACT_ARCH_CHOICES,
@@ -434,6 +436,7 @@ def evaluate_model(
     online_window: Optional[int] = None,
     online_lookahead: int = 5,
     sequence_records: Optional[list] = None,
+    per_joint_rot_error: bool = False,
 ):
     """评估模型"""
     hoi_protocol = hoi_metric_metadata(config)["hoi_metric_protocol"]
@@ -443,6 +446,14 @@ def evaluate_model(
         from model.rnn.contact_residual_runtime import ContactResidualPredictor
         residual_predictor = ContactResidualPredictor(residual_checkpoint, device=device)
         print(f"Published-object contact residual: {residual_checkpoint}")
+    # Optional per-joint rotation error over local joints 1..21 (sequence
+    # macro means): axis-difference MPJRE, the same with the pre-2026-10-25
+    # pytorch3d conversion (non-canonical, inflated), and the SO(3) geodesic.
+    per_joint_rot = (
+        {"mpjre_axis": [], "mpjre_axis_pytorch3d": [], "geodesic_deg": []}
+        if per_joint_rot_error
+        else None
+    )
     metrics = {
         "mpjpe": [],
         "mpjre_angle": [],
@@ -680,6 +691,7 @@ def evaluate_model(
                         gt_body_axis = gt_body_axis[:, :63].reshape(T, 21, 3)
 
                 pred_body_axis = None
+                pred_body_local = None
                 pred_full_pose_rotmat_all = pred_dict.get("pred_full_pose_rotmat")
                 if isinstance(pred_full_pose_rotmat_all, torch.Tensor):
                     full_glb = pred_full_pose_rotmat_all[sample_idx, :T]
@@ -694,10 +706,15 @@ def evaluate_model(
                                 9, 9, 9, 12, 13, 14, 16, 17, 18, 19, 20, 21,
                             ]
                             local_rot = _global_to_local_rotmat(full_glb, default_parents)
-                        pose_axis_full = t3d.matrix_to_axis_angle(
-                            local_rot.reshape(-1, 3, 3)
-                        ).reshape(T, full_glb.shape[1], 3)
+                        # pytorch3d 0.7.3 returns non-canonical axis-angles
+                        # (angle > pi) for ~20% of rotations, which inflates the
+                        # axis-difference MPJRE; use the canonical conversion in
+                        # float64, as Comparisons/common/metrics.py does.
+                        pose_axis_full = canonical_matrix_to_axis_angle(
+                            local_rot.reshape(-1, 3, 3).double()
+                        ).to(local_rot.dtype).reshape(T, full_glb.shape[1], 3)
                         pred_body_axis = pose_axis_full[:, 1:22, :]
+                        pred_body_local = local_rot[:, 1:22]
 
                 # --- MPJPE ---
                 pred_joints_eval = pred_joints_all[:, :num_eval_joints, :]
@@ -711,6 +728,20 @@ def evaluate_model(
                 if pred_body_axis is not None:
                     rot_error = torch.mean(torch.absolute(gt_body_axis - pred_body_axis)) * 57.2958
                     metrics["mpjre_angle"].append(rot_error.item())
+                    if per_joint_rot is not None and pred_body_local is not None:
+                        gt_axis64 = gt_body_axis.double()
+                        pred_local64 = pred_body_local.double()
+                        legacy_axis = t3d.matrix_to_axis_angle(pred_local64.reshape(-1, 3, 3)).reshape(T, 21, 3)
+                        gt_local64 = t3d.axis_angle_to_matrix(gt_axis64.reshape(-1, 3)).reshape(T, 21, 3, 3)
+                        rel = gt_local64.transpose(-1, -2) @ pred_local64
+                        cos = ((rel.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) * 0.5).clamp(-1.0, 1.0)
+                        rad2deg = 180.0 / np.pi
+                        per_joint_rot["mpjre_axis"].append(
+                            ((gt_body_axis - pred_body_axis).abs().mean(dim=(0, 2)) * rad2deg).cpu().numpy())
+                        per_joint_rot["mpjre_axis_pytorch3d"].append(
+                            ((gt_axis64 - legacy_axis).abs().mean(dim=(0, 2)) * rad2deg).cpu().numpy())
+                        per_joint_rot["geodesic_deg"].append(
+                            (torch.arccos(cos).mean(dim=0) * rad2deg).cpu().numpy())
                 else:
                     metrics["mpjre_angle"].append(float("nan"))
 
@@ -1323,6 +1354,11 @@ def evaluate_model(
     for key, values in metrics.items():
         valid = [v for v in values if not np.isnan(v)]
         avg_metrics[key] = float(np.mean(valid)) if valid else float("nan")
+    if per_joint_rot is not None:
+        avg_metrics["per_joint_rot"] = {
+            key: np.mean(np.stack(values), axis=0).tolist() if values else None
+            for key, values in per_joint_rot.items()
+        }
 
     return avg_metrics
 
@@ -1702,6 +1738,7 @@ def main():
             "object_trans_arch": args.object_trans_arch or getattr(load_config(args.config), "object_trans_arch", "current"),
             "seed": seed,
             "joint_metric_source": "pred_joints_global_vs_canonical_position_global",
+            "mpjre_axis_angle_conversion": "canonical_float64",
             "model_body_models": model_body_models,
             "results": all_results,
         }

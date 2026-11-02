@@ -5,6 +5,7 @@ import inspect
 from argparse import Namespace
 
 import numpy as np
+import pytest
 import torch
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -453,6 +454,8 @@ def test_geodesic_angle_and_perfect_metrics():
 
 def test_metrics_prefer_body_model_reconstructed_target_joints():
     batch = _make_batch(seq_len=5)
+    # HOI follows the main contact-palm protocol, so it needs contact frames.
+    batch["lhand_contact"][:, 1:3] = True
     target_joints = batch["position_global"].clone()
     batch["position_global"] = torch.randn_like(target_joints) * 100.0
     prediction = {
@@ -465,6 +468,7 @@ def test_metrics_prefer_body_model_reconstructed_target_joints():
     metrics = comparison_metric_stats(prediction, batch).means()
     assert metrics["human_pos_err_cm"] == 0.0
     assert metrics["hoi_err_cm"] == 0.0
+    assert metrics["hoi_err_egoimu_cm"] == 0.0
 
 
 def test_dip_sigma_is_positive_and_nll_is_differentiable():
@@ -849,3 +853,100 @@ def test_official_dip_checkpoint_signature_and_model_load():
     model = DIP18ReferenceHOIModel()
     assert model.glb.linear1.in_features == 72
     assert model.human_branch.linear2.out_features == 22 * 9
+
+
+def _physics_armature(standing: bool):
+    from Comparisons.globalpose.physics import SMPL24_PARENTS, Armature
+
+    rng = np.random.default_rng(0)
+    if standing:
+        # Rough upright T-pose skeleton: child joint offsets from the parent (m).
+        offsets = {
+            1: (0.08, -0.09, 0), 2: (-0.08, -0.09, 0), 3: (0, 0.11, 0),
+            4: (0, -0.40, 0), 5: (0, -0.40, 0), 6: (0, 0.14, 0),
+            7: (0, -0.42, 0), 8: (0, -0.42, 0), 9: (0, 0.06, 0),
+            10: (0, -0.05, 0.12), 11: (0, -0.05, 0.12), 12: (0, 0.22, 0),
+            13: (0.08, 0.12, 0), 14: (-0.08, 0.12, 0), 15: (0, 0.09, 0.05),
+            16: (0.10, 0.03, 0), 17: (-0.10, 0.03, 0), 18: (0.26, 0, 0),
+            19: (-0.26, 0, 0), 20: (0.25, 0, 0), 21: (-0.25, 0, 0),
+            22: (0.09, 0, 0), 23: (-0.09, 0, 0),
+        }
+        bone = np.zeros((24, 3))
+        for joint, offset in offsets.items():
+            bone[joint] = offset
+        com = np.zeros((24, 3))
+        mass = np.full(24, 3.0)
+        inertia = np.tile(np.eye(3) * 0.02, (24, 1, 1))
+    else:
+        bone = rng.normal(scale=0.1, size=(24, 3))
+        bone[0] = 0.0
+        com = rng.normal(scale=0.03, size=(24, 3))
+        mass = rng.uniform(0.5, 5.0, size=24)
+        factor = rng.normal(size=(24, 3, 3))
+        inertia = factor @ factor.transpose(0, 2, 1) * 0.01 + np.eye(3) * 0.01
+    return Armature(SMPL24_PARENTS, bone, com, mass, inertia, np.zeros(3))
+
+
+def test_globalpose_dynamics_port_matches_finite_differences():
+    from scipy.spatial.transform import Rotation
+
+    from Comparisons.globalpose.physics import DynamicModel
+
+    rng = np.random.default_rng(1)
+    model = DynamicModel(_physics_armature(standing=False))
+    pose = Rotation.from_rotvec(rng.normal(scale=0.5, size=(24, 3))).as_matrix()
+    vel = rng.normal(size=75)
+    acc = rng.normal(scale=5.0, size=75)
+    model.set_state_R(pose, rng.normal(size=3), vel)
+
+    M = model.mass_matrix()
+    assert np.allclose(M, M.T)
+    assert np.linalg.eigvalsh(M).min() > 0
+    h = model.inverse_dynamics(np.zeros(75))
+    assert np.allclose(model.inverse_dynamics(acc) - h, M @ acc, atol=1e-8)
+
+    rates = model.joint_rates()
+    for joint in (10, 23):
+        J = model.get_linear_Jacobian(joint)
+        Jdot = model.get_linear_Jacobian_dot(joint, rates)
+        position = model.get_position(joint)
+        velocity = model.get_linear_velocity(joint, rates)
+        assert np.allclose(J @ vel, velocity)
+        state = model.get_state_R()
+        eps = 1e-6
+        model.update_state(np.zeros(75), eps)
+        assert np.allclose((model.get_position(joint) - position) / eps, velocity, atol=1e-4)
+        assert np.allclose((model.get_linear_Jacobian(joint) - J) / eps, Jdot, atol=1e-4)
+        model.set_state_R(*state)
+
+    # At rest, the root generalized force holds the body against gravity.
+    model.set_state_R(pose, np.zeros(3), np.zeros(75))
+    assert np.allclose(model.inverse_dynamics(np.zeros(75))[:3], [0.0, 9.8 * model.mass.sum(), 0.0])
+
+
+def test_globalpose_physics_keeps_a_standing_body_still():
+    from Comparisons.globalpose.physics import CONTACT_JOINTS, GlobalPosePhysics, run_globalpose_physics
+
+    armature = _physics_armature(standing=True)
+    frames = 30
+    pose = np.tile(np.eye(3), (frames, 24, 1, 1))
+    root = np.array([0.0, 0.95, 0.0])
+    probe = GlobalPosePhysics(armature)
+    probe.reset(pose[0], root)
+    cjoint = probe.model.t_wb[list(CONTACT_JOINTS)] - probe.model.t_wb[0]
+    refined_pose, refined_root = run_globalpose_physics(
+        armature,
+        pose,
+        np.zeros((frames, 3)),
+        np.tile([0.1, 0.95, 0.95, 0.1, 0.1], (frames, 1)),
+        np.tile(cjoint, (frames, 1, 1)),
+        root,
+        fps=30.0,
+    )
+    assert refined_pose.shape == (frames, 24, 3, 3)
+    assert np.allclose(refined_root[0], root)
+    assert np.abs(refined_root - root).max() < 0.01
+
+    with pytest.raises(ValueError):
+        run_globalpose_physics(armature, pose, np.zeros((frames, 3)), np.zeros((frames, 5)),
+                               np.tile(cjoint, (frames, 1, 1)), root, fps=25.0)

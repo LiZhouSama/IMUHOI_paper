@@ -32,12 +32,26 @@ from Comparisons.common.adapters import (
     adapt_batch,
     tensor_to_device,
 )
-from Comparisons.common.losses import DIPLoss, GlobalPoseLoss, TIPLoss, TransPoseLoss
-from Comparisons.dip18 import DIP18HOIModel, DIP18ReferenceHOIModel
+from Comparisons.common.losses import (
+    DIPLoss,
+    DIPPaperLoss,
+    GlobalPoseLoss,
+    GlobalPosePaperLoss,
+    TIPLoss,
+    TransPoseLoss,
+    TransPosePaperLoss,
+)
+from Comparisons.common.paper_protocol import (
+    TIP_TRAIN_FUTURE,
+    TIP_TRAIN_HISTORY,
+    adapt_batch_paper,
+)
+from Comparisons.dip18 import DIP18HOIModel, DIP18PaperModel, DIP18ReferenceHOIModel
 from Comparisons.globalpose import GlobalPoseHOIModel
 from Comparisons.tip import TIPHOIModel, TIPReferenceHOIModel
 from Comparisons.tip.sbp_cache import attach_tip_sbp_from_cache
 from Comparisons.transpose import TransPoseHOIModel
+from configs import FRAME_RATE
 from utils.utils import setup_seed
 
 
@@ -117,11 +131,113 @@ METHOD_TRAINING_DEFAULTS = {
 TIP_N_HEADS = 16
 TIP_STATE_NOISE = 0.15
 
+# Protocol v3 ("paper"): every method follows its paper/released training
+# recipe on the shared IMUHOI stream (see Comparisons/common/paper_protocol.py).
+# ``checkpoint`` is the published model-selection rule; the run writes the
+# chosen weights to selected.pt:
+#   best              lowest total validation loss (best.pt)
+#   final             state after the fixed schedule
+#   best_per_network  every independently trained network at its own lowest
+#                     validation loss on GT upstream inputs
+PAPER_PROTOCOL_VERSION = 3
+PAPER_TRAINING_DEFAULTS = {
+    # dip18/train_and_eval configuration.py: Adam 1e-4 decayed 0.96 every
+    # 2000 steps, batch 16, 80 epochs, clip-by-norm 1, early stopping.
+    "dip18": {
+        "epochs": 80, "batch_size": 16, "lr": 1e-4, "optimizer": "adam",
+        "scheduler": "dip_exponential", "weight_decay": 0.0, "grad_clip": 1.0,
+        "window_size": 120, "windows_per_sequence": 1, "obj_loss_weight": 1.0,
+        "eval_every": 2, "early_stopping_patience": 10, "checkpoint": "best",
+    },
+    # TIP README: 1100 epochs, batch 256, Adam 1e-4 (weight decay is only used
+    # by AdamW there), per-step cosine with T_max = epochs + 850, clip 5,
+    # 40-frame windows, history noise 0.15, past dropout 0.8, 5 SBPs.
+    # train_model.py has no validation and keeps the last state.
+    "tip": {
+        "epochs": 1100, "batch_size": 256, "lr": 1e-4, "optimizer": "adam",
+        "scheduler": "tip_cosine", "weight_decay": 0.0, "grad_clip": 5.0,
+        "window_size": 40, "windows_per_sequence": 4, "obj_loss_weight": 6.0,
+        "eval_every": 10, "early_stopping_patience": 0, "checkpoint": "final",
+    },
+    # TransPose Sec. 4.3: each network trained separately, batch 256, Adam 1e-3.
+    "transpose": {
+        "epochs": 300, "batch_size": 256, "lr": 1e-3, "optimizer": "adam",
+        "scheduler": "none", "weight_decay": 0.0, "grad_clip": 0.0,
+        "window_size": 120, "windows_per_sequence": 4, "obj_loss_weight": 1.0,
+        "eval_every": 5, "early_stopping_patience": 0,
+        "checkpoint": "best_per_network",
+    },
+    # GlobalPose Sec. 4.1: 100 epochs of independent (teacher-forced) training
+    # followed by 200 joint epochs; optimizer settings of the comparison code.
+    # The total validation loss is dominated by the stationary BCE, which
+    # overfits while every pose/velocity term keeps improving, so the model
+    # after the full schedule is used.
+    "globalpose": {
+        "epochs": 300, "batch_size": 16, "lr": 1e-4, "optimizer": "adamw",
+        "scheduler": "none", "weight_decay": 1e-5, "grad_clip": 1.0,
+        "window_size": 120, "windows_per_sequence": 1, "obj_loss_weight": 1.0,
+        "eval_every": 5, "early_stopping_patience": 0, "teacher_epochs": 100,
+        "checkpoint": "final",
+    },
+}
+CHECKPOINT_POLICIES = ("best", "final", "best_per_network")
+# Training files of the canonical OMOMO run (4705 minus the 5% holdout).  The
+# epoch budgets above were run there; ``--schedule_scale auto`` multiplies every
+# epoch-like setting by this count over the new training-file count, so a
+# smaller dataset gets the same number of optimizer steps (batch size and
+# windows per sequence are unchanged), as in the main pipeline's
+# ``--schedule_scale auto``.
+SCHEDULE_REFERENCE_TRAINING_FILES = 4470
+# TransPose networks share no parameters; with GT upstream inputs each one's
+# validation term depends on that network alone.
+TRANSPOSE_NETWORK_TERMS = {
+    "pose_s1": ("gt_leaf",),
+    "pose_s2": ("gt_full",),
+    "pose_s3": ("gt_pose",),
+    "tran_b1": ("gt_contact",),
+    "tran_b2": ("gt_root_velocity",),
+    "obj_head": ("gt_obj_velocity", "gt_obj_position"),
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train paper-method comparison baselines on IMUHOI")
     parser.add_argument("--method", choices=METHODS, required=True)
+    parser.add_argument(
+        "--protocol",
+        choices=("paper", "legacy"),
+        default="paper",
+        help=(
+            "paper: v3 paper-faithful methods on the shared IMUHOI stream; "
+            "legacy: the earlier v2 adapters/variants"
+        ),
+    )
+    parser.add_argument(
+        "--windows_per_sequence",
+        type=int,
+        default=None,
+        help="Random training windows drawn per sequence and epoch (paper protocol)",
+    )
+    parser.add_argument(
+        "--globalpose_teacher_epochs",
+        type=int,
+        default=None,
+        help="GlobalPose epochs trained on ground-truth cascade inputs (paper protocol)",
+    )
     parser.add_argument("--cfg", default="configs/IMUHOI_train_rnn.yaml")
+    parser.add_argument(
+        "--dataset",
+        default=None,
+        help="Train on this cfg.datasets key only (overrides cfg.train_datasets)",
+    )
+    parser.add_argument(
+        "--schedule_scale",
+        default=None,
+        help=(
+            "Multiply epochs, validation/teacher intervals by this factor; 'auto' "
+            "matches the optimizer steps of the canonical OMOMO run"
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
@@ -199,8 +315,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--eval_every",
         type=int,
-        default=5,
-        help="Run validation every N epochs (also runs at epoch 1 and the final epoch)",
+        default=None,
+        help="Run validation every N epochs (also runs at epoch 1 and the final epoch); default per method",
     )
     parser.add_argument(
         "--save_every",
@@ -211,8 +327,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--early_stopping_patience",
         type=int,
-        default=0,
-        help="Validation checks without improvement; 0 disables early stopping",
+        default=None,
+        help="Validation checks without improvement; 0 disables early stopping; default per method",
+    )
+    parser.add_argument(
+        "--checkpoint_policy",
+        choices=CHECKPOINT_POLICIES,
+        default=None,
+        help="Weights written to selected.pt; default per method (legacy: best)",
     )
     parser.add_argument("--resume", default=None, help="Resume model, optimizer, and scheduler from a checkpoint")
     parser.add_argument(
@@ -229,6 +351,13 @@ def parse_args() -> argparse.Namespace:
             "For GlobalPose with --pretrained, freeze PL/IK/VR and optimize "
             "only the object head. Defaults to enabled for the official variant."
         ),
+    )
+    parser.add_argument(
+        "--pin_memory",
+        "--pin-memory",
+        action=_BooleanOptionalAction,
+        default=None,
+        help="Override cfg.dataloader_pin_memory (disable on WSL if the pin thread segfaults)",
     )
     parser.add_argument("--amp", action="store_true", help="Use CUDA automatic mixed precision")
     parser.add_argument(
@@ -256,7 +385,7 @@ def load_cfg(args: argparse.Namespace):
             raise ValueError("--tip_n_heads must be a positive divisor of 256")
         if args.tip_state_noise < 0:
             raise ValueError("--tip_state_noise must be non-negative")
-        if args.tip_variant == "official":
+        if args.tip_variant == "official" and args.protocol == "legacy":
             # The public object checkpoint has no SBP channels.
             args.n_sbps = 0
     if args.freeze_reference_human is None:
@@ -271,17 +400,56 @@ def load_cfg(args: argparse.Namespace):
         raise ValueError("--freeze-reference-human requires --pretrained")
     if not 0.0 <= args.validation_fraction < 1.0:
         raise ValueError("--validation_fraction must be in [0, 1)")
-    if args.eval_every <= 0 or args.save_every <= 0:
-        raise ValueError("--eval_every and --save_every must be positive")
-    if args.early_stopping_patience < 0:
-        raise ValueError("--early_stopping_patience must be non-negative")
+    if args.save_every <= 0:
+        raise ValueError("--save_every must be positive")
     for name in ("max_train_sequences", "max_eval_sequences"):
         value = getattr(args, name)
         if value is not None and value <= 0:
             raise ValueError(f"--{name} must be positive")
     with open(args.cfg, "r") as f:
         cfg = edict(yaml.safe_load(f))
-    method_defaults = METHOD_TRAINING_DEFAULTS[args.method]
+    cfg.comparison_paper = args.protocol == "paper"
+    if args.dataset is not None:
+        if args.dataset not in cfg.datasets:
+            raise KeyError(f"Dataset {args.dataset!r} is not present in {args.cfg}")
+        cfg.train_datasets = [args.dataset]
+    method_defaults = (
+        PAPER_TRAINING_DEFAULTS if cfg.comparison_paper else METHOD_TRAINING_DEFAULTS
+    )[args.method]
+    if cfg.comparison_paper:
+        cfg.windows_per_sequence = int(
+            args.windows_per_sequence
+            if args.windows_per_sequence is not None
+            else method_defaults["windows_per_sequence"]
+        )
+        cfg.globalpose_teacher_epochs = int(
+            args.globalpose_teacher_epochs
+            if args.globalpose_teacher_epochs is not None
+            else method_defaults.get("teacher_epochs", 0)
+        )
+        if args.eval_every is None:
+            args.eval_every = int(method_defaults["eval_every"])
+        if args.early_stopping_patience is None:
+            args.early_stopping_patience = int(method_defaults["early_stopping_patience"])
+        if args.checkpoint_policy is None:
+            args.checkpoint_policy = str(method_defaults["checkpoint"])
+    else:
+        cfg.windows_per_sequence = 1
+        cfg.globalpose_teacher_epochs = 0
+        if args.eval_every is None:
+            args.eval_every = 5
+        if args.early_stopping_patience is None:
+            args.early_stopping_patience = 0
+        if args.checkpoint_policy is None:
+            args.checkpoint_policy = "best"
+    if args.checkpoint_policy == "best_per_network" and not (
+        cfg.comparison_paper and args.method == "transpose"
+    ):
+        raise ValueError("best_per_network selection is defined for paper TransPose only")
+    if args.eval_every <= 0:
+        raise ValueError("--eval_every must be positive")
+    if args.early_stopping_patience < 0:
+        raise ValueError("--early_stopping_patience must be non-negative")
     if args.obj_loss_weight is None:
         args.obj_loss_weight = float(method_defaults["obj_loss_weight"])
     if args.obj_loss_weight < 0:
@@ -295,7 +463,12 @@ def load_cfg(args: argparse.Namespace):
     cfg.comparison_grad_clip = method_defaults["grad_clip"]
     cfg.train.window = int(method_defaults["window_size"])
     cfg.test.window = int(method_defaults["window_size"])
-    if args.method == "tip" and args.tip_variant == "official" and args.window_size is None:
+    if (
+        not cfg.comparison_paper
+        and args.method == "tip"
+        and args.tip_variant == "official"
+        and args.window_size is None
+    ):
         cfg.train.window = 120
         cfg.test.window = 120
     if args.epochs is not None:
@@ -316,12 +489,15 @@ def load_cfg(args: argparse.Namespace):
         cfg.device = args.device
     if args.num_workers is not None:
         cfg.num_workers = args.num_workers
+    if args.pin_memory is not None:
+        cfg.dataloader_pin_memory = bool(args.pin_memory)
     if args.window_size is not None:
         if args.window_size <= 1:
             raise ValueError("--window_size must be greater than 1")
         cfg.train.window = int(args.window_size)
         cfg.test.window = int(args.window_size)
     cfg.debug = bool(args.debug)
+    cfg.tip_sbp_cache_root = args.tip_sbp_cache_root
     cfg.tip_variant = str(args.tip_variant)
     cfg.transpose_variant = str(args.transpose_variant)
     cfg.globalpose_variant = str(args.globalpose_variant)
@@ -404,7 +580,11 @@ def create_loader(
     is_training = split == "train" if training is None else bool(training)
     window_cfg = cfg.train if is_training else cfg.test
     window_size = int(window_cfg.window)
-    if method == "tip" and getattr(cfg, "tip_variant", "official") == "legacy":
+    paper = bool(getattr(cfg, "comparison_paper", False))
+    if paper and method == "tip":
+        # Context frames for TIP's 11-frame acc filter and 40-frame acc sum.
+        window_size += TIP_TRAIN_HISTORY + TIP_TRAIN_FUTURE
+    elif method == "tip" and getattr(cfg, "tip_variant", "official") == "legacy":
         # Legacy extension windows include context for its rolling acc-sum.
         window_size += TIP_ACC_SUM_WIN_LEN
     if sequence_paths is None:
@@ -415,13 +595,62 @@ def create_loader(
         )
         if limit is not None:
             sequence_paths = _sequence_files(paths)[: int(limit)]
-    dataset = IMUDataset(
+    if paper:
+        # Shared stream: the corpus IMU with the main pipeline's fixed
+        # per-sequence Noitom noise (seed 42), for training and validation.
+        dataset = IMUDataset(
+            data_dir=paths,
+            sequence_paths=sequence_paths,
+            window_size=window_size,
+            debug=bool(cfg.debug),
+            obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
+            simulate_imu_noise=bool(getattr(cfg, "simulate_imu_noise", True)),
+            simulate_imu_noise_seed=int(getattr(cfg, "simulate_imu_noise_seed", 42)),
+            resolve_bimanual_contact_conflicts=bool(
+                getattr(cfg, "resolve_bimanual_contact_conflicts", False)
+            ),
+            random_window=is_training,
+            imu_protocol="imuhoi",
+            imu_source="stored",
+            windows_per_sequence=int(cfg.windows_per_sequence) if is_training else 1,
+            tip_sbp_cache_root=(
+                getattr(cfg, "tip_sbp_cache_root", None) if method == "tip" else None
+            ),
+            lean=True,
+        )
+    else:
+        dataset = _legacy_dataset(cfg, method, paths, sequence_paths, window_size, is_training)
+    if len(dataset) == 0:
+        return None
+    return DataLoader(
+        dataset,
+        batch_size=int(cfg.batch_size),
+        shuffle=is_training,
+        num_workers=int(cfg.num_workers),
+        # WSL can segfault in the pin-memory thread; the config switch applies.
+        pin_memory=bool(getattr(cfg, "dataloader_pin_memory", True))
+        and torch.cuda.is_available(),
+        drop_last=(is_training and len(dataset) >= int(cfg.batch_size)),
+        persistent_workers=int(cfg.num_workers) > 0,
+    )
+
+
+def _legacy_dataset(cfg, method, paths, sequence_paths, window_size, is_training):
+    return IMUDataset(
         data_dir=paths,
         sequence_paths=sequence_paths,
         window_size=window_size,
         debug=bool(cfg.debug),
         obj_points_sample_count=int(getattr(cfg, "mesh_downsample_points", 256)),
-        simulate_imu_noise=is_training,
+        # Training draws fresh Noitom-style noise per sample; validation uses
+        # the evaluation protocol's fixed per-sequence realization (seed 42)
+        # so checkpoint selection sees the same input condition as testing.
+        simulate_imu_noise=bool(getattr(cfg, "simulate_imu_noise", True)),
+        simulate_imu_noise_seed=(
+            None
+            if is_training
+            else int(getattr(cfg, "simulate_imu_noise_seed", 42))
+        ),
         resolve_bimanual_contact_conflicts=bool(getattr(cfg, "resolve_bimanual_contact_conflicts", False)),
         random_window=is_training,
         body_model_path=(
@@ -442,20 +671,70 @@ def create_loader(
             else "imuhoi"
         ),
     )
-    if len(dataset) == 0:
-        return None
-    return DataLoader(
-        dataset,
-        batch_size=int(cfg.batch_size),
-        shuffle=is_training,
-        num_workers=int(cfg.num_workers),
-        pin_memory=torch.cuda.is_available(),
-        drop_last=(is_training and len(dataset) >= int(cfg.batch_size)),
-        persistent_workers=int(cfg.num_workers) > 0,
-    )
+
+
+def build_paper_model_and_loss(args: argparse.Namespace, device: torch.device):
+    """Paper-faithful models (protocol v3) and their training objectives."""
+    if args.method == "dip18":
+        return DIP18PaperModel().to(device), DIPPaperLoss(obj_weight=args.obj_loss_weight)
+    if args.method == "tip":
+        model = TIPHOIModel(
+            input_size_imu=90,  # 72 rotated IMU channels + 18 acc-sum features
+            obj_imu_dim=15,
+            n_sbps=args.n_sbps,
+            n_heads=args.tip_n_heads,
+            past_state_dropout=0.8,
+            object_state_feedback=False,
+            past_dropout_always_on=True,
+        )
+        return model.to(device), TIPLoss(n_sbps=args.n_sbps, obj_weight=args.obj_loss_weight)
+    if args.method == "transpose":
+        model = TransPoseHOIModel(
+            human_imu_dim=72,
+            obj_imu_dim=12,
+            object_bidirectional=False,
+            object_condition_on_full=False,
+            human_condition_on_object=False,
+            transpose_reference=False,
+            lstm_dropout=0.0,
+        )
+        return model.to(device), TransPosePaperLoss(obj_weight=args.obj_loss_weight)
+    if args.method == "globalpose":
+        model = GlobalPoseHOIModel(
+            obj_imu_dim=12,
+            object_bidirectional=False,
+            object_with_init=True,
+            human_condition_on_object=False,
+        ).to(device)
+        model.freeze_reference_human = False
+        return model, GlobalPosePaperLoss(obj_weight=args.obj_loss_weight)
+    raise ValueError(args.method)
+
+
+def paper_model_kwargs(args: argparse.Namespace) -> dict:
+    if args.method == "tip":
+        return {
+            "input_size_imu": 90, "obj_imu_dim": 15, "n_sbps": args.n_sbps,
+            "n_heads": args.tip_n_heads, "past_state_dropout": 0.8,
+            "object_state_feedback": False, "past_dropout_always_on": True,
+        }
+    if args.method == "transpose":
+        return {
+            "human_imu_dim": 72, "obj_imu_dim": 12, "object_bidirectional": False,
+            "object_condition_on_full": False, "human_condition_on_object": False,
+            "transpose_reference": False, "lstm_dropout": 0.0,
+        }
+    if args.method == "globalpose":
+        return {
+            "obj_imu_dim": 12, "object_bidirectional": False,
+            "object_with_init": True, "human_condition_on_object": False,
+        }
+    return {}
 
 
 def build_model_and_loss(args: argparse.Namespace, device: torch.device):
+    if getattr(args, "protocol", "legacy") == "paper":
+        return build_paper_model_and_loss(args, device)
     if args.method == "dip18":
         # RefCodes/dip18/my_simple/train_obj.py uses w_human=10 and trains the
         # released raw-matrix human branch together with object velocity.
@@ -700,9 +979,12 @@ def build_scheduler(cfg, optimizer: torch.optim.Optimizer):
             lr_lambda=lambda step: 0.96 ** (float(step) / 2000.0),
         )
     if name == "tip_cosine":
+        # A scaled schedule keeps the unscaled period, so the per-step learning
+        # rate trajectory is the one of the reference run.
+        base_epochs = int(getattr(cfg, "schedule_base_epochs", cfg.epochs))
         return torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=int(cfg.epochs) + 850,
+            T_max=base_epochs + 850,
         )
     raise ValueError(f"Unsupported scheduler: {cfg.comparison_scheduler!r}")
 
@@ -778,6 +1060,117 @@ def model_inference_forward(
     return model_forward(method, model, adapted)
 
 
+def paper_forward(
+    method: str,
+    model: torch.nn.Module,
+    adapted: dict[str, torch.Tensor],
+    *,
+    training: bool,
+    epoch: int,
+    teacher_epochs: int,
+    tip_state_noise: float = TIP_STATE_NOISE,
+    tip_window: int = 40,
+) -> dict[str, torch.Tensor]:
+    """Forward of the paper-faithful models (protocol v3)."""
+    if method == "dip18":
+        output = model(adapted["imu"], adapted["obj_imu"])
+        output["pose_target_n"] = model.normalize_pose(adapted["pose_target"])
+        return output
+    if method == "tip":
+        if training:
+            # TIP learns state[t] -> state[t+1] from IMU[t] with uniform
+            # history noise (train_model.py, noise_input_hist).
+            state_input = adapted["state_target"][:, :-1]
+            noise = (torch.rand_like(state_input) - 0.5) * (2.0 * float(tip_state_noise))
+            return model(
+                adapted["imu"][:, :-1],
+                (state_input + noise).nan_to_num(0.0),
+                adapted["obj_imu"][:, :-1],
+            )
+        return model.infer_autoregressive(
+            adapted["imu"],
+            adapted["obj_imu"],
+            window_size=tip_window,
+            initial_state=adapted["initial_state"],
+            emit_initial_state=True,
+            measured_root_2axis=adapted["measured_root_2axis"],
+        )
+    if method == "transpose":
+        from Comparisons.common.paper_protocol import (
+            TRANSPOSE_FULL_NOISE,
+            TRANSPOSE_LEAF_NOISE,
+        )
+
+        teacher = None
+        if training:
+            teacher = {
+                "leaf": adapted["leaf_target"]
+                + torch.randn_like(adapted["leaf_target"]) * TRANSPOSE_LEAF_NOISE,
+                "full": adapted["full_target"]
+                + torch.randn_like(adapted["full_target"]) * TRANSPOSE_FULL_NOISE,
+            }
+        return model(adapted["imu"], adapted["obj_imu"], teacher=teacher)
+    if method == "globalpose":
+        teacher = adapted["teacher"] if training and epoch <= teacher_epochs else None
+        return model(
+            adapted["x"],
+            adapted["obj_imu"],
+            apply_gravity_correction=True,
+            column_r6d=True,
+            pl_init=adapted["pl_init"],
+            vr_init=adapted["vr_init"],
+            teacher=teacher,
+        )
+    raise ValueError(method)
+
+
+def _clip_gradients(model: torch.nn.Module, max_norm: float, separate_object: bool) -> None:
+    """Clip by global norm; optionally keep the object extension separate so
+    its gradients cannot rescale the human network's update."""
+    parameters = [p for p in model.parameters() if p.grad is not None]
+    if not separate_object or not hasattr(model, "obj_head"):
+        torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+        return
+    object_ids = {id(p) for p in model.obj_head.parameters()}
+    human = [p for p in parameters if id(p) not in object_ids]
+    objects = [p for p in parameters if id(p) in object_ids]
+    for group in (human, objects):
+        if group:
+            torch.nn.utils.clip_grad_norm_(group, max_norm)
+
+
+@torch.no_grad()
+def compute_dip_normalization(
+    loader: DataLoader, device: torch.device, max_batches: int | None = None
+) -> dict[str, torch.Tensor]:
+    """Training-set z-score statistics of DIP inputs and SMPL targets."""
+    sums: dict[str, torch.Tensor] = {}
+    squares: dict[str, torch.Tensor] = {}
+    count = 0
+    for batch_index, batch in enumerate(tqdm(loader, desc="dip stats", leave=False)):
+        if max_batches is not None and batch_index >= max_batches:
+            break
+        batch = tensor_to_device(batch, device)
+        adapted = adapt_batch_paper(batch, "dip18", fps=FRAME_RATE)
+        values = {
+            "input": adapted["imu"],
+            "pose": adapted["pose_target"],
+            "obj": adapted["obj_imu"],
+        }
+        for key, value in values.items():
+            flat = value.reshape(-1, value.shape[-1]).double()
+            sums[key] = sums.get(key, 0.0) + flat.sum(dim=0)
+            squares[key] = squares.get(key, 0.0) + flat.square().sum(dim=0)
+        count += values["input"].shape[0] * values["input"].shape[1]
+    stats = {}
+    for key in sums:
+        mean = sums[key] / count
+        std = (squares[key] / count - mean.square()).clamp_min(0.0).sqrt()
+        stats[f"{key}_mean"] = mean.float()
+        stats[f"{key}_std"] = std.clamp_min(1e-3).float()
+    return stats
+
+
 def run_epoch(
     method: str,
     model: torch.nn.Module,
@@ -793,6 +1186,10 @@ def run_epoch(
     max_batches: int | None = None,
     scaler: GradScaler | None = None,
     use_amp: bool = False,
+    paper: bool = False,
+    epoch: int = 1,
+    teacher_epochs: int = 0,
+    per_network_validation: bool = False,
 ) -> dict[str, float]:
     train = optimizer is not None
     amp_enabled = bool(use_amp and device.type == "cuda")
@@ -814,8 +1211,66 @@ def run_epoch(
         if max_batches is not None and batch_index >= max_batches:
             break
         batch = tensor_to_device(batch, device)
-        if method == "tip":
+        if method == "tip" and "tip_sbp" not in batch:
             batch = attach_tip_sbp_from_cache(batch, tip_sbp_cache_root, device=device)
+        if paper:
+            adapted = adapt_batch_paper(
+                batch,
+                method,
+                fps=FRAME_RATE,
+                training=train,
+                windowed=True,
+                # Training follows RNNWithInitDataset (first target frame for
+                # PL and VR); validation uses the online test initialization.
+                globalpose_init_mode="reference_train" if train else "reference",
+                n_sbps=n_sbps,
+            )
+            with autocast(enabled=amp_enabled):
+                output = paper_forward(
+                    method,
+                    model,
+                    adapted,
+                    training=train,
+                    epoch=epoch,
+                    teacher_epochs=teacher_epochs,
+                    tip_state_noise=tip_state_noise,
+                )
+                loss_dict = loss_fn(output, adapted)
+                loss = loss_dict["loss"]
+                if per_network_validation and not train:
+                    # Clean GT upstream positions isolate every TransPose
+                    # network for best_per_network selection ("gt_" terms).
+                    gt_output = model(
+                        adapted["imu"],
+                        adapted["obj_imu"],
+                        teacher={
+                            "leaf": adapted["leaf_target"],
+                            "full": adapted["full_target"],
+                        },
+                    )
+                    loss_dict = {
+                        **loss_dict,
+                        **{
+                            f"gt_{key}": value
+                            for key, value in loss_fn(gt_output, adapted).items()
+                        },
+                    }
+            if train:
+                optimizer.zero_grad(set_to_none=True)
+                assert scaler is not None
+                scale_before = scaler.get_scale()
+                scaler.scale(loss).backward()
+                if grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    _clip_gradients(model, grad_clip, separate_object=True)
+                scaler.step(optimizer)
+                scaler.update()
+                if scheduler is not None and scaler.get_scale() >= scale_before:
+                    scheduler.step()
+            count += 1
+            for key, value in loss_dict.items():
+                totals[key] = totals.get(key, 0.0) + float(value.detach().cpu())
+            continue
         adapted = adapt_batch(
             batch,
             method=method,
@@ -903,6 +1358,31 @@ def _project_relative_paths(paths: list[str]) -> list[str]:
     return relative
 
 
+def apply_schedule_scale(cfg, args: argparse.Namespace, num_training_files: int) -> float:
+    """Scale every epoch-like setting so the optimizer-step budget is kept."""
+    cfg.schedule_base_epochs = int(cfg.epochs)
+    if args.schedule_scale is None:
+        return 1.0
+    if str(args.schedule_scale).lower() == "auto":
+        if num_training_files <= 0:
+            raise ValueError("--schedule_scale auto needs training files")
+        scale = SCHEDULE_REFERENCE_TRAINING_FILES / float(num_training_files)
+    else:
+        scale = float(args.schedule_scale)
+    if scale <= 0:
+        raise ValueError("--schedule_scale must be positive")
+    cfg.epochs = max(1, int(round(cfg.epochs * scale)))
+    args.eval_every = max(1, int(round(args.eval_every * scale)))
+    args.save_every = max(1, int(round(args.save_every * scale)))
+    cfg.globalpose_teacher_epochs = int(round(cfg.globalpose_teacher_epochs * scale))
+    print(
+        f"schedule scale {scale:.4f}: epochs {cfg.schedule_base_epochs} -> {cfg.epochs}, "
+        f"eval_every {args.eval_every}, save_every {args.save_every}, "
+        f"teacher_epochs {cfg.globalpose_teacher_epochs}"
+    )
+    return scale
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_cfg(args)
@@ -976,6 +1456,7 @@ def main() -> None:
             else "configured_test_path"
         )
 
+    schedule_scale = apply_schedule_scale(cfg, args, len(training_files))
     train_loader = create_loader(
         cfg,
         "train",
@@ -1007,6 +1488,14 @@ def main() -> None:
         json.dump(split_manifest, handle, indent=2)
 
     model, loss_fn = build_model_and_loss(args, device)
+    paper = bool(cfg.comparison_paper)
+    protocol_version = PAPER_PROTOCOL_VERSION if paper else COMPARISON_PROTOCOL_VERSION
+    if paper and args.method == "dip18" and resume_path is None:
+        # DIP z-scores inputs and targets with training-set statistics.
+        stats = compute_dip_normalization(train_loader, device)
+        model.set_normalization({key: value.to(device) for key, value in stats.items()})
+        with open(save_dir / "dip_normalization.json", "w") as handle:
+            json.dump({key: value.tolist() for key, value in stats.items()}, handle)
     pretrained_info = None
     if args.pretrained is not None:
         pretrained_path = Path(args.pretrained)
@@ -1058,8 +1547,10 @@ def main() -> None:
             raise ValueError(
                 f"Resume checkpoint method is {resume.get('method')!r}, not {args.method!r}"
             )
-        if int(resume.get("comparison_protocol_version", -1)) != COMPARISON_PROTOCOL_VERSION:
-            raise ValueError("Resume checkpoint protocol does not match corrected protocol v2")
+        if int(resume.get("comparison_protocol_version", -1)) != protocol_version:
+            raise ValueError(
+                f"Resume checkpoint protocol does not match protocol v{protocol_version}"
+            )
         if int(resume.get("n_sbps", args.n_sbps)) != args.n_sbps:
             raise ValueError("Resume checkpoint n_sbps does not match --n_sbps")
         model.load_state_dict(resume["model"], strict=True)
@@ -1087,7 +1578,11 @@ def main() -> None:
         "n_sbps": args.n_sbps,
         "tip_sbp_cache_root": args.tip_sbp_cache_root,
         "obj_loss_weight": args.obj_loss_weight,
-        "comparison_protocol_version": COMPARISON_PROTOCOL_VERSION,
+        "comparison_protocol_version": protocol_version,
+        "protocol": args.protocol,
+        "imu_source": "stored_imuhoi_stream_noitom_seed42" if paper else "method_synthesis",
+        "windows_per_sequence": int(cfg.windows_per_sequence),
+        "globalpose_teacher_epochs": int(cfg.globalpose_teacher_epochs),
         "dip_variant": "official" if args.method == "dip18" else None,
         "tip_variant": args.tip_variant if args.method == "tip" else None,
         "transpose_variant": args.transpose_variant if args.method == "transpose" else None,
@@ -1112,6 +1607,10 @@ def main() -> None:
             else args.method == "tip"
         ),
         "window_size": int(cfg.train.window),
+        "train_datasets": list(cfg.train_datasets),
+        "schedule_scale": schedule_scale,
+        "schedule_base_epochs": int(cfg.schedule_base_epochs),
+        "epochs": int(cfg.epochs),
         "num_training_files": len(training_files),
         "num_validation_files": len(validation_files),
         "validation_source": validation_source,
@@ -1120,6 +1619,7 @@ def main() -> None:
         "eval_every": args.eval_every,
         "save_every": args.save_every,
         "early_stopping_patience": args.early_stopping_patience,
+        "checkpoint_policy": args.checkpoint_policy,
         "amp": use_amp,
         "pretrained": pretrained_info,
         "freeze_reference_human": bool(args.freeze_reference_human),
@@ -1152,7 +1652,8 @@ def main() -> None:
             "checks_without_improvement": checks_without_improvement,
             "method": args.method,
             "n_sbps": args.n_sbps,
-            "comparison_protocol_version": COMPARISON_PROTOCOL_VERSION,
+            "comparison_protocol_version": protocol_version,
+            "protocol": args.protocol,
             "dip_variant": "official" if args.method == "dip18" else None,
             "tip_variant": args.tip_variant if args.method == "tip" else None,
             "transpose_variant": args.transpose_variant if args.method == "transpose" else None,
@@ -1184,7 +1685,7 @@ def main() -> None:
             "amp": use_amp,
             "pretrained": pretrained_info,
             "freeze_reference_human": bool(args.freeze_reference_human),
-            "model_kwargs": (
+            "model_kwargs": paper_model_kwargs(args) if paper else (
                 {
                     "n_sbps": args.n_sbps,
                     "n_heads": args.tip_n_heads,
@@ -1232,6 +1733,21 @@ def main() -> None:
         print(f"checkpoint already reached epoch {start_epoch - 1}; target is {epochs}")
         return
 
+    per_network = args.checkpoint_policy == "best_per_network"
+    per_network_path = save_dir / "best_per_network.pt"
+    network_best: dict[str, dict] = {}
+    network_state: dict[str, dict[str, torch.Tensor]] = {}
+    if per_network and resume_path is not None and per_network_path.exists():
+        saved = _load_checkpoint(per_network_path)
+        network_best = dict(saved.get("network_selection", {}))
+        for name in network_best:
+            prefix = f"{name}."
+            network_state[name] = {
+                key[len(prefix):]: value
+                for key, value in saved["model"].items()
+                if key.startswith(prefix)
+            }
+
     last_epoch = start_epoch - 1
     last_train_metrics: dict[str, float] = {}
     for epoch in range(start_epoch, epochs + 1):
@@ -1251,6 +1767,9 @@ def main() -> None:
             max_batches=args.max_train_batches,
             scaler=scaler,
             use_amp=use_amp,
+            paper=paper,
+            epoch=epoch,
+            teacher_epochs=int(cfg.globalpose_teacher_epochs),
         )
         last_train_metrics = train_metrics
         print(f"epoch {epoch:04d} train {train_metrics}")
@@ -1272,8 +1791,34 @@ def main() -> None:
                     tip_sbp_cache_root=args.tip_sbp_cache_root,
                     max_batches=args.max_eval_batches,
                     use_amp=use_amp,
+                    paper=paper,
+                    epoch=epoch,
+                    teacher_epochs=int(cfg.globalpose_teacher_epochs),
+                    per_network_validation=per_network,
                 )
             print(f"epoch {epoch:04d} eval {eval_metrics}")
+            if per_network:
+                improved_networks = []
+                for name, terms in TRANSPOSE_NETWORK_TERMS.items():
+                    value = sum(float(eval_metrics[key]) for key in terms)
+                    if value < network_best.get(name, {}).get("value", float("inf")):
+                        network_best[name] = {"epoch": epoch, "value": value}
+                        network_state[name] = {
+                            key: tensor.detach().cpu().clone()
+                            for key, tensor in getattr(model, name).state_dict().items()
+                        }
+                        improved_networks.append(name)
+                if improved_networks:
+                    payload = checkpoint_payload(
+                        epoch, eval_metrics, include_training_state=False
+                    )
+                    for name, state in network_state.items():
+                        payload["model"].update(
+                            {f"{name}.{key}": value for key, value in state.items()}
+                        )
+                    payload["network_selection"] = network_best
+                    _atomic_torch_save(payload, per_network_path)
+                    print(f"epoch {epoch:04d} per-network best: {improved_networks}")
             if eval_metrics.get("loss", float("inf")) < best_eval:
                 best_eval = float(eval_metrics["loss"])
                 checks_without_improvement = 0
@@ -1336,6 +1881,17 @@ def main() -> None:
             ),
             save_dir / "last.pt",
         )
+    if args.checkpoint_policy == "final":
+        selected = checkpoint_payload(
+            last_epoch, last_train_metrics, include_training_state=False
+        )
+    else:
+        source = per_network_path if per_network else save_dir / "best.pt"
+        selected = _load_checkpoint(source) if source.exists() else None
+    if selected is not None:
+        selected["checkpoint_policy"] = args.checkpoint_policy
+        _atomic_torch_save(selected, save_dir / "selected.pt")
+        print(f"selected.pt <- {args.checkpoint_policy} (epoch {selected.get('epoch')})")
     print(f"saved comparison run to {save_dir}")
 
 

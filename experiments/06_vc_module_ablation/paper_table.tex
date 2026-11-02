@@ -1,0 +1,57 @@
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcccccc}
+\toprule
+Variant & F1 L & F1 R & F1 obj & Event F1 & Obj (cm) & HOI (cm) \\
+\midrule
+\multicolumn{7}{l}{\textit{OMOMO}} \\
+IMUHOI++ (full) & 95.5 & 95.8 & 98.1 & 56.2 & 13.34 & 10.48 \\
+w/o HP prior & 92.6$^\dagger$ & 93.1$^\dagger$ & 97.4$^\dagger$ & 40.6$^\dagger$ & 14.11$^\dagger$ & 10.73$^\dagger$ \\
+w/o conditional contact & 95.0$^\dagger$ & 95.3$^\dagger$ & 98.2 & 52.1$^\dagger$ & 13.56$^\dagger$ & 10.67 \\
+w/o left arm & 94.9$^\dagger$ & 95.8 & 98.2$^\dagger$ & 57.7 & 13.49 & 10.55 \\
+w/o right arm & 95.6 & 95.7 & 98.2$^\dagger$ & 55.7 & 13.31 & 10.49 \\
+w/o torso & 95.4 & 95.8 & 98.2$^\dagger$ & 56.9 & 13.29 & 10.57 \\
+w/o legs & 95.3 & 95.9 & 98.2 & 56.7 & 13.44 & 10.57 \\
+\midrule
+\multicolumn{7}{l}{\textit{BEHAVE}} \\
+IMUHOI++ (full) & 83.8 & 84.5 & 92.2 & 29.6 & 22.93 & 17.19 \\
+w/o HP prior & 79.7$^\dagger$ & 80.1$^\dagger$ & 91.2 & 16.3$^\dagger$ & 25.11$^\dagger$ & 19.23$^\dagger$ \\
+w/o conditional contact & 82.4 & 82.8$^\dagger$ & 91.4 & 23.7$^\dagger$ & 24.07$^\dagger$ & 17.39 \\
+w/o left arm & 83.4 & 83.5 & 92.4 & 25.4$^\dagger$ & 23.38 & 17.42 \\
+w/o right arm & 83.8 & 82.3$^\dagger$ & 91.8 & 26.9 & 23.44 & 17.25 \\
+w/o torso & 84.6 & 83.6 & 92.2 & 27.9 & 22.75 & 16.76 \\
+w/o legs & 84.6 & 83.6 & 92.0 & 28.1 & 23.58 & 17.87 \\
+\midrule
+\multicolumn{7}{l}{\textit{IMHD}} \\
+IMUHOI++ (full) & 87.7 & 96.5 & 70.8 & 11.5 & 32.69 & 17.23 \\
+w/o HP prior & 86.8 & 92.3$^\dagger$ & 70.0 & 2.4$^\dagger$ & 33.18 & 17.88 \\
+w/o conditional contact & 90.9$^\dagger$ & 97.4 & 69.8 & 22.2 & 30.49$^\dagger$ & 15.62$^\dagger$ \\
+w/o left arm & -- & -- & -- & -- & -- & -- \\
+w/o right arm & -- & -- & -- & -- & -- & -- \\
+w/o torso & -- & -- & -- & -- & -- & -- \\
+w/o legs & -- & -- & -- & -- & -- & -- \\
+\midrule
+\multicolumn{7}{l}{\textit{PAHOI}} \\
+IMUHOI++ (full) & 94.1 & 93.5 & 96.3 & 54.6 & 9.95 & 8.06 \\
+w/o HP prior & 92.3 & 93.0 & 94.7$^\dagger$ & 50.0 & 10.73$^\dagger$ & 8.20 \\
+w/o conditional contact & 93.5 & 92.2 & 95.9 & 53.7 & 9.80 & 7.68 \\
+w/o left arm & -- & -- & -- & -- & -- & -- \\
+w/o right arm & -- & -- & -- & -- & -- & -- \\
+w/o torso & -- & -- & -- & -- & -- & -- \\
+w/o legs & -- & -- & -- & -- & -- & -- \\
+\midrule
+\multicolumn{7}{l}{\textit{HODome}} \\
+IMUHOI++ (full) & 92.1 & 92.7 & 94.0 & 36.4 & 26.66 & 17.99 \\
+w/o HP prior & 81.6$^\dagger$ & 88.1$^\dagger$ & 89.0$^\dagger$ & 17.6$^\dagger$ & 26.89 & 17.84 \\
+w/o conditional contact & 90.7 & 90.6$^\dagger$ & 93.4 & 30.2$^\dagger$ & 26.03 & 17.42 \\
+w/o left arm & -- & -- & -- & -- & -- & -- \\
+w/o right arm & -- & -- & -- & -- & -- & -- \\
+w/o torso & -- & -- & -- & -- & -- & -- \\
+w/o legs & -- & -- & -- & -- & -- & -- \\
+\bottomrule
+\end{tabular}
+\caption{Ablation of the velocity-contact module. Every variant retrains its VC, OT and joint stage. F1 in \%; event F1: contact onsets and releases matched within $\pm$10 frames. $^\dagger$: difference to the full model with a 95\% paired bootstrap interval excluding zero.}
+\label{tab:vc_ablation}
+\end{table}

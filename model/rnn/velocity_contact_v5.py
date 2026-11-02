@@ -36,6 +36,27 @@ fraction of the training windows' initializers so the nets learn to weigh them
 against the IMU evidence: Gaussian noise of ``v5_obj_vel_init_noise_std`` /
 ``v5_hand_vel_init_noise_std`` (m/s per axis) on the velocity inits, and each
 contact-init channel flipped with ``v5_contact_init_flip_prob``.
+
+Module ablations (retrained variants, all default off; an un-ablated module
+keeps the parameter and buffer layout of earlier v5 checkpoints):
+
+* ``vc_ablation_no_pose_prior``: the VC reads no HumanPose output at all.  The
+  body-group encoders, the boundary encoder ``b_t``, the endpoint and
+  anticipation heads (which read only ``b_t``), the HP hand dynamics and the
+  palm-derived bimanual coupling signals (span, span rate, relative palm
+  speed) are removed; the IMU-only coupling signals stay.
+* ``vc_ablation_direct_contact``: the hand head estimates P(hand contact)
+  directly, as IMU-HOI does, instead of P(contact | object moving) multiplied
+  by P(object moving); it is trained with BCE on every frame
+  (``hand_contact_direct``).
+* ``vc_ablation_drop_body_groups``: body groups left out of the pose prior
+  (applied when v4 builds the group encoders).
+* ``vc_ablation_no_coupling``: no coupling features at all.
+* ``vc_ablation_causal_obj_move``: a causal object-motion LSTM instead of the
+  bidirectional one (which reads the online lookahead).
+
+With the first, the last two and ``v5_init_noise_prob: 0`` the VC is IMU-HOI's
+velocity/contact evidence plus the conditional contact factorization only.
 """
 from __future__ import annotations
 
@@ -54,6 +75,28 @@ COUPLING_WINDOWS = ((5, 5), (20, 10))
 PER_HAND_SIGNALS = 3
 SHARED_OBJECT_SIGNALS = 2
 SHARED_BIMANUAL_SIGNALS = 4
+# Span, span rate and relative palm speed come from HumanPose palm positions;
+# the fourth bimanual signal (forearm-forearm rotation rate) is IMU-only.
+PALM_BIMANUAL_SIGNALS = 3
+
+BODY_GROUPS = ("left_arm", "right_arm", "torso", "left_leg", "right_leg")
+# Everything on the HumanPose input path, removed by vc_ablation_no_pose_prior.
+POSE_PRIOR_MODULES = (
+    "group_encoders",
+    "group_pose_norms",
+    "group_vel_norms",
+    "group_acc_norms",
+    "root_vel_norm",
+    "boundary_input_norm",
+    "boundary_rnn",
+    "boundary_fusion",
+    "boundary_hidden_norm",
+    "contact_endpoint_input_norm",
+    "contact_endpoint_rnn",
+    "contact_endpoint_head",
+    "contact_anticipation_norm",
+    "contact_anticipation_head",
+)
 
 
 def rotation_angle(relative: torch.Tensor) -> torch.Tensor:
@@ -93,10 +136,32 @@ class V5VelocityContactModule(V4VelocityContactModule):
         super().__init__(cfg)
         self.arch = "v5"
         self.heading_normalize_imu = bool(getattr(cfg, "v5_heading_normalize_imu", False))
-        scales = 2 * len(COUPLING_WINDOWS)
+        self.no_pose_prior = bool(getattr(cfg, "vc_ablation_no_pose_prior", False))
+        self.direct_contact = bool(getattr(cfg, "vc_ablation_direct_contact", False))
+        self.no_coupling = bool(getattr(cfg, "vc_ablation_no_coupling", False))
+        self.causal_obj_move = bool(getattr(cfg, "vc_ablation_causal_obj_move", False))
+        self.obj_move_bidirectional = not self.causal_obj_move
+        self.dropped_body_groups = tuple(
+            name for name in BODY_GROUPS if name not in self.body_group_indices
+        )
+        if self.no_pose_prior:
+            if self.dropped_body_groups:
+                raise ValueError(
+                    "vc_ablation_no_pose_prior already removes every body group; "
+                    "do not combine it with vc_ablation_drop_body_groups."
+                )
+            for name in POSE_PRIOR_MODULES:
+                delattr(self, name)
+            self.requires_hp = False
+            self.obj_move_input_dim -= self.boundary_hidden_dim
+            self.hand_contact_input_dim -= self.boundary_hidden_dim + self.hand_dyn_dim
+        scales = 0 if self.no_coupling else 2 * len(COUPLING_WINDOWS)
+        bimanual_signals = SHARED_BIMANUAL_SIGNALS - (
+            PALM_BIMANUAL_SIGNALS if self.no_pose_prior else 0
+        )
         self.object_coupling_dim = SHARED_OBJECT_SIGNALS * scales
         self.hand_coupling_dim = (
-            2 * PER_HAND_SIGNALS + SHARED_OBJECT_SIGNALS + SHARED_BIMANUAL_SIGNALS
+            2 * PER_HAND_SIGNALS + SHARED_OBJECT_SIGNALS + bimanual_signals
         ) * scales
 
         hidden_dim = int(getattr(cfg, "velocity_hidden_dim", 128))
@@ -111,7 +176,7 @@ class V5VelocityContactModule(V4VelocityContactModule):
             n_hidden=contact_hidden,
             n_init=3,
             n_rnn_layer=1,
-            bidirectional=True,
+            bidirectional=self.obj_move_bidirectional,
             dropout=dropout,
         )
         self.hand_contact_input_dim = self.hand_contact_input_dim + self.hand_coupling_dim
@@ -137,6 +202,25 @@ class V5VelocityContactModule(V4VelocityContactModule):
             "_v5_heading_normalize_imu",
             torch.tensor(int(self.heading_normalize_imu), dtype=torch.int64),
         )
+        # Only ablated modules carry the marker, so earlier v5 checkpoints load
+        # unchanged.  The direct-contact variant has the full model's topology,
+        # and only this marker tells the two apart.
+        if self.ablation_code:
+            self.register_buffer(
+                "_v5_ablation_code",
+                torch.tensor(self.ablation_code, dtype=torch.int64),
+            )
+
+    @property
+    def ablation_code(self) -> int:
+        """Bit 0: no pose prior, 1: direct contact, 2-6: dropped BODY_GROUPS, 7: no coupling,
+        8: causal object-motion head."""
+        code = int(self.no_pose_prior) | (int(self.direct_contact) << 1)
+        for bit, name in enumerate(BODY_GROUPS):
+            if name in self.dropped_body_groups:
+                code |= 1 << (2 + bit)
+        code |= (int(self.no_coupling) << 7) | (int(self.causal_obj_move) << 8)
+        return code
 
     def _perturb_inits(self, hand_vel_init, obj_vel_init, contact_init):
         """Training-only initializer corruption on a random subset of windows."""
@@ -156,7 +240,10 @@ class V5VelocityContactModule(V4VelocityContactModule):
         return hand_vel_init, obj_vel_init, contact_init
 
     def _coupling_features(self, human_imu_denorm, obj_imu, hand_pos):
-        """Rotation-invariant coupling signals; returns (object, hand) feature sets."""
+        """Rotation-invariant coupling signals; returns (object, hand) feature sets.
+
+        ``hand_pos`` None (no pose prior) drops the palm-derived bimanual signals.
+        """
         batch_size, seq_len = human_imu_denorm.shape[:2]
         fps = float(self.fps)
         # Fixed evidence: acos() has an infinite derivative at zero rotation, so
@@ -164,7 +251,6 @@ class V5VelocityContactModule(V4VelocityContactModule):
         with torch.autocast(device_type=human_imu_denorm.device.type, enabled=False):
             imu = human_imu_denorm.detach().float()
             obj = obj_imu.detach().float()
-            hand_pos = hand_pos.detach()
             sensors = [self.left_hand_sensor, self.right_hand_sensor]
             forearm_rot = rotation_6d_to_matrix(imu[:, :, sensors, 3:9].reshape(-1, 6)).reshape(
                 batch_size, seq_len, 2, 3, 3
@@ -190,21 +276,21 @@ class V5VelocityContactModule(V4VelocityContactModule):
                     )
                 )
 
-            palms = hand_pos.float()
-            span = (palms[:, :, 0] - palms[:, :, 1]).norm(dim=-1)
-            span_rate = torch.zeros_like(span)
-            palm_rel_speed = torch.zeros_like(span)
-            if seq_len > 1:
-                span_rate[:, 1:] = (span[:, 1:] - span[:, :-1]).abs() * fps
-                span_rate[:, 0] = span_rate[:, 1]
-                relative_disp = (palms[:, 1:, 0] - palms[:, :-1, 0]) - (palms[:, 1:, 1] - palms[:, :-1, 1])
-                palm_rel_speed[:, 1:] = relative_disp.norm(dim=-1) * fps
-                palm_rel_speed[:, 0] = palm_rel_speed[:, 1]
             forearm_pair = forearm_rot[:, :, 0].transpose(-1, -2) @ forearm_rot[:, :, 1]
-            bimanual_signals = torch.stack(
-                (span, span_rate, palm_rel_speed, rotation_rate(forearm_pair, fps)),
-                dim=-1,
-            )
+            bimanual = [rotation_rate(forearm_pair, fps)]
+            if hand_pos is not None:
+                palms = hand_pos.detach().float()
+                span = (palms[:, :, 0] - palms[:, :, 1]).norm(dim=-1)
+                span_rate = torch.zeros_like(span)
+                palm_rel_speed = torch.zeros_like(span)
+                if seq_len > 1:
+                    span_rate[:, 1:] = (span[:, 1:] - span[:, :-1]).abs() * fps
+                    span_rate[:, 0] = span_rate[:, 1]
+                    relative_disp = (palms[:, 1:, 0] - palms[:, :-1, 0]) - (palms[:, 1:, 1] - palms[:, :-1, 1])
+                    palm_rel_speed[:, 1:] = relative_disp.norm(dim=-1) * fps
+                    palm_rel_speed[:, 0] = palm_rel_speed[:, 1]
+                bimanual = [span, span_rate, palm_rel_speed] + bimanual
+            bimanual_signals = torch.stack(bimanual, dim=-1)
 
             object_features = multiscale(object_signals)
             hand_features = multiscale(
@@ -309,26 +395,33 @@ class V5VelocityContactModule(V4VelocityContactModule):
                 "pred_obj_vel": obj_vel,
             }
 
-        pose_streams = self._prepare_pose_streams(
-            hp_out if hp_out is not None else data_dict.get("hp_out"),
-            device,
-            dtype,
-            batch_size,
-            seq_len,
-        )
-        boundary_out = self._encode_body_groups(pose_streams)
-        hand_dyn_feat = torch.cat(
-            (
-                pose_streams["hand_vel"].reshape(batch_size, seq_len, -1),
-                pose_streams["hand_acc"].reshape(batch_size, seq_len, -1),
-            ),
-            dim=-1,
-        )
-        object_coupling, hand_coupling = self._coupling_features(
-            human_imu_denorm, obj_imu, pose_streams["hand_pos"]
-        )
-        object_coupling = object_coupling.to(dtype)
-        hand_coupling = hand_coupling.to(dtype)
+        # Pose-prior evidence: boundary features b_t and HP hand dynamics.
+        prior_feats = []
+        hand_pos = None
+        if not self.no_pose_prior:
+            pose_streams = self._prepare_pose_streams(
+                hp_out if hp_out is not None else data_dict.get("hp_out"),
+                device,
+                dtype,
+                batch_size,
+                seq_len,
+            )
+            boundary_out = self._encode_body_groups(pose_streams)
+            hand_dyn_feat = torch.cat(
+                (
+                    pose_streams["hand_vel"].reshape(batch_size, seq_len, -1),
+                    pose_streams["hand_acc"].reshape(batch_size, seq_len, -1),
+                ),
+                dim=-1,
+            )
+            prior_feats = [boundary_out, hand_dyn_feat]
+            hand_pos = pose_streams["hand_pos"]
+        object_coupling, hand_coupling = [], []
+        if not self.no_coupling:
+            object_feats, hand_feats = self._coupling_features(
+                human_imu_denorm, obj_imu, hand_pos
+            )
+            object_coupling, hand_coupling = [object_feats.to(dtype)], [hand_feats.to(dtype)]
 
         if self.heading_normalize_imu:
             hand_imu_feat, obj_feat, hand_vel_feat, obj_vel_feat = self._heading_normalize_contact_inputs(
@@ -340,52 +433,61 @@ class V5VelocityContactModule(V4VelocityContactModule):
             ].reshape(batch_size, seq_len, -1)
             obj_feat, hand_vel_feat, obj_vel_feat = obj_imu, hand_vel_flat, obj_vel
 
-        obj_move_input = torch.cat((hand_imu_feat, obj_feat, boundary_out, object_coupling), dim=-1)
+        obj_move_input = torch.cat(
+            [hand_imu_feat, obj_feat] + prior_feats[:1] + object_coupling, dim=-1
+        )
         obj_move_logits = self.obj_move_net((obj_move_input, contact_init))
         obj_move_prob = torch.sigmoid(obj_move_logits)
 
         hand_contact_input = torch.cat(
-            (
-                hand_imu_feat,
-                obj_feat,
-                hand_vel_feat,
-                obj_vel_feat,
-                boundary_out,
-                hand_dyn_feat,
-                hand_coupling,
-            ),
+            [hand_imu_feat, obj_feat, hand_vel_feat, obj_vel_feat] + prior_feats + hand_coupling,
             dim=-1,
         )
         hand_contact_logits = self.hand_contact_net((hand_contact_input, contact_init))
-        hand_contact_prob_cond = torch.sigmoid(hand_contact_logits)
-        hand_contact_prob = obj_move_prob * hand_contact_prob_cond
+        if self.direct_contact:
+            hand_contact_prob = torch.sigmoid(hand_contact_logits)
+            contact_out = {"pred_hand_contact_logits_direct": hand_contact_logits}
+        else:
+            hand_contact_prob_cond = torch.sigmoid(hand_contact_logits)
+            hand_contact_prob = obj_move_prob * hand_contact_prob_cond
+            contact_out = {
+                "pred_hand_contact_prob_cond": hand_contact_prob_cond,
+                "pred_hand_contact_logits_cond": hand_contact_logits,
+                "pred_hand_contact_prob_marginal": hand_contact_prob,
+            }
 
-        endpoint_hidden, _ = self.contact_endpoint_rnn(self.contact_endpoint_input_norm(boundary_out))
-        endpoint_logits = self.contact_endpoint_head(endpoint_hidden)
-        endpoint_prob = torch.sigmoid(endpoint_logits)
-        anticipation_logits = self.contact_anticipation_head(
-            self.contact_anticipation_norm(boundary_out)
-        )
-
-        return {
+        out = {
             "pred_hand_glb_vel": hand_vel,
             "pred_hand_glb_vel_flat": hand_vel_flat,
             "pred_obj_vel": obj_vel,
             "pred_hand_contact_logits": torch.cat((hand_contact_logits, obj_move_logits), dim=-1),
             "pred_hand_contact_prob": torch.cat((hand_contact_prob, obj_move_prob), dim=-1),
             "pred_obj_move_prob": obj_move_prob,
-            "pred_hand_contact_prob_cond": hand_contact_prob_cond,
-            "pred_hand_contact_logits_cond": hand_contact_logits,
-            "pred_hand_contact_prob_marginal": hand_contact_prob,
-            "pred_contact_endpoint_logits": endpoint_logits,
-            "pred_contact_endpoint_prob": endpoint_prob,
-            "pred_contact_from_endpoints_prob": recover_contact_state_from_endpoints(
-                endpoint_prob,
-                contact_init,
-            ),
-            "pred_contact_anticipation_logits": anticipation_logits,
-            "pred_contact_anticipation_prob": torch.sigmoid(anticipation_logits),
+            **contact_out,
         }
+        if self.no_pose_prior:
+            return out
+
+        boundary_out = prior_feats[0]
+        endpoint_hidden, _ = self.contact_endpoint_rnn(self.contact_endpoint_input_norm(boundary_out))
+        endpoint_logits = self.contact_endpoint_head(endpoint_hidden)
+        endpoint_prob = torch.sigmoid(endpoint_logits)
+        anticipation_logits = self.contact_anticipation_head(
+            self.contact_anticipation_norm(boundary_out)
+        )
+        out.update(
+            {
+                "pred_contact_endpoint_logits": endpoint_logits,
+                "pred_contact_endpoint_prob": endpoint_prob,
+                "pred_contact_from_endpoints_prob": recover_contact_state_from_endpoints(
+                    endpoint_prob,
+                    contact_init,
+                ),
+                "pred_contact_anticipation_logits": anticipation_logits,
+                "pred_contact_anticipation_prob": torch.sigmoid(anticipation_logits),
+            }
+        )
+        return out
 
     def validate_checkpoint_state_dict(self, state_dict):
         """Reject v4 (and differently configured v5) checkpoints."""
@@ -404,6 +506,15 @@ class V5VelocityContactModule(V4VelocityContactModule):
             raise ValueError(
                 "Checkpoint is not marked as VC v5 (v4 pose prior + coupling "
                 "features); retrain or select the matching --velocity_contact_arch."
+            )
+        ablation = normalized.get("_v5_ablation_code")
+        ablation = int(ablation.item()) if isinstance(ablation, torch.Tensor) and ablation.numel() == 1 else 0
+        if ablation != self.ablation_code:
+            raise ValueError(
+                f"Checkpoint VC ablation code {ablation} does not match the configured "
+                f"{self.ablation_code} (bit 0 no pose prior, bit 1 direct contact, "
+                f"bits 2-6 dropped {BODY_GROUPS}, bit 7 no coupling, bit 8 causal "
+                "object-motion head); set the matching vc_ablation_* keys."
             )
         heading = normalized.get("_v5_heading_normalize_imu")
         if (
