@@ -1,0 +1,41 @@
+# IMU-HOI 3-branch baseline (old model of the GT-contact comparison): frozen VC-IMUHOI stage + published
+# 3-branch OT/joint pipelines (configs, checkpoints, eval JSONs). The HP is shared with IMUHOI++ (filelist_ckpt.txt).
+# OMOMO
+outputs/IMUHOI++/RNN_cano/imuhoi3b_20261008_omomo/vc_imuhoi/velocity_contact_IMUHOI_10081945_omomo_vc_imuhoi_20261008/best.pt
+outputs/IMUHOI++/RNN_cano/imuhoi3b_20261008_omomo/vc_imuhoi/velocity_contact_IMUHOI_10081945_omomo_vc_imuhoi_20261008/config.yaml
+outputs/IMUHOI++/RNN_cano/imuhoi3b_20261012_omomo_unified
+outputs/IMUHOI++/RNN_cano/chain_imuhoi3b_20261012_omomo_unified.sh
+# BEHAVE
+outputs/IMUHOI++/RNN_cano/imuhoi3b_20261008_behave/experiment_manifest.json
+outputs/IMUHOI++/RNN_cano/imuhoi3b_20261008_behave/hp_config.yaml
+outputs/IMUHOI++/RNN_cano/imuhoi3b_20261008_behave/vc_config.yaml
+outputs/IMUHOI++/RNN_cano/imuhoi3b_20261008_behave/shared_config.yaml
+outputs/IMUHOI++/RNN_cano/imuhoi3b_20261008_behave/summary.md
+outputs/IMUHOI++/RNN_cano/imuhoi3b_20261008_behave/vc_imuhoi/velocity_contact_IMUHOI_10082052_behave_vc_imuhoi_20261008/best.pt
+outputs/IMUHOI++/RNN_cano/imuhoi3b_20261008_behave/vc_imuhoi/velocity_contact_IMUHOI_10082052_behave_vc_imuhoi_20261008/config.yaml
+outputs/IMUHOI++/RNN_cano/imuhoi3b_20261008_behave/vc_imuhoi_ot_3branch
+# IMHD / PAHOI / HODome
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/imhd/imuhoi3b/experiment_manifest.json
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/imhd/imuhoi3b/hp_config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/imhd/imuhoi3b/vc_config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/imhd/imuhoi3b/shared_config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/imhd/imuhoi3b/summary.md
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/imhd/imuhoi3b/vc_imuhoi/velocity_contact_IMUHOI_10100654_imhd_vc_imuhoi_remaining3_20261010/best.pt
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/imhd/imuhoi3b/vc_imuhoi/velocity_contact_IMUHOI_10100654_imhd_vc_imuhoi_remaining3_20261010/config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/imhd/imuhoi3b/vc_imuhoi_ot_3branch
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/pahoi/imuhoi3b/experiment_manifest.json
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/pahoi/imuhoi3b/hp_config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/pahoi/imuhoi3b/vc_config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/pahoi/imuhoi3b/shared_config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/pahoi/imuhoi3b/summary.md
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/pahoi/imuhoi3b/vc_imuhoi/velocity_contact_IMUHOI_10101407_pahoi_vc_imuhoi_remaining3_20261010/best.pt
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/pahoi/imuhoi3b/vc_imuhoi/velocity_contact_IMUHOI_10101407_pahoi_vc_imuhoi_remaining3_20261010/config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/pahoi/imuhoi3b/vc_imuhoi_ot_3branch
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/hodome/imuhoi3b/experiment_manifest.json
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/hodome/imuhoi3b/hp_config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/hodome/imuhoi3b/vc_config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/hodome/imuhoi3b/shared_config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/hodome/imuhoi3b/summary.md
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/hodome/imuhoi3b/vc_imuhoi/velocity_contact_IMUHOI_10101856_hodome_vc_imuhoi_remaining3_20261010/best.pt
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/hodome/imuhoi3b/vc_imuhoi/velocity_contact_IMUHOI_10101856_hodome_vc_imuhoi_remaining3_20261010/config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/hodome/imuhoi3b/vc_imuhoi_ot_3branch

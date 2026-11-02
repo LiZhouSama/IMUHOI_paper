@@ -1,0 +1,17 @@
+# Processed data of the five datasets (train + window-test sets for training, full-sequence test sets for the
+# online evaluation) and the SMPL body models. unified/ and split_info.json are never read and are left out.
+process/IMUHOI++cano/processed_split_data_OMOMO_full/train
+process/IMUHOI++cano/processed_split_data_OMOMO_full/test
+process/IMUHOI++cano/processed_seg_data_BEHAVE_full/train
+process/IMUHOI++cano/processed_seg_data_BEHAVE_full/test
+process/IMUHOI++cano/processed_split_data_BEHAVE/test
+process/IMUHOI++cano/processed_seg_data_IMHD_full/train
+process/IMUHOI++cano/processed_seg_data_IMHD_full/test
+process/IMUHOI++cano/processed_split_data_IMHD/test
+process/IMUHOI++cano/processed_split_data_PAHOI_full/train
+process/IMUHOI++cano/processed_split_data_PAHOI_full/test
+process/IMUHOI++cano/processed_seg_data_HODOME_full/train
+process/IMUHOI++cano/processed_seg_data_HODOME_full/test
+process/IMUHOI++cano/processed_split_data_HODOME/test
+datasets/smpl_models/smplh/neutral/model.npz
+datasets/smpl_models/smplx/SMPLX_NEUTRAL.npz

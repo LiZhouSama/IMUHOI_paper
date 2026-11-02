@@ -1,0 +1,54 @@
+# Published IMUHOI++ checkpoints and recipes of the five datasets: frozen HP, VC stage (input of OT training),
+# full OT + joint pipelines (reference rows, configs, best/final checkpoints, eval JSONs).
+# OMOMO
+outputs/IMUHOI++/RNN_cano/omomo_cano_20260907/hp/human_pose_09072119_omomo_cano/best.pt
+outputs/IMUHOI++/RNN_cano/omomo_cano_20260907/hp/human_pose_09072119_omomo_cano/config.yaml
+outputs/IMUHOI++/RNN_cano/vc_v5_20260930/omomo_v5ar/velocity_contact_v5_09301324_omomo_vc_v5ar_20260930/best.pt
+outputs/IMUHOI++/RNN_cano/vc_v5_20260930/omomo_v5ar/velocity_contact_v5_09301324_omomo_vc_v5ar_20260930/config.yaml
+outputs/IMUHOI++/RNN_cano/vc_v5_20260930/vc_config_omomo_v5ar.yaml
+outputs/IMUHOI++/RNN_cano/vc_v5_20260930_ot_omomo_v5ar_unified
+# BEHAVE
+outputs/IMUHOI++/RNN_cano/behave_full_trust_20260911/hp/human_pose_09111505_behave_hp_20260911/best.pt
+outputs/IMUHOI++/RNN_cano/behave_full_trust_20260911/hp/human_pose_09111505_behave_hp_20260911/config.yaml
+outputs/IMUHOI++/RNN_cano/vc_v5_20260930/behave_v5ar/velocity_contact_v5_09301147_behave_vc_v5ar_20260930/best.pt
+outputs/IMUHOI++/RNN_cano/vc_v5_20260930/behave_v5ar/velocity_contact_v5_09301147_behave_vc_v5ar_20260930/config.yaml
+outputs/IMUHOI++/RNN_cano/vc_v5_20260930/vc_config_behave_v5ar.yaml
+outputs/IMUHOI++/RNN_cano/vc_v5_20260930_ot_behave_v5ar
+# Shared launch scripts of the published OMOMO / BEHAVE pipelines (reference)
+outputs/IMUHOI++/RNN_cano/vc_v5_20260930/train_vc.sh
+outputs/IMUHOI++/RNN_cano/vc_v5_20260930/run_ot.sh
+outputs/IMUHOI++/RNN_cano/vc_v5_20260930/protocol_1002/run_ot_omomo_v5ar_unified.sh
+# IMHD / PAHOI / HODome (one orchestrator run each from recipe.yaml)
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/recipe.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/provenance.json
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/summary.md
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/imhd/proposed/experiment_manifest.json
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/imhd/proposed/hp_config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/imhd/proposed/vc_config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/imhd/proposed/shared_config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/imhd/proposed/summary.md
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/imhd/proposed/hp/human_pose_10100114_imhd_hp_remaining3_20261010/best.pt
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/imhd/proposed/hp/human_pose_10100114_imhd_hp_remaining3_20261010/config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/imhd/proposed/vc_v5/velocity_contact_v5_10100229_imhd_vc_v5_remaining3_20261010/best.pt
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/imhd/proposed/vc_v5/velocity_contact_v5_10100229_imhd_vc_v5_remaining3_20261010/config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/imhd/proposed/v2_armrot_biclose
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/pahoi/proposed/experiment_manifest.json
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/pahoi/proposed/hp_config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/pahoi/proposed/vc_config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/pahoi/proposed/shared_config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/pahoi/proposed/summary.md
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/pahoi/proposed/hp/human_pose_10100950_pahoi_hp_remaining3_20261010/best.pt
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/pahoi/proposed/hp/human_pose_10100950_pahoi_hp_remaining3_20261010/config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/pahoi/proposed/vc_v5/velocity_contact_v5_10101041_pahoi_vc_v5_remaining3_20261010/best.pt
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/pahoi/proposed/vc_v5/velocity_contact_v5_10101041_pahoi_vc_v5_remaining3_20261010/config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/pahoi/proposed/v2_armrot_biclose
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/hodome/proposed/experiment_manifest.json
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/hodome/proposed/hp_config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/hodome/proposed/vc_config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/hodome/proposed/shared_config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/hodome/proposed/summary.md
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/hodome/proposed/hp/human_pose_10101550_hodome_hp_remaining3_20261010/best.pt
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/hodome/proposed/hp/human_pose_10101550_hodome_hp_remaining3_20261010/config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/hodome/proposed/vc_v5/velocity_contact_v5_10101621_hodome_vc_v5_remaining3_20261010/best.pt
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/hodome/proposed/vc_v5/velocity_contact_v5_10101621_hodome_vc_v5_remaining3_20261010/config.yaml
+outputs/IMUHOI++/RNN_cano/remaining3_v5ar_vs_imuhoi3b_20261010/hodome/proposed/v2_armrot_biclose
