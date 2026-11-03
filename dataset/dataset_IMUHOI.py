@@ -22,6 +22,7 @@ from utils.utils import (
     _make_noise_generator,
     _smooth_acceleration,
     _stable_sequence_seed,
+    sequence_noise_key,
 )
 
 _VEL_SELECTION_INDEX_LIST = (
@@ -346,6 +347,7 @@ class IMUDataset(Dataset):
         self.full_sequence = full_sequence
         self.simulate_imu_noise = simulate_imu_noise
         self.simulate_imu_noise_seed = simulate_imu_noise_seed
+        self._noise_key_reported = False
         self.imu_noise_cfg = merge_noise_cfg(imu_noise_cfg)
         self.obj_points_sample_count = int(max(1, obj_points_sample_count))
         self.resolve_bimanual_contact_conflicts = bool(resolve_bimanual_contact_conflicts)
@@ -532,10 +534,14 @@ class IMUDataset(Dataset):
         if not self.simulate_imu_noise:
             return
 
-        base_seed = _stable_sequence_seed(
-            self.simulate_imu_noise_seed,
-            os.path.realpath(os.path.abspath(file_path)),
-        )
+        noise_key = sequence_noise_key(file_path)
+        # getattr: subclasses / objects built without __init__ may lack the flag.
+        if not getattr(self, "_noise_key_reported", False):
+            self._noise_key_reported = True
+            real_path = os.path.realpath(os.path.abspath(file_path))
+            if noise_key != real_path:
+                print(f"IMU noise keys re-rooted to the reference checkout: {real_path} -> {noise_key}")
+        base_seed = _stable_sequence_seed(self.simulate_imu_noise_seed, noise_key)
         seq_noise_cfg_raw = seq_data.get("imu_noise_params", None)
         seq_noise_cfg = (
             merge_noise_cfg(seq_noise_cfg_raw)

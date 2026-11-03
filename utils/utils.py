@@ -282,6 +282,29 @@ def _stable_sequence_seed(base_seed, sequence_key=None):
     return seed % (2 ** 63 - 1)
 
 
+# The per-sequence IMU noise seed hashes the sequence file's real path. Every published result was produced in
+# NOISE_KEY_REFERENCE_ROOT, so on any other checkout the part of the path from "/process/" on is re-rooted onto
+# that directory: all machines then draw the published noise realization, and keys in the reference checkout are
+# unchanged. IMUHOI_NOISE_KEY_MODE=native keeps this machine's own real path (pre-2026-11-03 behaviour elsewhere).
+NOISE_KEY_REFERENCE_ROOT = "/mnt/d/a_WORK/Projects/PhD/tasks/IMUHOI"
+_NOISE_KEY_ANCHOR = "/process/"
+_PROJECT_ROOT_REAL = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
+
+
+def sequence_noise_key(file_path):
+    """Key hashed into the per-sequence IMU noise seed (machine-independent for corpora under process/)."""
+    real = os.path.realpath(os.path.abspath(file_path))
+    if _PROJECT_ROOT_REAL == NOISE_KEY_REFERENCE_ROOT:
+        return real
+    if os.environ.get("IMUHOI_NOISE_KEY_MODE", "reference").strip().lower() == "native":
+        return real
+    posix = real.replace(os.sep, "/")
+    anchor = posix.rfind(_NOISE_KEY_ANCHOR)
+    if anchor < 0:
+        return real
+    return NOISE_KEY_REFERENCE_ROOT + posix[anchor:]
+
+
 def _make_noise_generator(seed, device):
     if seed is None:
         return None

@@ -1,6 +1,7 @@
 # OT 模块消融实验方案（服务器端执行）
 
-编写：2026-11-02（本地 WSL 机器上的 agent，交给服务器 `llz@202.120.59.70:/disk2/mmzhou/IMUHOI` 上的 agent 执行）。
+编写：2026-11-02（本地 WSL 机器上的 agent，交给服务器 `llz@202.120.59.70:/disk2/mmzhou/IMUHOI` 上的 agent 执行）；
+2026-11-03 修订：IMU 噪声 key 修复（1.1、1.3、1.4、4.3、7、8 节）。
 项目根目录在服务器上就是 `/disk2/mmzhou/IMUHOI`，下文所有路径都相对它。代码注释用英文，汇报用简体中文。
 
 ## 0. 目标
@@ -46,6 +47,9 @@ python scripts/upload/verify_upload.py --no-hash  # 只比大小，先快速看�
 有缺失或不一致时，把报告里的路径列出来交给用户重传，不要自己猜着补。`code` 组如果因为服务器上的代码比清单更新
 （例如已经开始改代码）而不一致，要确认不一致的只是你自己改过的文件。
 
+2026-11-03 的噪声 key 修复（见 1.4）改了 `utils/utils.py`、`dataset/dataset_IMUHOI.py` 和本文档，并新增了
+`test/test_sequence_noise_key.py`。前三个文件与清单的 sha256 不一致是预期的，它们用 1.3 的单元测试和 1.4 的噪声 key 检查来确认。
+
 ### 1.2 环境
 
 本地参考环境：Python 3.8.20、torch 1.13.1+cu117（cuDNN 8500）、pytorch3d 0.7.3、numpy 1.23.5、RTX 4080 SUPER。
@@ -66,19 +70,52 @@ python scripts/upload/verify_upload.py --no-hash  # 只比大小，先快速看�
 python -m pytest -q test/test_rnn_object_trans_v2.py test/test_rnn_ot_v2_armrot_biclose.py \
   test/test_rnn_ot_known_prefix_fast_path.py test/test_rnn_ot_bimanual_closure.py \
   test/test_rnn_ot_forearm_obj_rotation.py test/test_eval_hoi_metric.py test/test_rnn_online_inference.py \
-  test/test_rnn_vc_ot_compat.py test/test_rnn_ot_arch_loss_weights.py test/test_rnn_vc_v5.py test/test_rnn_imuhoi_arch.py
+  test/test_rnn_vc_ot_compat.py test/test_rnn_ot_arch_loss_weights.py test/test_rnn_vc_v5.py test/test_rnn_imuhoi_arch.py \
+  test/test_sequence_noise_key.py
 ```
 
-本地结果：97 passed。
+本地结果：102 passed。
 
 ### 1.4 端到端复现发表版评测（检验数据 + 检查点 + 代码 + 环境）
 
-在服务器上，用发表版检查点对 10 个 pipeline（5 个数据集 × 新/旧模型）跑在线评测，与随检查点一起上传的发表版 JSON 比较。
-评测命令与编排器 `evaluate()` 相同（见 4.3），只是 `--output_json` 写到新文件。允许的差异（不同 GPU 的浮点差别）：
+**先做噪声 key 检查。** 每个序列的 IMU 噪声种子是 `42 + blake2b(序列文件的路径)`，发表版的所有结果都是在本地
+`/mnt/d/a_WORK/Projects/PhD/tasks/IMUHOI` 下产生的。2026-11-03 之前的代码直接用本机的真实路径做 key，所以服务器上的
+`/workspace/IMUHOI/process/...` 抽到的是另一份噪声，训练和测试都是。11-02 的复现超差就是这个原因：把 key 映射回本地路径后，
+已测的 3 个 pipeline 在服务器 A100 上与发表版的差距都在 0.003 cm 以内。现在 `utils/utils.py::sequence_noise_key` 会把真实
+路径中 `/process/` 之前的部分换成本地项目根，本地的 key 保持不变。在服务器项目根目录运行：
 
-- 物体误差、HOI 误差、根节点误差：≤ 0.05 cm；
+```bash
+python - <<'EOF'
+import glob
+from utils.utils import NOISE_KEY_REFERENCE_ROOT as REF, _stable_sequence_seed, sequence_noise_key
+f = "process/IMUHOI++cano/processed_split_data_BEHAVE/test/Date07_Sub08_backpack_hug.pt"
+seed = _stable_sequence_seed(42, sequence_noise_key(f))
+print("key:", sequence_noise_key(f), "seed:", seed)
+assert seed == 5689844386628324063, "noise key differs from the published one"
+files = glob.glob("process/IMUHOI++cano/processed_*/**/*.pt", recursive=True)
+bad = [p for p in files if not sequence_noise_key(p).startswith(REF + "/process/")]
+print(f"{len(files)} sequence files, {len(bad)} keys outside {REF}/process/")
+assert files and not bad, bad[:5]
+EOF
+```
 
-超出这个范围，说明数据、检查点或环境有问题，先停下来汇报。对照的 JSON：
+两条断言都要通过（文件数取决于上传了哪些数据，本地是 17820 个）。另外：
+
+- 训练和评测日志里要出现一行 `IMU noise keys re-rooted to the reference checkout: <服务器路径>/process/... ->
+  /mnt/d/a_WORK/Projects/PhD/tasks/IMUHOI/process/...`；
+- 不要设置 `IMUHOI_NOISE_KEY_MODE=native`，它会恢复按本机路径取种子的旧行为；
+- 如果第 3 节的代码改动放在另一个目录里开发，那里也要带上这个修复；
+- 11-02 跑出的 3 个复现结果作废。
+
+然后在服务器上，用发表版检查点对 10 个 pipeline（5 个数据集 × 新/旧模型）跑在线评测，与随检查点一起上传的发表版 JSON 比较。
+评测命令与编排器 `evaluate()` 相同（见 4.3），只是 `--output_json` 和 `--sequence_records_json` 写到新文件。允许的差异
+（不同 GPU 的浮点差别）：
+
+- 物体误差、HOI 误差、根节点误差：≤ 0.05 cm。
+
+超出这个范围，说明数据、检查点或环境有问题，先停下来汇报。这个聚合容差查不出噪声不一致：换一份噪声时，单个序列的误差会差
+1–2 cm，聚合值却只移动约一个抽样标准误（OMOMO 0.07–0.22 cm、BEHAVE 0.42 cm），可能碰巧落在容差内，11-02 的 OMOMO `full`
+就是这样。所以上面的噪声 key 检查必须先通过。对照的 JSON：
 
 | 数据集 | 新模型（我们） | 旧模型（三分支） |
 |---|---|---|
@@ -315,20 +352,34 @@ python scripts/run_behave_full_pipeline_trust.py --cfg $RECIPE --dataset $DS --e
 
 ### 4.3 只评测、不重训的两行（以及 1.4 的复现评测）
 
+检查点的选法与编排器 `ckpt_set` 一致：stage 目录里有 `best_human_pose.pt` / `best_velocity_contact.pt` 就用它，没有就用
+4.1 的冻结输入。新模型的联合阶段微调 VC（HP 冻结），三分支模型的联合阶段微调 HP（VC 冻结）。所以三分支的 stage 目录里没有
+`best_velocity_contact.pt`，VC 要用 4.1 表中 VC-IMUHOI 阶段的 `best.pt`（`$VC_IMUHOI`）。10 个发表版 pipeline 的
+`experiment_manifest.json` 都是这样记录的。
+
 ```bash
-# new model: PIPE=$OUT/$DS/full/v2_armrot_biclose, archs v5 / v2
-# old model: PIPE=$OUT/$DS/imuhoi3b/vc_imuhoi_ot_3branch, archs imuhoi / imuhoi, and --hp_ckpt $STAGE/best_human_pose.pt
-STAGE=$(ls -d $PIPE/object_trans_* | tail -1)
+# Joint-phase stage dir. Match directories only: in the 3-branch pipeline dir object_trans_joint_train.log sorts
+# after object_trans_IMUHOI_*, so `ls -d $PIPE/object_trans_* | tail -1` returns the log file there.
+STAGE=$(find "$PIPE" -mindepth 1 -maxdepth 1 -type d -name 'object_trans_*' | sort | tail -1)
+
+# New model: PIPE=$OUT/$DS/full/v2_armrot_biclose
 python eval_batch_online.py --config $PIPE/config.yaml --dataset $DS --hp_ckpt $HP \
   --vc_ckpt $STAGE/best_velocity_contact.pt --ot_ckpt $STAGE/best_object_trans.pt \
   --velocity_contact_arch v5 --object_trans_arch v2 --simulate_imu_noise --simulate_imu_noise_seed 42 --seed 42 \
   --num_workers 2 --online_batch_size 48 --per_joint_rot_error --oracle_vc_contact all \
   --output_json $OUT/$DS/full_oracle_eval/eval_${DS}_best.json \
   --sequence_records_json $OUT/$DS/full_oracle_eval/eval_${DS}_best_records.json
+
+# Old model (3-branch): PIPE=$OUT/$DS/imuhoi3b/vc_imuhoi_ot_3branch
+python eval_batch_online.py --config $PIPE/config.yaml --dataset $DS --hp_ckpt $STAGE/best_human_pose.pt \
+  --vc_ckpt $VC_IMUHOI --ot_ckpt $STAGE/best_object_trans.pt \
+  --velocity_contact_arch imuhoi --object_trans_arch imuhoi --simulate_imu_noise --simulate_imu_noise_seed 42 --seed 42 \
+  --num_workers 2 --online_batch_size 48 --per_joint_rot_error --oracle_vc_contact all \
+  --output_json $OUT/$DS/imuhoi3b_oracle_eval/eval_${DS}_best.json \
+  --sequence_records_json $OUT/$DS/imuhoi3b_oracle_eval/eval_${DS}_best_records.json
 ```
 
-三分支模型的联合阶段会微调 HP，所以它的 `--hp_ckpt` 要用 stage 目录里的 `best_human_pose.pt`；编排器的 `ckpt_set` 也是这样
-选的。做 1.4 的复现检查时，去掉 `--oracle_vc_contact`，`PIPE` 指向发表版目录。
+做 1.4 的复现检查时，去掉 `--oracle_vc_contact`，`PIPE` 指向 1.4 表中发表版 JSON 所在的目录，输出写到新文件。
 
 ## 5. 汇总与报告
 
@@ -373,7 +424,8 @@ python eval_batch_online.py --config $PIPE/config.yaml --dataset $DS --hp_ckpt $
   要把模式锚定在解释器路径上，或者直接用 PID。
 - **模型选择**：`best.pt` 按测试窗口损失选择，早停也看测试集。这与发表版一致，但属于共同局限，要在 README 的局限一节写明。
 - **IMU 噪声**：训练和评测都用数据集级的 Noitom 噪声模型（`process/imu_noise.py`），每个序列一个固定的随机实现，种子为 42。
-  `--simulate_imu_noise_seed 42` 不要改。
+  `--simulate_imu_noise_seed 42` 不要改。每个序列的种子还取决于它的 key（见 1.4）：新写的加噪代码也要用
+  `sequence_noise_key(file_path)` 做 key，不能直接用本机路径。
 
 ## 8. 交付物
 
@@ -381,7 +433,7 @@ python eval_batch_online.py --config $PIPE/config.yaml --dataset $DS --hp_ckpt $
 - `$OUT/{ds}/{row}/`：每一行的 pipeline 目录、评测 JSON 和逐序列记录。
 - `$OUT/{ds}/summary.md`、`metrics.json`，以及 `experiments/07_ot_module_ablation/`（README、各数据集汇总、论文格式表）。
 - 一段中文汇报：
-  - 第 0 步检查结果（完整性、环境版本、复现差距）；
+  - 第 0 步检查结果（完整性、环境版本、噪声 key 检查的输出、复现差距）；
   - 每组消融的主要数字和置信区间；
   - 双手交互帧上的发现；
   - 与发表版的差距；

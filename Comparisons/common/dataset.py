@@ -37,6 +37,7 @@ from utils.utils import (
     _make_noise_generator,
     _smooth_acceleration,
     _stable_sequence_seed,
+    sequence_noise_key,
 )
 
 _VEL_SELECTION_INDEX_LIST = (
@@ -473,7 +474,7 @@ def apply_main_sequence_noise(seq_data, file_path, base_seed, noise_cfg) -> bool
     comparison baselines therefore see bit-identical noisy IMU to the main
     pipeline.
     """
-    seed = _stable_sequence_seed(base_seed, os.path.realpath(os.path.abspath(file_path)))
+    seed = _stable_sequence_seed(base_seed, sequence_noise_key(file_path))
     applied = False
     for offset, key in enumerate(("human_imu", "obj_imu")):
         imu = seq_data.get(key)
@@ -788,7 +789,7 @@ class IMUDataset(Dataset):
         # hand-object directions/lengths, sensor velocities) that the
         # comparison baselines never read; their keys are filled with zeros.
         self.lean = bool(lean)
-        self._real_paths = {}
+        self._noise_keys = {}
         if self.imu_protocol not in {
             "imuhoi", "dip18_reference", "tip_reference", "transpose_reference",
             "globalpose_reference",
@@ -1199,12 +1200,12 @@ class IMUDataset(Dataset):
             seq_noise_cfg_raw = seq_data.get("imu_noise_params", None)
             seq_noise_cfg = merge_noise_cfg(seq_noise_cfg_raw) if seq_noise_cfg_raw is not None else self.imu_noise_cfg
             imu_noise_applied = False
-            real_path = self._real_paths.get(file_path)
-            if real_path is None:
+            noise_key = self._noise_keys.get(file_path)
+            if noise_key is None:
                 # realpath walks every path component (slow on WSL drives).
-                real_path = os.path.realpath(os.path.abspath(file_path))
-                self._real_paths[file_path] = real_path
-            noise_seed = _stable_sequence_seed(self.simulate_imu_noise_seed, real_path)
+                noise_key = sequence_noise_key(file_path)
+                self._noise_keys[file_path] = noise_key
+            noise_seed = _stable_sequence_seed(self.simulate_imu_noise_seed, noise_key)
             noise_generator = _make_noise_generator(noise_seed, device)
 
             # The released TIP loader normalizes against frame zero of the
