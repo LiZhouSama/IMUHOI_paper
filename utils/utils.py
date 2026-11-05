@@ -571,7 +571,7 @@ def build_model_input_dict(batch, cfg, device, add_noise=True):
     else:
         obj_points_canonical = torch.zeros(bs, obj_points_count, 3, device=device, dtype=dtype)
     
-    return {
+    inputs = {
         'human_imu': human_imu,
         'obj_imu': obj_imu,
         'v_init': v_init,
@@ -594,6 +594,12 @@ def build_model_input_dict(batch, cfg, device, add_noise=True):
         'window_start': batch.get('window_start'),
         'window_end': batch.get('window_end'),
     }
+    # HP plug-in runs: the cached frames of an external pose estimator for these windows
+    # (empty unless cfg.external_hp_cache_dir is set).
+    from utils.external_hp_cache import attach_external_hp_inputs
+
+    inputs.update(attach_external_hp_inputs(batch, cfg, device, dtype, bs, seq))
+    return inputs
 
 
 # ============ 数学工具 ============

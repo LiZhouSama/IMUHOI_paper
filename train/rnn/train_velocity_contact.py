@@ -13,6 +13,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 sys.path.insert(0, PROJECT_ROOT)
 
 from model import HumanPoseModule
+from model.rnn.external_human_pose import maybe_build_external_human_pose
 from model.rnn.velocity_contact import (
     VELOCITY_CONTACT_ARCH_CHOICES,
     build_velocity_contact_module,
@@ -949,8 +950,13 @@ def main():
     print(f"Model params: {sum(p.numel() for p in model.parameters())}")
 
     # frozen HP model (Stage 1) for hp_out
-    hp_model = None
-    if cfg.hp_ckpt and bool(getattr(model, "requires_hp", True)):
+    hp_model = maybe_build_external_human_pose(
+        cfg, torch.device(cfg.device), cfg.hp_ckpt, no_trans=cfg.no_trans
+    )
+    if hp_model is not None:
+        # HP plug-in run: a cached external estimator; never fall back to GT hp_out.
+        hp_model = hp_model.to(torch.device(cfg.device))
+    elif cfg.hp_ckpt and bool(getattr(model, "requires_hp", True)):
         device = torch.device(cfg.device)
         try:
             hp_model = HumanPoseModule(cfg, device, no_trans=cfg.no_trans)

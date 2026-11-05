@@ -45,7 +45,8 @@ from typing import Optional
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SAGE_PYTHON = Path("/home/l/anaconda3/envs/SAGE/bin/python")
+# IMUHOI_PYTHON overrides the interpreter of every stage (e.g. a server conda env).
+SAGE_PYTHON = Path(os.environ.get("IMUHOI_PYTHON") or "/home/l/anaconda3/envs/SAGE/bin/python")
 DEFAULT_CFG = PROJECT_ROOT / "configs/IMUHOI_train_rnn.yaml"
 DATASET = "behave"                   # overridden by --dataset
 REFERENCE_DATASET = "omomo"          # the dataset the config's schedule was tuned on
@@ -431,6 +432,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--check_gpu_before_stage", action="store_true",
                         help="Print all GPU memory levels before each training/evaluation subprocess.")
+    parser.add_argument("--eval_records", action="store_true",
+                        help="Also write per-sequence records (eval_<ds>_<tag>_records.json) in every online eval.")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--skip_hp", type=Path, default=None, help="reuse an existing HumanPose checkpoint")
@@ -677,7 +680,9 @@ def main() -> int:
                    "--velocity_contact_arch", VC_ARCH, "--object_trans_arch", ot_arch,
                    *evaluation_noise_args, "--seed", args.seed if args.eval_seed is None else args.eval_seed,
                    "--num_workers", args.num_workers, "--online_batch_size", args.eval_batch_size,
-                   "--per_joint_rot_error", "--output_json", out_json], log_path)
+                   "--per_joint_rot_error", "--output_json", out_json,
+                   *(["--sequence_records_json", out_json.with_name(f"{out_json.stem}_records.json")]
+                     if args.eval_records else [])], log_path)
 
     def variant(name: str) -> bool:
         spec = VARIANTS[name]

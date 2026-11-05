@@ -1,0 +1,22 @@
+# HP plug-in jobs: <dataset> <method>, longest first (BEHAVE VC = 986 epochs; GlobalPose caches
+# run the CPU physics optimizer).  scripts/hp_plugin/queue.sh hands them to its GPU lanes in order.
+behave globalpose
+behave dip18
+behave transpose
+behave tip
+omomo globalpose
+omomo dip18
+omomo transpose
+omomo tip
+imhd globalpose
+imhd dip18
+imhd transpose
+imhd tip
+hodome globalpose
+hodome dip18
+hodome transpose
+hodome tip
+pahoi globalpose
+pahoi dip18
+pahoi transpose
+pahoi tip

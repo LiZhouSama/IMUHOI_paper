@@ -14,6 +14,7 @@ from .velocity_contact import (
     normalize_velocity_contact_arch,
 )
 from .human_pose import HumanPoseModule
+from .external_human_pose import ExternalHumanPoseModule, is_external_hp
 from .object_trans import ObjectTransModule
 from .object_trans_v3 import V3ObjectTransModule
 from .object_trans_legacy import LegacyObjectTransModule
@@ -188,7 +189,11 @@ class IMUHOIModel(nn.Module):
             if self.velocity_contact_arch == "current"
             else build_velocity_contact_module(cfg, velocity_contact_arch=self.velocity_contact_arch)
         )
-        self.human_pose_module = HumanPoseModule(cfg, device, no_trans=no_trans)
+        # HumanPoseModule, or a cached external pose estimator (HP plug-in runs).
+        if is_external_hp(cfg):
+            self.human_pose_module = ExternalHumanPoseModule(cfg, device, no_trans=no_trans)
+        else:
+            self.human_pose_module = HumanPoseModule(cfg, device, no_trans=no_trans)
         if self.object_trans_arch == "legacy":
             self.object_trans_module = LegacyObjectTransModule(cfg)
         elif self.object_trans_arch == "imuhoi":
@@ -395,6 +400,11 @@ class IMUHOIModel(nn.Module):
         from utils.utils import load_checkpoint
         
         for name, path in module_paths.items():
+            if name == "human_pose" and isinstance(self.human_pose_module, ExternalHumanPoseModule):
+                # No weights: the HP 'checkpoint' of a plug-in run is its cache manifest.
+                self.human_pose_module.check_source(path)
+                print(f"human_pose is the external {self.human_pose_module.method} cache {self.human_pose_module.cache_dir}")
+                continue
             if path and os.path.exists(path):
                 module = getattr(self, f"{name}_module", None)
                 if module is not None:
@@ -462,9 +472,14 @@ class IMUHOIModel(nn.Module):
         past the published frames, as the lookahead does, so every frame sees
         the same neighbours it saw inside its own window.
         """
+        hp_module = self.human_pose_module
+        derive_external = getattr(hp_module, "derive_refined_human_outputs", None)
+        if callable(derive_external):
+            # External HP: refine only the reduced joints of the external skeleton.
+            derive_external(results, data_dict, chunk_rows=chunk_rows)
+            return
         refined_pose = results["p_pred"]
         refined_root = results["root_trans_pred"]
-        hp_module = self.human_pose_module
         human_imu = data_dict["human_imu"]
         batch_size, seq_len = refined_pose.shape[:2]
         device = refined_pose.device
@@ -593,7 +608,8 @@ class IMUHOIModel(nn.Module):
             hp_input_dict['trans_gt'] = data_dict["trans_gt"]
         else:
             hp_input_dict['trans_init'] = data_dict["trans_init"]
-        
+        hp_input_dict.update(self._external_hp_inputs(data_dict))
+
         hp_out = self.human_pose_module(hp_input_dict)
         results.update(hp_out)
         
@@ -672,7 +688,13 @@ class IMUHOIModel(nn.Module):
         ):
             if key in data_dict:
                 hp_input_dict[key] = data_dict[key]
+        hp_input_dict.update(self._external_hp_inputs(data_dict))
         return hp_input_dict
+
+    @staticmethod
+    def _external_hp_inputs(data_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Cached external-estimator frames (``ext_hp_*``, HP plug-in runs) for the HP stage."""
+        return {key: value for key, value in data_dict.items() if key.startswith("ext_hp_")}
 
     def _compute_fk_output(
         self,

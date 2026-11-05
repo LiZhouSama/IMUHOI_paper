@@ -183,6 +183,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output_json", default=None)
     parser.add_argument("--save_predictions", default=None)
+    parser.add_argument(
+        "--save_hp_cache",
+        default=None,
+        help=(
+            "HP plug-in experiment: also write every sequence's online local pose and root "
+            "translation into this external-HP cache directory (utils/external_hp_cache.py)."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     noise_group = parser.add_mutually_exclusive_group()
     noise_group.add_argument(
@@ -697,6 +705,27 @@ def _serialize_predictions(
     torch.save(payload, destination / f"{safe_name}.pt")
 
 
+def _save_hp_cache_entry(cache_dir: Path, batch: dict, prediction: dict) -> None:
+    """One sequence of an external-HP cache: the published (post-physics/oracle) pose and root."""
+    from pytorch3d.transforms import matrix_to_rotation_6d
+
+    from utils.external_hp_cache import write_cache_entry
+
+    seq_path = batch.get("seq_path")
+    if isinstance(seq_path, (list, tuple)):
+        seq_path = seq_path[0]
+    local = prediction["local_rot"][0].detach().float()
+    rot6d = matrix_to_rotation_6d(local.reshape(-1, 3, 3)).reshape(local.shape[0], local.shape[1], 6)
+    write_cache_entry(
+        cache_dir,
+        seq_path,
+        rot6d,
+        prediction["root_trans"][0].detach().float(),
+        seq_name=_sequence_name(batch),
+        translation_mode=str(prediction["translation_mode"]),
+    )
+
+
 def main() -> None:
     args = parse_args()
     _validate_args(args)
@@ -948,6 +977,7 @@ def main() -> None:
     initialization_modes = set()
     object_velocity_frames = set()
     prediction_dir = Path(args.save_predictions) if args.save_predictions else None
+    hp_cache_dir = Path(args.save_hp_cache) if args.save_hp_cache else None
 
     def finish(raw_batch, batch, prediction, physics_job) -> None:
         if physics_job is not None:
@@ -974,6 +1004,8 @@ def main() -> None:
             _serialize_predictions(
                 prediction_dir, raw_batch, prediction, args.method
             )
+        if hp_cache_dir is not None:
+            _save_hp_cache_entry(hp_cache_dir, raw_batch, prediction)
 
     # Sequences wait here until their physics job is done; finishing in
     # loader order keeps per_sequence deterministic.
@@ -1146,6 +1178,7 @@ def main() -> None:
             else getattr(model, "human_condition_on_object", False)
         ),
         "data_dirs": data_dirs,
+        "hp_cache": str(hp_cache_dir) if hp_cache_dir is not None else None,
         "num_sequences": len(per_sequence),
         "aggregation": "macro_mean_over_sequences",
         "metrics": metrics,

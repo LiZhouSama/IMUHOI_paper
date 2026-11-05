@@ -1,0 +1,50 @@
+# Comparison baselines (Comparisons/, protocol v3) for the HP plug-in experiment (scripts/hp_plugin/):
+# each method's selected.pt per dataset (the checkpoint of the published comparison table) and its
+# published online evals (reference of build_hp_cache.py's reproduction check; DIP: GT root and fixed root).
+# Check on the server: sha256sum -c scripts/upload/comparisons_sha256.txt
+scripts/upload/comparisons_sha256.txt
+outputs/Comparisons/omomo_cano_20261023/dip18/selected.pt
+outputs/Comparisons/omomo_cano_20261023/dip18/eval_omomo_test_online.json
+outputs/Comparisons/omomo_cano_20261023/dip18/eval_omomo_test_online_gtroot.json
+outputs/Comparisons/omomo_cano_20261023/tip/selected.pt
+outputs/Comparisons/omomo_cano_20261023/tip/eval_omomo_test_online.json
+outputs/Comparisons/omomo_cano_20261023/transpose/selected.pt
+outputs/Comparisons/omomo_cano_20261023/transpose/eval_omomo_test_online.json
+outputs/Comparisons/omomo_cano_20261023/globalpose/selected.pt
+outputs/Comparisons/omomo_cano_20261023/globalpose/eval_omomo_test_online.json
+outputs/Comparisons/all4_cano_20261023/behave/dip18/selected.pt
+outputs/Comparisons/all4_cano_20261023/behave/dip18/eval_behave_test_online.json
+outputs/Comparisons/all4_cano_20261023/behave/dip18/eval_behave_test_online_gtroot.json
+outputs/Comparisons/all4_cano_20261023/behave/tip/selected.pt
+outputs/Comparisons/all4_cano_20261023/behave/tip/eval_behave_test_online.json
+outputs/Comparisons/all4_cano_20261023/behave/transpose/selected.pt
+outputs/Comparisons/all4_cano_20261023/behave/transpose/eval_behave_test_online.json
+outputs/Comparisons/all4_cano_20261023/behave/globalpose/selected.pt
+outputs/Comparisons/all4_cano_20261023/behave/globalpose/eval_behave_test_online.json
+outputs/Comparisons/all4_cano_20261023/imhd/dip18/selected.pt
+outputs/Comparisons/all4_cano_20261023/imhd/dip18/eval_imhd_test_online.json
+outputs/Comparisons/all4_cano_20261023/imhd/dip18/eval_imhd_test_online_gtroot.json
+outputs/Comparisons/all4_cano_20261023/imhd/tip/selected.pt
+outputs/Comparisons/all4_cano_20261023/imhd/tip/eval_imhd_test_online.json
+outputs/Comparisons/all4_cano_20261023/imhd/transpose/selected.pt
+outputs/Comparisons/all4_cano_20261023/imhd/transpose/eval_imhd_test_online.json
+outputs/Comparisons/all4_cano_20261023/imhd/globalpose/selected.pt
+outputs/Comparisons/all4_cano_20261023/imhd/globalpose/eval_imhd_test_online.json
+outputs/Comparisons/all4_cano_20261023/pahoi/dip18/selected.pt
+outputs/Comparisons/all4_cano_20261023/pahoi/dip18/eval_pahoi_test_online.json
+outputs/Comparisons/all4_cano_20261023/pahoi/dip18/eval_pahoi_test_online_gtroot.json
+outputs/Comparisons/all4_cano_20261023/pahoi/tip/selected.pt
+outputs/Comparisons/all4_cano_20261023/pahoi/tip/eval_pahoi_test_online.json
+outputs/Comparisons/all4_cano_20261023/pahoi/transpose/selected.pt
+outputs/Comparisons/all4_cano_20261023/pahoi/transpose/eval_pahoi_test_online.json
+outputs/Comparisons/all4_cano_20261023/pahoi/globalpose/selected.pt
+outputs/Comparisons/all4_cano_20261023/pahoi/globalpose/eval_pahoi_test_online.json
+outputs/Comparisons/all4_cano_20261023/hodome/dip18/selected.pt
+outputs/Comparisons/all4_cano_20261023/hodome/dip18/eval_hodome_test_online.json
+outputs/Comparisons/all4_cano_20261023/hodome/dip18/eval_hodome_test_online_gtroot.json
+outputs/Comparisons/all4_cano_20261023/hodome/tip/selected.pt
+outputs/Comparisons/all4_cano_20261023/hodome/tip/eval_hodome_test_online.json
+outputs/Comparisons/all4_cano_20261023/hodome/transpose/selected.pt
+outputs/Comparisons/all4_cano_20261023/hodome/transpose/eval_hodome_test_online.json
+outputs/Comparisons/all4_cano_20261023/hodome/globalpose/selected.pt
+outputs/Comparisons/all4_cano_20261023/hodome/globalpose/eval_hodome_test_online.json

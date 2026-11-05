@@ -22,6 +22,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 sys.path.insert(0, PROJECT_ROOT)
 
 from model import HumanPoseModule, ObjectTransModule
+from model.rnn.external_human_pose import maybe_build_external_human_pose
 from model.rnn.velocity_contact import (
     VELOCITY_CONTACT_ARCH_CHOICES,
     build_velocity_contact_module,
@@ -1491,11 +1492,14 @@ def main():
     elif vc_ckpt:
         print(f"警告: VelocityContact权重不存在: {vc_ckpt}")
 
-    hp_model = HumanPoseModule(cfg, device, no_trans=cfg.no_trans)
-    if hp_ckpt and os.path.exists(hp_ckpt):
-        load_checkpoint(hp_model, hp_ckpt, device)
-    elif hp_ckpt:
-        print(f"警告: HumanPose权重不存在: {hp_ckpt}")
+    # HP plug-in runs use a cached external estimator (its 'checkpoint' is the cache manifest).
+    hp_model = maybe_build_external_human_pose(cfg, device, hp_ckpt, no_trans=cfg.no_trans)
+    if hp_model is None:
+        hp_model = HumanPoseModule(cfg, device, no_trans=cfg.no_trans)
+        if hp_ckpt and os.path.exists(hp_ckpt):
+            load_checkpoint(hp_model, hp_ckpt, device)
+        elif hp_ckpt:
+            print(f"警告: HumanPose权重不存在: {hp_ckpt}")
 
     if cfg.object_trans_arch == 'legacy':
         ot_model_cls = LegacyObjectTransModule
